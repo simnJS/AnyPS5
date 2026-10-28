@@ -1,0 +1,130 @@
+name: Fork Linux tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONFIGURE: >-
+    -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+    -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+jobs:
+  linux:
+    if: github.repository == 'simnJS/AnyPS5'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: submodules
+        name: Key the submodules on their commits
+        run: |
+          echo "key=$(git ls-files -s | awk '$1 == "160000" { print $2, $4 }' | cat - .gitmodules | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:3rdparty/ffmpeg-core)" >> "$GITHUB_OUTPUT"
+      - id: submodule-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Check out the submodules
+        run: |
+          if [ -f "$RUNNER_TEMP/submodule-gitdirs.tar" ]; then tar -xf "$RUNNER_TEMP/submodule-gitdirs.tar"; fi
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        run: tar -cf "$RUNNER_TEMP/submodule-gitdirs.tar" .git/modules
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Install the build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libx11-dev libxext-dev libxrandr-dev libasound2-dev libpulse-dev mesa-vulkan-drivers
+      - name: Free disk space for the full build
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: fork-linux
+          max-size: 4G
+          evict-old-files: job
+      - id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/externals
+          key: ffmpeg-fork-linux-${{ runner.os }}-${{ steps.submodules.outputs.ffmpeg }}
+      - id: configure
+        run: cmake -S . -B build $CONFIGURE "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown"
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: build/externals
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+      - name: Check that every test executable is registered with ctest
+        run: python3 tools/check_test_registration.py build
+      - id: build
+        name: Build everything, keeping on after a target fails
+        run: cmake --build build -- -k 0
+      - id: libs
+        if: ${{ !cancelled() && steps.configure.outcome == 'success' }}
+        run: cmake --build build --target libs -- -k 0
+      - id: tests
+        name: Run every test
+        if: ${{ !cancelled() && steps.configure.outcome == 'success' }}
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: python3 tools/select_tests.py ctest build --output-on-failure --timeout 120 --parallel 4 --repeat until-pass:2 --output-log ctest.log --output-junit ctest.xml
+      - name: List the failed tests
+        if: ${{ !cancelled() && steps.configure.outcome == 'success' }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import pathlib, xml.etree.ElementTree as ET
+          report = pathlib.Path("build/ctest.xml")
+          if not report.exists():
+              print("No ctest report: the tests did not run.")
+              raise SystemExit
+          cases = ET.parse(report).getroot().iter("testcase")
+          failed, total = [], 0
+          for case in cases:
+              total += 1
+              if case.find("failure") is not None or case.get("status") == "fail":
+                  failed.append(case.get("name"))
+          print(f"### Linux: {total - len(failed)} of {total} tests passed")
+          for name in sorted(failed):
+              print(f"- `{name}`")
+          EOF
+      - name: Check the skipped tests
+        if: ${{ !cancelled() && steps.configure.outcome == 'success' }}
+        continue-on-error: true
+        run: python3 tools/check_skips.py build/ctest.xml
+      - name: Report compiler cache statistics
+        if: ${{ !cancelled() }}
+        run: ccache --show-stats
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: fork-linux-tests
+          path: |
+            build/ctest.log
+            build/ctest.xml
+          if-no-files-found: ignore
