@@ -507,7 +507,7 @@ def make_eof_segment_prefix_image():
     struct.pack_into("<IIQQQQQQ", image, 232, 1, 5, 0x1000, 0x1000, 0x1000, 0x1000, 0x1000, 0x1000)
     for index, tag in enumerate(tags):
         struct.pack_into("<qQ", image, 0x400 + index * 16, *tag)
-    image[0x1ffe:0x2000] = bytes.fromhex("64 90")
+    image[0x1ffd:0x2000] = bytes.fromhex("64 20 00")
     return image
 
 
@@ -532,7 +532,7 @@ def add_alias(image, size, begin=0x1200):
 def main():
     groups = ("metadata", "padding", "register_loads", "displacement_bounds", "alu_execution",
               "register_address_loads", "moved_branch", "rejected", "gs_traps", "gs_traps_implicit",
-              "gs_non_memory")
+              "gs_non_memory", "fs_non_memory")
     groups += tuple(f"displacement_r{register}" for register in range(16) if register != 4)
     groups += tuple(f"alu_{name}" for name in ALU_READ)
     parser = argparse.ArgumentParser(description="Run Windows guest TLS function coverage fixtures")
@@ -837,6 +837,14 @@ def main():
             check_gs_traps([
                 ("gs-lea", bytes.fromhex("65 8d 05 11 11 11 11"), False),
                 ("gs-nop-memory", bytes.fromhex("65 0f 1f 05 11 11 11 11"), False),
+            ])
+        if args.group in ("all", "fs_non_memory"):
+            check_gs_traps([
+                ("fs-nop", bytes.fromhex("64 90"), False),
+                ("fs-register-move", bytes.fromhex("64 48 89 c8"), False),
+                ("fs-and-register", bytes.fromhex("64 22 d0"), False),
+                ("fs-cpuid", bytes.fromhex("64 0f a2"), False),
+                ("fs-lea", bytes.fromhex("64 48 8d 05 11 11 11 11"), False),
             ])
         if args.group in ("all", "gs_traps_implicit"):
             check_gs_traps([

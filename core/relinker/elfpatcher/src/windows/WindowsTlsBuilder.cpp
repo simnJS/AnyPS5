@@ -162,6 +162,8 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
                 }
                 continue;
             }
+            if (info.SegmentPrefix != 0 && !info.HasMemoryOperand)
+                continue;
             if (info.SegmentPrefix != 0 && !(insidePrevious && info.SegmentPrefix != 0x64)) {
                 const auto position = info.OpcodeOffset;
                 bool hasOperandSizePrefix = false;
