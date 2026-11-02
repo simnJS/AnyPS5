@@ -16,6 +16,7 @@ import unwrap_self
 SELF_MAGIC = 0x1D3D154F
 ELF_HEADER_OFFSET = 0x1A0
 PROGRAM_TABLE_OFFSET = 0x40
+PT_NULL = 0
 PT_LOAD = 1
 PT_DYNAMIC = 2
 PT_TLS = 7
@@ -91,6 +92,18 @@ def read_program_headers(path):
 
 
 class UnwrapTest(unittest.TestCase):
+    def test_mapped_segments_at_virtual_address_zero_keep_their_template(self):
+        for kind in (PT_DYNAMIC, PT_TLS):
+            with self.subTest(kind=kind):
+                segments = default_segments()
+                segments[2] = (kind, 4, 0x1234, 0, 0x10, 8)
+                result, output = self.convert(build_container(segments, default_records(), default_payloads()))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data, headers = read_program_headers(output)
+                self.assertEqual(headers[2][2], headers[0][2])
+                self.assertEqual(headers[2][5:7], (0x10, 0x10))
+                self.assertEqual(data[headers[2][2]:headers[2][2] + 0x10], pattern(1, 0x10))
+
     def test_unsupported_inner_elf_machines_are_refused(self):
         for machine in (0, 3, 40, 183, 0x3E00, 0xFFFF):
             with self.subTest(machine=machine):
@@ -1389,6 +1402,27 @@ class UnwrapTest(unittest.TestCase):
                 self.assertIn(message, result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
                 self.assertEqual(output.read_bytes(), b"previous output")
+
+    def test_invalid_non_null_segment_alignment_is_refused_before_replacing_output(self):
+        output = Path(self.directory) / "output.elf"
+        for kind in (PT_DYNAMIC, PT_NOTE, PT_PHDR, SCE_COMMENT):
+            with self.subTest(kind=kind):
+                segments = default_segments()
+                segments[2] = (kind, 6, 0x1580, 0x1040, 0x10, 3)
+                container = build_container(segments, default_records(), default_payloads())
+                output.write_bytes(b"previous output")
+                result, output = self.convert(container)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("segment 2 alignment is not a power of two", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(output.read_bytes(), b"previous output")
+
+    def test_null_segment_alignment_is_ignored(self):
+        segments = default_segments()
+        segments[2] = (PT_NULL, 0, 0, 0, 0, 3)
+        container = build_container(segments, default_records(), default_payloads())
+        _, _, headers = unwrap_self.parse_elf(container)
+        self.assertEqual(headers[2]["align"], 3)
 
     def test_load_alignment_zero_and_one_remain_supported(self):
         for alignment in (0, 1):
