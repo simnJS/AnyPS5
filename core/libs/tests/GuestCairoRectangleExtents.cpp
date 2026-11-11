@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string_view>
 #include <vector>
 
@@ -24,7 +25,7 @@ struct Extents {
 };
 
 void Same(double actual, double expected, double tolerance) {
-    if (tolerance == 0) assert(actual == expected);
+    if (tolerance == 0) assert(actual == expected && std::signbit(actual) == std::signbit(expected));
     else assert(std::abs(actual - expected) <= tolerance);
 }
 
@@ -85,6 +86,34 @@ void CheckRectangles() {
     Expect(context, "MZM", {{3, 4}, {3, 4}}, {3, 4, 3, 4});
     cairo_rectangle(context, 3, 4, 0, 5);
     Expect(context, "MLZM", {{3, 4}, {3, 9}, {3, 4}}, {3, 4, 3, 9});
+
+    const double infinity = std::numeric_limits<double>::infinity();
+    cairo_rectangle(context, 0, 0, 1e7, 10);
+    Expect(context, "MLLLZM", {{0, 0}, {-0x1.9da6p+22, 0}, {-0x1.9da6p+22, 10}, {0, 10}, {0, 0}},
+           {-0x1.9da6p+22, 0, 0, 10});
+    cairo_rectangle(context, 8388000, 0, 1000, 10);
+    Expect(context, "MLLLZM",
+           {{0x1.fff68p+22, 0}, {-0x1.fff9ep+22, 0}, {-0x1.fff9ep+22, 10}, {0x1.fff68p+22, 10}, {0x1.fff68p+22, 0}},
+           {-0x1.fff9ep+22, 0, 0x1.fff68p+22, 10});
+    cairo_rectangle(context, 1, 2, infinity, 10);
+    Expect(context, "MLZM", {{1, 2}, {1, 12}, {1, 2}}, {1, 2, 1, 12});
+    cairo_rectangle(context, 1, 2, 3, -infinity);
+    Expect(context, "MLZM", {{1, 2}, {4, 2}, {1, 2}}, {1, 2, 4, 2});
+    cairo_rectangle(context, 5, 6, 0.3, 0.7);
+    Expect(context, "MLLLZM",
+           {{5, 6}, {0x1.534p+2, 6}, {0x1.534p+2, 0x1.accp+2}, {5, 0x1.accp+2}, {5, 6}},
+           {5, 6, 0x1.534p+2, 0x1.accp+2});
+    cairo_rectangle(context, 5, 6, 1.0 / 512, 1.0 / 512);
+    Expect(context, "MZM", {{5, 6}, {5, 6}}, {5, 6, 5, 6});
+    cairo_rectangle(context, 5, 6, 3.0 / 512, 3.0 / 512);
+    Expect(context, "MLLLZM",
+           {{5, 6}, {0x1.408p+2, 6}, {0x1.408p+2, 0x1.808p+2}, {5, 0x1.808p+2}, {5, 6}},
+           {5, 6, 0x1.408p+2, 0x1.808p+2});
+    cairo_rectangle(context, -0.001, -0.001, 1, 1);
+    Expect(context, "MLLLZM", {{0, 0}, {1, 0}, {1, 1}, {0, 1}, {0, 0}}, {0, 0, 1, 1});
+    cairo_move_to(context, -0.001, 3);
+    cairo_line_to(context, 2, -0.001);
+    Expect(context, "ML", {{0, 3}, {2, 0}}, {0, 0, 2, 3});
 
     cairo_move_to(context, 1, 1);
     cairo_line_to(context, 2, 2);
