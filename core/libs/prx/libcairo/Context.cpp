@@ -1,10 +1,13 @@
 #include "prx/libcairo/include/Context.hpp"
 #include "prx/libcairo/include/Path.hpp"
 #include "prx/libcairo/include/Spline.hpp"
+#include "prx/libc/include/General.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <vector>
@@ -141,7 +144,19 @@ double Fixed(double coordinate) {
     if (std::isnan(coordinate)) return 0;
     constexpr double kMinimum = -8388606.0;
     constexpr double kMaximum = 8388606.0 - 1.0 / 256.0;
-    return std::nearbyint(std::clamp(coordinate, kMinimum, kMaximum) * 256.0) / 256.0;
+    return std::nearbyint(std::clamp(coordinate, kMinimum, kMaximum) * 256.0) / 256.0 + 0.0;
+}
+
+std::uint32_t WrappedFixed(double distance) {
+    const double shifted = distance + 26388279066624.0;
+    std::uint64_t bits;
+    std::memcpy(&bits, &shifted, sizeof(bits));
+    return static_cast<std::uint32_t>(bits);
+}
+
+double WrappedSum(double coordinate, double distance) {
+    const auto fixed = static_cast<std::uint32_t>(static_cast<std::int32_t>(coordinate * 256.0));
+    return static_cast<std::int32_t>(fixed + WrappedFixed(distance)) / 256.0;
 }
 
 void DevicePoint(const ContextStorage* state, double& x, double& y) {
@@ -216,7 +231,7 @@ void AppendRelativeLine(ContextStorage* state, double dx, double dy) {
     cairo_matrix_transform_distance(&state->matrix, &dx, &dy);
     double sx = 1, sy = 1;
     cairo_surface_get_device_scale(state->target, &sx, &sy);
-    AppendLine(state, Fixed(state->currentX + Fixed(dx * sx)), Fixed(state->currentY + Fixed(dy * sy)));
+    AppendLine(state, WrappedSum(state->currentX, dx * sx), WrappedSum(state->currentY, dy * sy));
 }
 
 void ClosePath(ContextStorage* state) {
@@ -722,10 +737,8 @@ void APS5_VABI cairo_path_extents(CairoContext* context, double* x1, double* y1,
         double sx = 1, sy = 1;
         cairo_surface_get_device_scale(state->target, &sx, &sy);
         CairoMatrix deviceInverse{sx, 0, 0, sy, 0, 0};
-        if (cairo_matrix_invert(&userInverse) != kSuccess || cairo_matrix_invert(&deviceInverse) != kSuccess) {
-            state->status = kInvalidMatrix;
-            box = {};
-        } else if (!IsIdentity(deviceInverse) || !IsIdentity(userInverse)) {
+        if (cairo_matrix_invert(&userInverse) != kSuccess || cairo_matrix_invert(&deviceInverse) != kSuccess) NotImplemented_nid_no_patch(__func__);
+        if (!IsIdentity(deviceInverse) || !IsIdentity(userInverse)) {
             CairoMatrix inverse{};
             cairo_matrix_multiply(&inverse, &deviceInverse, &userInverse);
             TransformBoundingBox(inverse, box);
