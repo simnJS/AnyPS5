@@ -1,5 +1,6 @@
 #include "prx/libcairo/include/Context.hpp"
 #include "prx/libcairo/include/Path.hpp"
+#include "prx/libcairo/include/Spline.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -17,10 +18,12 @@ constexpr int kInvalidMatrix = 5;
 constexpr int kNullPointer = 7;
 constexpr int kInvalidDash = 19;
 constexpr int kInvalidPathData = 9;
+constexpr int kOperatorOver = 2;
 
 constexpr CairoMatrix kIdentity{1, 0, 0, 1, 0, 0};
 
 struct GraphicsStyle {
+    int op{kOperatorOver};
     int antialias{};
     int fillRule{};
     int lineCap{};
@@ -207,6 +210,126 @@ void AppendLine(ContextStorage* state, double x, double y) {
         state->currentX = x;
         state->currentY = y;
     }
+}
+
+void AppendRelativeLine(ContextStorage* state, double dx, double dy) {
+    cairo_matrix_transform_distance(&state->matrix, &dx, &dy);
+    double sx = 1, sy = 1;
+    cairo_surface_get_device_scale(state->target, &sx, &sy);
+    AppendLine(state, Fixed(state->currentX + Fixed(dx * sx)), Fixed(state->currentY + Fixed(dy * sy)));
+}
+
+void ClosePath(ContextStorage* state) {
+    if (!state->hasCurrent) return;
+    AppendLine(state, state->startX, state->startY);
+    if (state->status != kSuccess) return;
+    if (state->path && !state->path->empty() && state->path->back().type == 1) state->path->pop_back();
+    PathEntry close{};
+    close.type = 3;
+    if (!Record(state, close)) return;
+    AppendMove(state, state->startX, state->startY);
+}
+
+struct Box {
+    double x1, y1, x2, y2;
+};
+
+void AddPoint(Box& box, double x, double y) {
+    if (x < box.x1) box.x1 = x;
+    else if (x > box.x2) box.x2 = x;
+    if (y < box.y1) box.y1 = y;
+    else if (y > box.y2) box.y2 = y;
+}
+
+void AddSplinePoint(void* closure, double x, double y) {
+    AddPoint(*static_cast<Box*>(closure), Fixed(x), Fixed(y));
+}
+
+bool Contains(const Box& box, double x, double y) {
+    return box.x1 <= x && x <= box.x2 && box.y1 <= y && y <= box.y2;
+}
+
+bool PathBox(const ContextStorage* state, Box& box) {
+    if (!state->path) return false;
+    bool hasBox = false;
+    bool pending = false;
+    double currentX = 0, currentY = 0;
+    for (const auto& entry : *state->path) {
+        if (entry.type == 0) {
+            pending = true;
+            currentX = entry.points[0];
+            currentY = entry.points[1];
+            continue;
+        }
+        if (pending) {
+            if (hasBox) AddPoint(box, currentX, currentY);
+            else box = {currentX, currentY, currentX, currentY};
+            hasBox = true;
+            pending = false;
+        }
+        if (entry.type == 1) {
+            AddPoint(box, entry.points[0], entry.points[1]);
+            currentX = entry.points[0];
+            currentY = entry.points[1];
+        } else if (entry.type == 2) {
+            AddPoint(box, entry.points[4], entry.points[5]);
+            if (!Contains(box, entry.points[0], entry.points[1]) || !Contains(box, entry.points[2], entry.points[3]))
+                CairoSplineBound({currentX, currentY}, {entry.points[0], entry.points[1]},
+                                 {entry.points[2], entry.points[3]}, {entry.points[4], entry.points[5]},
+                                 AddSplinePoint, &box);
+            currentX = entry.points[4];
+            currentY = entry.points[5];
+        }
+    }
+    return hasBox;
+}
+
+bool IsIdentity(const CairoMatrix& matrix) {
+    return matrix.xx == 1 && matrix.yx == 0 && matrix.xy == 0 && matrix.yy == 1 &&
+           matrix.x0 == 0 && matrix.y0 == 0;
+}
+
+void TransformBoundingBox(const CairoMatrix& matrix, Box& box) {
+    if (matrix.xy == 0 && matrix.yx == 0) {
+        if (matrix.xx != 1) {
+            const double first = box.x1 * matrix.xx;
+            const double second = box.x2 * matrix.xx;
+            box.x1 = first < second ? first : second;
+            box.x2 = first < second ? second : first;
+        }
+        if (matrix.x0 != 0) {
+            box.x1 += matrix.x0;
+            box.x2 += matrix.x0;
+        }
+        if (matrix.yy != 1) {
+            const double first = box.y1 * matrix.yy;
+            const double second = box.y2 * matrix.yy;
+            box.y1 = first < second ? first : second;
+            box.y2 = first < second ? second : first;
+        }
+        if (matrix.y0 != 0) {
+            box.y1 += matrix.y0;
+            box.y2 += matrix.y0;
+        }
+        return;
+    }
+    const double cornersX[4] = {box.x1, box.x2, box.x1, box.x2};
+    const double cornersY[4] = {box.y1, box.y1, box.y2, box.y2};
+    double minX = 0, maxX = 0, minY = 0, maxY = 0;
+    for (int i = 0; i < 4; ++i) {
+        double x = cornersX[i], y = cornersY[i];
+        cairo_matrix_transform_point(&matrix, &x, &y);
+        if (i == 0) {
+            minX = maxX = x;
+            minY = maxY = y;
+            continue;
+        }
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+    }
+    box = {minX, minY, maxX, maxY};
 }
 
 } // namespace
@@ -495,6 +618,16 @@ int APS5_VABI cairo_get_dash_count(CairoContext* context) {
     return state ? state->style.dashCount : 0;
 }
 
+void APS5_VABI cairo_set_operator(CairoContext* context, int op) {
+    auto* state = Valid(context);
+    if (state) state->style.op = op;
+}
+
+int APS5_VABI cairo_get_operator(CairoContext* context) {
+    auto* state = Valid(context);
+    return state ? state->style.op : kOperatorOver;
+}
+
 void APS5_VABI cairo_new_path(CairoContext* context) {
     auto* state = Valid(context);
     if (!state) return;
@@ -553,11 +686,44 @@ void APS5_VABI cairo_curve_to(CairoContext* context, double x1, double y1,
 
 void APS5_VABI cairo_close_path(CairoContext* context) {
     auto* state = Valid(context);
-    if (!state || !state->hasCurrent) return;
-    PathEntry close{};
-    close.type = 3;
-    if (!Record(state, close)) return;
-    AppendMove(state, state->startX, state->startY);
+    if (state) ClosePath(state);
+}
+
+void APS5_VABI cairo_rectangle(CairoContext* context, double x, double y, double width, double height) {
+    auto* state = Valid(context);
+    if (!state) return;
+    DevicePoint(state, x, y);
+    if (!AppendMove(state, x, y)) return;
+    AppendRelativeLine(state, width, 0);
+    if (state->status != kSuccess) return;
+    AppendRelativeLine(state, 0, height);
+    if (state->status != kSuccess) return;
+    AppendRelativeLine(state, -width, 0);
+    if (state->status != kSuccess) return;
+    ClosePath(state);
+}
+
+void APS5_VABI cairo_path_extents(CairoContext* context, double* x1, double* y1, double* x2, double* y2) {
+    Box box{};
+    auto* state = Valid(context);
+    if (state && PathBox(state, box)) {
+        CairoMatrix userInverse = state->matrix;
+        double sx = 1, sy = 1;
+        cairo_surface_get_device_scale(state->target, &sx, &sy);
+        CairoMatrix deviceInverse{sx, 0, 0, sy, 0, 0};
+        if (cairo_matrix_invert(&userInverse) != kSuccess || cairo_matrix_invert(&deviceInverse) != kSuccess) {
+            state->status = kInvalidMatrix;
+            box = {};
+        } else if (!IsIdentity(deviceInverse) || !IsIdentity(userInverse)) {
+            CairoMatrix inverse{};
+            cairo_matrix_multiply(&inverse, &deviceInverse, &userInverse);
+            TransformBoundingBox(inverse, box);
+        }
+    }
+    if (x1) *x1 = box.x1;
+    if (y1) *y1 = box.y1;
+    if (x2) *x2 = box.x2;
+    if (y2) *y2 = box.y2;
 }
 
 int APS5_VABI cairo_has_current_point(CairoContext* context) {

@@ -42,4 +42,6 @@ void APS5_VABI cairo_set_dash(CairoContext* context, const double* dashes,
                              int numDashes, double offset);
 void APS5_VABI cairo_get_dash(CairoContext* context, double* dashes, double* offset);
 int APS5_VABI cairo_get_dash_count(CairoContext* context);
+void APS5_VABI cairo_set_operator(CairoContext* context, int op);
+int APS5_VABI cairo_get_operator(CairoContext* context);
 }
