@@ -334,6 +334,10 @@ void TransformBoundingBox(const CairoMatrix& matrix, Box& box) {
 
 } // namespace
 
+int CairoContextStatus(CairoContext* context) {
+    return context ? State(context)->status : kNullPointer;
+}
+
 extern "C" {
 
 CairoContext* APS5_VABI cairo_create(CairoSurface* target) {
@@ -669,6 +673,13 @@ void APS5_VABI cairo_curve_to(CairoContext* context, double x1, double y1,
         x1 == x2 && y1 == y2 && x2 == x3 && y2 == y3) {
         AppendLine(state, x3, y3);
         return;
+    }
+    if (state->path && state->path->size() >= 2 && state->path->back().type == 1) {
+        const auto& previous = state->path->back();
+        const auto& earlier = (*state->path)[state->path->size() - 2];
+        const int endpoint = earlier.type == 2 ? 4 : 0;
+        if (earlier.points[endpoint] == previous.points[0] && earlier.points[endpoint + 1] == previous.points[1])
+            state->path->pop_back();
     }
     PathEntry command{};
     command.type = 2;

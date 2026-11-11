@@ -25,10 +25,6 @@ int APS5_VABI cairo_stroke_extents() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI cairo_arc_negative() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 
 
 
@@ -161,10 +157,6 @@ int APS5_VABI cairo_clip() {
 }
 
 int APS5_VABI cairo_pattern_create_for_surface() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI cairo_arc() {
     NotImplemented_nid_no_patch(__func__);
 }
 
