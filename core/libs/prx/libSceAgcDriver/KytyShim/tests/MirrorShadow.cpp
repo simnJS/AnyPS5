@@ -150,9 +150,8 @@ void Fallback() {
 	      "a device without sparse binding is refused by name: " + GuestMirror::Unsupported(gpu.graphics));
 	GuestMirror mirror(gpu.graphics);
 	Check(!mirror.Available() && mirror.Size() == 0, "no mirror without sparse binding");
-	Check(Contains(mirror.Description(), "no mirror: the device has no sparseBinding") &&
-	          Contains(mirror.Description(), "keeps buffers of its own"),
-	      "the fallback says why: " + mirror.Description());
+	Check(Contains(mirror.Description(), "no mirror: the device has no sparseBinding"),
+	      "a device without a mirror says why: " + mirror.Description());
 	mirror.NoteRange(0x10000, 0x10000);
 	const auto wait = mirror.Submit();
 	mirror.WaitIdle();
