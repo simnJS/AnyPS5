@@ -129,7 +129,7 @@ The [coding conventions](CONVENTIONS.md) give the naming and formatting rules.
 ## How a pull request is integrated
 
 1. **Open it against `AnyKyty`** and fill in the template. It is AnyPS5's and says `main`: read `AnyKyty`.
-2. **The CI runs** on every push ([workflow](../../.github/workflows/anykyty.yml)): the conventions and settings checks, a Linux build with the shim tests, the CPU tests under ThreadSanitizer and AddressSanitizer, and a Windows build with the shim tests. It must be green. A change to documentation only skips the builds.
+2. **The CI runs** on every push ([workflow](../../.github/workflows/anykyty.yml)): the conventions and settings checks, a Linux build with the shim tests, the CPU tests under ThreadSanitizer and AddressSanitizer, and a Windows build with the shim tests. It must be green. A change to documentation only skips the builds and the GPU tests: only the conventions run, in about two minutes.
 3. **A maintainer reviews it**: the diff, both checks, the builds and tests on Linux. A change on a path every title uses (presentation, memory, faults) may get a session on a title.
 4. **Larger changes go through a `test/<name>` branch** first, sometimes grouped with others: the maintainers run one title per engine family, and testers with AMD, Intel or Windows are asked to run theirs.
 5. **The maintainer pushes your commits to `AnyKyty`**, with you as the author, and closes the pull request with "merged as `<sha>`". GitHub shows it as closed, not merged: that is expected.
