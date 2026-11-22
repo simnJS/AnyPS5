@@ -193,10 +193,6 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	if (mirror->Requested(aside, WrittenBytes)) {
 		if (mirror->AnyOwned(aside, WrittenBytes)) return "a range owns pages of its block that it does not reach";
 		if (buffers.IsRegionRegistered(aside, WrittenBytes)) return "the cache reports a page that is only bound with its block";
-		buffers.NoteGpuWrites(aside, WrittenBytes);
-		if (buffers.IsRegionGpuModified(aside, WrittenBytes)) {
-			return "a GPU write noted on a page that is only bound with its block marks it";
-		}
 	} else {
 		std::printf("%s: the first range ends its block, the pages bound beside a range are not checked\n", Name);
 	}
@@ -208,6 +204,19 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	if (!mirror->SharedQueue() && mirror->Totals().waits == 0) return "the submission did not wait for its bind";
 	if (!ReadsPattern(reader.Words(FirstBytes), 0)) {
 		return "a read by device address did not see the bytes uploaded into the mirror";
+	}
+	if (mirror->Requested(aside, WrittenBytes)) {
+		buffers.SynchronizeBuffersInRange(aside, WrittenBytes);
+		reader.Record(scheduler, mirror->DeviceAddress() + aside - origin, WrittenBytes);
+		Finish(scheduler);
+		if (!ReadsPattern(reader.Words(WrittenBytes), (aside - address) / sizeof(uint32_t))) {
+			return "a page bound beside a range is not brought up to date for a read by device address";
+		}
+		if (mirror->AnyOwned(aside, WrittenBytes)) return "a page brought up to date beside a range is owned by it";
+		buffers.NoteGpuWrites(aside, WrittenBytes);
+		if (!buffers.IsRegionGpuModified(aside, WrittenBytes)) {
+			return "a GPU write noted on a page a shader can reach by device address does not mark it";
+		}
 	}
 
 	const auto [joined, joined_offset] = buffers.ObtainRange(address, JoinedBytes, false);

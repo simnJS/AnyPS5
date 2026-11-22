@@ -1394,8 +1394,9 @@ void BufferCache::RequestRange(uint64_t vaddr, uint64_t size) {
 	m_fresh.clear();
 	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	m_guest_mirror->Own(begin, Common::AlignUp(vaddr + size, CACHING_PAGESIZE) - begin, &m_fresh);
+	const auto block = m_guest_mirror->BlockSize();
 	for (const auto& [first, last]: m_fresh) {
-		WriteTableEntries(first, last);
+		WriteTableEntries(Common::AlignDown(first, block), Common::AlignUp(last, block));
 	}
 	if (!m_fresh.empty()) {
 		m_register_epoch++;
@@ -2919,7 +2920,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 		EXIT("BufferCache: invalid GPU write range\n");
 	}
 	m_scheduler.Context().CollectHotPageWrites(vaddr, size);
-	m_guest_mirror->ForEachOwned(vaddr, size, [&](uint64_t start, uint64_t finish) {
+	m_guest_mirror->ForEachRequested(vaddr, size, [&](uint64_t start, uint64_t finish) {
 		m_guest_mirror->Use(start, finish - start);
 		NoteWrite(start, finish - start);
 		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(start, finish - start, [&](uint64_t page, uint64_t bytes) {
@@ -3314,7 +3315,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::CollectSpanRanges(uint64_t span, uint64_t bytes, std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
-	m_guest_mirror->ForEachOwned(span, bytes, [&](uint64_t start, uint64_t finish) { ranges.emplace_back(start, finish - start); });
+	m_guest_mirror->ForEachRequested(span, bytes, [&](uint64_t start, uint64_t finish) { ranges.emplace_back(start, finish - start); });
 }
 
 }
