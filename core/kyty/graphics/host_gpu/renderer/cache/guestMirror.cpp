@@ -242,6 +242,9 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 	m_words        = ((m_size >> m_block_bits) + 63) / 64;
 	m_bound        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
 	m_ready        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
+	m_used.assign(m_words, 0);
+	m_device.assign(m_words, 0);
+	m_ages.resize(((m_size >> m_block_bits) + AgeChunkBlocks - 1) / AgeChunkBlocks);
 	vk::PhysicalDeviceVulkan13Properties properties13 {};
 	vk::PhysicalDeviceProperties2        properties {.pNext = &properties13};
 	graphics.physical_device.getProperties2(&properties);
@@ -349,7 +352,111 @@ bool GuestMirror::Ready(uint64_t vaddr, uint64_t size) const noexcept {
 	return AllSet(m_ready.get(), vaddr, size);
 }
 
-void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
+bool GuestMirror::AnyRequested(uint64_t vaddr, uint64_t size) const noexcept {
+	bool any = false;
+	ForEachRequested(vaddr, size, [&any](uint64_t, uint64_t) { any = true; });
+	return any;
+}
+
+void GuestMirror::Use(uint64_t vaddr, uint64_t size) noexcept {
+	if (!Holds(vaddr, size)) return;
+	const auto first = (vaddr - m_base) >> m_block_bits;
+	const auto last  = (vaddr - m_base + size - 1) >> m_block_bits;
+	for (auto word = first / 64; word <= last / 64; word++) {
+		const auto low  = word == first / 64 ? first % 64 : 0;
+		const auto high = word == last / 64 ? last % 64 : 63;
+		const auto mask = (high == 63 ? ~uint64_t {0} : (uint64_t {2} << high) - 1) & ~((uint64_t {1} << low) - 1);
+		if (m_used[word] == 0) m_used_words.push_back(word);
+		m_used[word] |= mask;
+	}
+}
+
+void GuestMirror::NoteDevice(uint64_t vaddr, uint64_t size) noexcept {
+	if (!Holds(vaddr, size)) return;
+	const auto first = (vaddr - m_base) >> m_block_bits;
+	const auto last  = (vaddr - m_base + size - 1) >> m_block_bits;
+	for (auto block = first; block <= last; block++) {
+		m_device[block / 64] |= uint64_t {1} << (block % 64);
+	}
+}
+
+uint32_t GuestMirror::AgeOf(uint64_t block) const noexcept {
+	const auto& chunk = m_ages[block / AgeChunkBlocks];
+	return chunk ? chunk[block % AgeChunkBlocks] : 0;
+}
+
+void GuestMirror::Age(uint32_t frame) {
+	for (const auto word: m_used_words) {
+		for (auto bits = m_used[word]; bits != 0; bits &= bits - 1) {
+			const auto block = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
+			auto&      chunk = m_ages[block / AgeChunkBlocks];
+			if (!chunk) chunk = std::make_unique<uint32_t[]>(AgeChunkBlocks);
+			chunk[block % AgeChunkBlocks] = frame;
+		}
+		m_used[word] = 0;
+	}
+	m_used_words.clear();
+}
+
+void GuestMirror::PickOldest(uint64_t max_blocks, uint32_t older_than, Runs& victims) const {
+	victims.clear();
+	if (m_size == 0 || max_blocks == 0) return;
+	struct Candidate {
+		bool     device = false;
+		uint32_t age    = 0;
+		uint64_t block  = 0;
+	};
+	std::vector<Candidate> candidates;
+	for (uint64_t word = 0; word < m_words; word++) {
+		for (auto bits = m_bound[word].load(std::memory_order_acquire) & ~m_used[word]; bits != 0; bits &= bits - 1) {
+			const auto block = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
+			const auto age   = AgeOf(block);
+			if (age >= older_than) continue;
+			candidates.push_back({(m_device[word] >> (block % 64) & 1u) != 0, age, block});
+		}
+	}
+	const auto count = std::min<uint64_t>(max_blocks, candidates.size());
+	std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(count), candidates.end(),
+	                  [](const Candidate& a, const Candidate& b) {
+		                  return a.device != b.device ? !a.device : a.age != b.age ? a.age < b.age : a.block < b.block;
+	                  });
+	candidates.resize(count);
+	std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.block < b.block; });
+	for (const auto& candidate: candidates) {
+		const auto begin = m_base + (candidate.block << m_block_bits);
+		if (!victims.empty() && victims.back().second == begin) {
+			victims.back().second += BlockSize();
+		} else {
+			victims.emplace_back(begin, begin + BlockSize());
+		}
+	}
+}
+
+void GuestMirror::Release(const Runs& runs) {
+	if (m_size == 0 || runs.empty()) return;
+	Flush();
+	std::vector<Run> blocks;
+	for (const auto& [begin, end]: runs) {
+		if (begin >= end || !Holds(begin, end - begin)) continue;
+		const auto first = (begin - m_base) >> m_block_bits;
+		const auto last  = (end - m_base - 1) >> m_block_bits;
+		for (auto block = first; block <= last; block++) {
+			const auto bit = uint64_t {1} << (block % 64);
+			if ((m_bound[block / 64].load(std::memory_order_relaxed) & bit) == 0) continue;
+			m_ready[block / 64].fetch_and(~bit, std::memory_order_acq_rel);
+			m_bound[block / 64].fetch_and(~bit, std::memory_order_relaxed);
+			m_device[block / 64] &= ~bit;
+			if (!blocks.empty() && blocks.back().first + blocks.back().count == block) {
+				blocks.back().count++;
+			} else {
+				blocks.push_back({block, 1});
+			}
+		}
+	}
+	if (!blocks.empty()) Post({.kind = Kind::Unbind, .runs = std::move(blocks)});
+}
+
+void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh) {
 	if (m_size == 0 || size == 0 || UINT64_MAX - vaddr < size) return;
 	const uint64_t blocks = m_size >> m_block_bits;
 	if (vaddr < m_base) {
@@ -374,6 +481,14 @@ void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
 		const auto value = word.load(std::memory_order_relaxed);
 		if ((value & bit) != 0) continue;
 		word.store(value | bit, std::memory_order_relaxed);
+		if (fresh != nullptr) {
+			const auto begin = m_base + (block << m_block_bits);
+			if (!fresh->empty() && fresh->back().second == begin) {
+				fresh->back().second += BlockSize();
+			} else {
+				fresh->emplace_back(begin, begin + BlockSize());
+			}
+		}
 		if (m_pending.empty()) m_first_pending = Now();
 		m_pending_blocks++;
 		if (!m_pending.empty() && m_pending.back().first + m_pending.back().count == block) {

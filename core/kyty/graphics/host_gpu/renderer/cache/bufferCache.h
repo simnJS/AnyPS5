@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/guestMirror.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -140,6 +141,8 @@ public:
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
+	void PinDeviceAddressRange(uint64_t vaddr, uint64_t size);
+	static void NoteBdaCycles(uint64_t cycles) noexcept;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool       is_written,
 	                                                        bool       is_texel_buffer = false,
@@ -302,6 +305,20 @@ private:
 	    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id = {},
 	    ObtainFrom from = ObtainFrom::Any);
 	[[nodiscard]] BufferId InsertBuffer(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainRange(uint64_t vaddr, uint64_t size, bool is_written,
+	                                                       bool is_texel_buffer);
+	void                   RequestRange(uint64_t vaddr, uint64_t size);
+	void                   WriteTableEntries(uint64_t begin, uint64_t end);
+	void                   NoteBlockRegions(uint64_t begin, uint64_t end, bool insert);
+	[[nodiscard]] Buffer*  Owner(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] Buffer&  ReadbackSource(uint64_t vaddr, uint64_t size);
+	void                   EvictOldBlocks();
+	void                   SwitchArm(bool t2);
+	bool                   m_t2 = false;
+	BufferId               m_storage;
+	GuestMirror::Runs      m_fresh;
+	GuestMirror::Runs      m_victims;
+	int64_t                m_evict_check = 0;
 	void                   CheckMirrorRange(const Buffer& buffer, uint64_t vaddr, uint64_t size) noexcept;
 	void                   CheckMirrorCopies(const Buffer& buffer, std::span<const vk::BufferCopy> copies) noexcept;
 

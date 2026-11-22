@@ -466,9 +466,7 @@ bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
 			continue;
 		}
 		m_mapped_ranges.ForEachInRange(base, CachedBytes, [this](uint64_t start, uint64_t end) {
-			if (const auto id = m_buffer_cache.FindBuffer(start, end - start)) {
-				m_buffer_cache.GetBuffer(id).device_address_pinned = true;
-			}
+			m_buffer_cache.PinDeviceAddressRange(start, end - start);
 		});
 	}
 	return written;
@@ -517,9 +515,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 	}
 	for (const auto& [first, last]: ranges) {
 		m_mapped_ranges.ForEachInRange(first, last - first, [this](uint64_t start, uint64_t stop) {
-			if (const auto id = m_buffer_cache.FindBuffer(start, stop - start)) {
-				m_buffer_cache.GetBuffer(id).device_address_pinned = true;
-			}
+			m_buffer_cache.PinDeviceAddressRange(start, stop - start);
 		});
 	}
 	if (program.info.ray_query && m_ray_tracing->Enabled()) {
@@ -1088,6 +1084,10 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
+	struct Cycles {
+		uint64_t start = __builtin_readcyclecounter();
+		~Cycles() { BufferCache::NoteBdaCycles(__builtin_readcyclecounter() - start); }
+	} cycles;
 	m_buffer_cache.PrepareFaultBuffer();
 	if (may_write) {
 		m_buffer_cache.NoteDeviceAddressUse();
