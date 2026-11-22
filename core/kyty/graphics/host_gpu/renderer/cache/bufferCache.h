@@ -515,6 +515,22 @@ private:
 	bool                                                     m_stream_in_place = false;
 	std::unique_ptr<std::array<StreamMemo, StreamMemoSlots>> m_stream_memo =
 	    std::make_unique<std::array<StreamMemo, StreamMemoSlots>>();
+	struct WrittenMemo {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t cpu_epoch    = 0;
+		uint64_t gpu_epoch    = 0;
+		uint64_t region_epoch = 0;
+		uint64_t registration = 0;
+		[[nodiscard]] bool Covers(const WrittenMemo& now) const noexcept {
+			return size != 0 && vaddr == now.vaddr && size == now.size && registration == now.registration &&
+			       ((cpu_epoch == now.cpu_epoch && gpu_epoch == now.gpu_epoch) ||
+			        (region_epoch != 0 && region_epoch == now.region_epoch));
+		}
+	};
+	static constexpr size_t                                    WrittenMemoSlots = 1024;
+	std::unique_ptr<std::array<WrittenMemo, WrittenMemoSlots>> m_written_memo =
+	    std::make_unique<std::array<WrittenMemo, WrittenMemoSlots>>();
 	uint64_t m_gc_tick = 0;
 	void                                       GrowRegionTables(uint64_t region);
 	std::vector<uint32_t>                      m_region_buffer_count;

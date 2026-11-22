@@ -244,6 +244,19 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	}
 	if (mirror->Totals().unbound_reads != 0) return "a read of a block that was not bound was counted";
 
+	(void)MemoryTracker::TakeWrittenUploadStats();
+	(void)buffers.ObtainRange(address + WrittenAt, WrittenBytes, true);
+	(void)buffers.ObtainRange(address + WrittenAt, WrittenBytes, true);
+	if (MemoryTracker::TakeWrittenUploadStats().uploads != 1) {
+		return "a written range is passed again although no page of it changed";
+	}
+	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address + WrittenAt, WrittenBytes);
+	(void)buffers.ObtainRange(address + WrittenAt, WrittenBytes, true);
+	if (MemoryTracker::TakeWrittenUploadStats().uploads != 1) {
+		return "a written range is not passed again after its pages changed";
+	}
+	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address + WrittenAt, WrittenBytes);
+
 	if (mirror->AnyRequested(address + FarAt, WrittenBytes)) return "a block no range reached is requested";
 	buffers.NoteGpuWrites(address + FarAt, WrittenBytes);
 	if (buffers.IsRegionGpuModified(address + FarAt, WrittenBytes)) {

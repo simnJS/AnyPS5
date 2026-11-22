@@ -135,6 +135,36 @@ bool MirrorCheck() {
 	return enabled;
 }
 
+std::vector<vk::BufferMemoryBarrier> CopyBarriers(std::span<const vk::BufferCopy> copies, bool source,
+                                                  const vk::BufferMemoryBarrier& model) {
+	constexpr size_t   MaxBarriers = 16;
+	constexpr uint64_t FirstGap    = 64 * 1024;
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	ranges.reserve(copies.size());
+	for (const auto& copy: copies) {
+		const auto offset = source ? copy.srcOffset : copy.dstOffset;
+		ranges.emplace_back(offset, offset + copy.size);
+	}
+	std::sort(ranges.begin(), ranges.end());
+	for (uint64_t gap = 0;; gap = gap == 0 ? FirstGap : gap * 4) {
+		size_t count = 0;
+		for (size_t index = 0; index < ranges.size(); index++) {
+			if (count != 0 && ranges[index].first <= ranges[count - 1].second + gap) {
+				ranges[count - 1].second = std::max(ranges[count - 1].second, ranges[index].second);
+			} else {
+				ranges[count++] = ranges[index];
+			}
+		}
+		ranges.resize(count);
+		if (count <= MaxBarriers) break;
+	}
+	std::vector<vk::BufferMemoryBarrier> barriers(ranges.size(), model);
+	for (size_t index = 0; index < ranges.size(); index++) {
+		barriers[index].offset = ranges[index].first;
+		barriers[index].size   = ranges[index].second - ranges[index].first;
+	}
+	return barriers;
+}
 
 }
 
@@ -230,11 +260,10 @@ bool BufferCache::DownloadMemory(uint64_t vaddr, uint64_t size) {
 	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	before.buffer              = buffer.Handle();
-	before.offset              = buffer.HandleOffset();
-	before.size                = buffer.Size();
+	const auto barriers        = CopyBarriers(copies, true, before);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-	                       nullptr);
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
+	                       static_cast<uint32_t>(barriers.size()), barriers.data(), 0, nullptr);
 	native.copyBuffer(buffer.Handle(), download.buffer->Handle(),
 	                  static_cast<uint32_t>(copies.size()), copies.data());
 
@@ -1445,19 +1474,21 @@ void BufferCache::RecordUpload(std::span<const vk::BufferCopy> copies, vk::Buffe
 		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.buffer              = buffer.Handle();
-		before.offset              = buffer.HandleOffset();
-		before.size                = buffer.Size();
+		auto barriers              = CopyBarriers(copies, false, before);
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr,
+		                       static_cast<uint32_t>(barriers.size()), barriers.data(), 0, nullptr);
 		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
 		                  copies.data());
-		auto after          = before;
-		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		for (auto& after: barriers) {
+			after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		}
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr,
+		                       static_cast<uint32_t>(barriers.size()), barriers.data(), 0, nullptr);
 	}
 }
 
@@ -1690,15 +1721,29 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedRange(uint64_t vaddr
 		}
 	}
 	RequestRange(vaddr, size);
-	(void)SynchronizeRange(vaddr, size, is_written, is_texel_buffer);
-	if (is_written) {
-		m_gpu_write_generation++;
-		if (m_gpu_modified_ranges.Add(vaddr, size)) {
-			NoteGpuModifiedChange(vaddr, size, true);
-		}
-		ForgetColorMetadataChecks(vaddr, size);
-		NoteWrite(vaddr, size);
+	if (!is_written) {
+		(void)SynchronizeRange(vaddr, size, false, is_texel_buffer);
+		return {m_storage.get(), m_storage->Offset(vaddr)};
 	}
+	const WrittenMemo now {.vaddr        = vaddr,
+	                       .size         = size,
+	                       .cpu_epoch    = RegionManager::CpuDirtyEpoch(),
+	                       .gpu_epoch    = RegionManager::GpuCleanEpoch(),
+	                       .region_epoch = CpuModificationEpoch(vaddr, size),
+	                       .registration = RegistrationEpoch()};
+	auto& memo = (*m_written_memo)[((vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull >> 32u) % WrittenMemoSlots];
+	if (memo.Covers(now)) {
+		if (MirrorCheck()) CheckMirrorRange(vaddr, size);
+	} else {
+		(void)SynchronizeRange(vaddr, size, true, is_texel_buffer);
+		memo = now;
+	}
+	m_gpu_write_generation++;
+	if (m_gpu_modified_ranges.Add(vaddr, size)) {
+		NoteGpuModifiedChange(vaddr, size, true);
+	}
+	ForgetColorMetadataChecks(vaddr, size);
+	NoteWrite(vaddr, size);
 	return {m_storage.get(), m_storage->Offset(vaddr)};
 }
 
