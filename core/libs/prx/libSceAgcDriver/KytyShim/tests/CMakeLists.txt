@@ -155,7 +155,7 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
             PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_label_order: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     add_test(NAME kyty_shim_buffer_write_coverage COMMAND kyty_shim_cross_queue_label_order_tests buffer-write-coverage)
     set_tests_properties(kyty_shim_buffer_write_coverage PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
-            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_COMMAND_MEMORY_IN_PLACE=0"
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_buffer_write_coverage: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     add_test(NAME kyty_shim_renderer_shutdown COMMAND kyty_shim_cross_queue_label_order_tests renderer-shutdown)
     set_tests_properties(kyty_shim_renderer_shutdown PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
@@ -163,17 +163,12 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
 endif()
 
 if(NOT ANYPS5_KYTY_DLL)
-    add_test_executable(kyty_shim_in_place_labels_tests ${CMAKE_CURRENT_SOURCE_DIR}/InPlaceLabels.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
-    target_include_directories(kyty_shim_in_place_labels_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    configure_host_test_executable(kyty_shim_in_place_labels_tests)
-    if(MINGW)
-        target_link_libraries(kyty_shim_in_place_labels_tests PRIVATE stdc++ gcc_eh)
-    endif()
-    target_link_libraries(kyty_shim_in_place_labels_tests PRIVATE Kyty::gpu libkernel libc)
-    add_test(NAME kyty_shim_in_place_labels COMMAND kyty_shim_in_place_labels_tests)
-    set_tests_properties(kyty_shim_in_place_labels PROPERTIES TIMEOUT 20
-            PASS_REGULAR_EXPRESSION "kyty_shim_in_place_labels: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test_executable(kyty_shim_label_order_tests ${CMAKE_CURRENT_SOURCE_DIR}/LabelOrder.cpp)
+    configure_host_test_executable(kyty_shim_label_order_tests)
+    target_include_directories(kyty_shim_label_order_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty)
+    add_test(NAME kyty_shim_label_order COMMAND kyty_shim_label_order_tests)
+    set_tests_properties(kyty_shim_label_order PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_label_order: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
@@ -265,11 +260,11 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     target_link_libraries(kyty_shim_mirror_windows_tests PRIVATE libSceAgcDriver libkernel libc)
     add_test(NAME kyty_shim_mirror_windows COMMAND kyty_shim_mirror_windows_tests)
     set_tests_properties(kyty_shim_mirror_windows PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
-            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_COMMAND_MEMORY_IN_PLACE=0"
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_mirror_windows: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     add_test(NAME kyty_shim_mirror_windows_checked COMMAND kyty_shim_mirror_windows_tests)
     set_tests_properties(kyty_shim_mirror_windows_checked PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
-            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_COMMAND_MEMORY_IN_PLACE=0;KYTY_MIRROR_CHECK=1"
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_MIRROR_CHECK=1"
             PASS_REGULAR_EXPRESSION "kyty_shim_mirror_windows: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePages.cpp)
     add_test_executable(kyty_shim_buffer_cache_pages_tests ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePagesMain.cpp)

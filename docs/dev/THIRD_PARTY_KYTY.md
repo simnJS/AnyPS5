@@ -194,7 +194,6 @@ AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN
 | `KYTY_REPLAY_GPU_PAGE_READS` | `0` turns it off, any other value or unset leaves it on | on | A guest read that faults on a GPU-owned page, on bytes no GPU write is near, is replayed on the backing view instead of waiting for a readback; instructions that write memory or read the shifted register are never replayed; `0` waits for the readback as before; on Windows the replay ends on the single step exception of the vectored handler | perf | all | AnyKyty |
 | `KYTY_REPLAY_AFTER_READBACK` | `0` turns it off, any other value or unset leaves it on | on | A guest read that faults on bytes the GPU wrote no longer waits for the execution thread to release the page after the copy; the copied bytes are read by replaying the instruction on the backing view, and the release is posted without waiting; an instruction the replay cannot serve waits for the release as before; `0` always waits for the release | perf | all | AnyKyty |
 | `KYTY_HOT_PAGE_WRITE_WATCH` | `1` turns it on, any other value or unset leaves it off | off | Linux: a watched page the guest writes twice within a second stops faulting; it stays writable under asynchronous userfaultfd write protection, and its writes are collected with `PAGEMAP_SCAN` when a submission starts, when a memory wait or semaphore passes, before a CPU flip, and before the GPU writes a range that holds it; a page idle for 4 s, or whose mapping changes, goes back to `mprotect`; `[kyty-hot-pages]` sums it up every 10 s; off by default because the collections cost more than the faults they remove in a city scene, where memory waits pass thousands of times a second | perf | Linux | AnyKyty |
-| `KYTY_COMMAND_MEMORY_IN_PLACE` | `1` turns it on, anything else leaves it off | off | Experimental: before labels waited for their own tick here, the GPU stopped while an open-world AAA title loaded (a compute program looping on memory served in place); since, one session of that title ran without a stop but 8 % slower (the execute thread drains the GPU for labels it cannot defer). A buffer of the cache that touches command memory (the 64 KiB blocks the command processor reads and the command buffer segments `libSceAgc` writes, as marked for the write fault blocks, see [Details](#details)) and holds no GPU-written page is a `VkBuffer` bound to the guest's direct memory itself, imported with `VK_EXT_external_memory_host` in chunks of 256 MiB of the second view: the GPU reads it where the guest writes it, its pages are never write protected nor uploaded, and a command buffer the guest refills no longer faults. A buffer already in video memory moves in place at the next frame after a guest write fault in command memory. While any buffer is in place, the host follows the GPU instead of running ahead of it: `RELEASE_MEM` labels are written once the GPU reached them, flips complete once their frame is done (no early flip) and wait for the previous frame (one frame in flight), every submission ends with a barrier that makes GPU writes visible to the host, `WRITE_DATA`, fills and copies into such memory run on the GPU in order, and a command processor read of a block the GPU writes in flight waits for that write. Direct memory only (the guest file is remapped by the guest); textures keep their own copies. `[kyty-command-memory]` sums up every 10 s the buffers served in place, the conversions, the refusals, the pinned chunks, the pages handed to and from tracking, the GPU writes noted and the reads that waited, the labels written at completion and the flips that waited | perf | all | AnyKyty |
 | `KYTY_MIRROR_CHECK` | `0` or `1`, else stops | `0` | On a device that binds sparse buffers, the buffer cache keeps its buffers as windows of one sparse buffer that mirrors the guest memory (offset and device address follow the guest address), whose 64 KiB blocks are bound by a thread of their own before the submission that first uses them, which waits for the bind on the GPU. A range used from the mirror while one of its blocks is not bound (a binding, an upload, a readback) is counted in the `[kyty-mirror]` summary every 10 s; `1` stops at the first one with its address. `vkCmdUpdateBuffer` into the mirror always stops | debug | all | AnyKyty |
 | `KYTY_SUSPEND_POINT_DEPTH` | 1 to 64, else stops | `8` | Suspend points the GPU may have in flight; `1` is KytyPS5's behaviour. See [below](#details) | perf | all | `b370e0778c` |
 | `KYTY_PROGRAM_LOCK` | `narrow` or `wide`, else stops | `narrow` | Scope of the program-cache lock; `wide` is upstream's scope and endless spin. See [below](#details) | perf | all | `6d40e04a28` |
@@ -507,31 +506,9 @@ KytyPS5's behaviour; another value stops the emulator with a message naming the 
 Why a label drains: when `[kyty-labels]` is printed, the line `[kyty-label-drains]` follows it with the labels of the
 period and their distinct addresses, how many were deferred to the end of a tick, written at once and written after a
 drain, and the first reason, in this order, that kept each drained label from being deferred: not a deferable kind (the
-GDS read, an invalid range); its own bytes lie under a GPU write to memory served in place that the GPU has not finished
-(the written ranges are kept byte for byte next to the 64 KiB blocks); its own bytes hold data the GPU wrote in the
-cache; `KYTY_LABELS_AROUND_GPU_WRITES=0`; the backing view does not hold it; only its 64 KiB block is under an in-place
-GPU write in flight; its page is GPU-written in the cache and no label is pending. Then: how many drained labels lie
-under an in-place write in flight and how many only share its block, the drain waits in eight classes of duration (count
-and milliseconds), and the GPU writes to memory served in place that were noted over a completion write still pending.
-The line `[kyty-label-covers]` then splits the drained labels that lie under an in-place GPU write in flight by what
-noted that write: a `WRITE_DATA` done as a GPU copy, a `DMA_DATA` fill or copy, a buffer bound for writing (its whole
-bound range), a texel buffer filled from an image; and says whether the newest such write was noted in the label's own
-tick and whether one covers exactly the label's bytes.
-
-Labels deferred to their own tick in place: while memory is served in place (`KYTY_COMMAND_MEMORY_IN_PLACE=1`), two of these
-reasons no longer drain. A label whose bytes no in-place GPU write in flight covers, on a page the cache does not hold
-as GPU-written, is deferred like any label on a clean page; one on a GPU-written page of the cache whose own bytes are
-clean and that the backing view holds is deferred around the GPU writes as with `KYTY_LABELS_AROUND_GPU_WRITES`, also when
-no label is pending. Both go on the first-in first-out priority queue at their own tick, so they are written after the GPU
-finished everything recorded before them, after every older label, and before a later label that drains. A label whose
-own bytes are under in-place writes in flight is deferred the same way when all of them are `WRITE_DATA` copies or
-`DMA_DATA` fills and copies: those were recorded before the label, so the GPU has done them when the label's tick ends,
-and a later one to the same bytes drains first as below. A label under a buffer bound for writing or a texel buffer
-filled from an image, or whose bytes the cache holds as GPU-written, still drains. Until such a label is
-written, a `WRITE_DATA`, a reference clock copy or a `DMA_DATA` to its bytes, and a read of them the command processor
-decides on (`WAIT_REG_MEM`, predication, a conditional execution), first drains the GPU as the label did before;
-a fill or copy the renderer would do on the CPU goes to the GPU; and a GPU write to memory served in place noted over its
-bytes stops the emulator with a message, because the label would land after a write that comes later in the stream.
+GDS read, an invalid range); its own bytes hold data the GPU wrote in the cache; `KYTY_LABELS_AROUND_GPU_WRITES=0`; the
+backing view does not hold it; its page is GPU-written in the cache and no label is pending. Then the drain waits in
+eight classes of duration (count and milliseconds).
 
 Blocked waits on deferred writes: KytyPS5's command processor submits the open command buffer after a pass over a
 submission that made progress, but not after one that yields to another queue, nor when a queue resumes straight into a

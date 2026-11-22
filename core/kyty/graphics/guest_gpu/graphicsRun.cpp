@@ -62,12 +62,6 @@ static thread_local GuestGpu*         g_executing_gpu     = nullptr;
 static thread_local bool              g_cp_thread         = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
-#if defined(ANYPS5_KYTY)
-namespace {
-bool InPlaceLabelHeldBack(CommandScheduler& scheduler, uint64_t address, uint64_t size);
-void SettleInPlaceLabels(CommandScheduler& scheduler, uint64_t address, uint64_t size);
-}
-#endif
 
 constexpr size_t OperationQueueSize = 4096;
 constexpr size_t ResolvedQueueSize = 256;
@@ -449,11 +443,6 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 		WaitForExecution(write->sequence);
 		break;
 	}
-#if defined(ANYPS5_KYTY)
-	if (InPlaceLabelHeldBack(m_renderer.GetCommandScheduler(), begin, size)) {
-		ExecuteSync([this, begin, size] { SettleInPlaceLabels(m_renderer.GetCommandScheduler(), begin, size); });
-	}
-#endif
 	CopyFromGuest(value, address, size);
 }
 
@@ -778,9 +767,6 @@ void CommandProcessor::ReadDecisionMemory(const volatile void* address, void* va
 		m_pipeline->ReadDecisionMemory(address, value, size);
 		return;
 	}
-#if defined(ANYPS5_KYTY)
-	SettleInPlaceLabels(GetScheduler(), reinterpret_cast<uint64_t>(address), size);
-#endif
 	CopyFromGuest(value, address, size);
 }
 
@@ -1074,9 +1060,6 @@ void CommandProcessor::WriteData(uint64_t address, const uint32_t* src, uint32_t
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
 		const auto* data  = write_one_address ? src + dw_num - 1 : src;
 		const auto  bytes = uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t);
-#if defined(ANYPS5_KYTY)
-		SettleInPlaceLabels(GetScheduler(), reinterpret_cast<uint64_t>(dst), bytes);
-#endif
 		if (m_renderer.WriteAroundGpuWrites(dst, data, bytes)) {
 			LibKernel::Memory::NoteEmulatorWrite(reinterpret_cast<uint64_t>(dst), bytes);
 			return;
@@ -1106,9 +1089,6 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto sequence = EmitCallback([this, dst_address, num_bytes] {
-#if defined(ANYPS5_KYTY)
-		SettleInPlaceLabels(GetScheduler(), dst_address, num_bytes);
-#endif
 		auto& buffers = m_renderer.GetBufferCache();
 		if (GuestRange {dst_address, num_bytes}.Valid() &&
 		    !buffers.IsRegionGpuModified(dst_address, num_bytes)) {
@@ -1190,11 +1170,6 @@ void CommandProcessor::ExecuteDmaData(bool dst_gds, uint64_t dst_address_or_offs
                                       uint64_t src_address_or_offset_or_immediate,
                                       uint32_t num_bytes) {
 	auto& buffer_cache = m_renderer.GetBufferCache();
-#if defined(ANYPS5_KYTY)
-	if (!dst_gds) {
-		SettleInPlaceLabels(GetScheduler(), dst_address_or_offset, num_bytes);
-	}
-#endif
 	if (src_sel == 2) {
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
@@ -2817,57 +2792,22 @@ struct LabelOrderStats {
 	std::atomic<int64_t>  last_line {0};
 	std::atomic<uint64_t> deferred {0};
 	std::atomic<uint64_t> immediate {0};
-	std::atomic<uint64_t> covered {0};
-	std::atomic<uint64_t> block_only {0};
-	std::array<std::atomic<uint64_t>, static_cast<size_t>(InPlaceMemory::WriteKind::Count)> cover_kinds {};
-	std::atomic<uint64_t> cover_same_tick {0};
-	std::atomic<uint64_t> cover_exact {0};
 	std::array<std::atomic<uint64_t>, LabelOrder::ReasonCount> reasons {};
 	std::array<std::atomic<uint64_t>, LabelWaitBuckets>        waits {};
 	std::array<std::atomic<uint64_t>, LabelWaitBuckets>        wait_ns {};
 	std::mutex                                                 addresses_mutex;
 	std::unordered_set<uint64_t>                               addresses;
-	std::atomic<uint64_t> own_tick_block {0};
-	std::atomic<uint64_t> own_tick_page {0};
-	std::atomic<uint64_t> own_tick_copy {0};
-	std::atomic<uint64_t> settles {0};
 };
 LabelOrderStats g_label_stats;
-
-bool InPlaceLabelHeldBack(CommandScheduler&, uint64_t address, uint64_t size) {
-	return InPlaceMemory::MeetsDeferredLabel(address, size);
-}
-
-void SettleInPlaceLabels(CommandScheduler& scheduler, uint64_t address, uint64_t size) {
-	if (InPlaceLabelHeldBack(scheduler, address, size)) {
-		const auto tick = scheduler.CurrentTick();
-		scheduler.Wait(tick);
-		scheduler.WaitPriorityOperations(tick);
-		g_label_stats.settles.fetch_add(1, std::memory_order_relaxed);
-	}
-}
 
 void NoteLabelAddress(uint64_t address) {
 	std::lock_guard lock(g_label_stats.addresses_mutex);
 	g_label_stats.addresses.insert(address);
 }
 
-void NoteLabelDrain(const LabelOrder::Facts& facts, uint64_t waited_ns, const InPlaceMemory::WriteCover& cover,
-                    uint64_t tick) {
+void NoteLabelDrain(const LabelOrder::Facts& facts, uint64_t waited_ns) {
 	auto& stats = g_label_stats;
 	stats.reasons[static_cast<size_t>(LabelOrder::DrainReason(facts))].fetch_add(1, std::memory_order_relaxed);
-	if (facts.in_place_bytes) {
-		stats.covered.fetch_add(1, std::memory_order_relaxed);
-		for (size_t kind = 0; kind < stats.cover_kinds.size(); kind++) {
-			if ((cover.kinds >> kind & 1u) != 0) {
-				stats.cover_kinds[kind].fetch_add(1, std::memory_order_relaxed);
-			}
-		}
-		stats.cover_same_tick.fetch_add(cover.tick == tick ? 1 : 0, std::memory_order_relaxed);
-		stats.cover_exact.fetch_add(cover.exact ? 1 : 0, std::memory_order_relaxed);
-	} else if (facts.in_place_block) {
-		stats.block_only.fetch_add(1, std::memory_order_relaxed);
-	}
 	const auto bucket = static_cast<size_t>(
 	    std::upper_bound(LabelWaitLimitsNs.begin(), LabelWaitLimitsNs.end(), waited_ns) - LabelWaitLimitsNs.begin());
 	stats.waits[bucket].fetch_add(1, std::memory_order_relaxed);
@@ -2898,15 +2838,6 @@ void CommandProcessor::LogLabelSummary() {
 	const auto drain_ns  = take(stats.drain_ns);
 	const auto deferred  = take(stats.deferred);
 	const auto immediate = take(stats.immediate);
-	const auto covered   = take(stats.covered);
-	const auto block     = take(stats.block_only);
-	const auto same_tick = take(stats.cover_same_tick);
-	const auto exact     = take(stats.cover_exact);
-	std::array<uint64_t, static_cast<size_t>(InPlaceMemory::WriteKind::Count)> kinds {};
-	for (size_t i = 0; i < kinds.size(); i++) {
-		kinds[i] = take(stats.cover_kinds[i]);
-	}
-	const auto over      = InPlaceMemory::TakeGpuWritesOverPending();
 	std::array<uint64_t, LabelOrder::ReasonCount> reasons {};
 	std::array<uint64_t, LabelWaitBuckets>        waits {};
 	std::array<double, LabelWaitBuckets>          wait_ms {};
@@ -2923,11 +2854,7 @@ void CommandProcessor::LogLabelSummary() {
 		addresses = stats.addresses.size();
 		stats.addresses.clear();
 	}
-	const auto own_block      = take(stats.own_tick_block);
-	const auto own_page       = take(stats.own_tick_page);
-	const auto own_copy       = take(stats.own_tick_copy);
-	const auto settles        = take(stats.settles);
-	if (around + drains + own_block + own_page + own_copy == 0) {
+	if (around + drains == 0) {
 		return;
 	}
 	::Log::WriteToConsoleAndLog(fmt::format(
@@ -2937,31 +2864,14 @@ void CommandProcessor::LogLabelSummary() {
 	const auto reason = [&reasons](LabelOrder::Reason id) { return reasons[static_cast<size_t>(id)]; };
 	::Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-label-drains] summary of the last {:.0f} s: {} RELEASE_MEM labels at {} addresses: {} deferred to the end "
-	    "of a tick, {} written at once, {} written after a drain; drained because: {} not deferable, {} own bytes under an "
-	    "in-place GPU write in flight, {} own bytes GPU-written in the cache, {} around writes off, {} no backing view, {} "
-	    "only the 64 KiB block under an in-place GPU write in flight, {} on a GPU-written page with no label pending, {} "
-	    "other; of the drained labels {} lie under an in-place GPU write in flight and {} only share its block; drain "
-	    "waits under 0.1/0.25/0.5/1/2/4/8 ms and above: {} ({:.1f} ms, in the same order {:.1f}); {} in-place GPU writes "
-	    "noted over a pending completion write; {} labels that only share the block of an in-place write and {} on a "
-	    "GPU-written page with no label pending deferred to their own tick, {} drains before a later write or decision read "
-	    "of the bytes of such a label\n",
+	    "of a tick, {} written at once, {} written after a drain; drained because: {} not deferable, {} own bytes "
+	    "GPU-written in the cache, {} around writes off, {} no backing view, {} on a GPU-written page with no label "
+	    "pending, {} other; drain waits under 0.1/0.25/0.5/1/2/4/8 ms and above: {} ({:.1f} ms, in the same order {:.1f})\n",
 	    static_cast<double>(now - last) / 1e9, deferred + immediate + drains, addresses, deferred, immediate, drains,
-	    reason(LabelOrder::Reason::NotDeferable), reason(LabelOrder::Reason::InPlaceBytes),
-	    reason(LabelOrder::Reason::CacheBytes), reason(LabelOrder::Reason::AroundOff),
-	    reason(LabelOrder::Reason::NoBacking), reason(LabelOrder::Reason::InPlaceBlock),
-	    reason(LabelOrder::Reason::NoLabelPending), reason(LabelOrder::Reason::Other), covered, block,
-	    fmt::join(waits, "/"), static_cast<double>(drain_ns) / 1e6, fmt::join(wait_ms, "/"), over, own_block, own_page,
-	    settles));
-	const auto kind = [&kinds](InPlaceMemory::WriteKind id) { return kinds[static_cast<size_t>(id)]; };
-	::Log::WriteToConsoleAndLog(fmt::format(
-	    "[kyty-label-covers] summary of the last {:.0f} s: of {} drained labels under an in-place GPU write in flight, {} "
-	    "lie under a WRITE_DATA copy, {} under a DMA_DATA fill or copy, {} under a buffer bound for writing, {} under a "
-	    "texel buffer filled from an image (a label under several kinds counts in each); for {} the newest such write was "
-	    "noted in the label's own tick, for {} in an earlier one; for {} a write covers exactly the label's bytes; "
-	    "{} labels under WRITE_DATA or DMA_DATA copies only deferred to their own tick\n",
-	    static_cast<double>(now - last) / 1e9, covered, kind(InPlaceMemory::WriteKind::WriteData),
-	    kind(InPlaceMemory::WriteKind::DmaData), kind(InPlaceMemory::WriteKind::Binding),
-	    kind(InPlaceMemory::WriteKind::TexelBuffer), same_tick, covered - same_tick, exact, own_copy));
+	    reason(LabelOrder::Reason::NotDeferable), reason(LabelOrder::Reason::CacheBytes),
+	    reason(LabelOrder::Reason::AroundOff), reason(LabelOrder::Reason::NoBacking),
+	    reason(LabelOrder::Reason::NoLabelPending), reason(LabelOrder::Reason::Other), fmt::join(waits, "/"),
+	    static_cast<double>(drain_ns) / 1e6, fmt::join(wait_ms, "/")));
 }
 
 bool CommandProcessor::LabelsAroundGpuWrites() {
@@ -3000,53 +2910,30 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 #else
 	const auto labels_pending = [this] { return m_deferred_labels.load(std::memory_order_acquire); };
 #endif
-	const bool at_completion = InPlaceMemory::Live();
 #if defined(ANYPS5_KYTY)
 	bool drained = false;
 #endif
-	if (data_sel != 0 &&
-	    (at_completion || m_renderer.GetOcclusionQueries().HasPendingDumps() || labels_pending() != 0)) {
+	if (data_sel != 0 && (m_renderer.GetOcclusionQueries().HasPendingDumps() || labels_pending() != 0)) {
 		const auto     vaddr = reinterpret_cast<uint64_t>(address);
 		const uint64_t size  = data_sel == 1 ? sizeof(uint32_t) : sizeof(uint64_t);
 		auto&          buffers   = m_renderer.GetBufferCache();
 		const bool     deferable = data_sel <= 3 && GuestRange {vaddr, size}.Valid();
 		const bool     gpu_page  = deferable && buffers.IsRegionGpuModified(vaddr, size);
-		bool           plain     = deferable && !gpu_page;
+		const bool     plain     = deferable && !gpu_page;
 #if defined(ANYPS5_KYTY)
-		bool around = gpu_page && m_labels_around_gpu_writes && labels_pending() != 0 &&
+		const bool around = gpu_page && m_labels_around_gpu_writes && labels_pending() != 0 &&
 		              !buffers.HasGpuDirtyBytes(vaddr, size) &&
 		              LibKernel::Memory::FindBackingPointer(vaddr, size) != nullptr;
-		LabelOrder::Facts         facts {.deferable = deferable};
-		InPlaceMemory::WriteCover cover;
+		LabelOrder::Facts facts {.deferable = deferable};
 		if (deferable) {
 			facts.around_enabled = m_labels_around_gpu_writes;
 		}
 		const auto gather = [&] {
 			facts.tracked_page   = buffers.IsRegionTrackedGpuModified(vaddr, size);
 			facts.tracked_bytes  = buffers.HasTrackedGpuDirtyBytes(vaddr, size);
-			facts.in_place_block = buffers.InPlaceGpuWriteTick(vaddr, size) != 0;
-			cover                = facts.in_place_block ? buffers.InPlaceGpuWriteCover(vaddr, size) : InPlaceMemory::WriteCover {};
-			facts.in_place_bytes = cover.tick != 0;
-			constexpr uint32_t Ordered = 1u << static_cast<uint32_t>(InPlaceMemory::WriteKind::WriteData) |
-			                             1u << static_cast<uint32_t>(InPlaceMemory::WriteKind::DmaData);
-			facts.in_place_ordered = facts.in_place_bytes && (cover.kinds & ~Ordered) == 0;
 			facts.backing        = LibKernel::Memory::FindBackingPointer(vaddr, size) != nullptr;
 			facts.label_pending  = labels_pending() != 0;
 		};
-		bool     gathered = false;
-		uint64_t own_tick = 0;
-		if (at_completion && gpu_page && !around) {
-			gather();
-			gathered         = true;
-			const auto route = LabelOrder::AtCompletion(facts);
-			if (route != LabelOrder::Route::Drain) {
-				plain  = route == LabelOrder::Route::Defer;
-				around = route == LabelOrder::Route::DeferAround;
-				(facts.in_place_bytes ? g_label_stats.own_tick_copy : plain ? g_label_stats.own_tick_block : g_label_stats.own_tick_page)
-				    .fetch_add(1, std::memory_order_relaxed);
-				own_tick = InPlaceMemory::NoteDeferredLabel(vaddr, size);
-			}
-		}
 #else
 		const bool around = false;
 #endif
@@ -3059,9 +2946,6 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 				g_label_stats.around.fetch_add(1, std::memory_order_relaxed);
 			}
 #endif
-			if (at_completion) {
-				InPlaceMemory::NoteLabelAtCompletion();
-			}
 #if defined(ANYPS5_KYTY)
 			g_label_stats.deferred.fetch_add(1, std::memory_order_relaxed);
 			NoteLabelAddress(vaddr);
@@ -3070,11 +2954,7 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 #if defined(ANYPS5_KYTY)
 			s_deferred_labels.fetch_add(1, std::memory_order_relaxed);
 #endif
-#if defined(ANYPS5_KYTY)
-			auto write_deferred = [this, address, data, data_sel, own_tick] {
-#else
 			auto write_deferred = [this, address, data, data_sel] {
-#endif
 				if (data_sel == 1) {
 					const auto value = static_cast<uint32_t>(data);
 					m_renderer.WriteFromCompletion(address, &value, sizeof(value));
@@ -3082,18 +2962,13 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 					const uint64_t value = data_sel == 3 ? Sync::ReadReferenceClock() : data;
 					m_renderer.WriteFromCompletion(address, &value, sizeof(value));
 				}
-#if defined(ANYPS5_KYTY)
-				if (own_tick != 0) {
-					InPlaceMemory::ForgetDeferredLabel(own_tick);
-				}
-#endif
 				m_deferred_labels.fetch_sub(1, std::memory_order_release);
 #if defined(ANYPS5_KYTY)
 				s_deferred_labels.fetch_sub(1, std::memory_order_release);
 #endif
 			};
 #if defined(ANYPS5_KYTY)
-			if (m_labels_after_dumps && !at_completion) {
+			if (m_labels_after_dumps) {
 				GetScheduler().DeferPriorityOperationAfter(
 				    std::max<uint64_t>(m_renderer.GetOcclusionQueries().LastPendingDumpTick(), 1),
 				    std::move(write_deferred), vaddr, size);
@@ -3108,11 +2983,11 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 			}
 			return;
 		}
-		if (labels_pending() != 0 || at_completion) {
+		if (labels_pending() != 0) {
 			auto&      scheduler = GetScheduler();
 			const auto tick      = scheduler.CurrentTick();
 #if defined(ANYPS5_KYTY)
-			if (deferable && !gathered) {
+			if (deferable) {
 				gather();
 			}
 			const auto started = LabelClockNs();
@@ -3123,7 +2998,7 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 			const auto waited = static_cast<uint64_t>(LabelClockNs() - started);
 			g_label_stats.drains.fetch_add(1, std::memory_order_relaxed);
 			g_label_stats.drain_ns.fetch_add(waited, std::memory_order_relaxed);
-			NoteLabelDrain(facts, waited, cover, tick);
+			NoteLabelDrain(facts, waited);
 			NoteLabelAddress(vaddr);
 			drained = true;
 #endif

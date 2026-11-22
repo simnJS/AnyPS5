@@ -10,9 +10,6 @@ struct Facts {
 	bool deferable      = false;
 	bool tracked_page   = false;
 	bool tracked_bytes  = false;
-	bool in_place_block = false;
-	bool in_place_bytes = false;
-	bool in_place_ordered = false;
 	bool around_enabled = false;
 	bool backing        = false;
 	bool label_pending  = false;
@@ -22,11 +19,9 @@ enum class Route : uint8_t { Defer, DeferAround, Drain };
 
 enum class Reason : uint8_t {
 	NotDeferable,
-	InPlaceBytes,
 	CacheBytes,
 	AroundOff,
 	NoBacking,
-	InPlaceBlock,
 	NoLabelPending,
 	Other,
 	Count
@@ -38,33 +33,19 @@ inline constexpr size_t ReasonCount = static_cast<size_t>(Reason::Count);
 	if (!facts.deferable) {
 		return Route::Drain;
 	}
-	if (!facts.tracked_page && !facts.in_place_block) {
-		return Route::Defer;
-	}
-	const bool around = facts.around_enabled && facts.label_pending && !facts.in_place_block && !facts.tracked_bytes &&
-	                    facts.backing;
-	return around ? Route::DeferAround : Route::Drain;
-}
-
-[[nodiscard]] constexpr Route AtCompletion(const Facts& facts) noexcept {
-	if (!facts.deferable || (facts.in_place_bytes && !facts.in_place_ordered)) {
-		return Route::Drain;
-	}
 	if (!facts.tracked_page) {
 		return Route::Defer;
 	}
-	return facts.around_enabled && !facts.tracked_bytes && facts.backing ? Route::DeferAround : Route::Drain;
+	const bool around = facts.around_enabled && facts.label_pending && !facts.tracked_bytes && facts.backing;
+	return around ? Route::DeferAround : Route::Drain;
 }
 
 [[nodiscard]] constexpr Reason DrainReason(const Facts& facts) noexcept {
 	if (!facts.deferable) {
 		return Reason::NotDeferable;
 	}
-	if (facts.in_place_bytes) {
-		return Reason::InPlaceBytes;
-	}
 	if (!facts.tracked_page) {
-		return facts.in_place_block ? Reason::InPlaceBlock : Reason::Other;
+		return Reason::Other;
 	}
 	if (facts.tracked_bytes) {
 		return Reason::CacheBytes;
@@ -74,9 +55,6 @@ inline constexpr size_t ReasonCount = static_cast<size_t>(Reason::Count);
 	}
 	if (!facts.backing) {
 		return Reason::NoBacking;
-	}
-	if (facts.in_place_block) {
-		return Reason::InPlaceBlock;
 	}
 	return facts.label_pending ? Reason::Other : Reason::NoLabelPending;
 }

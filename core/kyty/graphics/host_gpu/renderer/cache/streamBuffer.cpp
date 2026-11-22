@@ -143,13 +143,6 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
-               vk::Buffer imported, vk::DeviceAddress device_address)
-    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
-      m_device_address(device_address), m_buffer(imported), m_size(size), m_coherent(true), m_in_place(true) {
-	EXIT_IF(imported == nullptr || size == 0 || device_address == 0);
-}
-
-Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
                MirrorWindow mirror)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
       m_handle_offset(cpu_address), m_device_address(mirror.address), m_buffer(mirror.buffer), m_size(size),
@@ -164,11 +157,7 @@ Buffer::~Buffer() {
 	if (m_buffer == nullptr || m_window) {
 		return;
 	}
-	if (m_in_place) {
-		m_graphics->device.destroyBuffer(m_buffer);
-	} else {
-		vmaDestroyBuffer(m_allocator, m_buffer, m_allocation);
-	}
+	vmaDestroyBuffer(m_allocator, m_buffer, m_allocation);
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {
