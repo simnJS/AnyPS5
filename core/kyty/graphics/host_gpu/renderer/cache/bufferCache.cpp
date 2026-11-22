@@ -1380,6 +1380,15 @@ void BufferCache::RequestRange(uint64_t vaddr, uint64_t size) {
 	}
 	m_fresh.clear();
 	m_guest_mirror->NoteRange(vaddr, size, &m_fresh);
+	if (!m_fresh.empty() && vaddr < m_fresh.front().first && vaddr + size <= m_fresh.back().second) {
+		auto last = m_fresh.back().second;
+		if (std::find(m_growth_ends.begin(), m_growth_ends.end(), m_fresh.front().first) != m_growth_ends.end()) {
+			const auto leap = std::min(StreamLeap, m_guest_mirror->Base() + m_guest_mirror->Size() - last);
+			m_guest_mirror->NoteRange(last, leap, &m_fresh);
+			last += leap;
+		}
+		m_growth_ends[m_growth_next++ % m_growth_ends.size()] = last;
+	}
 	for (const auto& [begin, end]: m_fresh) {
 		WriteTableEntries(begin, end);
 		NoteBlockRegions(begin, end, true);

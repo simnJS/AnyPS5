@@ -531,6 +531,9 @@ private:
 	static constexpr size_t                                    WrittenMemoSlots = 1024;
 	std::unique_ptr<std::array<WrittenMemo, WrittenMemoSlots>> m_written_memo =
 	    std::make_unique<std::array<WrittenMemo, WrittenMemoSlots>>();
+	static constexpr uint64_t StreamLeap = CACHING_PAGESIZE * 128;
+	std::array<uint64_t, 16>  m_growth_ends {};
+	uint32_t                  m_growth_next = 0;
 	uint64_t m_gc_tick = 0;
 	void                                       GrowRegionTables(uint64_t region);
 	std::vector<uint32_t>                      m_region_buffer_count;

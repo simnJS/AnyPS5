@@ -50,6 +50,9 @@ constexpr uint64_t    StreamedAt   = 0x30000;
 constexpr uint64_t    MirroredAt   = 0x34000;
 constexpr uint64_t    WrittenBytes = 0x1000;
 constexpr uint64_t    FarAt        = 0x70000;
+constexpr uint64_t    GrowAt       = 0x40000;
+constexpr uint64_t    GrowBlock    = 0x10000;
+constexpr uint64_t    LeapBytes    = 0x200000;
 constexpr uint32_t    GpuValue     = 0x5eed1234u;
 
 std::string g_skipped;
@@ -276,6 +279,20 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		mirror->WaitIdle();
 		MirrorWindowsTestAccess::CheckRange(buffers, address + NextAt, WrittenBytes);
 		if (mirror->Totals().unbound_reads != 1) return "a range whose blocks are not bound is not counted";
+	}
+
+	if (mirror->BlockSize() == GrowBlock) {
+		const auto grow = address + GrowAt;
+		(void)buffers.ObtainRange(grow, GrowBlock / 2, false);
+		(void)buffers.ObtainRange(grow, GrowBlock + GrowBlock / 2, false);
+		if (mirror->AnyRequested(grow + 2 * GrowBlock, GrowBlock)) return "a range that grew once binds ahead of itself";
+		(void)buffers.ObtainRange(grow, 2 * GrowBlock + GrowBlock / 2, false);
+		if (!mirror->Requested(grow + 3 * GrowBlock, LeapBytes)) {
+			return "a range that grew again at the same edge does not bind ahead of itself";
+		}
+	} else {
+		std::printf("%s: blocks of %llu KiB, the leap ahead of a growing range is not checked\n", Name,
+		            static_cast<unsigned long long>(mirror->BlockSize() >> 10u));
 	}
 
 	Finish(scheduler);
