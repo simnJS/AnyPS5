@@ -686,6 +686,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	graphics.sparse_buffers_enabled = supported2.features.sparseBinding == VK_TRUE &&
+	                                  supported2.features.sparseResidencyBuffer == VK_TRUE;
+	device_features.sparseBinding         = graphics.sparse_buffers_enabled ? VK_TRUE : VK_FALSE;
+	device_features.sparseResidencyBuffer = graphics.sparse_buffers_enabled ? VK_TRUE : VK_FALSE;
 	if (!device_features.shaderStorageImageMultisample) {
 		graphics.physical_device_properties.limits.storageImageSampleCounts =
 		    vk::SampleCountFlagBits::e1;
@@ -732,10 +736,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.native_ray_tracing_enabled = ray_query_enabled;
 	LOGF("Vulkan native ray tracing: %s\n", graphics.native_ray_tracing_enabled ? "true" : "false");
 	RayTracing::SetDeviceSupport(graphics.native_ray_tracing_enabled);
-	const float                              queue_priority = 1.0f;
-	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	const std::array<float, 2>               queue_priorities {1.0f, 1.0f};
+	const float&                             queue_priority = queue_priorities[0];
+	std::array<vk::DeviceQueueCreateInfo, 3> queue_create_infos {};
 	queue_create_infos[0] = {
-	    .queueFamilyIndex = queue_family, .queueCount = 1, .pQueuePriorities = &queue_priority};
+	    .queueFamilyIndex = queue_family, .queueCount = 1, .pQueuePriorities = queue_priorities.data()};
 	uint32_t   queue_create_count = 1;
 	const auto families           = physical_device.getQueueFamilyProperties();
 	graphics.readback_family      = static_cast<uint32_t>(-1);
@@ -750,6 +755,33 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 			break;
 		}
 	}
+	graphics.sparse_family      = static_cast<uint32_t>(-1);
+	graphics.sparse_queue_index = 0;
+	if (graphics.sparse_buffers_enabled) {
+		const auto sparse = [&](uint32_t family) {
+			return family != queue_family && family != graphics.readback_family && families[family].queueCount != 0 &&
+			       (families[family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		};
+		for (uint32_t pass = 0; pass < 2 && graphics.sparse_family == static_cast<uint32_t>(-1); pass++) {
+			for (uint32_t family = 0; family < families.size(); family++) {
+				if (sparse(family) && (pass == 1 || families[family].queueFlags == vk::QueueFlagBits::eSparseBinding)) {
+					graphics.sparse_family = family;
+					queue_create_infos[queue_create_count++] = {
+					    .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &queue_priority};
+					break;
+				}
+			}
+		}
+		if (graphics.sparse_family == static_cast<uint32_t>(-1) &&
+		    (families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding)) {
+			graphics.sparse_family = queue_family;
+			if (families[queue_family].queueCount >= 2) {
+				queue_create_infos[0].queueCount = 2;
+				graphics.sparse_queue_index      = 1;
+			}
+		}
+	}
+
 	vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR presentation {};
 	const char* maintenance = nullptr;
 	if (HasExtension(instance_extensions, VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME) &&
@@ -1184,6 +1216,10 @@ void WindowContext::CreateVulkan() {
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+	}
+	if (graphic_ctx.sparse_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.sparse_family, graphic_ctx.sparse_queue_index,
+		                            &graphic_ctx.sparse_queue);
 	}
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
