@@ -66,18 +66,19 @@ public:
 
 	using Wait = MirrorWait;
 
-	GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes = DefaultSizes);
+	GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes = DefaultSizes, uint64_t base = 0);
 	~GuestMirror();
 	KYTY_CLASS_NO_COPY(GuestMirror);
 
 	[[nodiscard]] bool               Available() const noexcept { return m_size != 0; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
+	[[nodiscard]] uint64_t           Base() const noexcept { return m_base; }
 	[[nodiscard]] uint64_t           BlockSize() const noexcept { return uint64_t {1} << m_block_bits; }
 	[[nodiscard]] uint64_t           DeviceAddress() const noexcept { return m_device_address; }
 	[[nodiscard]] const std::string& Description() const noexcept { return m_description; }
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] bool               Holds(uint64_t vaddr, uint64_t size) const noexcept {
-		return size != 0 && vaddr < m_size && size <= m_size - vaddr;
+		return size != 0 && vaddr >= m_base && vaddr - m_base < m_size && size <= m_size - (vaddr - m_base);
 	}
 	[[nodiscard]] bool     IsBound(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool     Requested(uint64_t vaddr, uint64_t size) const noexcept;
@@ -136,6 +137,7 @@ private:
 
 	GraphicContext& m_graphics;
 	uint64_t        m_size           = 0;
+	uint64_t        m_base           = 0;
 	uint32_t        m_block_bits     = MinBlockBits;
 	uint32_t        m_memory_type    = 0;
 	uint64_t        m_device_address = 0;

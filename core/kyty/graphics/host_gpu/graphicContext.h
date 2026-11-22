@@ -76,6 +76,8 @@ struct GraphicContext {
 	vk::Queue                          sparse_queue           = nullptr;
 	uint32_t                           sparse_family          = static_cast<uint32_t>(-1);
 	uint32_t                           sparse_queue_index     = 0;
+	uint64_t                           mirror_base            = 0;
+	uint64_t                           mirror_size            = 0;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

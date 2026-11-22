@@ -226,10 +226,11 @@ GuestMirror::ProbeResult GuestMirror::Probe(const GraphicContext& graphics, std:
 	return result;
 }
 
-GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes): m_graphics(graphics) {
+GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes, uint64_t base)
+    : m_graphics(graphics), m_base(base) {
 	const auto probe = Probe(graphics, sizes);
 	if (probe.size == 0) {
-		m_description = fmt::format("no mirror: {}; the buffer cache keeps buffers of its own", probe.refusal);
+		m_description = fmt::format("no mirror: {}", probe.refusal);
 		return;
 	}
 	m_size = probe.size;
@@ -245,9 +246,9 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 	vk::PhysicalDeviceProperties2        properties {.pNext = &properties13};
 	graphics.physical_device.getProperties2(&properties);
 	m_description = fmt::format(
-	    "sparse mirror of {} at base 0, device address 0x{:x} to 0x{:x} (probe {:.1f} ms: {}), blocks of {} KiB, {} queue of "
-	    "family {}, memory type {}, every usage of the cache's buffers, shared with the readback family{}",
-	    Gib(m_size), m_device_address, m_device_address + m_size, probe.ms, probe.trials, BlockSize() >> 10u,
+	    "sparse mirror of {} at guest address 0x{:x}, device address 0x{:x} to 0x{:x} (probe {:.1f} ms: {}), blocks of {} KiB, "
+	    "{} queue of family {}, memory type {}, every usage of the cache's buffers, shared with the readback family{}",
+	    Gib(m_size), m_base, m_device_address, m_device_address + m_size, probe.ms, probe.trials, BlockSize() >> 10u,
 	    m_shared_queue ? "the work" : fmt::format("its own (index {})", graphics.sparse_queue_index),
 	    graphics.sparse_family, m_memory_type,
 	    m_size > properties13.maxBufferSize ? fmt::format(", above maxBufferSize ({})", Gib(properties13.maxBufferSize))
@@ -323,14 +324,14 @@ void GuestMirror::DestroyBuffer() {
 }
 
 bool GuestMirror::IsBound(uint64_t vaddr) const noexcept {
-	const auto block = vaddr >> m_block_bits;
-	return block / 64 < m_words && (m_bound[block / 64].load(std::memory_order_relaxed) & (uint64_t {1} << (block % 64))) != 0;
+	const auto block = (vaddr - m_base) >> m_block_bits;
+	return vaddr >= m_base && block / 64 < m_words && (m_bound[block / 64].load(std::memory_order_relaxed) & (uint64_t {1} << (block % 64))) != 0;
 }
 
 bool GuestMirror::AllSet(const std::atomic<uint64_t>* bits, uint64_t vaddr, uint64_t size) const noexcept {
 	if (!Holds(vaddr, size)) return false;
-	const auto first = vaddr >> m_block_bits;
-	const auto last  = (vaddr + size - 1) >> m_block_bits;
+	const auto first = (vaddr - m_base) >> m_block_bits;
+	const auto last  = (vaddr - m_base + size - 1) >> m_block_bits;
 	for (auto word = first / 64; word <= last / 64; word++) {
 		const auto low  = word == first / 64 ? first % 64 : 0;
 		const auto high = word == last / 64 ? last % 64 : 63;
@@ -351,8 +352,14 @@ bool GuestMirror::Ready(uint64_t vaddr, uint64_t size) const noexcept {
 void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
 	if (m_size == 0 || size == 0 || UINT64_MAX - vaddr < size) return;
 	const uint64_t blocks = m_size >> m_block_bits;
-	const uint64_t first  = vaddr >> m_block_bits;
-	uint64_t       last   = (vaddr + size - 1) >> m_block_bits;
+	if (vaddr < m_base) {
+		m_outside_blocks += ((std::min(vaddr + size, m_base) - vaddr + BlockSize() - 1) >> m_block_bits);
+		if (vaddr + size <= m_base) return;
+		size -= m_base - vaddr;
+		vaddr = m_base;
+	}
+	const uint64_t first  = (vaddr - m_base) >> m_block_bits;
+	uint64_t       last   = (vaddr - m_base + size - 1) >> m_block_bits;
 	if (first >= blocks) {
 		m_outside_blocks += last - first + 1;
 		return;
@@ -417,9 +424,9 @@ void GuestMirror::Trim(std::span<const std::pair<uint64_t, uint64_t>> live, Wait
 	std::vector<uint64_t> covered(m_words, 0);
 	const uint64_t        blocks = m_size >> m_block_bits;
 	for (const auto& [vaddr, size]: live) {
-		if (size == 0 || UINT64_MAX - vaddr < size || (vaddr >> m_block_bits) >= blocks) continue;
-		const auto first = vaddr >> m_block_bits;
-		const auto last  = std::min((vaddr + size - 1) >> m_block_bits, blocks - 1);
+		if (size == 0 || UINT64_MAX - vaddr < size || vaddr < m_base || ((vaddr - m_base) >> m_block_bits) >= blocks) continue;
+		const auto first = (vaddr - m_base) >> m_block_bits;
+		const auto last  = std::min((vaddr - m_base + size - 1) >> m_block_bits, blocks - 1);
 		for (auto block = first; block <= last; block++) {
 			covered[block / 64] |= uint64_t {1} << (block % 64);
 		}

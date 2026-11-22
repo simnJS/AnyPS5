@@ -201,7 +201,7 @@ extern "C" int RunKytyBufferCachePagesTest() {
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* unavailable = gpu.Initialize()) {
+	if (const auto* unavailable = gpu.Initialize(false, true)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "kyty_shim_buffer_cache_pages: %s, no usable Vulkan device (%s)\n",
 		             required ? "FAILED" : "skipped", unavailable);

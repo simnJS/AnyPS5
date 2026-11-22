@@ -145,7 +145,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
                MirrorWindow mirror)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
-      m_handle_offset(cpu_address), m_device_address(mirror.address), m_buffer(mirror.buffer), m_size(size),
+      m_handle_offset(cpu_address - mirror.base), m_device_address(mirror.address), m_buffer(mirror.buffer), m_size(size),
       m_window(true) {
 	EXIT_IF(mirror.buffer == nullptr || size == 0 || mirror.address == 0);
 #if defined(ANYPS5_KYTY)

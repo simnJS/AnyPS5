@@ -194,6 +194,12 @@ private:
 		graphics.sparse_queue_index = sparse_index;
 		if (sparse) {
 			graphics.device.getQueue(sparse_family, sparse_index, &graphics.sparse_queue);
+			constexpr uint64_t GiB   = uint64_t {1} << 30u;
+			const uint64_t     space = graphics.physical_device_properties.limits.sparseAddressSpaceSize;
+			if (space < 64 * GiB) {
+				graphics.mirror_base = 0x2'0000'0000;
+				graphics.mirror_size = std::min<uint64_t>(4 * GiB, space & ~(GiB - 1));
+			}
 		}
 		graphics.occlusion_queries_enabled = true;
 		return true;

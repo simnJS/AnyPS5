@@ -533,7 +533,7 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
 	auto& graphics = gpu.graphics;
-	if (const auto* unavailable = gpu.Initialize(true)) {
+	if (const auto* unavailable = gpu.Initialize(true, true)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "kyty_shim_image_write_back_alias: %s, no usable Vulkan device (%s)\n",
 		             required ? "FAILED" : "skipped", unavailable);

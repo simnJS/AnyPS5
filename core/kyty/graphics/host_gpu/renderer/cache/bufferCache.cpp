@@ -389,19 +389,23 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	GetBuffer(null_id).Fill(0, 16, 0);
-	if (!GuestMirror::Unsupported(m_graphics).empty()) {
-		::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] no mirror: {}; the buffer cache keeps buffers of its own\n",
-		                                        GuestMirror::Unsupported(m_graphics)));
-	} else {
-		m_guest_mirror = std::make_unique<GuestMirror>(m_graphics);
-		::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] {}\n", m_guest_mirror->Description()));
-		if (!m_guest_mirror->Available()) {
-			m_guest_mirror.reset();
-		} else {
-			SetVulkanObjectNameF(m_graphics.device, m_guest_mirror->Handle(), "Kyty.GuestMirror[size=0x{:x}]",
-			                     m_guest_mirror->Size());
-		}
+	if (const auto refusal = GuestMirror::Unsupported(m_graphics); !refusal.empty()) {
+		EXIT("[kyty-mirror] no mirror: %s; AnyKyty keeps the guest memory the GPU reads in a sparse buffer and needs "
+		     "sparseBinding, sparseResidencyBuffer and a queue that binds sparse memory\n",
+		     refusal.c_str());
 	}
+	const std::array<uint64_t, 1> chosen {m_graphics.mirror_size};
+	m_guest_mirror = m_graphics.mirror_size != 0
+	                     ? std::make_unique<GuestMirror>(m_graphics, chosen, m_graphics.mirror_base)
+	                     : std::make_unique<GuestMirror>(m_graphics, GuestMirror::DefaultSizes, m_graphics.mirror_base);
+	::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] {}\n", m_guest_mirror->Description()));
+	if (!m_guest_mirror->Available()) {
+		EXIT("[kyty-mirror] %s; AnyKyty keeps the guest memory the GPU reads in a sparse buffer of 64 GiB or more and "
+		     "cannot run on this GPU\n",
+		     m_guest_mirror->Description().c_str());
+	}
+	SetVulkanObjectNameF(m_graphics.device, m_guest_mirror->Handle(), "Kyty.GuestMirror[size=0x{:x}]",
+	                     m_guest_mirror->Size());
 	m_scheduler.SetSubmitHook(
 	    [](void* self, CommandBuffer& command, SubmitInfo& submit) {
 		    auto* cache = static_cast<BufferCache*>(self);
@@ -1525,8 +1529,9 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::InsertBuffer(uint64_t vaddr, uint64_t size) {
 	if (m_guest_mirror && m_guest_mirror->Holds(vaddr, size)) {
-		return m_slot_buffers.insert(m_graphics, m_scheduler, vaddr, size,
-		                             MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress()});
+		return m_slot_buffers.insert(
+		    m_graphics, m_scheduler, vaddr, size,
+		    MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress(), m_guest_mirror->Base()});
 	}
 	const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, vaddr,
 	                                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);

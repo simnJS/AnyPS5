@@ -41,6 +41,7 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 struct MirrorWindow {
 	vk::Buffer        buffer  = nullptr;
 	vk::DeviceAddress address = 0;
+	uint64_t          base    = 0;
 };
 
 class Buffer {

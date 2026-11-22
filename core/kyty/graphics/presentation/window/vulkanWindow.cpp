@@ -295,6 +295,13 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(device_features2.features.samplerAnisotropy, "samplerAnisotropy");
 		check_feature(device_features2.features.robustBufferAccess, "robustBufferAccess");
+		check_feature(device_features2.features.sparseBinding, "sparseBinding");
+		check_feature(device_features2.features.sparseResidencyBuffer, "sparseResidencyBuffer");
+		if (std::ranges::none_of(device.getQueueFamilyProperties(), [](const vk::QueueFamilyProperties& family) {
+			    return family.queueCount != 0 && (family.queueFlags & vk::QueueFlagBits::eSparseBinding);
+		    })) {
+			reject("No queue family binds sparse memory");
+		}
 #if defined(__APPLE__)
 		if (device_features2.features.depthBounds != VK_TRUE) {
 			LOGF("depthBounds is not supported\n");
