@@ -1,3 +1,28 @@
+if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    if(WIN32)
+    add_test_executable(kyty_shim_pm4_shader_registers_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/Pm4ShaderRegisters.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Pm4ShaderRegistersMain.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_pm4_shader_registers_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(kyty_shim_pm4_shader_registers_tests)
+    if(MINGW)
+        target_link_libraries(kyty_shim_pm4_shader_registers_tests PRIVATE stdc++ gcc_eh)
+    endif()
+    target_link_libraries(kyty_shim_pm4_shader_registers_tests PRIVATE
+            "$<TARGET_GENEX_EVAL:kyty_shim_pm4_shader_registers_tests,$<TARGET_PROPERTY:Kyty::gpu,INTERFACE_LINK_LIBRARIES>>"
+            Kyty::gpu libSceAgcDriver libkernel libc)
+    else()
+        target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Pm4ShaderRegisters.cpp)
+        add_test_executable(kyty_shim_pm4_shader_registers_tests ${CMAKE_CURRENT_SOURCE_DIR}/Pm4ShaderRegistersMain.cpp)
+        target_link_libraries(kyty_shim_pm4_shader_registers_tests PRIVATE libSceAgcDriver libkernel libc)
+    endif()
+    add_test(NAME kyty_shim_pm4_shader_registers COMMAND kyty_shim_pm4_shader_registers_tests)
+    set_tests_properties(kyty_shim_pm4_shader_registers PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_FALLBACKS=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_pm4_shader_registers: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+
 add_test_executable(kyty_shim_half_fallback_tests ${CMAKE_CURRENT_SOURCE_DIR}/HalfFallback.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_half_fallback_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_include_directories(kyty_shim_half_fallback_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
@@ -9,6 +34,29 @@ target_link_libraries(kyty_shim_half_fallback_tests PRIVATE Kyty::gpu libkernel 
 add_test(NAME kyty_shim_half_fallback COMMAND kyty_shim_half_fallback_tests)
 set_tests_properties(kyty_shim_half_fallback PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_half_fallback: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
+if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    if(WIN32)
+    add_test_executable(kyty_shim_pm4_write_data_tests ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteData.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteDataMain.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_pm4_write_data_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(kyty_shim_pm4_write_data_tests)
+    if(MINGW)
+        target_link_libraries(kyty_shim_pm4_write_data_tests PRIVATE stdc++ gcc_eh)
+    endif()
+    target_link_libraries(kyty_shim_pm4_write_data_tests PRIVATE
+            "$<TARGET_GENEX_EVAL:kyty_shim_pm4_write_data_tests,$<TARGET_PROPERTY:Kyty::gpu,INTERFACE_LINK_LIBRARIES>>"
+            Kyty::gpu libSceAgcDriver libkernel libc)
+    else()
+        target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteData.cpp)
+        add_test_executable(kyty_shim_pm4_write_data_tests ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteDataMain.cpp)
+        target_link_libraries(kyty_shim_pm4_write_data_tests PRIVATE libSceAgcDriver libkernel libc)
+    endif()
+    add_test(NAME kyty_shim_pm4_write_data COMMAND kyty_shim_pm4_write_data_tests)
+    set_tests_properties(kyty_shim_pm4_write_data PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_FALLBACKS=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_pm4_write_data: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
 
 add_test_executable(kyty_shim_half_profile_tests ${CMAKE_CURRENT_SOURCE_DIR}/HalfProfile.cpp)
 configure_host_test_executable(kyty_shim_half_profile_tests)
@@ -424,6 +472,19 @@ add_test(NAME kyty_shim_pair_codegen COMMAND kyty_shim_pair_codegen_tests)
 set_tests_properties(kyty_shim_pair_codegen PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_pair_codegen: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+add_test_executable(kyty_shim_f32_product_contraction_tests ${CMAKE_CURRENT_SOURCE_DIR}/F32ProductContraction.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_f32_product_contraction_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_include_directories(kyty_shim_f32_product_contraction_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include
+        ${CMAKE_SOURCE_DIR}/3rdparty/xxHash ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+configure_host_test_executable(kyty_shim_f32_product_contraction_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_f32_product_contraction_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_f32_product_contraction_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_f32_product_contraction COMMAND kyty_shim_f32_product_contraction_tests)
+set_tests_properties(kyty_shim_f32_product_contraction PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "kyty_shim_f32_product_contraction: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 if(NOT ANYPS5_KYTY_DLL)
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/DescriptorTables.cpp)
     add_test_executable(kyty_shim_descriptor_tables_tests ${CMAKE_CURRENT_SOURCE_DIR}/DescriptorTablesMain.cpp)
@@ -741,3 +802,17 @@ target_link_libraries(kyty_shim_wave_split_codegen_tests PRIVATE Kyty::gpu libke
 add_test(NAME kyty_shim_wave_split_codegen COMMAND kyty_shim_wave_split_codegen_tests)
 set_tests_properties(kyty_shim_wave_split_codegen PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_wave_split_codegen: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_subdirectory(${CMAKE_SOURCE_DIR}/tools/hw-oracle/kyty ${CMAKE_CURRENT_BINARY_DIR}/hw-oracle-kyty)
+add_test_executable(kyty_shim_hw_oracle_tests ${CMAKE_CURRENT_SOURCE_DIR}/HwOracle.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+configure_host_test_executable(kyty_shim_hw_oracle_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_hw_oracle_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_hw_oracle_tests PRIVATE kyty_hw_oracle libkernel libc)
+add_dependencies(kyty_shim_hw_oracle_tests kyty_oracle_runner)
+add_test(NAME kyty_shim_hw_oracle COMMAND kyty_shim_hw_oracle_tests)
+set_tests_properties(kyty_shim_hw_oracle PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "kyty_shim_hw_oracle: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_hw_oracle_rows COMMAND kyty_shim_hw_oracle_tests rows)
+set_tests_properties(kyty_shim_hw_oracle_rows PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_hw_oracle_rows: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
