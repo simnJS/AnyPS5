@@ -1,4 +1,5 @@
 #include "TestVulkanDevice.h"
+#include "common/alignment.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
 #include "gpu_tiler_shaders/buffer_scatter_spv.h"
@@ -185,7 +186,20 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	}
 	if (!mirror->Requested(address, FirstBytes)) return "a range's blocks are not requested when it is obtained";
 	if (mirror->Ready(address, FirstBytes)) return "a range's blocks are bound before its submission";
-	if (!buffers.IsRegionRegistered(address, 1)) return "the mirror does not report the blocks of an obtained range";
+	if (!buffers.IsRegionRegistered(address, 1)) return "the cache does not report the pages of an obtained range";
+	if (!mirror->Owned(address, FirstBytes)) return "a range does not own its pages";
+	const auto page  = uint64_t {1} << GuestMirror::PageBits;
+	const auto aside = Common::AlignUp(address + FirstBytes, page) + page;
+	if (mirror->Requested(aside, WrittenBytes)) {
+		if (mirror->AnyOwned(aside, WrittenBytes)) return "a range owns pages of its block that it does not reach";
+		if (buffers.IsRegionRegistered(aside, WrittenBytes)) return "the cache reports a page that is only bound with its block";
+		buffers.NoteGpuWrites(aside, WrittenBytes);
+		if (buffers.IsRegionGpuModified(aside, WrittenBytes)) {
+			return "a GPU write noted on a page that is only bound with its block marks it";
+		}
+	} else {
+		std::printf("%s: the first range ends its block, the pages bound beside a range are not checked\n", Name);
+	}
 
 	AddressReader reader(graphics, scheduler, JoinedBytes);
 	reader.Record(scheduler, mirror->DeviceAddress() + address - origin, FirstBytes);
@@ -267,6 +281,7 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	}
 	buffers.RequestDeviceRange(address + FarAt, WrittenBytes);
 	if (!mirror->Requested(address + FarAt, WrittenBytes)) return "a range read by device address is not requested";
+	if (!mirror->Owned(address + FarAt, WrittenBytes)) return "a range read by device address is not owned";
 
 	const char* check = std::getenv("KYTY_MIRROR_CHECK");
 	if (check == nullptr || std::strcmp(check, "1") != 0) {
@@ -289,6 +304,9 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		(void)buffers.ObtainRange(grow, 2 * GrowBlock + GrowBlock / 2, false);
 		if (!mirror->Requested(grow + 3 * GrowBlock, LeapBytes)) {
 			return "a range that grew again at the same edge does not bind ahead of itself";
+		}
+		if (mirror->AnyOwned(grow + 4 * GrowBlock, LeapBytes - GrowBlock)) {
+			return "blocks bound ahead of a range are owned before a range reaches them";
 		}
 	} else {
 		std::printf("%s: blocks of %llu KiB, the leap ahead of a growing range is not checked\n", Name,

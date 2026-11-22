@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/guestMirror.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -242,6 +243,7 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 	m_words        = ((m_size >> m_block_bits) + 63) / 64;
 	m_bound        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
 	m_ready        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
+	m_owned        = std::make_unique<std::atomic<uint64_t>[]>(((m_size >> PageBits) + 63) / 64);
 	m_used.assign(m_words, 0);
 	m_device.assign(m_words, 0);
 	m_ages.resize(((m_size >> m_block_bits) + AgeChunkBlocks - 1) / AgeChunkBlocks);
@@ -331,10 +333,10 @@ bool GuestMirror::IsBound(uint64_t vaddr) const noexcept {
 	return vaddr >= m_base && block / 64 < m_words && (m_bound[block / 64].load(std::memory_order_relaxed) & (uint64_t {1} << (block % 64))) != 0;
 }
 
-bool GuestMirror::AllSet(const std::atomic<uint64_t>* bits, uint64_t vaddr, uint64_t size) const noexcept {
+bool GuestMirror::AllSet(const std::atomic<uint64_t>* bits, uint32_t shift, uint64_t vaddr, uint64_t size) const noexcept {
 	if (!Holds(vaddr, size)) return false;
-	const auto first = (vaddr - m_base) >> m_block_bits;
-	const auto last  = (vaddr - m_base + size - 1) >> m_block_bits;
+	const auto first = (vaddr - m_base) >> shift;
+	const auto last  = (vaddr - m_base + size - 1) >> shift;
 	for (auto word = first / 64; word <= last / 64; word++) {
 		const auto low  = word == first / 64 ? first % 64 : 0;
 		const auto high = word == last / 64 ? last % 64 : 63;
@@ -345,11 +347,60 @@ bool GuestMirror::AllSet(const std::atomic<uint64_t>* bits, uint64_t vaddr, uint
 }
 
 bool GuestMirror::Requested(uint64_t vaddr, uint64_t size) const noexcept {
-	return AllSet(m_bound.get(), vaddr, size);
+	return AllSet(m_bound.get(), m_block_bits, vaddr, size);
 }
 
 bool GuestMirror::Ready(uint64_t vaddr, uint64_t size) const noexcept {
-	return AllSet(m_ready.get(), vaddr, size);
+	return AllSet(m_ready.get(), m_block_bits, vaddr, size);
+}
+
+bool GuestMirror::Owned(uint64_t vaddr, uint64_t size) const noexcept {
+	return AllSet(m_owned.get(), PageBits, vaddr, size);
+}
+
+bool GuestMirror::AnyOwned(uint64_t vaddr, uint64_t size) const noexcept {
+	bool any = false;
+	ForEachOwned(vaddr, size, [&any](uint64_t, uint64_t) { any = true; });
+	return any;
+}
+
+void GuestMirror::Own(uint64_t vaddr, uint64_t size, Runs* fresh) {
+	if (!Holds(vaddr, size)) return;
+	const auto first = (vaddr - m_base) >> PageBits;
+	const auto last  = (vaddr - m_base + size - 1) >> PageBits;
+	for (auto word = first / 64; word <= last / 64; word++) {
+		const auto low   = word == first / 64 ? first % 64 : 0;
+		const auto high  = word == last / 64 ? last % 64 : 63;
+		const auto mask  = (high == 63 ? ~uint64_t {0} : (uint64_t {2} << high) - 1) & ~((uint64_t {1} << low) - 1);
+		const auto value = m_owned[word].load(std::memory_order_relaxed);
+		auto       added = mask & ~value;
+		if (added == 0) continue;
+		m_owned[word].store(value | mask, std::memory_order_release);
+		while (fresh != nullptr && added != 0) {
+			const auto start  = static_cast<uint64_t>(std::countr_zero(added));
+			const auto length = static_cast<uint64_t>(std::countr_one(added >> start));
+			const auto begin  = m_base + ((word * 64 + start) << PageBits);
+			const auto end    = begin + (length << PageBits);
+			if (!fresh->empty() && fresh->back().second == begin) {
+				fresh->back().second = end;
+			} else {
+				fresh->emplace_back(begin, end);
+			}
+			added = start + length >= 64 ? 0 : added & ~((uint64_t {1} << (start + length)) - 1);
+		}
+	}
+}
+
+void GuestMirror::Disown(uint64_t begin, uint64_t end) noexcept {
+	if (begin >= end || !Holds(begin, end - begin)) return;
+	const auto first = Common::AlignDown(begin - m_base, BlockSize()) >> PageBits;
+	const auto last  = (Common::AlignUp(end - m_base, BlockSize()) - 1) >> PageBits;
+	for (auto word = first / 64; word <= last / 64; word++) {
+		const auto low  = word == first / 64 ? first % 64 : 0;
+		const auto high = word == last / 64 ? last % 64 : 63;
+		const auto mask = (high == 63 ? ~uint64_t {0} : (uint64_t {2} << high) - 1) & ~((uint64_t {1} << low) - 1);
+		m_owned[word].fetch_and(~mask, std::memory_order_release);
+	}
 }
 
 bool GuestMirror::AnyRequested(uint64_t vaddr, uint64_t size) const noexcept {
@@ -453,6 +504,7 @@ void GuestMirror::Release(const Runs& runs) {
 			}
 		}
 	}
+	for (const auto& [begin, end]: runs) Disown(begin, end);
 	if (!blocks.empty()) Post({.kind = Kind::Unbind, .runs = std::move(blocks)});
 }
 

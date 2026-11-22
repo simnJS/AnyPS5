@@ -35,6 +35,7 @@ public:
 	static constexpr uint64_t Headroom        = 96 * GiB;
 	static constexpr uint32_t MinBlockBits    = 16;
 	static constexpr uint64_t ChunkBytes      = uint64_t {32} << 20u;
+	static constexpr uint32_t PageBits        = 14;
 	static constexpr size_t   MaxBindsPerCall = 256;
 
 	static constexpr std::array<uint64_t, 10> DefaultSizes {864 * GiB, 832 * GiB, 800 * GiB, 768 * GiB, 704 * GiB,
@@ -86,39 +87,21 @@ public:
 	[[nodiscard]] bool     Requested(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool     Ready(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool     AnyRequested(uint64_t vaddr, uint64_t size) const noexcept;
+	[[nodiscard]] bool     Owned(uint64_t vaddr, uint64_t size) const noexcept;
+	[[nodiscard]] bool     AnyOwned(uint64_t vaddr, uint64_t size) const noexcept;
 	template <typename Func>
 	void ForEachRequested(uint64_t vaddr, uint64_t size, Func&& func) const {
-		if (m_size == 0 || size == 0 || vaddr >= m_base + m_size || vaddr + size <= m_base) return;
-		const uint64_t begin = std::max(vaddr, m_base);
-		const uint64_t end   = std::min(vaddr + size, m_base + m_size);
-		const uint64_t first = (begin - m_base) >> m_block_bits;
-		const uint64_t last  = (end - m_base - 1) >> m_block_bits;
-		uint64_t       run   = UINT64_MAX;
-		for (uint64_t word = first / 64; word <= last / 64; word++) {
-			const auto low  = word == first / 64 ? first % 64 : 0;
-			const auto high = word == last / 64 ? last % 64 : 63;
-			const auto mask = (high == 63 ? ~uint64_t {0} : (uint64_t {2} << high) - 1) & ~((uint64_t {1} << low) - 1);
-			const auto bits = m_bound[word].load(std::memory_order_acquire) & mask;
-			if (bits == mask) {
-				if (run == UINT64_MAX) run = word * 64 + low;
-				continue;
-			}
-			for (uint64_t bit = low; bit <= high; bit++) {
-				const bool set = (bits >> bit & 1u) != 0;
-				if (set && run == UINT64_MAX) {
-					run = word * 64 + bit;
-				} else if (!set && run != UINT64_MAX) {
-					func(std::max(begin, m_base + (run << m_block_bits)), m_base + ((word * 64 + bit) << m_block_bits));
-					run = UINT64_MAX;
-				}
-			}
-		}
-		if (run != UINT64_MAX) func(std::max(begin, m_base + (run << m_block_bits)), end);
+		ForEachSet(m_bound.get(), m_block_bits, vaddr, size, std::forward<Func>(func));
+	}
+	template <typename Func>
+	void ForEachOwned(uint64_t vaddr, uint64_t size, Func&& func) const {
+		ForEachSet(m_owned.get(), PageBits, vaddr, size, std::forward<Func>(func));
 	}
 	[[nodiscard]] uint64_t OutsideBlocks() const noexcept { return m_outside_blocks; }
 	[[nodiscard]] bool     SharedQueue() const noexcept { return m_shared_queue; }
 
 	void               NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh = nullptr);
+	void               Own(uint64_t vaddr, uint64_t size, Runs* fresh = nullptr);
 	void               Use(uint64_t vaddr, uint64_t size) noexcept;
 	void               NoteDevice(uint64_t vaddr, uint64_t size) noexcept;
 	void               Age(uint32_t frame);
@@ -169,7 +152,37 @@ private:
 	[[nodiscard]] Grant Allocate(uint64_t wanted);
 	void               Free(Slot slot);
 	void               Post(Command&& command);
-	[[nodiscard]] bool AllSet(const std::atomic<uint64_t>* bits, uint64_t vaddr, uint64_t size) const noexcept;
+	[[nodiscard]] bool AllSet(const std::atomic<uint64_t>* bits, uint32_t shift, uint64_t vaddr, uint64_t size) const noexcept;
+	void               Disown(uint64_t begin, uint64_t end) noexcept;
+	template <typename Func>
+	void ForEachSet(const std::atomic<uint64_t>* map, uint32_t shift, uint64_t vaddr, uint64_t size, Func&& func) const {
+		if (m_size == 0 || size == 0 || vaddr >= m_base + m_size || vaddr + size <= m_base) return;
+		const uint64_t begin = std::max(vaddr, m_base);
+		const uint64_t end   = std::min(vaddr + size, m_base + m_size);
+		const uint64_t first = (begin - m_base) >> shift;
+		const uint64_t last  = (end - m_base - 1) >> shift;
+		uint64_t       run   = UINT64_MAX;
+		for (uint64_t word = first / 64; word <= last / 64; word++) {
+			const auto low  = word == first / 64 ? first % 64 : 0;
+			const auto high = word == last / 64 ? last % 64 : 63;
+			const auto mask = (high == 63 ? ~uint64_t {0} : (uint64_t {2} << high) - 1) & ~((uint64_t {1} << low) - 1);
+			const auto bits = map[word].load(std::memory_order_acquire) & mask;
+			if (bits == mask) {
+				if (run == UINT64_MAX) run = word * 64 + low;
+				continue;
+			}
+			for (uint64_t bit = low; bit <= high; bit++) {
+				const bool set = (bits >> bit & 1u) != 0;
+				if (set && run == UINT64_MAX) {
+					run = word * 64 + bit;
+				} else if (!set && run != UINT64_MAX) {
+					func(std::max(begin, m_base + (run << shift)), m_base + ((word * 64 + bit) << shift));
+					run = UINT64_MAX;
+				}
+			}
+		}
+		if (run != UINT64_MAX) func(std::max(begin, m_base + (run << shift)), end);
+	}
 	[[nodiscard]] uint32_t AgeOf(uint64_t block) const noexcept;
 	static constexpr uint64_t AgeChunkBlocks = 16384;
 
@@ -184,6 +197,7 @@ private:
 
 	std::unique_ptr<std::atomic<uint64_t>[]> m_bound;
 	std::unique_ptr<std::atomic<uint64_t>[]> m_ready;
+	std::unique_ptr<std::atomic<uint64_t>[]> m_owned;
 	uint64_t                                 m_words          = 0;
 	std::vector<uint64_t>                    m_used;
 	std::vector<uint64_t>                    m_used_words;

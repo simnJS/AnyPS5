@@ -1766,7 +1766,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		region_epochs.fill({UINT64_MAX, 0});
 		if (buffer_cache.InMirror(result.first)) {
 			const auto region = address & ~(TRACKER_REGION_SIZE - 1);
-			auto [begin, end] = buffer_cache.RequestedRun(address, size, region, region + TRACKER_REGION_SIZE);
+			auto [begin, end] = buffer_cache.OwnedRun(address, size, region, region + TRACKER_REGION_SIZE);
 			if (address + size <= end) {
 				const auto epoch = buffer_cache.CpuModificationEpoch(begin, end - begin);
 				if (buffer_cache.IsRegionCpuModified(begin, end - begin)) {

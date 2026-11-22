@@ -3178,7 +3178,7 @@ bool BufferCache::SynchronizeRangeFromImage(uint64_t vaddr, uint64_t size) {
 	auto&      buffer  = *m_storage;
 	const auto address = image.info.data.address;
 	uint64_t   available = 0;
-	m_guest_mirror->ForEachRequested(address, image.info.data.size, [&](uint64_t begin, uint64_t end) {
+	m_guest_mirror->ForEachOwned(address, image.info.data.size, [&](uint64_t begin, uint64_t end) {
 		if (begin == address + available) available = end - address;
 	});
 	if (available == 0) {

@@ -396,6 +396,22 @@ int Sparse() {
 	mirror.WaitIdle();
 	Check(mirror.Totals().bound_blocks == 301, "a block still requested is not bound again");
 
+	const uint64_t    page = uint64_t {1} << GuestMirror::PageBits;
+	GuestMirror::Runs owned;
+	mirror.Own(start, page, &owned);
+	mirror.Own(start + 2 * page, page, &owned);
+	Check(owned.size() == 2 && owned[0] == std::pair {start, start + page} && owned[1] == std::pair {start + 2 * page, start + 3 * page},
+	      "an owned range names the pages it adds");
+	owned.clear();
+	mirror.Own(start, 3 * page, &owned);
+	Check(owned.size() == 1 && owned[0] == std::pair {start + page, start + 2 * page}, "a wider owned range adds the missing page only");
+	Check(mirror.Owned(start, 3 * page) && !mirror.Owned(start, 4 * page) && mirror.AnyOwned(start + 2 * page, 2 * page) &&
+	          !mirror.AnyOwned(start + 3 * page, page) && mirror.IsBound(start + 3 * page),
+	      "pages are owned one by one inside a bound block");
+	owned.clear();
+	mirror.ForEachOwned(start + 0x100, block, [&](uint64_t begin, uint64_t end) { owned.emplace_back(begin, end); });
+	Check(owned.size() == 1 && owned[0] == std::pair {start + 0x100, start + 3 * page}, "owned pages are listed run by run, cut to the range");
+
 	GuestMirror::Runs all;
 	mirror.ForEachRequested(mirror.Base(), mirror.Size(), [&](uint64_t begin, uint64_t end) { all.emplace_back(begin, end); });
 	mirror.Release(all);
@@ -403,6 +419,7 @@ int Sparse() {
 	totals = mirror.Totals();
 	Check(totals.bound_blocks == 0 && totals.chunks == 0 && !mirror.IsBound(first) && !mirror.IsBound(run_base),
 	      "a release of every requested block unbinds everything and frees every chunk");
+	Check(!mirror.AnyOwned(start, block), "a released block owns no page");
 	GuestMirror::Runs fresh;
 	mirror.NoteRange(first, 0x100, &fresh);
 	Check(fresh.size() == 1 && fresh[0] == std::pair {start, start + block}, "a new request names the blocks it adds");

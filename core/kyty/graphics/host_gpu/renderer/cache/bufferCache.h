@@ -128,7 +128,7 @@ public:
 	void RequestDeviceRange(uint64_t vaddr, uint64_t size);
 	void EnsureRangeContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InMirror(const Buffer* buffer) const noexcept { return buffer != nullptr && buffer == m_storage.get(); }
-	[[nodiscard]] std::pair<uint64_t, uint64_t> RequestedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const;
+	[[nodiscard]] std::pair<uint64_t, uint64_t> OwnedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainRange(uint64_t vaddr, uint64_t size, bool is_written,
 	                                                       bool       is_texel_buffer = false,
 	                                                       ObtainFrom from            = ObtainFrom::Any);
@@ -278,7 +278,7 @@ private:
 	void                   RequestRange(uint64_t vaddr, uint64_t size);
 	void                   WriteTableEntries(uint64_t begin, uint64_t end);
 	void                   NoteBlockRegions(uint64_t begin, uint64_t end, bool insert);
-	[[nodiscard]] bool     Holds(uint64_t vaddr, uint64_t size) const noexcept { return m_guest_mirror->Requested(vaddr, size); }
+	[[nodiscard]] bool     Holds(uint64_t vaddr, uint64_t size) const noexcept { return m_guest_mirror->Owned(vaddr, size); }
 	[[nodiscard]] uint64_t Frame() const noexcept;
 	void                   EvictOldBlocks();
 	void                   CheckMirrorRange(uint64_t vaddr, uint64_t size) noexcept;
