@@ -1106,6 +1106,36 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 	}
 }
 
+#if defined(ANYPS5_KYTY)
+static void PrefetchLines(const void* data, size_t bytes, size_t limit) noexcept {
+	const auto* p = static_cast<const char*>(data);
+	for (size_t i = 0; i < std::min(bytes, limit); i += 64) {
+		__builtin_prefetch(p + i);
+	}
+}
+
+void GuestReadLog::PrefetchRecords() const noexcept {
+	if (m_failed || m_entries.empty()) {
+		return;
+	}
+	PrefetchLines(m_entries.data(), m_entries.size() * sizeof(Entry), 4096);
+	PrefetchLines(m_bytes.data(), m_bytes.size(), 4096);
+}
+
+void GuestReadLog::PrefetchGuest() const noexcept {
+	if (m_failed) {
+		return;
+	}
+	const size_t count = std::min<size_t>(m_entries.size(), 64);
+	for (size_t i = 0; i < count; i++) {
+		const auto& entry = m_entries[i];
+		if (!entry.zero_test && !entry.strict) {
+			__builtin_prefetch(reinterpret_cast<const void*>(entry.address));
+		}
+	}
+}
+
+#endif
 bool GuestReadLog::StillValid() const {
 	m_refresh.clear();
 	m_stale = StaleRead::None;

@@ -204,6 +204,17 @@ public:
 		return Element(head);
 	}
 
+	[[nodiscard]] const T* TryPeekAt(uint64_t ahead) {
+		const auto head = m_head.load(std::memory_order_relaxed);
+		if (m_consumer_tail - head <= ahead) {
+			m_consumer_tail = m_tail.load(std::memory_order_acquire);
+			if (m_consumer_tail - head <= ahead) {
+				return nullptr;
+			}
+		}
+		return Element(head + ahead);
+	}
+
 	void Stop() {
 		m_stopped.store(true, std::memory_order_seq_cst);
 		m_consumer_signal.fetch_add(1, std::memory_order_seq_cst);

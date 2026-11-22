@@ -223,6 +223,9 @@ public:
 		m_resolved_draw = resolved != nullptr ? WaitResolvedDraw(resolved) : nullptr;
 	}
 	static ResolvedDraw* WaitResolvedDraw(ResolvedDraw* resolved) noexcept;
+#if defined(ANYPS5_KYTY)
+	static void PrefetchResolvedDraw(const ResolvedDraw* resolved, bool records) noexcept;
+#endif
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	enum class AheadNote : uint8_t { NotAttempted, Prepared, NotPrepared, TableSkip };
 	enum class ExecuteCause : uint8_t { TableSkip, Revalidation, NotPrepared, Again, Other, Count };

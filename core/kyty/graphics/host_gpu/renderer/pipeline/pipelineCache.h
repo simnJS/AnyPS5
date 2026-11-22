@@ -111,6 +111,10 @@ public:
 	[[nodiscard]] bool ReadAroundGpuWrites() const { return m_around; }
 	void               NoteAroundLoads(std::span<uint64_t> addresses);
 	[[nodiscard]] bool StillValid() const;
+#if defined(ANYPS5_KYTY)
+	void PrefetchRecords() const noexcept;
+	void PrefetchGuest() const noexcept;
+#endif
 	[[nodiscard]] bool HasDescriptorRefresh() const { return !m_refresh.empty(); }
 	void RefreshDescriptorWords(std::span<ShaderRecompiler::IR::ResourceSnapshot>          resources,
 	                            std::span<const ShaderRecompiler::IR::ResourcePlan* const> plans) const;

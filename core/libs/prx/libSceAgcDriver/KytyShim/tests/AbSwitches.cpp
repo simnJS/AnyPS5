@@ -54,7 +54,7 @@ std::string Refused(const char* ab, const char* start = "", const char* settle =
 }
 
 void Refusals() {
-	const std::string listed = "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT";
+	const std::string listed = "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT, KYTY_PREFETCH_NEXT_DRAW";
 	Check(Contains(Refused("KYTY_GENERIC_COMPUTE_VARIANT"), "expected <seconds>:<setting>"),
 	      "a value without a phase length is refused");
 	Check(Contains(Refused("0.5:KYTY_GENERIC_COMPUTE_VARIANT"), "at least 1 s"), "a phase under 1 s is refused");
@@ -96,6 +96,9 @@ void Defaults() {
 	Check(IR::GenericComputeVariants(), "the compute variants see KYTY_GENERIC_COMPUTE_VARIANT on");
 	Check(Switches::Find("KYTY_GENERIC_COMPUTE_VARIANT") == Switch::GenericComputeVariant,
 	      "KYTY_GENERIC_COMPUTE_VARIANT is a runtime switch");
+	Check(Switches::On(Switch::PrefetchNextDraw), "KYTY_PREFETCH_NEXT_DRAW is on without the variable");
+	Check(Switches::Find("KYTY_PREFETCH_NEXT_DRAW") == Switch::PrefetchNextDraw,
+	      "KYTY_PREFETCH_NEXT_DRAW is a runtime switch");
 	Check(!Switches::Find("KYTY_RELAXED_SHADER_FLOAT").has_value(), "KYTY_RELAXED_SHADER_FLOAT is not a runtime switch");
 	Check(!Ab::Configured() && Ab::AtFlip().empty() && !Ab::Listed(Switch::GenericComputeVariant),
 	      "without KYTY_AB a flip prints nothing and changes nothing");
@@ -170,6 +173,7 @@ void EnvironmentArms() {
 	      "arm A is the environment's value");
 	static_cast<void>(run.AtPresent(2, 1.0, 1.0));
 	Check(IR::GenericComputeVariants(), "phase B turns the listed setting over");
+	Check(Switches::On(Switch::PrefetchNextDraw), "a setting KYTY_AB does not list keeps its value");
 	static_cast<void>(run.AtPresent(3, 2.0, 2.0));
 	Check(!IR::GenericComputeVariants(), "phase A restores the environment's value");
 	SetVariable("KYTY_GENERIC_COMPUTE_VARIANT", nullptr);
@@ -204,6 +208,7 @@ int Flips() {
 int main() {
 	if (const char* ab = std::getenv("KYTY_AB"); ab != nullptr && *ab != '\0') return Flips();
 	SetVariable("KYTY_GENERIC_COMPUTE_VARIANT", nullptr);
+	SetVariable("KYTY_PREFETCH_NEXT_DRAW", nullptr);
 	Switches::Reload();
 	Defaults();
 	Refusals();

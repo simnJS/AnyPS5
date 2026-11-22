@@ -495,6 +495,16 @@ void GuestGpu::ExecutionThread() {
 			const auto* next = operations.TryPeek();
 			operation->stream_in_place = next != nullptr && !IsDrawOperation(next->kind);
 		}
+#if defined(ANYPS5_KYTY)
+		if (m_resolving && Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::PrefetchNextDraw)) {
+			if (const auto* next = operations.TryPeekAt(0); next != nullptr && next->resolved != nullptr) {
+				RenderExecutor::PrefetchResolvedDraw(next->resolved, false);
+			}
+			if (const auto* later = operations.TryPeekAt(1); later != nullptr && later->resolved != nullptr) {
+				RenderExecutor::PrefetchResolvedDraw(later->resolved, true);
+			}
+		}
+#endif
 		operation->processor->Execute(*operation);
 		const auto sequence = operation->sequence;
 		operation.reset();
