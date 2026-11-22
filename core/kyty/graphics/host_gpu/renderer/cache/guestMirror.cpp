@@ -533,38 +533,6 @@ void GuestMirror::Flush() {
 	m_pending.clear();
 }
 
-void GuestMirror::Trim(std::span<const std::pair<uint64_t, uint64_t>> live, Wait after) {
-	if (m_size == 0) return;
-	Flush();
-	std::vector<uint64_t> covered(m_words, 0);
-	const uint64_t        blocks = m_size >> m_block_bits;
-	for (const auto& [vaddr, size]: live) {
-		if (size == 0 || UINT64_MAX - vaddr < size || vaddr < m_base || ((vaddr - m_base) >> m_block_bits) >= blocks) continue;
-		const auto first = (vaddr - m_base) >> m_block_bits;
-		const auto last  = std::min((vaddr - m_base + size - 1) >> m_block_bits, blocks - 1);
-		for (auto block = first; block <= last; block++) {
-			covered[block / 64] |= uint64_t {1} << (block % 64);
-		}
-	}
-	std::vector<Run> runs;
-	for (uint64_t word = 0; word < m_words; word++) {
-		const auto bound  = m_bound[word].load(std::memory_order_relaxed);
-		const auto unused = bound & ~covered[word];
-		if (unused == 0) continue;
-		m_ready[word].fetch_and(~unused, std::memory_order_acq_rel);
-		m_bound[word].store(bound & covered[word], std::memory_order_relaxed);
-		for (auto bits = unused; bits != 0; bits &= bits - 1) {
-			const auto block = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
-			if (!runs.empty() && runs.back().first + runs.back().count == block) {
-				runs.back().count++;
-			} else {
-				runs.push_back({block, 1});
-			}
-		}
-	}
-	if (!runs.empty()) Post({.kind = Kind::Unbind, .runs = std::move(runs), .after = after});
-}
-
 void GuestMirror::WaitIdle() {
 	if (m_size == 0) return;
 	Common::UniqueLock lock(m_mutex);

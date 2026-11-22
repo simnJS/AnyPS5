@@ -12,7 +12,6 @@
 #include "graphics/shader/shaderBindings.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
-#include "loader/demonsSoulsPageFree.h"
 
 #include <atomic>
 #include <span>
@@ -21,7 +20,6 @@
 #include <array>
 #include <bit>
 #include <map>
-#include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
@@ -276,34 +274,7 @@ void RenderContext::MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) c
 void RenderContext::FreedByGame(uint64_t vaddr, uint64_t size) {
 	if (m_gpu == nullptr || m_gpu->IsStopping() || !GuestRange {vaddr, size}.Valid()) return;
 	m_gpu->SendCommand([this, vaddr, size] {
-		if (!IsMapped(vaddr, size)) return;
-		const auto start = std::chrono::steady_clock::now();
-		static BufferCache::FreeBlockSplits splits;
-		static uint64_t                     blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0;
-		static auto                         next = start + std::chrono::seconds(30);
-		const auto                          lists = splits.lists;
-		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, &Loader::DemonsSoulsPageFree::FreeBlocksIn, &splits);
-		const auto took  = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-		ns += took;
-		max_ns = std::max(max_ns, took);
-		if (freed != 0) {
-			blocks++;
-			bytes += size;
-			let_go += freed;
-		}
-		if ((freed == 0 && splits.lists == lists) || start < next) return;
-		std::printf("Engine frees: %llu freed blocks (%.0f MiB) had buffers over them: %.0f MiB of buffers let go (%.0f MiB cut off "
-		            "buffers over other free blocks too, the allocator's lists read %llu times), %.1f ms on the GPU thread (at most "
-		            "%.2f ms a block)\n",
-		            static_cast<unsigned long long>(blocks), static_cast<double>(bytes) / 1048576.0,
-		            static_cast<double>(let_go) / 1048576.0, static_cast<double>(splits.cut) / 1048576.0,
-		            static_cast<unsigned long long>(splits.lists), static_cast<double>(ns) / 1e6,
-		            static_cast<double>(max_ns) / 1e6);
-		std::fflush(stdout);
-		blocks = bytes = let_go = ns = max_ns = 0;
-		splits = {};
-		next   = start + std::chrono::seconds(30);
+		if (IsMapped(vaddr, size)) (void)m_buffer_cache.DropFreedRange(vaddr, size);
 	});
 }
 
@@ -374,13 +345,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
-		const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
 		m_buffer_cache.ForgetCommandBuffers(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
-		if (registered) {
-			m_buffer_cache.DeleteUnmappedBuffers(vaddr, size);
-			m_buffer_cache.SplitUnmappedBuffers(vaddr, size);
-		}
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		m_strict_watch.UnmapMemory(vaddr, size);
@@ -427,7 +393,7 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 		}
 		m_mapped_ranges.ForEachInRange(base, window, [&](uint64_t start, uint64_t end) {
 			if (!contiguous || start == base) {
-				(void)m_buffer_cache.FindBuffer(start, end - start);
+				m_buffer_cache.RequestDeviceRange(start, end - start);
 			}
 		});
 	};
@@ -466,7 +432,7 @@ bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
 			continue;
 		}
 		m_mapped_ranges.ForEachInRange(base, CachedBytes, [this](uint64_t start, uint64_t end) {
-			m_buffer_cache.PinDeviceAddressRange(start, end - start);
+			m_buffer_cache.RequestDeviceRange(start, end - start);
 		});
 	}
 	return written;
@@ -515,7 +481,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 	}
 	for (const auto& [first, last]: ranges) {
 		m_mapped_ranges.ForEachInRange(first, last - first, [this](uint64_t start, uint64_t stop) {
-			m_buffer_cache.PinDeviceAddressRange(start, stop - start);
+			m_buffer_cache.RequestDeviceRange(start, stop - start);
 		});
 	}
 	if (program.info.ray_query && m_ray_tracing->Enabled()) {
@@ -1084,10 +1050,6 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
-	struct Cycles {
-		uint64_t start = __builtin_readcyclecounter();
-		~Cycles() { BufferCache::NoteBdaCycles(__builtin_readcyclecounter() - start); }
-	} cycles;
 	m_buffer_cache.PrepareFaultBuffer();
 	if (may_write) {
 		m_buffer_cache.NoteDeviceAddressUse();

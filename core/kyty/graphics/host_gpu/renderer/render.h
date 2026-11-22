@@ -241,7 +241,7 @@ public:
 	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers = true);
+	void FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings, uint64_t invocations_x = 0);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,

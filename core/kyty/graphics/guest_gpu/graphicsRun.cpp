@@ -2269,7 +2269,7 @@ void CommandProcessor::EmitHleRefitArgs() {
 		ReportRefitOutsideGuest(RayTracing::DropHleRefitOutsideGuest(refit, sizes, none, ReadRefitBlasSize));
 		for (size_t i = 0; i < refit.size(); i++) {
 			if (refit[i] != 0 && sizes[i] > RayTracing::HleRefitBlasHeaderBytes) {
-				(void)cache.ObtainBuffer(refit[i], sizes[i], true);
+				(void)cache.ObtainRange(refit[i], sizes[i], true);
 			}
 		}
 		context.PrepareBda(true, false);
@@ -2328,10 +2328,10 @@ void CommandProcessor::EmitHleRefit() {
 			const auto blas = refit[i];
 			const auto size = sizes[i];
 			if (blas != 0 && size > header_bytes && header_layout == 2) {
-				(void)cache.ObtainBuffer(blas, size, true);
+				(void)cache.ObtainRange(blas, size, true);
 			} else if (blas != 0 && size > header_bytes) {
 				(void)cache.PrepareDeviceAddressRead(blas, header_bytes);
-				(void)cache.ObtainBuffer(blas + header_bytes, size - header_bytes, true);
+				(void)cache.ObtainRange(blas + header_bytes, size - header_bytes, true);
 			}
 		}
 		context.PrepareBda(true, false);
@@ -2478,7 +2478,7 @@ void CommandProcessor::EmitHleTlas() {
 			}
 			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
 			cache.InvalidateUnlessGpuModified(build.header, sizeof(header));
-			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
+			(void)cache.ObtainRange(build.header + 256u, size - 256u, true);
 			context.NoteHleTlas(build.header, size, build.count != 0 ? blases : std::vector<uint64_t> {});
 			recorded[index] = 1;
 		}

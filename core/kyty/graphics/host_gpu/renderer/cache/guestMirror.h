@@ -126,7 +126,6 @@ public:
 	void               Release(const Runs& runs);
 	[[nodiscard]] Wait Submit();
 	void               Flush();
-	void               Trim(std::span<const std::pair<uint64_t, uint64_t>> live, Wait after = {});
 	void               WaitIdle();
 	void               WaitBound(uint64_t value);
 	void               NoteUnboundRead() noexcept { m_unbound_reads.fetch_add(1, std::memory_order_relaxed); }

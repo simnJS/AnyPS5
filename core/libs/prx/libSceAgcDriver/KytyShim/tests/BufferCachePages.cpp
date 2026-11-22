@@ -45,7 +45,7 @@ uint64_t BlockAt(uint64_t address, uint32_t index) {
 
 const char* CheckGpuPageLeftByWriteAround(BufferCache& buffers, uint64_t block) {
 	const auto page = block + 3 * Page;
-	(void)buffers.ObtainBuffer(page, sizeof(GameValue), true);
+	(void)buffers.ObtainRange(page, sizeof(GameValue), true);
 	if (!buffers.IsRegionGpuModified(page, Page)) {
 		return "a written buffer range did not make its page GPU-dirty";
 	}
@@ -63,7 +63,7 @@ const char* CheckGpuPageLeftByWriteAround(BufferCache& buffers, uint64_t block) 
 }
 
 const char* CheckMarkAheadWaitsForIndirectWrites(RenderContext& renderer, BufferCache& buffers, uint64_t block) {
-	(void)buffers.ObtainBuffer(block, Block, false, false);
+	(void)buffers.ObtainRange(block, Block, false, false);
 	buffers.InvalidateFaultedPage(block + Page);
 	auto& tables = renderer.GetIndirectWriteTables();
 	tables.NotePendingWrites();
@@ -162,7 +162,7 @@ int CheckBufferCachePages(Libs::Graphics::GraphicContext& graphics, uint64_t add
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 
 	const auto first = BlockAt(address, 0);
-	(void)buffers.ObtainBuffer(first, Block, false, false);
+	(void)buffers.ObtainRange(first, Block, false, false);
 	int failures = Report(buffers.IsRegionCpuDirty(first, Block) ? "a buffer read did not leave its pages clean" : nullptr);
 	if (failures == 0) {
 		failures += Report(CheckGpuPageLeftByWriteAround(buffers, first));
@@ -174,7 +174,7 @@ int CheckBufferCachePages(Libs::Graphics::GraphicContext& graphics, uint64_t add
 	const auto last = scheduler.CurrentTick();
 	scheduler.Wait(last);
 	scheduler.WaitPriorityOperations(last);
-	(void)buffers.DropFreedRange(address, GuestBytes, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, GuestBytes);
 	return failures;
 }
 

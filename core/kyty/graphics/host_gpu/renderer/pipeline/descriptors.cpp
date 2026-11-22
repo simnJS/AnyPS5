@@ -351,7 +351,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     uint64_t invocations_x) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto& [address, size] = source;
 	if (address == 0 || size == 0) {
 		return {nullptr, 0, vk::WholeSize};
 	}
@@ -372,10 +372,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		if (!resource.proven_writes.empty()) {
 			const auto writes = BoundBufferWrites(resource, address, size, invocations_x);
 			if (!writes.empty()) {
-				return cache.ObtainBufferWithProvenWrites(address, size, writes, id);
+				return cache.ObtainRangeWithProvenWrites(address, size, writes);
 			}
 		}
-		return cache.ObtainBuffer(address, size, resource.written, resource.formatted, id);
+		return cache.ObtainRange(address, size, resource.written, resource.formatted);
 	}();
 	if (counters) {
 		queries.NoteReadTarget(address, size, *buffer, offset);
@@ -1473,7 +1473,7 @@ static void CopyGpuFlatLoads(RenderContext& context, const vk::DescriptorBufferI
 	copies.reserve(loads.size());
 	for (const auto& load: loads) {
 		const auto bytes            = uint64_t {load.count} * sizeof(uint32_t);
-		const auto [buffer, offset] = cache.ObtainBuffer(load.address, bytes, false);
+		const auto [buffer, offset] = cache.ObtainRange(load.address, bytes, false);
 		copies.push_back({buffer->Handle(),
 		                  vk::BufferCopy {offset, target.offset + uint64_t {load.slot} * sizeof(uint32_t),
 		                                  bytes}});
@@ -2743,9 +2743,8 @@ void RenderExecutor::CommitTemplateBindings(CommandBuffer& buffer, const Pipelin
 	                                   "RenderExecutor::FindBuffers", shader_hash, 0);
 }
 
-void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers) {
+void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
-	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
@@ -2808,7 +2807,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 #endif
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
-			source = {address, size, find_buffers ? cache.FindBuffer(address, size) : NULL_BUFFER_ID};
+			source = {address, size};
 		}
 	}
 }
@@ -3035,9 +3034,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	std::array<const ShaderStageRuntime*, 4> dma_stages {};
 	uint32_t                                 dma_stage_count = 0;
 	bool                                     uses_image_heap = false;
-	FindBuffers(stages, std::ranges::any_of(stages, [](const auto* stage) {
-		            return stage->runtime->module->info.info.uses_dma;
-	            }));
+	FindBuffers(stages);
 	for (auto* stage: stages) {
 		if (stage->runtime->module->info.info.uses_dma) {
 			m_context.CacheDmaBases(*stage->runtime);

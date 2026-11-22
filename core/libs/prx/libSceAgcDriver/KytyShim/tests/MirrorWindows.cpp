@@ -21,15 +21,13 @@
 namespace Libs::Graphics {
 
 struct MirrorWindowsTestAccess {
-	static bool ReadBack(BufferCache& cache, Buffer& buffer, uint64_t address, uint64_t size) {
+	static bool ReadBack(BufferCache& cache, uint64_t address, uint64_t size) {
 		std::vector<vk::BufferCopy> copies;
 		uint64_t                    total = 0;
-		cache.CollectDownloadCopies(buffer, address, size, copies, total);
-		return !copies.empty() && cache.DownloadOnReadbackQueue(buffer, copies, total);
+		cache.CollectDownloadCopies(address, size, copies, total);
+		return !copies.empty() && cache.DownloadOnReadbackQueue(copies, total);
 	}
-	static void CheckRange(BufferCache& cache, const Buffer& buffer, uint64_t address, uint64_t size) {
-		cache.CheckMirrorRange(buffer, address, size);
-	}
+	static void CheckRange(BufferCache& cache, uint64_t address, uint64_t size) { cache.CheckMirrorRange(address, size); }
 	static void DiscardGpuWrites(BufferCache& cache, uint64_t address, uint64_t size) {
 		cache.DiscardGpuWrites(address, size);
 	}
@@ -42,7 +40,7 @@ namespace {
 using namespace Libs::Graphics;
 
 constexpr const char* Name         = "kyty_shim_mirror_windows";
-constexpr uint64_t    GuestBytes   = 0x40000;
+constexpr uint64_t    GuestBytes   = 0x80000;
 constexpr int         CpuReadWrite = 0x03;
 constexpr uint64_t    FirstBytes   = 0x8000;
 constexpr uint64_t    JoinedBytes  = 0x20000;
@@ -51,6 +49,7 @@ constexpr uint64_t    NextAt   = 0x24000;
 constexpr uint64_t    StreamedAt   = 0x30000;
 constexpr uint64_t    MirroredAt   = 0x34000;
 constexpr uint64_t    WrittenBytes = 0x1000;
+constexpr uint64_t    FarAt        = 0x70000;
 constexpr uint32_t    GpuValue     = 0x5eed1234u;
 
 std::string g_skipped;
@@ -164,30 +163,29 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	auto& buffers   = renderer.GetBufferCache();
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 	auto* mirror = buffers.GetGuestMirror();
-	if (mirror == nullptr) {
-		g_skipped = "the device gives no sparse mirror";
-		return nullptr;
-	}
+	if (mirror == nullptr) return "the cache has no mirror";
 	if (!mirror->Holds(address, GuestBytes)) {
-		g_skipped = "the guest memory lies above the mirror";
+		g_skipped = "the guest memory lies outside the mirror";
 		return nullptr;
 	}
-	if (!buffers.UsesMirror()) return "the cache does not keep its buffers in the mirror";
+	const auto origin = mirror->Base();
 
 	auto* guest = reinterpret_cast<uint32_t*>(address);
 	for (uint64_t index = 0; index < GuestBytes / sizeof(uint32_t); index++) guest[index] = Pattern(index);
 
-	const auto [window, offset] = buffers.ObtainBuffer(address, FirstBytes, false);
-	if (!window->IsWindow() || window->Handle() != mirror->Handle()) return "a cache buffer is not a window of the mirror";
-	if (offset != address || window->HandleOffset() != address) return "a window's offset is not the guest address";
-	if (window->BufferDeviceAddress() + offset != mirror->DeviceAddress() + address) {
-		return "a window's device address is not the mirror's plus the guest address";
+	if (buffers.IsRegionRegistered(address, GuestBytes)) return "the mirror holds blocks before any range was obtained";
+	const auto [range, offset] = buffers.ObtainRange(address, FirstBytes, false);
+	if (range->Handle() != mirror->Handle()) return "a range is not served from the mirror";
+	if (offset != address - origin) return "a range's offset is not its guest address in the mirror";
+	if (range->BufferDeviceAddress() + offset != mirror->DeviceAddress() + address - origin) {
+		return "a range's device address is not the mirror's plus its guest address";
 	}
-	if (!mirror->Requested(address, FirstBytes)) return "a window's blocks are not requested when it is made";
-	if (mirror->Ready(address, FirstBytes)) return "a window's blocks are bound before its submission";
+	if (!mirror->Requested(address, FirstBytes)) return "a range's blocks are not requested when it is obtained";
+	if (mirror->Ready(address, FirstBytes)) return "a range's blocks are bound before its submission";
+	if (!buffers.IsRegionRegistered(address, 1)) return "the mirror does not report the blocks of an obtained range";
 
 	AddressReader reader(graphics, scheduler, JoinedBytes);
-	reader.Record(scheduler, mirror->DeviceAddress() + address, FirstBytes);
+	reader.Record(scheduler, mirror->DeviceAddress() + address - origin, FirstBytes);
 	Finish(scheduler);
 	if (!mirror->Ready(address, FirstBytes)) return "a submission went without binding its blocks";
 	if (!mirror->SharedQueue() && mirror->Totals().waits == 0) return "the submission did not wait for its bind";
@@ -195,36 +193,36 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		return "a read by device address did not see the bytes uploaded into the mirror";
 	}
 
-	const auto [joined, joined_offset] = buffers.ObtainBuffer(address, JoinedBytes, false);
-	if (!joined->IsWindow() || joined_offset != address || joined->Size() < JoinedBytes) {
-		return "a join of two windows is not one window at the guest address";
+	const auto [joined, joined_offset] = buffers.ObtainRange(address, JoinedBytes, false);
+	if (joined->Handle() != mirror->Handle() || joined_offset != address - origin) {
+		return "a wider range over an obtained one is not the same place in the mirror";
 	}
-	reader.Record(scheduler, mirror->DeviceAddress() + address, JoinedBytes);
+	reader.Record(scheduler, mirror->DeviceAddress() + address - origin, JoinedBytes);
 	Finish(scheduler);
-	if (!ReadsPattern(reader.Words(JoinedBytes), 0)) return "a join lost or moved bytes of the windows it took in";
+	if (!ReadsPattern(reader.Words(JoinedBytes), 0)) return "a wider range lost or moved bytes";
 
-	const auto [streamed, streamed_offset] = buffers.ObtainBuffer(address + StreamedAt, 0x40, false);
+	const auto [streamed, streamed_offset] = buffers.ObtainRange(address + StreamedAt, 0x40, false);
 	const auto [mirrored, mirrored_offset] =
-	    buffers.ObtainBuffer(address + MirroredAt, 0x40, false, false, {}, ObtainFrom::Mirror);
+	    buffers.ObtainRange(address + MirroredAt, 0x40, false, false, ObtainFrom::Mirror);
 	if (streamed->Handle() == mirror->Handle()) return "a small read is no longer served by a stream copy";
-	if (mirrored->Handle() != mirror->Handle() || mirrored_offset != address + MirroredAt) {
+	if (mirrored->Handle() != mirror->Handle() || mirrored_offset != address + MirroredAt - origin) {
 		return "ObtainFrom::Mirror is served by a stream copy instead of the mirror";
 	}
 	(void)streamed_offset;
-	reader.Record(scheduler, mirror->DeviceAddress() + address + MirroredAt, 0x40);
+	reader.Record(scheduler, mirror->DeviceAddress() + address + MirroredAt - origin, 0x40);
 	Finish(scheduler);
 	if (!ReadsPattern(reader.Words(0x40), MirroredAt / sizeof(uint32_t))) {
 		return "a small range asked from the mirror does not read the guest bytes";
 	}
 
-	const auto [written, written_offset] = buffers.ObtainBuffer(address + WrittenAt, WrittenBytes, true);
-	if (written->Handle() != mirror->Handle()) return "a written range is not a window of the mirror";
+	const auto [written, written_offset] = buffers.ObtainRange(address + WrittenAt, WrittenBytes, true);
+	if (written->Handle() != mirror->Handle()) return "a written range is not served from the mirror";
 	written->Fill(written_offset, WrittenBytes, GpuValue);
 	(void)buffers.CommitWriteTicks();
 	Finish(scheduler);
 	if (BackingHolds(address + WrittenAt, WrittenBytes, GpuValue)) return "the GPU write reached guest memory by itself";
 	if (graphics.readback_queue) {
-		if (!MirrorWindowsTestAccess::ReadBack(buffers, *written, address + WrittenAt, WrittenBytes)) {
+		if (!MirrorWindowsTestAccess::ReadBack(buffers, address + WrittenAt, WrittenBytes)) {
 			return "nothing was read back from the mirror on the readback queue";
 		}
 		if (!BackingHolds(address + WrittenAt, WrittenBytes, GpuValue)) {
@@ -235,27 +233,41 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	}
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address + WrittenAt, WrittenBytes);
 
-	const auto [back, back_offset] = buffers.ObtainBuffer(address + NextAt, FirstBytes, false);
-	if (!back->IsWindow() || back_offset != address + NextAt) return "a range next to a written one is not a window";
-	reader.Record(scheduler, mirror->DeviceAddress() + address + NextAt, FirstBytes);
+	const auto [back, back_offset] = buffers.ObtainRange(address + NextAt, FirstBytes, false);
+	if (back->Handle() != mirror->Handle() || back_offset != address + NextAt - origin) {
+		return "a range next to a written one is not served from the mirror";
+	}
+	reader.Record(scheduler, mirror->DeviceAddress() + address + NextAt - origin, FirstBytes);
 	Finish(scheduler);
 	if (!ReadsPattern(reader.Words(FirstBytes), NextAt / sizeof(uint32_t))) {
-		return "a window next to a GPU-written one does not read the bytes of the guest memory";
+		return "a range next to a GPU-written one does not read the bytes of the guest memory";
 	}
 	if (mirror->Totals().unbound_reads != 0) return "a read of a block that was not bound was counted";
 
+	if (mirror->AnyRequested(address + FarAt, WrittenBytes)) return "a block no range reached is requested";
+	buffers.NoteGpuWrites(address + FarAt, WrittenBytes);
+	if (buffers.IsRegionGpuModified(address + FarAt, WrittenBytes)) {
+		return "a GPU write noted outside the requested blocks marks pages the mirror does not hold";
+	}
+	buffers.RequestDeviceRange(address + FarAt, WrittenBytes);
+	if (!mirror->Requested(address + FarAt, WrittenBytes)) return "a range read by device address is not requested";
+
 	const char* check = std::getenv("KYTY_MIRROR_CHECK");
 	if (check == nullptr || std::strcmp(check, "1") != 0) {
+		Finish(scheduler);
 		mirror->WaitIdle();
-		mirror->Trim({});
+		GuestMirror::Runs released;
+		mirror->ForEachRequested(address + NextAt, WrittenBytes,
+		                         [&](uint64_t begin, uint64_t end) { released.emplace_back(begin, end); });
+		mirror->Release(released);
 		mirror->WaitIdle();
-		MirrorWindowsTestAccess::CheckRange(buffers, *back, address + NextAt, WrittenBytes);
-		if (mirror->Totals().unbound_reads != 1) return "a window whose blocks are not bound is not counted";
+		MirrorWindowsTestAccess::CheckRange(buffers, address + NextAt, WrittenBytes);
+		if (mirror->Totals().unbound_reads != 1) return "a range whose blocks are not bound is not counted";
 	}
 
 	Finish(scheduler);
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address, GuestBytes);
-	(void)buffers.DropFreedRange(address, GuestBytes, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, GuestBytes);
 	return nullptr;
 }
 

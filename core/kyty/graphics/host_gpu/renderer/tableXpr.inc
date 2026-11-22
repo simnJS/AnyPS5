@@ -1347,9 +1347,9 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						if (image_starts(address)) return Spec::Refuse("blocks: written image start"), false;
 						proof.image_checked = true;
 					}
-					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
+					const auto [owner, offset] = buffer_cache.ObtainRange(address, size, true, formatted);
 					region_epochs.fill({UINT64_MAX, 0});
-					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner)
+					if (!buffer_cache.InMirror(owner))
 						return Spec::Refuse("blocks: written owner"), false;
 					if (formatted) textures.InvalidateMemoryFromGPU(address, size);
 					device = owner->BufferDeviceAddress() + offset;
@@ -1458,16 +1458,15 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							continue;
 						}
 					}
-					if (cpu_written) buffer_cache.EnsureBufferContents(address, size);
+					if (cpu_written) buffer_cache.EnsureRangeContents(address, size);
 					const auto registration_before = buffer_cache.RegistrationEpoch();
-					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, false, formatted);
+					const auto [owner, offset] = buffer_cache.ObtainRange(address, size, false, formatted);
 					region_epochs.fill({UINT64_MAX, 0});
 					fresh.cpu_epoch = buffer_cache.CpuModificationEpoch(address, size);
-					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner ||
-					    buffer_cache.IsRegionCpuModified(address, size))
+					if (!buffer_cache.InMirror(owner) || buffer_cache.IsRegionCpuModified(address, size))
 						return Spec::Refuse(owner == nullptr ? "blocks: read no owner"
 						                    : buffer_cache.IsRegionCpuModified(address, size) ? "blocks: read still CPU-modified"
-						                                                                       : "blocks: read owner not live"),
+						                                                                       : "blocks: read not from the mirror"),
 						       false;
 					if (Spec::Current() != nullptr && buffer_cache.IsRegionCpuDirty(address, size)) fresh.cpu_epoch = 0;
 					fresh.device       = owner->BufferDeviceAddress() + offset;
@@ -1763,14 +1762,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		LiveCensus::Scope miss(LiveCensus::DrawPhase, 0x7ab1e, &held == &table.args ? 10 : 11);
 		prepare();
 		const auto registration_before = buffer_cache.RegistrationEpoch();
-		const auto result = buffer_cache.ObtainBuffer(address, size, false);
+		const auto result = buffer_cache.ObtainRange(address, size, false);
 		region_epochs.fill({UINT64_MAX, 0});
-		const auto owner  = spec_state != nullptr ? buffer_cache.RegisteredBuffer(address, size)
-		                                               : buffer_cache.FindBuffer(address, size);
-		if (result.first != nullptr && buffer_cache.GetBufferIfLive(owner) == result.first) {
+		if (buffer_cache.InMirror(result.first)) {
 			const auto region = address & ~(TRACKER_REGION_SIZE - 1);
-			auto       begin  = std::max(result.first->CpuAddress(), region);
-			auto       end    = std::min(result.first->CpuAddress() + result.first->Size(), region + TRACKER_REGION_SIZE);
+			auto [begin, end] = buffer_cache.RequestedRun(address, size, region, region + TRACKER_REGION_SIZE);
 			if (address + size <= end) {
 				const auto epoch = buffer_cache.CpuModificationEpoch(begin, end - begin);
 				if (buffer_cache.IsRegionCpuModified(begin, end - begin)) {
@@ -1816,7 +1812,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		indices = obtain(table.indices[(index_base * 0x9e3779b97f4a7c15ull) >> 51u], index_base, index_bytes, [&] {
 			if (index_bytes <= BufferCache::CACHING_PAGESIZE && buffer_cache.IsRegionCpuModified(index_base, index_bytes) &&
 			    !buffer_cache.IsRegionGpuModified(index_base, index_bytes))
-				buffer_cache.EnsureBufferContents(index_base, index_bytes);
+				buffer_cache.EnsureRangeContents(index_base, index_bytes);
 		});
 		if (indices.first == nullptr) return Spec::Refuse("table: index buffer"), TableResult::Native;
 	}

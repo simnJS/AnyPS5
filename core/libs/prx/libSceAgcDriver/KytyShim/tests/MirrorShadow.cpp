@@ -347,41 +347,74 @@ int Sparse() {
 	      "300 scattered blocks go in calls of 256 ranges at most (calls " + std::to_string(totals.calls) + ")");
 	Check(RoundTrip(graphics, mirror.Handle(), run_base + 299 * 2 * block, block, 3), "the last scattered block holds data");
 
-	const std::array<std::pair<uint64_t, uint64_t>, 1> live {{{first, 0x100}}};
-	vk::SemaphoreTypeCreateInfo                        type {.semaphoreType = vk::SemaphoreType::eTimeline};
-	const vk::SemaphoreCreateInfo                      gate_info {.pNext = &type};
-	vk::Semaphore                                      gate;
-	Require(graphics.device.createSemaphore(&gate_info, nullptr, &gate) == vk::Result::eSuccess, "gate semaphore");
-	mirror.Trim(live, {gate, 7});
-	Check(!mirror.Requested(run_base, 1) && !mirror.Ready(run_base, 1) && mirror.Ready(first, 0x100),
-	      "a trim takes the blocks out of both maps at once");
-	Check(mirror.Totals().bound_blocks == 303, "an unbind waits for the work it follows");
-	const vk::SemaphoreSignalInfo open {.semaphore = gate, .value = 7};
-	Require(graphics.device.signalSemaphore(&open) == vk::Result::eSuccess, "gate signal");
+	const uint64_t                             start = first & ~(block - 1);
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	mirror.ForEachRequested(run_base, 6 * block, [&](uint64_t begin, uint64_t end) { runs.emplace_back(begin, end); });
+	Check(runs.size() == 3 && runs[0] == std::pair {run_base, run_base + block} &&
+	          runs[1] == std::pair {run_base + 2 * block, run_base + 3 * block} && runs[2].first == run_base + 4 * block,
+	      "the requested blocks of a range are listed run by run");
+	runs.clear();
+	mirror.ForEachRequested(run_base + 0x100, block, [&](uint64_t begin, uint64_t end) { runs.emplace_back(begin, end); });
+	Check(runs.size() == 1 && runs[0] == std::pair {run_base + 0x100, run_base + block}, "a listed run is cut to the range");
+	Check(!mirror.AnyRequested(run_base + block, block) && mirror.AnyRequested(run_base + block, 2 * block),
+	      "a range touches a requested block or not");
+
+	const auto covers = [](const GuestMirror::Runs& list, uint64_t address) {
+		return std::ranges::any_of(list, [&](const auto& run) { return run.first <= address && address < run.second; });
+	};
+	mirror.Use(first, 0x100);
+	mirror.Age(500);
+	mirror.Use(run_base + 2 * block, 1);
+	mirror.Age(900);
+	mirror.NoteDevice(run_base + 4 * block, 1);
+	GuestMirror::Runs victims;
+	mirror.PickOldest(2, 1000, victims);
+	Check(victims.size() == 1 && victims[0] == std::pair {start + block, start + 3 * block},
+	      "the oldest blocks go first, the lowest address first among equals, joined in runs");
+	mirror.PickOldest(302, 1000, victims);
+	Check(!covers(victims, run_base + 4 * block) && covers(victims, run_base + 2 * block),
+	      "a block reached by device address goes last");
+	mirror.PickOldest(400, 600, victims);
+	Check(covers(victims, first) && !covers(victims, run_base + 2 * block) && covers(victims, run_base + 4 * block),
+	      "no block used since the given frame goes");
+	mirror.Use(run_base, 1);
+	mirror.PickOldest(400, 1000, victims);
+	Check(!covers(victims, run_base), "a block used in the current frame does not go");
+	mirror.Age(1000);
+
+	const GuestMirror::Runs pair {{start + block, start + 3 * block}};
+	mirror.Release(pair);
+	Check(!mirror.Requested(start + block, 1) && !mirror.Ready(start + 2 * block, 1) && mirror.Ready(first, 0x100),
+	      "a release takes the blocks out of both maps at once");
 	mirror.WaitIdle();
-	graphics.device.destroySemaphore(gate);
 	totals = mirror.Totals();
-	Check(totals.bound_blocks == 1 && totals.unbound_blocks == 302, "a trim unbinds the blocks no live range covers");
-	Check(mirror.IsBound(first) && !mirror.IsBound(run_base), "the trim keeps the covered block");
-	Check(totals.chunks == 1, "a trim keeps the chunk that still holds a bound block");
-	Check(RoundTrip(graphics, mirror.Handle(), first & ~(block - 1), block, 4), "the kept block still holds data");
+	Check(totals.bound_blocks == 301 && totals.unbound_blocks == 2, "a release unbinds its blocks");
+	Check(mirror.IsBound(first) && !mirror.IsBound(start + block), "a release keeps the other blocks");
+	Check(RoundTrip(graphics, mirror.Handle(), start, block, 4), "a kept block still holds data");
 
 	mirror.NoteRange(run_base, 1);
 	mirror.Flush();
 	mirror.WaitIdle();
-	Check(mirror.Totals().bound_blocks == 2, "a trimmed block is bound again when a buffer comes back");
+	Check(mirror.Totals().bound_blocks == 301, "a block still requested is not bound again");
 
-	mirror.Trim({});
+	GuestMirror::Runs all;
+	mirror.ForEachRequested(mirror.Base(), mirror.Size(), [&](uint64_t begin, uint64_t end) { all.emplace_back(begin, end); });
+	mirror.Release(all);
 	mirror.WaitIdle();
 	totals = mirror.Totals();
 	Check(totals.bound_blocks == 0 && totals.chunks == 0 && !mirror.IsBound(first) && !mirror.IsBound(run_base),
-	      "a trim without live buffers unbinds everything and frees every chunk");
-	mirror.NoteRange(first, 0x100);
+	      "a release of every requested block unbinds everything and frees every chunk");
+	GuestMirror::Runs fresh;
+	mirror.NoteRange(first, 0x100, &fresh);
+	Check(fresh.size() == 1 && fresh[0] == std::pair {start, start + block}, "a new request names the blocks it adds");
+	fresh.clear();
+	mirror.NoteRange(first, 0x100, &fresh);
+	Check(fresh.empty(), "a request of requested blocks adds none");
 	mirror.Flush();
 	mirror.WaitIdle();
 	totals = mirror.Totals();
 	Check(totals.bound_blocks == 1 && totals.chunks == 1, "a block is bound again in a new chunk");
-	Check(RoundTrip(graphics, mirror.Handle(), first & ~(block - 1), block, 5), "the block bound again holds data");
+	Check(RoundTrip(graphics, mirror.Handle(), start, block, 5), "the block bound again holds data");
 
 	const auto stats = mirror.TakeStats();
 	Check(stats.calls == mirror.Totals().calls && stats.done_ns >= stats.call_ns, "the first stats cover everything");

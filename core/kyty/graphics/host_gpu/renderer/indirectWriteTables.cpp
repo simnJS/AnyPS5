@@ -88,7 +88,7 @@ void IndirectWriteTables::Cover(Table& table, std::vector<GuestRange>& targets) 
 	});
 	auto& buffer_cache = m_context.GetBufferCache();
 	for (const auto& group: CoalesceTargets(std::move(targets))) {
-		(void)buffer_cache.FindBuffer(group.address, group.size);
+		buffer_cache.RequestDeviceRange(group.address, group.size);
 	}
 	targets.clear();
 }

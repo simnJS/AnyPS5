@@ -82,18 +82,11 @@ public:
 		return address >= m_cpu_address && size <= Size() &&
 		       address - m_cpu_address <= Size() - size;
 	}
-	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
-	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
 	              uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
-
-	bool   is_deleted   = false;
-	int    stream_score = 0;
-	size_t lru_id       = 0;
-	bool device_address_pinned = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

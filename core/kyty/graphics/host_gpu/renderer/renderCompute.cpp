@@ -347,7 +347,7 @@ static void CacheDmaBases(RenderContext& context, const ShaderStageRuntime& stag
 		const auto base = low | uint64_t {high} << 32u;
 		for (uint64_t index = 0; index <= 2; ++index) {
 			const auto page = base + index * BufferCache::CACHING_PAGESIZE;
-			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+			if (context.IsMapped(page, 1)) context.GetBufferCache().RequestDeviceRange(page, 1);
 		}
 	};
 	const auto& info = stage.module->info.info;
@@ -972,7 +972,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		BindSharedMemory(m_context, input_info, bindings);
 	}
 	const auto [args_buffer, args_offset] =
-	    m_context.GetBufferCache().ObtainBuffer(args_addr, ArgsSize, false);
+	    m_context.GetBufferCache().ObtainRange(args_addr, ArgsSize, false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	m_context.GetOcclusionQueries().WriteForReaders();
@@ -1090,7 +1090,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			m_context.GetImageHeap().Rebind(*this);
 		}
 		RebindImages(bindings);
-		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainRange(
 		    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 		EXIT_IF((args_offset & 3u) != 0);
 		RebindBuffers(bindings);
