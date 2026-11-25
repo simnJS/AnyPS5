@@ -40,9 +40,6 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
-constexpr uint64_t StaleAge      = 2048;
-constexpr uint64_t PinnedAge     = 4 * uint64_t {BufferCache::USE_SCAN_PERIOD};
-static_assert(PinnedAge < StaleAge);
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -168,46 +165,6 @@ std::vector<vk::BufferMemoryBarrier> CopyBarriers(std::span<const vk::BufferCopy
 
 }
 
-void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
-                                  uint64_t size) {
-	auto* bytes = static_cast<const uint8_t*>(source);
-	while (size != 0) {
-		const auto chunk  = std::min(size, m_staging_buffer.Size());
-		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
-		const auto destination_offset = buffer.Offset(address);
-		EXIT_IF(destination_offset > buffer.Size() || chunk > buffer.Size() - destination_offset);
-		m_scheduler.EndRendering();
-		const auto command = m_scheduler.Current().Handle();
-		vk::BufferMemoryBarrier2 before {};
-		before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-		before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-		before.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-		before.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer        = buffer.Handle();
-		before.offset        = destination_offset;
-		before.size          = chunk;
-		vk::DependencyInfo dependency {};
-		dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
-		dependency.bufferMemoryBarrierCount = 1;
-		dependency.pBufferMemoryBarriers    = &before;
-		command.pipelineBarrier2(dependency);
-		const vk::BufferCopy copy {offset, destination_offset, chunk};
-		command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy);
-		auto after          = before;
-		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-		after.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-		after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-		dependency.pBufferMemoryBarriers = &after;
-		command.pipelineBarrier2(dependency);
-		bytes += chunk;
-		address += chunk;
-		size -= chunk;
-	}
-}
-
 void BufferCache::CollectDownloadCopies(uint64_t vaddr, uint64_t size, std::vector<vk::BufferCopy>& copies,
                                         uint64_t& total_size) {
 	const auto& buffer = *m_storage;
@@ -309,8 +266,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
     : m_graphics(graphics), m_scheduler(scheduler), m_resources(resources),
       m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
       m_null_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
@@ -320,10 +275,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
-	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
-	                     "BDA Page Table Buffer");
 	m_scheduler.BeginCommand();
-	m_bda_pagetable_buffer.Fill(0, m_bda_pagetable_buffer.Size(), 0);
 	m_fault_manager.PrepareFaultBuffer();
 	SetVulkanObjectNameF(m_graphics.device, m_null_buffer.Handle(), "Kyty.NullBuffer");
 	m_null_buffer.Fill(0, 16, 0);
@@ -347,6 +299,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_storage = std::make_unique<Buffer>(
 	    m_graphics, m_scheduler, m_guest_mirror->Base(), m_guest_mirror->Size(),
 	    MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress(), m_guest_mirror->Base()});
+	const uint64_t metadata[] {m_guest_mirror->DeviceAddress() - m_guest_mirror->Base(), m_guest_mirror->Base(),
+	                           m_guest_mirror->Size(), 0, FAULT_BITMAP_OFFSET / sizeof(uint32_t)};
+	const auto source = m_staging_buffer.Copy(metadata, sizeof(metadata), alignof(uint64_t));
+	GetFaultBuffer()->CopyFrom(m_scheduler.Current(), m_staging_buffer, source, 0, sizeof(metadata));
+	m_residency_words.resize((m_guest_mirror->Size() / MIRROR_BLOCK_SIZE + 31) / 32);
 	m_scheduler.SetSubmitHook(
 	    [](void* self, CommandBuffer& command, SubmitInfo& submit) {
 		    auto* cache = static_cast<BufferCache*>(self);
@@ -1339,7 +1296,7 @@ void BufferCache::CacheFaultedMemory(uint64_t vaddr, uint64_t size) {
 			break;
 		}
 	}
-	RequestRange(vaddr, size);
+	EnsureRangeContents(vaddr, size);
 	m_guest_mirror->NoteDevice(vaddr, size);
 }
 
@@ -1396,21 +1353,34 @@ void BufferCache::RequestRange(uint64_t vaddr, uint64_t size) {
 	m_guest_mirror->Own(begin, Common::AlignUp(vaddr + size, CACHING_PAGESIZE) - begin, &m_fresh);
 	const auto block = m_guest_mirror->BlockSize();
 	for (const auto& [first, last]: m_fresh) {
-		WriteTableEntries(Common::AlignDown(first, block), Common::AlignUp(last, block));
+		SetResident(Common::AlignDown(first, block), Common::AlignUp(last, block), true);
 	}
 	if (!m_fresh.empty()) {
 		m_register_epoch++;
 	}
 }
 
-void BufferCache::WriteTableEntries(uint64_t begin, uint64_t end) {
-	std::vector<vk::DeviceAddress> addresses;
-	addresses.reserve((end - begin) >> CACHING_PAGEBITS);
-	for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
-		addresses.push_back(m_storage->BufferDeviceAddress() + m_storage->Offset(page));
+void BufferCache::SetResident(uint64_t begin, uint64_t end, bool resident) {
+	const auto first = (begin - m_guest_mirror->Base()) / MIRROR_BLOCK_SIZE;
+	const auto last = (end - m_guest_mirror->Base() - 1) / MIRROR_BLOCK_SIZE;
+	uint64_t changed = UINT64_MAX, finish = 0;
+	for (auto word = first / 32; word <= last / 32; ++word) {
+		const auto low = word == first / 32 ? first % 32 : 0;
+		const auto high = word == last / 32 ? last % 32 : 31;
+		const uint32_t mask = (~uint32_t {0} << low) & (~uint32_t {0} >> (31 - high));
+		auto& bits = m_residency_words[word];
+		const auto next = resident ? bits | mask : bits & ~mask;
+		if (bits != next) {
+			bits = next;
+			changed = std::min(changed, word);
+			finish = word + 1;
+		}
 	}
-	WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(begin) * sizeof(vk::DeviceAddress), addresses.data(),
-	                addresses.size() * sizeof(vk::DeviceAddress));
+	if (changed == UINT64_MAX) return;
+	const auto bytes = (finish - changed) * sizeof(uint32_t);
+	const auto source = m_staging_buffer.Copy(m_residency_words.data() + changed, bytes, sizeof(uint32_t));
+	GetFaultBuffer()->CopyFrom(m_scheduler.Current(), m_staging_buffer, source,
+	                           RESIDENCY_OFFSET + changed * sizeof(uint32_t), bytes);
 }
 
 void BufferCache::NoteBlockRegions(uint64_t begin, uint64_t end, bool insert) {
@@ -2886,8 +2856,7 @@ void BufferCache::EvictOldBlocks() {
 		const auto slot = (m_stale_ring_next.fetch_add(1, std::memory_order_relaxed) % StaleRingSize) * 2;
 		m_stale_ring[slot].store(begin, std::memory_order_relaxed);
 		m_stale_ring[slot + 1].store(end - begin, std::memory_order_relaxed);
-		m_bda_pagetable_buffer.Fill(PageIndex(begin) * sizeof(vk::DeviceAddress),
-		                            ((end - begin) >> CACHING_PAGEBITS) * sizeof(vk::DeviceAddress), 0);
+		SetResident(begin, end, false);
 		NoteBlockRegions(begin, end, false);
 	}
 	const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
@@ -2909,7 +2878,7 @@ void BufferCache::ProcessFaultBuffer() {
 void BufferCache::ProcessUseBuffer() {
 	m_fault_manager.ProcessUseBuffer([this](std::span<const uint64_t> pages) {
 		for (const auto page: pages) {
-			m_guest_mirror->Use(page, CACHING_PAGESIZE);
+			m_guest_mirror->Use(page, MIRROR_BLOCK_SIZE);
 		}
 	});
 }

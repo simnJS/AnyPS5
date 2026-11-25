@@ -826,8 +826,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				const auto& counters         = m_context.GetLodStats().CounterBuffer();
 				item.start                   = buffer_count;
 				buffer_infos[buffer_count++] = {counters.Handle(), 0, counters.Size()};
-			} else if ((kind == Kind::BdaPagetable || kind == Kind::FaultBuffer) && buffer_count < buffer_infos.size()) {
-				const auto* owner = kind == Kind::BdaPagetable ? buffers.GetBdaPageTableBuffer() : buffers.GetFaultBuffer();
+			} else if (kind == Kind::FaultBuffer && buffer_count < buffer_infos.size()) {
+				const auto* owner = buffers.GetFaultBuffer();
 				item.start        = buffer_count;
 				buffer_infos[buffer_count++] = {owner->Handle(), 0, owner->Size()};
 			} else {

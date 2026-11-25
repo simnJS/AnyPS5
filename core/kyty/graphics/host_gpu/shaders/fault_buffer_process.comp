@@ -36,7 +36,7 @@ void main() {
             const uint bit = findLSB(word);
             word &= word - 1;
             const uint page = base_bit + bit;
-            download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+            download_buffer[store_index] = uint64_t(page);
         }
         fault_buffer[id][component] = 0u;
     }

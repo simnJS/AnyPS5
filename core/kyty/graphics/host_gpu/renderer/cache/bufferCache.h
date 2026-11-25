@@ -46,12 +46,15 @@ public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
-	static constexpr uint64_t NATIVE_RT_CONTEXT_PAGE = CACHING_NUMPAGES;
-	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    (CACHING_NUMPAGES + 1) * sizeof(vk::DeviceAddress);
-	static constexpr uint64_t WRITE_BITMAP_OFFSET = CACHING_NUMPAGES / 8;
-	static constexpr uint64_t USE_BITMAP_OFFSET   = 2 * WRITE_BITMAP_OFFSET;
-	static constexpr uint64_t HACK_MARKS_OFFSET   = 3 * WRITE_BITMAP_OFFSET;
+	static constexpr uint32_t MIRROR_BLOCK_BITS = GuestMirror::MinBlockBits;
+	static constexpr uint64_t MIRROR_BLOCK_SIZE = uint64_t {1} << MIRROR_BLOCK_BITS;
+	static constexpr uint64_t MIRROR_BITMAP_SIZE = GuestMirror::LargestSize / MIRROR_BLOCK_SIZE / 8;
+	static constexpr uint64_t RT_CONTEXT_OFFSET = 3 * sizeof(uint64_t);
+	static constexpr uint64_t RESIDENCY_OFFSET = 256;
+	static constexpr uint64_t FAULT_BITMAP_OFFSET = RESIDENCY_OFFSET + MIRROR_BITMAP_SIZE;
+	static constexpr uint64_t USE_BITMAP_OFFSET = FAULT_BITMAP_OFFSET + MIRROR_BITMAP_SIZE;
+	static constexpr uint64_t WRITE_BITMAP_OFFSET = USE_BITMAP_OFFSET + MIRROR_BITMAP_SIZE;
+	static constexpr uint64_t HACK_MARKS_OFFSET = WRITE_BITMAP_OFFSET + CACHING_NUMPAGES / 8;
 	static constexpr uint32_t HACK_MARK_ENTRIES   = 256;
 	static constexpr uint32_t HACK_MARK_DWORDS    = 16;
 	static constexpr uint32_t HACK_MARK_COUNTS    = 4;
@@ -73,12 +76,6 @@ public:
 		       HACK_MARK_ENTRIES;
 	}
 
-	static constexpr uint64_t PageIndex(uint64_t address) {
-		return (address < LOWER_ADDRESS_SIZE
-		            ? address
-		            : address - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE) >>
-		       CACHING_PAGEBITS;
-	}
 	static constexpr uint64_t GuestAddress(uint64_t offset) {
 		return offset < LOWER_ADDRESS_SIZE
 		           ? offset
@@ -146,7 +143,6 @@ public:
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] const Buffer& GetNullBuffer() const noexcept { return m_null_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainRangeForImage(uint64_t vaddr, uint64_t size);
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
@@ -268,7 +264,6 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
-	friend struct BufferCacheGcTestAccess;
 	friend struct MirrorWindowsTestAccess;
 	friend class TextureCache;
 
@@ -276,7 +271,7 @@ private:
 	                                                                   bool       is_texel_buffer,
 	                                                                   ObtainFrom from = ObtainFrom::Any);
 	void                   RequestRange(uint64_t vaddr, uint64_t size);
-	void                   WriteTableEntries(uint64_t begin, uint64_t end);
+	void                   SetResident(uint64_t begin, uint64_t end, bool resident);
 	void                   NoteBlockRegions(uint64_t begin, uint64_t end, bool insert);
 	[[nodiscard]] bool     Holds(uint64_t vaddr, uint64_t size) const noexcept { return m_guest_mirror->Owned(vaddr, size); }
 	[[nodiscard]] uint64_t Frame() const noexcept;
@@ -286,7 +281,6 @@ private:
 	WriteFaultOwner InvalidateGuestWriteFault(uint64_t vaddr);
 	[[nodiscard]] bool MayMarkAhead() const noexcept;
 
-	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer);
@@ -369,7 +363,7 @@ private:
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
+	std::vector<uint32_t>                             m_residency_words;
 	Buffer                                            m_null_buffer;
 	RangeSet                                          m_gpu_modified_ranges;
 	struct DirtyPageMask {

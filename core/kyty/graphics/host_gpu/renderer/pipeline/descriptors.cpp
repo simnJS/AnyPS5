@@ -113,7 +113,6 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::Samplers: return vk::DescriptorType::eSampler;
 		case BindingKind::Buffers:
 		case BindingKind::Gds:
-		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
@@ -2707,12 +2706,9 @@ void RenderExecutor::CommitTemplateBindings(CommandBuffer& buffer, const Pipelin
 			case BindingKind::UniformBuffers:
 				put(descriptors.uniform_buffers.data(), descriptors.uniform_buffers.size());
 				break;
-			case BindingKind::BdaPagetable:
 			case BindingKind::FaultBuffer: {
 				auto&       cache      = m_context.GetBufferCache();
-				const auto* bda_buffer = static_cast<BindingKind>(slot.kind) == BindingKind::BdaPagetable
-				                             ? cache.GetBdaPageTableBuffer()
-				                             : cache.GetFaultBuffer();
+				const auto* bda_buffer = cache.GetFaultBuffer();
 				const vk::DescriptorBufferInfo view {bda_buffer->Handle(), 0, bda_buffer->Size()};
 				put(&view, 1);
 				break;
@@ -3248,7 +3244,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_commit_capture_ok = m_commit_capture != nullptr && pipeline.uses_push_descriptors;
 	m_commit_capture_kinds.clear();
 	size_t image_cursor = 0;
-	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
+	vk::DescriptorBufferInfo address_buffer {};
 	vk::DescriptorBufferInfo                mip_stats_view;
 	struct TableRange {
 		TableBindingState* state;
@@ -3406,13 +3402,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						}
 						write.pBufferInfo = descriptors.uniform_buffers.data();
 						break;
-					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
 						auto& cache = m_context.GetBufferCache();
-						const auto* bda_buffer = kind == BindingKind::BdaPagetable
-						                             ? cache.GetBdaPageTableBuffer()
-						                             : cache.GetFaultBuffer();
-						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
+						const auto* bda_buffer = cache.GetFaultBuffer();
+						auto& view = address_buffer;
 						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
 						write.pBufferInfo = &view;
 						break;

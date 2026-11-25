@@ -2,65 +2,53 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
 
-#ifndef CACHING_PAGEBITS
-#error CACHING_PAGEBITS must be defined
-#endif
-
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32Ref { uint v; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4Ref { uvec4 v; };
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64Ref { uint64_t v; };
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2Ref { uvec2 v; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32Ref { float v; };
 
-layout(set = 0, binding = 0, std430) readonly buffer PageTable {
-	uint64_t pages[];
+layout(set = 0, binding = 0, std430) buffer MirrorState {
+	uint64_t mirror_base;
+	uint64_t guest_base;
+	uint64_t mirror_size;
+	uint64_t rt_context;
+	uint fault_word;
+	layout(offset = 256) uint words[];
 };
 
-const uint64_t kExtendedMemoryBase = 0x080000000000ul;
-const uint64_t kLowerAddressSize   = 1ul << 40;
-const uint     kPageMask           = (1u << CACHING_PAGEBITS) - 1u;
-const uint     kInvalidNode        = 0xffffffffu;
+const uint kInvalidNode = 0xffffffffu;
 
-#ifdef RT_RECORD_PAGES
-layout(set = 0, binding = 1, std430) buffer FaultPages {
-	uint fault_pages[];
-};
-
-void RecordFault(uint page) {
-	const uint word = page >> 5;
-	if (word < uint(fault_pages.length())) {
-		atomicOr(fault_pages[word], 1u << (page & 31u));
-	}
+bool Resident(uint block) {
+	const uint bit = 1u << (block & 31u);
+	const uint word = block >> 5;
+	if ((words[word] & bit) != 0) return true;
+	atomicOr(words[fault_word - 64u + word], bit);
+	return false;
 }
-#endif
 
-uint64_t HostAddress(uint64_t va) {
-	const uint64_t packed = va >= kExtendedMemoryBase ? va - kExtendedMemoryBase + kLowerAddressSize : va;
-	const uint64_t page   = packed >> CACHING_PAGEBITS;
-	if (page >= uint64_t(pages.length())) {
-		return 0;
-	}
-	const uint64_t base = pages[uint(page)];
-#ifdef RT_RECORD_PAGES
-	if (base == 0) {
-		RecordFault(uint(page));
-	}
-#endif
-	return base == 0 ? 0 : base + (va & uint64_t(kPageMask));
+uint64_t HostAddress(uint64_t va, uint bytes) {
+	const uint64_t offset = va - guest_base;
+	if (offset >= mirror_size || bytes > mirror_size - offset) return 0;
+	const uint first = uint(offset >> 16);
+	const uint last = uint((offset + bytes - 1u) >> 16);
+	const bool start = Resident(first);
+	const bool end = first == last || Resident(last);
+	return start && end ? mirror_base + va : 0;
 }
 
 uint LoadGuestU32(uint64_t va) {
-	const uint64_t host = HostAddress(va);
+	const uint64_t host = HostAddress(va, 4u);
 	return host == 0 ? 0u : U32Ref(host).v;
 }
 
 uvec4 LoadGuestU32x4(uint64_t va) {
-	const uint64_t host = HostAddress(va);
+	const uint64_t host = HostAddress(va, 16u);
 	return host == 0 ? uvec4(0) : U32x4Ref(host).v;
 }
 
 uvec2 LoadGuestU32x2(uint64_t va) {
-	const uint64_t host = HostAddress(va);
+	const uint64_t host = HostAddress(va, 8u);
 	return host == 0 ? uvec2(0) : U32x2Ref(host).v;
 }
 
@@ -91,7 +79,7 @@ uvec4 LoadNodeU32x4(uint64_t host, uint offset) {
 }
 
 BoxNode LoadBoxNode(uint64_t base, uint node) {
-	const uint64_t host = HostAddress(NodeAddress(base, node));
+	const uint64_t host = HostAddress(NodeAddress(base, node), NodeType(node) == 4u ? 64u : 112u);
 	BoxNode        box;
 	const uvec4    first = LoadNodeU32x4(host, 0);
 	box.children[0] = first.x;
@@ -199,7 +187,7 @@ vec3 LoadVertex(uint64_t node, uint id) {
 }
 
 void LoadTriangle(uint64_t node, uint type, out vec3 p[3]) {
-	const uint64_t host = HostAddress(node);
+	const uint64_t host = HostAddress(node, 64u);
 	const uvec3    ids  = TriangleVertexIds(type);
 	for (uint v = 0; v < 3; v++) {
 		const uint64_t at = host + uint64_t(ids[v] * 12);

@@ -43,14 +43,14 @@ Bounds NodeBounds(uint slot) {
 }
 
 void StoreGuestU32x4(uint64_t va, uvec4 value) {
-	const uint64_t host = HostAddress(va);
+	const uint64_t host = HostAddress(va, 16u);
 	if (host != 0) {
 		U32x4Ref(host).v = value;
 	}
 }
 
 void StoreGuestU32(uint64_t va, uint value) {
-	const uint64_t host = HostAddress(va);
+	const uint64_t host = HostAddress(va, 4u);
 	if (host != 0) {
 		U32Ref(host).v = value;
 	}

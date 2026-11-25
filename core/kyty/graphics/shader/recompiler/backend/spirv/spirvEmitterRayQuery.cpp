@@ -745,11 +745,7 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto header    = PackU64(s, ctx.Arg(inst, 8), ctx.Arg(inst, 9));
 	const auto alpha_off = Binary(s, spv::OpINotEqual, b, ctx.Arg(inst, 10), U32(s, 0));
 	const auto exec      = ctx.Arg(inst, 11);
-	const auto entry = s.builder.AllocateId();
-	s.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(s, 64), entry,
-	                      s.bda_pagetable_variable, U32(s, 0),
-	                      U32(s, static_cast<uint32_t>(BufferCache::NATIVE_RT_CONTEXT_PAGE)));
-	const auto context     = Load(s, wide, entry);
+	const auto context = LoadMirrorMetadata64(s, BufferCache::RT_CONTEXT_OFFSET);
 	const auto variant     = IR::RayQueryVariant(inst.Flags<uint32_t>());
 	const bool geometry_opacity = (variant & IR::RayQueryInitGeometryOpacity) != 0;
 	const bool no_leaf      = (variant & IR::RayQueryInitNoLeaf) != 0;

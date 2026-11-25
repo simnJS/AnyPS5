@@ -198,6 +198,17 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	}
 
 	AddressReader reader(graphics, scheduler, JoinedBytes);
+	Buffer bitmap(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(uint32_t));
+	const auto resident = [&](uint64_t guest) {
+		const auto block = (guest - origin) / BufferCache::MIRROR_BLOCK_SIZE;
+		bitmap.CopyFrom(scheduler.Current(), *buffers.GetFaultBuffer(),
+		                BufferCache::RESIDENCY_OFFSET + (block / 32) * sizeof(uint32_t), 0, sizeof(uint32_t));
+		Finish(scheduler);
+		bitmap.Invalidate(0, sizeof(uint32_t));
+		uint32_t bits;
+		std::memcpy(&bits, bitmap.Mapped().data(), sizeof(bits));
+		return (bits & (uint32_t {1} << (block % 32))) != 0;
+	};
 	reader.Record(scheduler, mirror->DeviceAddress() + address - origin, FirstBytes);
 	Finish(scheduler);
 	if (!mirror->Ready(address, FirstBytes)) return "a submission went without binding its blocks";
@@ -205,6 +216,7 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	if (!ReadsPattern(reader.Words(FirstBytes), 0)) {
 		return "a read by device address did not see the bytes uploaded into the mirror";
 	}
+	if (!resident(address) || resident(address + FarAt)) return "the shader residency map disagrees with the sparse binds";
 	if (mirror->Requested(aside, WrittenBytes)) {
 		buffers.SynchronizeBuffersInRange(aside, WrittenBytes);
 		reader.Record(scheduler, mirror->DeviceAddress() + aside - origin, WrittenBytes);
@@ -289,6 +301,7 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		return "a GPU write noted outside the requested blocks marks pages the mirror does not hold";
 	}
 	buffers.RequestDeviceRange(address + FarAt, WrittenBytes);
+	if (!resident(address + FarAt)) return "a range read by device address is missing from the shader residency map";
 	if (!mirror->Requested(address + FarAt, WrittenBytes)) return "a range read by device address is not requested";
 	if (!mirror->Owned(address + FarAt, WrittenBytes)) return "a range read by device address is not owned";
 

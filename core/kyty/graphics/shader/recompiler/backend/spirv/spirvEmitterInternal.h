@@ -153,7 +153,6 @@ struct EmitterState {
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	std::vector<uint32_t>                           memory_strides;
-	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	bool                                             converged_calls         = false;
@@ -653,6 +652,7 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
+uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBdaLoads(EmitterState& state);
 uint32_t RayStatsEnabled(EmitterState& state);

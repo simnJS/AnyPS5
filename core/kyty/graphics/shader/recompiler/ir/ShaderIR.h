@@ -445,7 +445,6 @@ enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
 	Samplers = FirstImageBinding + ImageBindingCount,
 	Gds,
-	BdaPagetable,
 	FaultBuffer,
 	FlattenedSrt,
 	ShaderData,
@@ -464,9 +463,9 @@ inline constexpr uint32_t UniformBufferBaseSlack = 256u;
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
 #if defined(ANYPS5_KYTY)
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 61u);
-#else
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 60u);
+#else
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 59u);
 #endif
 
 struct PushData {
