@@ -300,7 +300,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_graphics, m_scheduler, m_guest_mirror->Base(), m_guest_mirror->Size(),
 	    MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress(), m_guest_mirror->Base()});
 	const uint64_t metadata[] {m_guest_mirror->DeviceAddress() - m_guest_mirror->Base(), m_guest_mirror->Base(),
-	                           m_guest_mirror->Size(), 0, FAULT_BITMAP_OFFSET / sizeof(uint32_t)};
+	                           m_guest_mirror->Size(), 0,
+	                           FAULT_BITMAP_OFFSET / sizeof(uint32_t) | (USE_BITMAP_OFFSET / sizeof(uint32_t)) << 32u};
 	const auto source = m_staging_buffer.Copy(metadata, sizeof(metadata), alignof(uint64_t));
 	GetFaultBuffer()->CopyFrom(m_scheduler.Current(), m_staging_buffer, source, 0, sizeof(metadata));
 	m_residency_words.resize((m_guest_mirror->Size() / MIRROR_BLOCK_SIZE + 31) / 32);

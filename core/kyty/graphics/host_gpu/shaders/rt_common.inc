@@ -14,6 +14,7 @@ layout(set = 0, binding = 0, std430) buffer MirrorState {
 	uint64_t mirror_size;
 	uint64_t rt_context;
 	uint fault_word;
+	uint use_word;
 	layout(offset = 256) uint words[];
 };
 
@@ -22,7 +23,10 @@ const uint kInvalidNode = 0xffffffffu;
 bool Resident(uint block) {
 	const uint bit = 1u << (block & 31u);
 	const uint word = block >> 5;
-	if ((words[word] & bit) != 0) return true;
+	if ((words[word] & bit) != 0) {
+		atomicOr(words[use_word - 64u + word], bit);
+		return true;
+	}
 	atomicOr(words[fault_word - 64u + word], bit);
 	return false;
 }

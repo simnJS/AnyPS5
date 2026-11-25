@@ -2237,11 +2237,8 @@ uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t
 		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
 		                          bit);
 	};
-	const auto use = word(BufferCache::USE_BITMAP_OFFSET);
 	const auto ready = AndCondition(state, inside, holds(word(BufferCache::RESIDENCY_OFFSET)));
-	const auto used = holds(use);
-	EmitIfCondition(state, AndCondition(state, ready, Unary(state, spv::OpLogicalNot, boolean, used)),
-	                [&] { mark(use); });
+	EmitIfCondition(state, ready, [&] { mark(word(BufferCache::USE_BITMAP_OFFSET)); });
 	EmitIfCondition(state, AndCondition(state, inside, Unary(state, spv::OpLogicalNot, boolean, ready)),
 	                [&] { mark(word(BufferCache::FAULT_BITMAP_OFFSET)); });
 	return Select(state, u64, ready, Binary(state, spv::OpIAdd, u64, host_bias, address), ConstantU64(state, 0));
