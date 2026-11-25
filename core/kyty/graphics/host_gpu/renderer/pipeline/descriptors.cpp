@@ -2708,8 +2708,8 @@ void RenderExecutor::CommitTemplateBindings(CommandBuffer& buffer, const Pipelin
 				break;
 			case BindingKind::FaultBuffer: {
 				auto&       cache      = m_context.GetBufferCache();
-				const auto* bda_buffer = cache.GetFaultBuffer();
-				const vk::DescriptorBufferInfo view {bda_buffer->Handle(), 0, bda_buffer->Size()};
+				const auto* fault = cache.GetFaultBuffer();
+				const vk::DescriptorBufferInfo view {fault->Handle(), 0, fault->Size()};
 				put(&view, 1);
 				break;
 			}
@@ -3404,10 +3404,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						break;
 					case BindingKind::FaultBuffer: {
 						auto& cache = m_context.GetBufferCache();
-						const auto* bda_buffer = cache.GetFaultBuffer();
-						auto& view = address_buffer;
-						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
-						write.pBufferInfo = &view;
+						const auto* fault = cache.GetFaultBuffer();
+						address_buffer = {fault->Handle(), 0, fault->Size()};
+						write.pBufferInfo = &address_buffer;
 						break;
 					}
 					case BindingKind::MipStats: {

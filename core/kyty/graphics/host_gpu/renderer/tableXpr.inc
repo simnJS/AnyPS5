@@ -142,7 +142,6 @@ struct RenderExecutor::TableImageSet {
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
 	std::vector<Image>    images;
-	uint64_t              bda_generation = 0;
 	uint64_t validated_frame  = UINT64_MAX;
 	uint64_t resolution_epoch = 0;
 	struct Roles1 {
@@ -797,7 +796,6 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	std::array<vk::DescriptorBufferInfo, 4> buffer_infos {};
 	size_t                                  buffer_count = 0;
 	std::vector<vk::DescriptorImageInfo>    image_infos;
-	set->bda_generation = BufferCache::BdaTableGeneration();
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program  = *pair.programs[st];
 		const auto& prepared = table.prepared[st];
@@ -884,7 +882,6 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	auto&      textures   = m_context.GetTextureCache();
 	const auto frame      = m_context.FrameNumber();
 	const auto resolution = textures.ResolutionEpoch();
-	if (set.bda_generation != BufferCache::BdaTableGeneration()) return false;
 	if (Role() != 0) {
 		auto& mine = set.ResolutionEpoch(Role());
 		mine        = std::max(mine, set.RoleZeroEpoch());

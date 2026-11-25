@@ -177,7 +177,6 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
-	[[nodiscard]] static uint64_t BdaTableGeneration() noexcept { return 0; }
 	[[nodiscard]] StreamBuffer& GetTableUploadBuffer();
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
