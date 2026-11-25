@@ -652,6 +652,7 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
+uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active);
 uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBdaLoads(EmitterState& state);

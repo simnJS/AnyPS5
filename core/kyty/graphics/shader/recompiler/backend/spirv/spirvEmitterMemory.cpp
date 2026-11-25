@@ -2210,7 +2210,7 @@ uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset) {
 	return PackU64(state, load(offset / 4), load(offset / 4 + 1));
 }
 
-static uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active) {
+uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active) {
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
 	const auto offset = Binary(state, spv::OpISub, u64, address, LoadMirrorMetadata64(state, 8));
 	const auto inside = Binary(state, spv::OpULessThan, boolean, offset, LoadMirrorMetadata64(state, 16));
@@ -2271,7 +2271,7 @@ void DefineBdaLoads(EmitterState& state) {
 			state.builder.AddFunction(spv::OpFunctionParameter, u64, address);
 			EmitLabel(state, state.builder.AllocateId());
 			const auto body = [&]() {
-				const auto host = GetBdaPointer(state, address);
+				const auto host = EmitMirrorDeviceAddress(state, address, ConstantBool(state, true));
 				const auto present = Binary(state, spv::OpINotEqual, boolean, host, ConstantU64(state, 0));
 				return EmitValueOrDefaultIfCondition(state, present, u32, MissingBdaDword(state),
 				    [&] { return EmitBdaPointerLoad(state, host, coherent != 0u); });
