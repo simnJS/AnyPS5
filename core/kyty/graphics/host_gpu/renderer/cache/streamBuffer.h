@@ -38,10 +38,13 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+class GuestMirror;
+
 struct MirrorWindow {
 	vk::Buffer        buffer  = nullptr;
 	vk::DeviceAddress address = 0;
 	uint64_t          base    = 0;
+	const GuestMirror* mirror = nullptr;
 };
 
 class Buffer {
@@ -64,24 +67,19 @@ public:
 	[[nodiscard]] bool               IsWindow() const noexcept { return m_window; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] uint64_t           HandleOffset() const noexcept { return m_handle_offset; }
-	[[nodiscard]] uint64_t           HandleOrigin() const noexcept { return m_cpu_address - m_handle_offset; }
+	[[nodiscard]] uint64_t           GuestAddress(uint64_t offset) const noexcept;
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
 		EXIT_IF(m_device_address == 0);
 		return m_device_address;
 	}
-	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
-		return address - m_cpu_address + m_handle_offset;
-	}
+	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept;
 	[[nodiscard]] bool HoldsOffsets(uint64_t offset, uint64_t size) const noexcept {
 		return offset >= m_handle_offset && size <= Size() && offset - m_handle_offset <= Size() - size;
 	}
 	[[nodiscard]] uint64_t Capacity(uint64_t offset) const noexcept {
 		return HoldsOffsets(offset, 0) ? Size() - (offset - m_handle_offset) : 0;
 	}
-	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept {
-		return address >= m_cpu_address && size <= Size() &&
-		       address - m_cpu_address <= Size() - size;
-	}
+	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
@@ -108,6 +106,7 @@ private:
 	VmaAllocator                  m_allocator  = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	const GuestMirror*            m_mirror = nullptr;
 	bool                          m_window   = false;
 #if defined(ANYPS5_KYTY)
 	bool                          m_device_local = false;

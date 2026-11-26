@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <thread>
@@ -72,19 +73,33 @@ public:
 	using Wait = MirrorWait;
 	using Runs = std::vector<std::pair<uint64_t, uint64_t>>;
 
-	GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes = DefaultSizes, uint64_t base = 0);
+	GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes = DefaultSizes, uint64_t base = 0, uint64_t guest_span = 0);
 	~GuestMirror();
 	KYTY_CLASS_NO_COPY(GuestMirror);
 
 	[[nodiscard]] bool               Available() const noexcept { return m_size != 0; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
+	static constexpr uint32_t WindowBits = 24;
+	static constexpr uint64_t WindowSize = uint64_t {1} << WindowBits;
+	[[nodiscard]] uint64_t GuestSpan() const noexcept { return m_guest_span; }
+	[[nodiscard]] uint64_t Offset(uint64_t address) const noexcept;
+	[[nodiscard]] uint64_t Address(uint64_t offset) const noexcept;
+	[[nodiscard]] uint64_t WindowRemaining(uint64_t address) const noexcept {
+		return WindowSize - ((address - m_base) & (WindowSize - 1));
+	}
+	[[nodiscard]] bool InOneWindow(uint64_t address, uint64_t bytes) const noexcept {
+		return Holds(address, bytes) && bytes <= WindowRemaining(address) && bytes <= m_size && Offset(address) <= m_size - bytes;
+	}
+	[[nodiscard]] bool MapWindows(uint64_t address, uint64_t size);
+	void FreeWindow(uint64_t address);
+	[[nodiscard]] uint64_t ContiguousSize(uint64_t address, uint64_t bytes) const noexcept;
 	[[nodiscard]] uint64_t           Base() const noexcept { return m_base; }
 	[[nodiscard]] uint64_t           BlockSize() const noexcept { return uint64_t {1} << m_block_bits; }
 	[[nodiscard]] uint64_t           DeviceAddress() const noexcept { return m_device_address; }
 	[[nodiscard]] const std::string& Description() const noexcept { return m_description; }
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] bool               Holds(uint64_t vaddr, uint64_t size) const noexcept {
-		return size != 0 && vaddr >= m_base && vaddr - m_base < m_size && size <= m_size - (vaddr - m_base);
+		return size != 0 && vaddr >= m_base && vaddr - m_base < m_guest_span && size <= m_guest_span - (vaddr - m_base);
 	}
 	[[nodiscard]] bool     IsBound(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool     Requested(uint64_t vaddr, uint64_t size) const noexcept;
@@ -161,9 +176,9 @@ private:
 	void               Disown(uint64_t begin, uint64_t end) noexcept;
 	template <typename Func>
 	void ForEachSet(const std::atomic<uint64_t>* map, uint32_t shift, uint64_t vaddr, uint64_t size, Func&& func) const {
-		if (m_size == 0 || size == 0 || vaddr >= m_base + m_size || vaddr + size <= m_base) return;
+		if (m_size == 0 || size == 0 || vaddr >= m_base + m_guest_span || vaddr + size <= m_base) return;
 		const uint64_t begin = std::max(vaddr, m_base);
-		const uint64_t end   = std::min(vaddr + size, m_base + m_size);
+		const uint64_t end   = std::min(vaddr + size, m_base + m_guest_span);
 		const uint64_t first = (begin - m_base) >> shift;
 		const uint64_t last  = (end - m_base - 1) >> shift;
 		uint64_t       run   = UINT64_MAX;
@@ -192,6 +207,10 @@ private:
 	static constexpr uint64_t AgeChunkBlocks = 16384;
 
 	GraphicContext& m_graphics;
+	uint64_t        m_guest_span = 0;
+	std::vector<uint32_t> m_windows;
+	std::vector<uint32_t> m_guest_windows;
+	std::mutex m_windows_mutex;
 	uint64_t        m_size           = 0;
 	uint64_t        m_base           = 0;
 	uint32_t        m_block_bits     = MinBlockBits;

@@ -173,8 +173,13 @@ void BufferCache::CollectDownloadCopies(uint64_t vaddr, uint64_t size, std::vect
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(buffer.Offset(start), total_size, end - start);
-			    total_size += Common::AlignUp(end - start, 64);
+			    while (start < end) {
+				    const auto bytes = m_guest_mirror->ContiguousSize(start, end - start);
+				    EXIT_IF(bytes == 0);
+				    copies.emplace_back(buffer.Offset(start), total_size, bytes);
+				    total_size += Common::AlignUp(bytes, 64);
+				    start += bytes;
+			    }
 		    });
 		    if (m_gpu_modified_ranges.Subtract(address, bytes)) {
 			    NoteGpuModifiedChange(address, bytes, false);
@@ -191,7 +196,6 @@ bool BufferCache::DownloadMemory(uint64_t vaddr, uint64_t size) {
 	const auto&                 buffer = *m_storage;
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.HandleOrigin();
 	CollectDownloadCopies(vaddr, size, copies, total_size);
 	if (copies.empty()) {
 		return false;
@@ -236,16 +240,17 @@ bool BufferCache::DownloadMemory(uint64_t vaddr, uint64_t size) {
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
 	uint64_t written_begin = UINT64_MAX;
 	uint64_t written_end   = 0;
-	for (const auto& copy: copies) {
-		written_begin = std::min(written_begin, buffer_address + copy.srcOffset);
-		written_end   = std::max(written_end, buffer_address + copy.srcOffset + copy.size);
+	for (auto& copy: copies) {
+		copy.srcOffset = buffer.GuestAddress(copy.srcOffset);
+		written_begin = std::min<uint64_t>(written_begin, copy.srcOffset);
+		written_end   = std::max<uint64_t>(written_end, copy.srcOffset + copy.size);
 	}
-	auto publish = [total_size, buffer_address, copies = std::move(copies),
+	auto publish = [total_size, copies = std::move(copies),
 	                download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(
-			    buffer_address + copy.srcOffset,
+			    copy.srcOffset,
 			    download.mapped + (copy.dstOffset - download.offset), copy.size);
 		}
 	};
@@ -286,8 +291,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	}
 	const std::array<uint64_t, 1> chosen {m_graphics.mirror_size};
 	m_guest_mirror = m_graphics.mirror_size != 0
-	                     ? std::make_unique<GuestMirror>(m_graphics, chosen, m_graphics.mirror_base)
-	                     : std::make_unique<GuestMirror>(m_graphics, GuestMirror::DefaultSizes, m_graphics.mirror_base);
+	                     ? std::make_unique<GuestMirror>(m_graphics, chosen, m_graphics.mirror_base, GUEST_END - m_graphics.mirror_base)
+	                     : std::make_unique<GuestMirror>(m_graphics, GuestMirror::DefaultSizes, m_graphics.mirror_base, GUEST_END - m_graphics.mirror_base);
 	::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] {}\n", m_guest_mirror->Description()));
 	if (!m_guest_mirror->Available()) {
 		EXIT("[kyty-mirror] %s; AnyKyty keeps the guest memory the GPU reads in a sparse buffer of 64 GiB or more and "
@@ -298,18 +303,18 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	                     m_guest_mirror->Size());
 	m_storage = std::make_unique<Buffer>(
 	    m_graphics, m_scheduler, m_guest_mirror->Base(), m_guest_mirror->Size(),
-	    MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress(), m_guest_mirror->Base()});
+	    MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress(), m_guest_mirror->Base(), m_guest_mirror.get()});
 	m_host_view = std::make_unique<GuestHostView>(m_graphics, m_scheduler, m_staging_buffer, m_guest_mirror->Base(),
-	                                              m_guest_mirror->Size());
-	const uint64_t metadata[] {m_guest_mirror->DeviceAddress() - m_guest_mirror->Base(), m_guest_mirror->Base(),
-	                           m_guest_mirror->Size(), 0,
+	                                              m_guest_mirror->GuestSpan());
+	const uint64_t metadata[] {m_guest_mirror->DeviceAddress(), m_guest_mirror->Base(),
+	                           m_guest_mirror->GuestSpan(), 0,
 	                           FAULT_BITMAP_OFFSET / sizeof(uint32_t) | (USE_BITMAP_OFFSET / sizeof(uint32_t)) << 32u,
 	                           WRITE_BITMAP_OFFSET / sizeof(uint32_t), LibKernel::Memory::kExtendedMemoryBase,
 	                           LOWER_ADDRESS_SIZE, m_host_view->TableAddress()};
 	static_assert(sizeof(metadata) == HOST_TABLE_OFFSET + sizeof(uint64_t) && sizeof(metadata) <= RESIDENCY_OFFSET);
 	const auto source = m_staging_buffer.Copy(metadata, sizeof(metadata), alignof(uint64_t));
 	GetFaultBuffer()->CopyFrom(m_scheduler.Current(), m_staging_buffer, source, 0, sizeof(metadata));
-	m_residency_words.resize((m_guest_mirror->Size() / MIRROR_BLOCK_SIZE + 31) / 32);
+	m_residency_words.resize(RESIDENCY_SIZE / sizeof(uint32_t));
 	m_scheduler.SetSubmitHook(
 	    [](void* self, CommandBuffer& command, SubmitInfo& submit) {
 		    auto* cache = static_cast<BufferCache*>(self);
@@ -321,7 +326,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetSubmitHook(nullptr, nullptr);
-	m_guest_mirror->ForEachRequested(m_guest_mirror->Base(), m_guest_mirror->Size(), [this](uint64_t begin, uint64_t end) {
+	m_guest_mirror->ForEachRequested(m_guest_mirror->Base(), m_guest_mirror->GuestSpan(), [this](uint64_t begin, uint64_t end) {
 		if (m_memory_tracker.IsRegionGpuModified(begin, end - begin)) {
 			EXIT("BufferCache: destroyed with GPU-modified memory in the mirror\n");
 		}
@@ -995,13 +1000,12 @@ void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 	m_scheduler.WaitPriorityOperations(read.needed);
 	queue.staging->Invalidate(0, read.total_size);
 	const auto* mapped = queue.staging->Mapped().data();
-	const auto  origin = m_storage->HandleOrigin();
 	for (const auto& copy: read.copies) {
-		Libs::LibKernel::Memory::WriteBacking(origin + copy.srcOffset, mapped + copy.dstOffset, copy.size);
+		Libs::LibKernel::Memory::WriteBacking(m_storage->GuestAddress(copy.srcOffset), mapped + copy.dstOffset, copy.size);
 	}
 	for (const auto& follower: read.followers) {
 		for (const auto& copy: follower.copies) {
-			Libs::LibKernel::Memory::WriteBacking(origin + copy.srcOffset, mapped + copy.dstOffset, copy.size);
+			Libs::LibKernel::Memory::WriteBacking(m_storage->GuestAddress(copy.srcOffset), mapped + copy.dstOffset, copy.size);
 		}
 	}
 	read.slot->busy.store(false, std::memory_order_release);
@@ -1254,7 +1258,7 @@ uint64_t BufferCache::ReadAheadSize(uint64_t vaddr, uint64_t size) const {
 	const auto                faulting_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto                faulting_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	const auto                limit =
-	    std::min(m_storage->CpuAddress() + m_storage->Size(), faulting_end + MaxReadAhead);
+	    std::min(m_guest_mirror->Base() + m_guest_mirror->GuestSpan(), faulting_end + MaxReadAhead);
 	const auto latest_write = [&](uint64_t begin, uint64_t end) {
 		uint64_t latest = 0;
 		m_gpu_modified_ranges.ForEachInRange(begin, end - begin, [&](uint64_t first, uint64_t last) {
@@ -1435,7 +1439,7 @@ uint64_t BufferCache::ImportGeneration() {
 void BufferCache::RequestUnimportedRange(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || UINT64_MAX - vaddr < size) return;
 	const auto begin = std::max(vaddr, m_guest_mirror->Base());
-	const auto end   = std::min(vaddr + size, m_guest_mirror->Base() + m_guest_mirror->Size());
+	const auto end   = std::min(vaddr + size, m_guest_mirror->Base() + m_guest_mirror->GuestSpan());
 	if (begin >= end) return;
 	m_host_view->Publish();
 	m_host_view->ForEachGap(begin, end - begin, [this](uint64_t from, uint64_t to) { RequestDeviceRange(from, to - from); });
@@ -1445,7 +1449,7 @@ void BufferCache::RequestUnimportedRanges(const RangeSet& mapped, uint64_t mappi
 	const std::array layout {mapping_epoch, RegistrationEpoch(), m_host_view->Generation()};
 	if (layout == m_unimported_layout) return;
 	uint64_t bytes = 0;
-	mapped.ForEachInRange(m_guest_mirror->Base(), m_guest_mirror->Size(), [&](uint64_t begin, uint64_t end) {
+	mapped.ForEachInRange(m_guest_mirror->Base(), m_guest_mirror->GuestSpan(), [&](uint64_t begin, uint64_t end) {
 		m_host_view->ForEachGap(begin, end - begin, [&](uint64_t from, uint64_t to) {
 			RequestDeviceRange(from, to - from);
 			bytes += to - from;
@@ -1456,9 +1460,9 @@ void BufferCache::RequestUnimportedRanges(const RangeSet& mapped, uint64_t mappi
 }
 
 bool BufferCache::IsResident(uint64_t vaddr) const noexcept {
-	const auto block = (vaddr - m_guest_mirror->Base()) / MIRROR_BLOCK_SIZE;
-	return vaddr >= m_guest_mirror->Base() && block / 32 < m_residency_words.size() &&
-	       (m_residency_words[block / 32] >> (block % 32) & 1u) != 0;
+	const auto block = GuestOffset(vaddr) / MIRROR_BLOCK_SIZE;
+	return vaddr >= m_guest_mirror->Base() && block / RESIDENCY_BLOCKS < m_residency_words.size() &&
+	       (m_residency_words[block / RESIDENCY_BLOCKS] >> (block % RESIDENCY_BLOCKS) & 1u) != 0;
 }
 
 void BufferCache::NotePromotion(uint64_t begin, uint64_t end) {
@@ -1476,7 +1480,8 @@ void BufferCache::TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_
 	uint64_t   staged = 0;
 	const auto stage  = [&](uint64_t address, uint64_t bytes) {
 		if (bytes == 0) return;
-		if (!m_ordered_staged.empty() && m_ordered_staged.back().dstOffset + m_ordered_staged.back().size == buffer.Offset(address)) {
+		if (!m_ordered_staged.empty() && m_ordered_staged.back().dstOffset + m_ordered_staged.back().size == buffer.Offset(address) &&
+		    buffer.GuestAddress(m_ordered_staged.back().dstOffset) + m_ordered_staged.back().size == address) {
 			m_ordered_staged.back().size += bytes;
 		} else {
 			m_ordered_staged.emplace_back(staged, buffer.Offset(address), bytes);
@@ -1488,8 +1493,8 @@ void BufferCache::TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_
 	};
 	uint64_t ordered = 0;
 	for (const auto& copy: copies) {
-		const auto end = buffer.HandleOrigin() + copy.dstOffset + copy.size;
-		for (auto cursor = buffer.HandleOrigin() + copy.dstOffset; cursor < end;) {
+		const auto end = buffer.GuestAddress(copy.dstOffset) + copy.size;
+		for (auto cursor = buffer.GuestAddress(copy.dstOffset); cursor < end;) {
 			const auto stop = std::min(end, Common::AlignDown(cursor, MIRROR_BLOCK_SIZE) + MIRROR_BLOCK_SIZE);
 			auto       done = cursor;
 			if (promoted(cursor)) {
@@ -1560,10 +1565,8 @@ uint64_t BufferCache::Frame() const noexcept {
 
 void BufferCache::RequestRange(uint64_t vaddr, uint64_t size) {
 	static_assert(GuestMirror::PageBits == CACHING_PAGEBITS);
-	if (!m_guest_mirror->Holds(vaddr, size)) {
-		EXIT("[kyty-mirror] the GPU uses 0x%" PRIx64 " + 0x%" PRIx64 ", outside the mirror of 0x%" PRIx64
-		     " bytes at guest address 0x%" PRIx64 "\n",
-		     vaddr, size, m_guest_mirror->Size(), m_guest_mirror->Base());
+	if (!m_guest_mirror->MapWindows(vaddr, size)) {
+		EXIT("the GPU requested an unadmitted mirror range 0x%" PRIx64 "+0x%" PRIx64 "\n", vaddr, size);
 	}
 	m_guest_mirror->Use(vaddr, size);
 	if (m_guest_mirror->Owned(vaddr, size)) {
@@ -1574,7 +1577,9 @@ void BufferCache::RequestRange(uint64_t vaddr, uint64_t size) {
 	if (!m_fresh.empty() && vaddr < m_fresh.front().first && vaddr + size <= m_fresh.back().second) {
 		auto last = m_fresh.back().second;
 		if (std::find(m_growth_ends.begin(), m_growth_ends.end(), m_fresh.front().first) != m_growth_ends.end()) {
-			const auto leap = std::min(StreamLeap, m_guest_mirror->Base() + m_guest_mirror->Size() - last);
+			const auto leap = std::min({StreamLeap, m_guest_mirror->WindowRemaining(last - 1) - 1,
+			                            m_guest_mirror->Size() - (m_guest_mirror->Offset(last - 1) + 1),
+			                            m_guest_mirror->GuestSpan() - (last - m_guest_mirror->Base())});
 			m_guest_mirror->NoteRange(last, leap, &m_fresh);
 			last += leap;
 		}
@@ -1596,21 +1601,24 @@ void BufferCache::RequestRange(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::SetResident(uint64_t begin, uint64_t end, bool resident) {
-	const auto first = (begin - m_guest_mirror->Base()) / MIRROR_BLOCK_SIZE;
-	const auto last = (end - m_guest_mirror->Base() - 1) / MIRROR_BLOCK_SIZE;
+	const auto first = GuestOffset(begin) / MIRROR_BLOCK_SIZE;
+	const auto last = GuestOffset(end - 1) / MIRROR_BLOCK_SIZE;
 	uint64_t changed = UINT64_MAX, finish = 0;
-	for (auto word = first / 32; word <= last / 32; ++word) {
-		const auto low = word == first / 32 ? first % 32 : 0;
-		const auto high = word == last / 32 ? last % 32 : 31;
-		const uint32_t mask = (~uint32_t {0} << low) & (~uint32_t {0} >> (31 - high));
+	constexpr uint32_t resident_mask = (1u << RESIDENCY_BLOCKS) - 1;
+	for (auto word = first / RESIDENCY_BLOCKS; word <= last / RESIDENCY_BLOCKS; ++word) {
+		const auto low = word == first / RESIDENCY_BLOCKS ? first % RESIDENCY_BLOCKS : 0;
+		const auto high = word == last / RESIDENCY_BLOCKS ? last % RESIDENCY_BLOCKS : RESIDENCY_BLOCKS - 1;
+		const uint32_t mask = ((2u << high) - 1u) & (~0u << low);
 		auto& bits = m_residency_words[word];
-		const auto next = resident ? bits | mask : bits & ~mask;
-		for (auto fresh = next & ~bits; fresh != 0;) {
-			const auto start  = static_cast<uint32_t>(std::countr_zero(fresh));
+		const auto group = GuestAddress(word * RESIDENCY_BLOCKS * MIRROR_BLOCK_SIZE);
+		const auto slot = static_cast<uint32_t>(m_guest_mirror->Offset(std::max(begin, group)) >> GuestMirror::WindowBits);
+		const auto next = resident ? (slot << RESIDENCY_BLOCKS) | (bits & resident_mask) | mask : bits & ~mask;
+		for (auto fresh = (next & ~bits) & resident_mask; fresh != 0;) {
+			const auto start = static_cast<uint32_t>(std::countr_zero(fresh));
 			const auto length = static_cast<uint32_t>(std::countr_one(fresh >> start));
-			const auto from   = m_guest_mirror->Base() + (word * 32 + start) * MIRROR_BLOCK_SIZE;
+			const auto from = group + start * MIRROR_BLOCK_SIZE;
 			NotePromotion(from, from + length * MIRROR_BLOCK_SIZE);
-			fresh = start + length >= 32 ? 0 : fresh & ~((uint32_t {1} << (start + length)) - 1);
+			fresh &= ~(((1u << length) - 1u) << start);
 		}
 		if (bits != next) {
 			bits = next;
@@ -1675,7 +1683,7 @@ bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_writte
 		    const auto source = UploadCopies(copies, total_size);
 		    if (uploaded != nullptr) {
 			    for (const auto& copy: copies) {
-				    const auto address = m_storage->HandleOrigin() + copy.dstOffset;
+				    const auto address = m_storage->GuestAddress(copy.dstOffset);
 				    const auto first = std::max(address, vaddr);
 				    const auto last = std::min<uint64_t>(address + copy.size, vaddr + size);
 				    if (first < last) uploaded->Add(first, last - first);
@@ -1775,7 +1783,7 @@ vk::Buffer BufferCache::UploadCopies(std::vector<vk::BufferCopy>& copies, uint64
 		if (auto& deferred = MemoryTracker::DeferredProtects(); !deferred.empty()) {
 			bool queued = in_ring;
 			for (const auto& copy: copies) {
-				queued = queued && LibKernel::Memory::FindBackingPointer(buffer.HandleOrigin() + copy.dstOffset, copy.size) != nullptr;
+				queued = queued && LibKernel::Memory::FindBackingPointer(buffer.GuestAddress(copy.dstOffset), copy.size) != nullptr;
 			}
 			for (const auto& item: deferred) {
 				if (queued) {
@@ -1792,7 +1800,7 @@ vk::Buffer BufferCache::UploadCopies(std::vector<vk::BufferCopy>& copies, uint64
 			if (queued) m_protect_jobs = host_copies->Flush();
 		}
 		for (auto& copy: copies) {
-			const auto  address = buffer.HandleOrigin() + copy.dstOffset;
+			const auto  address = buffer.GuestAddress(copy.dstOffset);
 			const void* backing =
 			    in_ring ? LibKernel::Memory::FindBackingPointer(address, copy.size) : nullptr;
 			if (backing != nullptr) {
@@ -1936,7 +1944,7 @@ void BufferCache::CheckMirrorRange(uint64_t vaddr, uint64_t size) noexcept {
 
 void BufferCache::CheckMirrorCopies(std::span<const vk::BufferCopy> copies) noexcept {
 	for (const auto& copy: copies) {
-		CheckMirrorRange(m_storage->HandleOrigin() + copy.srcOffset, copy.size);
+		CheckMirrorRange(m_storage->GuestAddress(copy.srcOffset), copy.size);
 	}
 }
 
@@ -2462,12 +2470,11 @@ bool BufferCache::DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies
 		return false;
 	}
 	const auto& buffer         = *m_storage;
-	const auto  buffer_address = buffer.HandleOrigin();
 	uint64_t needed = m_device_address_tick;
-	const auto readback_begin = buffer_address + copies.front().srcOffset;
-	const auto readback_end   = buffer_address + copies.back().srcOffset + copies.back().size;
+	const auto readback_begin = buffer.GuestAddress(copies.front().srcOffset);
+	const auto readback_end   = buffer.GuestAddress(copies.back().srcOffset) + copies.back().size;
 	for (const auto& copy: copies) {
-		const auto begin = buffer_address + copy.srcOffset;
+		const auto begin = buffer.GuestAddress(copy.srcOffset);
 		const auto end   = begin + copy.size;
 		for (const auto& [vaddr, size]: m_pending_writes) {
 			if (vaddr < end && begin < vaddr + size) {
@@ -2618,7 +2625,7 @@ bool BufferCache::DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies
 	staging.Invalidate(0, total_size);
 	const auto* mapped = staging.Mapped().data();
 	for (const auto& copy: copies) {
-		Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+		Libs::LibKernel::Memory::WriteBacking(buffer.GuestAddress(copy.srcOffset),
 		                                      mapped + copy.dstOffset, copy.size);
 	}
 	return true;
@@ -3126,10 +3133,27 @@ void BufferCache::EvictOldBlocks() {
 	const auto block  = m_guest_mirror->BlockSize();
 	const auto wanted = std::min(used + PressureMargin - budget, MaxEvictBytes);
 	m_guest_mirror->PickOldest((wanted + block - 1) / block, static_cast<uint32_t>(frame - YoungFrames), m_victims);
-	if (m_victims.empty()) {
+	if (!m_victims.empty()) {
+		EvictBlocks(m_victims);
+		m_guest_mirror_evictions++;
+	}
+}
+
+void BufferCache::ReleaseWindowBlocks(std::span<const uint64_t> windows) {
+	GuestMirror::Runs runs;
+	for (const auto address: windows) {
+		m_guest_mirror->ForEachRequested(address, GuestMirror::WindowSize,
+		    [&](uint64_t begin, uint64_t end) { runs.emplace_back(begin, end); });
+	}
+	EvictBlocks(runs);
+	m_guest_mirror->WaitIdle();
+}
+
+void BufferCache::EvictBlocks(const GuestMirror::Runs& runs) {
+	if (runs.empty()) {
 		return;
 	}
-	for (const auto& [begin, end]: m_victims) {
+	for (const auto& [begin, end]: runs) {
 		if (m_memory_tracker.IsRegionGpuModified(begin, end - begin)) {
 			(void)DownloadMemory<true>(begin, end - begin);
 		}
@@ -3138,7 +3162,7 @@ void BufferCache::EvictOldBlocks() {
 	m_scheduler.Wait(tick);
 	m_scheduler.WaitPriorityOperations(tick);
 	WaitReadbackQueueCopies();
-	for (const auto& [begin, end]: m_victims) {
+	for (const auto& [begin, end]: runs) {
 		UnmarkGpuModified(begin, end - begin);
 		m_memory_tracker.MarkRegionAsCpuModified(begin, end - begin);
 		if (m_record_released) {
@@ -3151,14 +3175,13 @@ void BufferCache::EvictOldBlocks() {
 		NoteBlockRegions(begin, end, false);
 	}
 	const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
-	for (const auto& [begin, end]: m_victims) {
+	for (const auto& [begin, end]: runs) {
 		for (auto region = begin / TRACKER_REGION_SIZE; region * TRACKER_REGION_SIZE < end; ++region) {
 			m_region_registrations[region].store(epoch, std::memory_order_release);
 		}
 	}
 	m_registration_epoch.store(epoch, std::memory_order_release);
-	m_guest_mirror->Release(m_victims);
-	m_guest_mirror_evictions++;
+	m_guest_mirror->Release(runs);
 	m_gpu_write_generation++;
 }
 

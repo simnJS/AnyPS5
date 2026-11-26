@@ -56,12 +56,15 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint32_t MIRROR_BLOCK_BITS = GuestMirror::MinBlockBits;
 	static constexpr uint64_t MIRROR_BLOCK_SIZE = uint64_t {1} << MIRROR_BLOCK_BITS;
-	static constexpr uint64_t MIRROR_BITMAP_SIZE = GuestMirror::LargestSize / MIRROR_BLOCK_SIZE / 8;
+	static constexpr uint64_t MIRROR_BITMAP_SIZE = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) / MIRROR_BLOCK_SIZE / 8;
 	static constexpr uint64_t RT_CONTEXT_OFFSET = 3 * sizeof(uint64_t);
 	static constexpr uint64_t HOST_TABLE_OFFSET = 8 * sizeof(uint64_t);
 	static constexpr uint64_t HOST_ACCESS_OFFSET = HOST_TABLE_OFFSET + sizeof(uint64_t);
 	static constexpr uint64_t RESIDENCY_OFFSET = 256;
-	static constexpr uint64_t FAULT_BITMAP_OFFSET = RESIDENCY_OFFSET + MIRROR_BITMAP_SIZE;
+	static constexpr uint32_t RESIDENCY_BLOCKS = 16;
+	static constexpr uint64_t RESIDENCY_SIZE = MIRROR_BITMAP_SIZE * 8 / RESIDENCY_BLOCKS * sizeof(uint32_t);
+	static_assert(GuestMirror::LargestSize / GuestMirror::WindowSize <= (UINT32_MAX >> RESIDENCY_BLOCKS));
+	static constexpr uint64_t FAULT_BITMAP_OFFSET = RESIDENCY_OFFSET + RESIDENCY_SIZE;
 	static constexpr uint64_t USE_BITMAP_OFFSET = FAULT_BITMAP_OFFSET + MIRROR_BITMAP_SIZE;
 	static constexpr uint64_t WRITE_BITMAP_OFFSET = USE_BITMAP_OFFSET + MIRROR_BITMAP_SIZE;
 	static constexpr uint64_t HACK_MARKS_OFFSET = WRITE_BITMAP_OFFSET + CACHING_NUMPAGES / 8;
@@ -71,7 +74,8 @@ public:
 	static constexpr uint32_t HACK_MARK_GUEST_RAYS = HACK_MARK_COUNTS + static_cast<uint32_t>(HackMark::Count);
 	static constexpr uint64_t HACK_MARKS_SIZE     = uint64_t {HACK_MARK_ENTRIES} * HACK_MARK_DWORDS * 4;
 	static constexpr uint64_t RT_STATS_OFFSET     = HACK_MARKS_OFFSET + HACK_MARKS_SIZE;
-	static constexpr uint64_t FAULT_BUFFER_SIZE   = RT_STATS_OFFSET + sizeof(uint32_t);
+	static constexpr uint64_t FAULT_BUFFER_SIZE = RT_STATS_OFFSET + sizeof(uint32_t);
+	static constexpr uint64_t GUEST_END = LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
 	static constexpr uint32_t HACK_MARK_ORACLE_RETURNED   = HACK_MARK_GUEST_RAYS + 1;
 	static constexpr uint32_t HACK_MARK_ORACLE_RAYS       = HACK_MARK_GUEST_RAYS + 2;
 	static constexpr uint32_t HACK_MARK_ORACLE_CANDIDATES = HACK_MARK_GUEST_RAYS + 3;
@@ -86,6 +90,10 @@ public:
 		       HACK_MARK_ENTRIES;
 	}
 
+	static constexpr uint64_t GuestOffset(uint64_t address) {
+		return address < LibKernel::Memory::kExtendedMemoryBase ? address : address - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE;
+	}
+
 	static constexpr uint64_t GuestAddress(uint64_t offset) {
 		return offset < LOWER_ADDRESS_SIZE
 		           ? offset
@@ -97,6 +105,7 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
+	void                   ReleaseWindowBlocks(std::span<const uint64_t> windows);
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_fault = false);
 	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
@@ -352,6 +361,7 @@ private:
 	[[nodiscard]] bool     Holds(uint64_t vaddr, uint64_t size) const noexcept { return m_guest_mirror->Owned(vaddr, size); }
 	[[nodiscard]] uint64_t Frame() const noexcept;
 	void                   EvictOldBlocks();
+	void                   EvictBlocks(const GuestMirror::Runs& runs);
 	void                   CheckMirrorRange(uint64_t vaddr, uint64_t size) noexcept;
 	void                   CheckMirrorCopies(std::span<const vk::BufferCopy> copies) noexcept;
 	WriteFaultOwner InvalidateGuestWriteFault(uint64_t vaddr);

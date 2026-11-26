@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
 #include "kernel/memory.h"
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 
 #include <array>
 #include <cstdint>
@@ -169,14 +170,14 @@ void Finish(CommandScheduler& scheduler) {
 }
 
 bool IsResident(CommandScheduler& scheduler, BufferCache& buffers, Buffer& bitmap, uint64_t guest) {
-	const auto block = (guest - buffers.GetGuestMirror()->Base()) / BufferCache::MIRROR_BLOCK_SIZE;
+	const auto block = BufferCache::GuestOffset(guest) / BufferCache::MIRROR_BLOCK_SIZE;
 	bitmap.CopyFrom(scheduler.Current(), *buffers.GetFaultBuffer(),
-	                BufferCache::RESIDENCY_OFFSET + (block / 32) * sizeof(uint32_t), 0, sizeof(uint32_t));
+	                BufferCache::RESIDENCY_OFFSET + (block / BufferCache::RESIDENCY_BLOCKS) * sizeof(uint32_t), 0, sizeof(uint32_t));
 	Finish(scheduler);
 	bitmap.Invalidate(0, sizeof(uint32_t));
 	uint32_t bits;
 	std::memcpy(&bits, bitmap.Mapped().data(), sizeof(bits));
-	return (bits & (uint32_t {1} << (block % 32))) != 0;
+	return (bits & (uint32_t {1} << (block % BufferCache::RESIDENCY_BLOCKS))) != 0;
 }
 
 bool ReadsPattern(const std::vector<uint32_t>& words, uint64_t first) {
@@ -230,8 +231,12 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	heap.BeginDraw();
 	IR::ImageHeapView empty_view;
 	auto outside = request;
-	outside.base = buffers.GetGuestMirror()->Base() + buffers.GetGuestMirror()->Size() - 4u;
+	outside.base = BufferCache::GUEST_END - 4u;
 	if (heap.Acquire(outside, empty_view)) return "a table crossing the mirror limit was accepted";
+	auto crossing = request;
+	crossing.base = Common::AlignDown(address, GuestMirror::WindowSize) - 4u;
+	if (!renderer.IsMapped(crossing.base, crossing.size)) return "cross-window table fixture is not mapped";
+	if (heap.Acquire(crossing, empty_view)) return "an image table crossing two windows was admitted";
 	auto cpu_request = request;
 	cpu_request.step = sizeof(words);
 	if (!heap.Acquire(cpu_request, empty_view) || !empty_view.kinds.empty()) return "unexpected initial CPU kind";
@@ -540,10 +545,9 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	auto* mirror = buffers.GetGuestMirror();
 	if (mirror == nullptr) return "the cache has no mirror";
 	if (!mirror->Holds(address, GuestBytes)) {
-		g_skipped = "the guest memory lies outside the mirror";
-		return nullptr;
+		return "the high guest mapping was refused";
 	}
-	const auto origin = mirror->Base();
+	if (!renderer.MapMemory(address, GuestBytes)) return "could not register high windows";
 
 	auto* guest = reinterpret_cast<uint32_t*>(address);
 	for (uint64_t index = 0; index < GuestBytes / sizeof(uint32_t); index++) guest[index] = Pattern(index);
@@ -551,8 +555,8 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	if (buffers.IsRegionRegistered(address, GuestBytes)) return "the mirror holds blocks before any range was obtained";
 	const auto [range, offset] = buffers.ObtainRange(address, FirstBytes, false);
 	if (range->Handle() != mirror->Handle()) return "a range is not served from the mirror";
-	if (offset != address - origin) return "a range's offset is not its guest address in the mirror";
-	if (range->BufferDeviceAddress() + offset != mirror->DeviceAddress() + address - origin) {
+	if (offset >= mirror->Size() || mirror->Address(offset) != address) return "a mirror offset does not resolve to its high guest address";
+	if (range->BufferDeviceAddress() + offset != mirror->DeviceAddress() + mirror->Offset(address)) {
 		return "a range's device address is not the mirror's plus its guest address";
 	}
 	if (!mirror->Requested(address, FirstBytes)) return "a range's blocks are not requested when it is obtained";
@@ -571,7 +575,7 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	AddressReader reader(graphics, scheduler, JoinedBytes);
 	Buffer bitmap(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(uint32_t));
 	const auto resident = [&](uint64_t guest) { return IsResident(scheduler, buffers, bitmap, guest); };
-	reader.Record(scheduler, mirror->DeviceAddress() + address - origin, FirstBytes);
+	reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(address), FirstBytes);
 	Finish(scheduler);
 	if (!mirror->Ready(address, FirstBytes)) return "a submission went without binding its blocks";
 	if (!mirror->SharedQueue() && mirror->Totals().waits == 0) return "the submission did not wait for its bind";
@@ -581,7 +585,7 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	if (!resident(address) || resident(address + FarAt)) return "the shader residency map disagrees with the sparse binds";
 	if (mirror->Requested(aside, WrittenBytes)) {
 		buffers.SynchronizeBuffersInRange(aside, WrittenBytes);
-		reader.Record(scheduler, mirror->DeviceAddress() + aside - origin, WrittenBytes);
+		reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(aside), WrittenBytes);
 		Finish(scheduler);
 		if (!ReadsPattern(reader.Words(WrittenBytes), (aside - address) / sizeof(uint32_t))) {
 			return "a page bound beside a range is not brought up to date for a read by device address";
@@ -594,10 +598,10 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	}
 
 	const auto [joined, joined_offset] = buffers.ObtainRange(address, JoinedBytes, false);
-	if (joined->Handle() != mirror->Handle() || joined_offset != address - origin) {
+	if (joined->Handle() != mirror->Handle() || joined_offset != mirror->Offset(address)) {
 		return "a wider range over an obtained one is not the same place in the mirror";
 	}
-	reader.Record(scheduler, mirror->DeviceAddress() + address - origin, JoinedBytes);
+	reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(address), JoinedBytes);
 	Finish(scheduler);
 	if (!ReadsPattern(reader.Words(JoinedBytes), 0)) return "a wider range lost or moved bytes";
 
@@ -605,11 +609,11 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	const auto [mirrored, mirrored_offset] =
 	    buffers.ObtainRange(address + MirroredAt, 0x40, false, false, ObtainFrom::Mirror);
 	if (streamed->Handle() == mirror->Handle()) return "a small read is no longer served by a stream copy";
-	if (mirrored->Handle() != mirror->Handle() || mirrored_offset != address + MirroredAt - origin) {
+	if (mirrored->Handle() != mirror->Handle() || mirrored_offset != mirror->Offset(address + MirroredAt)) {
 		return "ObtainFrom::Mirror is served by a stream copy instead of the mirror";
 	}
 	(void)streamed_offset;
-	reader.Record(scheduler, mirror->DeviceAddress() + address + MirroredAt - origin, 0x40);
+	reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(address + MirroredAt), 0x40);
 	Finish(scheduler);
 	if (!ReadsPattern(reader.Words(0x40), MirroredAt / sizeof(uint32_t))) {
 		return "a small range asked from the mirror does not read the guest bytes";
@@ -657,10 +661,10 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	if (!taken.empty()) return "a GPU write into a heap table is reported twice";
 
 	const auto [back, back_offset] = buffers.ObtainRange(address + NextAt, FirstBytes, false);
-	if (back->Handle() != mirror->Handle() || back_offset != address + NextAt - origin) {
+	if (back->Handle() != mirror->Handle() || back_offset != mirror->Offset(address + NextAt)) {
 		return "a range next to a written one is not served from the mirror";
 	}
-	reader.Record(scheduler, mirror->DeviceAddress() + address + NextAt - origin, FirstBytes);
+	reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(address + NextAt), FirstBytes);
 	Finish(scheduler);
 	if (!ReadsPattern(reader.Words(FirstBytes), NextAt / sizeof(uint32_t))) {
 		return "a range next to a GPU-written one does not read the bytes of the guest memory";
@@ -734,6 +738,59 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	return failure;
 }
 
+const char* CheckCapacity(GraphicContext& graphics, uint64_t address) {
+	const auto saved_size = graphics.mirror_size;
+	graphics.mirror_size = 32 * GuestMirror::WindowSize;
+	RenderContext renderer(graphics);
+	graphics.mirror_size = saved_size;
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+	auto& cache = renderer.GetBufferCache();
+	auto& mirror = *cache.GetGuestMirror();
+	const auto page = BufferCache::CACHING_PAGESIZE;
+	const auto extended = Libs::LibKernel::Memory::kExtendedMemoryBase;
+	Libs::LibKernel::Memory::InstallGpuResources(&renderer);
+	struct Mappings {
+		std::vector<uint64_t> live;
+		~Mappings() {
+			for (const auto base: live) sceKernelMunmap(base, BufferCache::CACHING_PAGESIZE);
+			Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+		}
+	} mappings;
+	if (!renderer.MapMemory(extended, page)) return "could not translate an extended guest address";
+	const auto keep = mirror.Offset(extended);
+	uint64_t refused = 0;
+	for (uint64_t n = 0; n <= 32; ++n) {
+		const auto base = 900 * GuestMirror::GiB + n * GuestMirror::WindowSize;
+		void* at = reinterpret_cast<void*>(base);
+		const int result = sceKernelMapFlexibleMemory(&at, page, CpuReadWrite, 0x90);
+		if (result == SCE_KERNEL_ERROR_ENOMEM) {
+			refused = base;
+			break;
+		}
+		if (result != 0 || reinterpret_cast<uint64_t>(at) != base) return "could not allocate capacity fixture";
+		mappings.live.push_back(base);
+	}
+	if (refused == 0 || mappings.live.empty() || renderer.IsMapped(refused, page) ||
+	    mirror.Offset(refused) != UINT64_MAX || mirror.Offset(extended) != keep) return "capacity refusal changed live mappings";
+	const auto base = mappings.live.back();
+	const auto slot = mirror.Offset(base);
+	cache.RequestDeviceRange(base, page);
+	Finish(scheduler);
+	if (sceKernelMunmap(base, page) != 0) return "could not free the bound test window";
+	mappings.live.pop_back();
+	void* retry = reinterpret_cast<void*>(refused);
+	if (sceKernelMapFlexibleMemory(&retry, page, CpuReadWrite, 0x90) != 0) return "could not retry a refused mapping";
+	mappings.live.push_back(refused);
+	if (mirror.Offset(base) != UINT64_MAX || mirror.Offset(refused) != slot || mirror.Offset(extended) != keep ||
+	    mirror.Offset(address) == UINT64_MAX) return "reusing a mirror slot changed another mapping";
+	renderer.UnmapMemory(extended, page);
+	Finish(scheduler);
+	return nullptr;
+}
+
 const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 	RenderContext renderer(graphics);
 	CommandProcessor producer(renderer, 0);
@@ -772,7 +829,7 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 	};
 	const auto reads = [&](uint64_t source) {
 		if (!prepare() || !mirror->Requested(source, 8)) return false;
-		reader.Record(scheduler, mirror->DeviceAddress() + source - mirror->Base(), 8);
+		reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(source), 8);
 		Finish(scheduler);
 		return ReadsPattern(reader.Words(8), (source - address) / sizeof(uint32_t)) &&
 		       mirror->Ready(source, 8) && IsResident(scheduler, buffers, bitmap, source) &&
@@ -791,7 +848,7 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 	const auto  imported = [&](uint64_t source) { return view != nullptr && view->Lookup(source) != 0; };
 	const auto  binds    = [&](uint64_t source) {
 		if (prepare() || !mirror->Requested(source, 8)) return false;
-		reader.Record(scheduler, mirror->DeviceAddress() + source - mirror->Base(), 8);
+		reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(source), 8);
 		Finish(scheduler);
 		return ReadsPattern(reader.Words(8), (source - address) / sizeof(uint32_t)) && IsResident(scheduler, buffers, bitmap, source);
 	};
@@ -826,23 +883,6 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 
 const char* CheckTableReach(GraphicContext& graphics, uint64_t address, bool at_end) {
 	using Reach = ShaderRecompiler::Decoder::RecordReach;
-	const auto mirror_base = graphics.mirror_base;
-	const auto mirror_size = graphics.mirror_size;
-	struct Restore {
-		GraphicContext& graphics;
-		uint64_t        base;
-		uint64_t        size;
-		~Restore() {
-			graphics.mirror_base = base;
-			graphics.mirror_size = size;
-		}
-	} restore {graphics, mirror_base, mirror_size};
-	if (at_end) {
-		constexpr uint64_t Block = BufferCache::MIRROR_BLOCK_SIZE;
-		const auto         end   = Common::AlignUp(address, Block) + 3 * Block;
-		graphics.mirror_base     = Common::AlignDown(address, GuestMirror::GiB);
-		graphics.mirror_size     = end - graphics.mirror_base;
-	}
 	RenderContext    renderer(graphics);
 	CommandProcessor producer(renderer, 0);
 	producer.Reset();
@@ -860,10 +900,7 @@ const char* CheckTableReach(GraphicContext& graphics, uint64_t address, bool at_
 		g_unchecked = "the fixture is too small for the blocks of a reach read from a table";
 		return nullptr;
 	}
-	if (at_end && (!mirror->Available() || mirror->Base() + mirror->Size() != bare + block)) {
-		g_unchecked = "the device gave no mirror that ends inside the fixture";
-		return nullptr;
-	}
+	if (at_end && (first + sizeof(uint32_t) - mirror->Base()) % GuestMirror::WindowSize != 0) return "fixture misses the window boundary";
 	auto* guest = reinterpret_cast<uint32_t*>(address);
 	for (uint64_t i = 0; i < GuestBytes / sizeof(uint32_t); ++i) guest[i] = Pattern(i);
 	const auto vsharp = [](uint64_t at, uint64_t base, uint32_t stride, uint32_t records) {
@@ -910,7 +947,7 @@ const char* CheckTableReach(GraphicContext& graphics, uint64_t address, bool at_
 	AddressReader reader(graphics, scheduler, 8);
 	Buffer        bitmap(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(uint32_t));
 	const auto    verify = [&]() -> const char* {
-		buffers.ForgetGuestMemory(bare, block);
+		buffers.ForgetGuestMemory(bare, at_end ? 2 * block : block);
 		const bool imports = view != nullptr && view->Lookup(kept) != 0;
 		if (view != nullptr && view->Lookup(bare) != 0) return "a block kept its import after it was dropped";
 		if (mirror->AnyRequested(bare, block) || (!at_end && mirror->AnyRequested(kept, block))) {
@@ -918,13 +955,13 @@ const char* CheckTableReach(GraphicContext& graphics, uint64_t address, bool at_
 		}
 		if (!renderer.SynchronizeDmaFootprint(std::span {&dispatch, 1})) return "the reach read from a table was not found";
 		renderer.PrepareBda(false, false);
-		const uint64_t bytes = at_end ? sizeof(uint32_t) : 8;
+		const uint64_t bytes = 8;
 		if (!mirror->Requested(first, bytes)) {
-			return at_end ? "a reach that crosses the end of the mirror left its last word inside out of the mirror"
+			return at_end ? "a reach that crosses a window boundary lost a word"
 			              : "a reach read from a table left a mapped block without an import out of the mirror";
 		}
 		if (!at_end && imports && mirror->AnyRequested(kept, block)) return "a reach read from a table bound an imported block";
-		reader.Record(scheduler, mirror->DeviceAddress() + first - mirror->Base(), bytes);
+		reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(first), bytes);
 		Finish(scheduler);
 		if (!ReadsPattern(reader.Words(bytes), (first - address) / sizeof(uint32_t)) || !IsResident(scheduler, buffers, bitmap, first)) {
 			return "a block bound for a reach read from a table does not hold its guest memory";
@@ -971,7 +1008,7 @@ const char* CheckCut(GraphicContext& graphics, uint64_t address) {
 		const std::array<uint32_t, 4> fresh {GpuValue, GpuValue + 1, GpuValue + 2, GpuValue + 3};
 		reader.Store(scheduler, view->Lookup(stored), fresh.data(), sizeof(fresh));
 		(void)buffers.ObtainRange(stored, sizeof(fresh), false, false, ObtainFrom::Mirror);
-		reader.Record(scheduler, mirror->DeviceAddress() + stored - mirror->Base(), sizeof(fresh));
+		reader.Record(scheduler, mirror->DeviceAddress() + mirror->Offset(stored), sizeof(fresh));
 		Finish(scheduler);
 		const auto words = reader.Words(sizeof(fresh));
 		if (std::memcmp(words.data(), fresh.data(), sizeof(fresh)) != 0) {
@@ -1097,13 +1134,15 @@ extern "C" int RunKytyMirrorWindowsTest() {
 		std::fprintf(stderr, "%s: FAILED: could not create the allocator\n", Name);
 		return 1;
 	}
-	void* guest = nullptr;
-	if (sceKernelMapFlexibleMemory(&guest, GuestBytes, CpuReadWrite, 0) != 0 || guest == nullptr) {
+	constexpr uint64_t Fixture = 960 * GuestMirror::GiB - 3 * BufferCache::MIRROR_BLOCK_SIZE;
+	void* guest = reinterpret_cast<void*>(Fixture);
+	if (sceKernelMapFlexibleMemory(&guest, GuestBytes, CpuReadWrite, 0x90) != 0 || reinterpret_cast<uint64_t>(guest) != Fixture) {
 		std::fprintf(stderr, "%s: FAILED: could not map guest backing\n", Name);
 		return 1;
 	}
 	const auto  address = reinterpret_cast<uint64_t>(guest);
 	const auto* failure = CheckWindows(graphics, address);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckCapacity(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckDispatch(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckRemap(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckCut(graphics, address);

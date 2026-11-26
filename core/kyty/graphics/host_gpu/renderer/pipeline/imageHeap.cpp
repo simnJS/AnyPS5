@@ -251,7 +251,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	auto& cache = m_context.GetBufferCache();
 	const auto* mirror = cache.GetGuestMirror();
 	if (!GuestRange {request.base, request.size}.Valid() || mirror == nullptr ||
-	    !mirror->Holds(request.base, request.size) || size / 4u > UINT32_MAX - 8u ||
+	    !mirror->InOneWindow(request.base, request.size) || size / 4u > UINT32_MAX - 8u ||
 	    request.first >= size || request.step / 4u > UINT32_MAX || request.root == nullptr ||
 	    request.count == 0u || request.step == 0u ||
 	    ((request.base | request.first | request.step) & 3u) != 0u) {
@@ -1118,7 +1118,7 @@ void ImageHeap::AppendJobs(View& view, uint32_t id, const std::vector<Range>* ra
 	const auto& memory = view.memory;
 	const auto* mirror = m_context.GetBufferCache().GetGuestMirror();
 	Slots::Job job {.table       = memory.snapshot ? memory.snapshot->BufferDeviceAddress()
-	                                              : mirror->DeviceAddress() + (memory.base - mirror->Base()),
+	                                              : mirror->DeviceAddress() + mirror->Offset(memory.base),
 	                .slots       = view.buffer->BufferDeviceAddress(),
 	                .guest       = memory.base,
 	                .table_words = static_cast<uint32_t>(memory.size / 4u),

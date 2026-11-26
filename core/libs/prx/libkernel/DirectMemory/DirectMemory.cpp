@@ -443,6 +443,14 @@ static void MapUnmappedPages(void* addr, size_t len) {
 
 bool Reserved(const void* addr, size_t len);
 
+#if defined(ANYPS5_KYTY)
+static std::atomic<DirectMemoryMapAdmission> g_mapAdmission{nullptr};
+
+void DirectMemorySetMapAdmission_nid_no_patch(DirectMemoryMapAdmission admit) {
+    g_mapAdmission.store(admit, std::memory_order_release);
+}
+#endif
+
 namespace {
 
 constexpr int GuestMapFixedFlag = 0x10;
@@ -1913,6 +1921,19 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
     return flags | GuestMapFixedFlag;
 }
 
+bool AdmitMapping([[maybe_unused]] void* address, [[maybe_unused]] std::size_t bytes) {
+#if defined(ANYPS5_KYTY)
+    if (auto admit = g_mapAdmission.load(std::memory_order_acquire)) return admit(reinterpret_cast<std::uintptr_t>(address), bytes);
+#endif
+    return true;
+}
+
+bool AdmitPlacedMapping(void* address, std::size_t bytes) {
+    if (AdmitMapping(address, bytes)) return true;
+    Unmap(address, bytes);
+    return false;
+}
+
 int MapDirectRecorded(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
     ValidateAlignment(alignment);
@@ -1927,6 +1948,7 @@ int MapDirectRecorded(void** addr, size_t len, int prot, int flags, int64_t phys
     GuestAllocations::Mutation mutation;
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+    if ((flags & GuestMapFixedFlag) != 0 && !AdmitMapping(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
         EraseReservations(*addr, len);
         RecordProtection(*addr, len, prot);
@@ -1936,6 +1958,7 @@ int MapDirectRecorded(void** addr, size_t len, int prot, int flags, int64_t phys
     RequireAliasesUnpinned(mutation, static_cast<std::uint64_t>(physStart), len);
     std::lock_guard lock(g_directLock);
     void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
+    if (!AdmitPlacedMapping(mapped, len)) return SCE_KERNEL_ERROR_ENOMEM;
     try {
         AddMapping(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), LinuxProtFromSce(prot));
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, (prot & GuestProtGpuWrite) != 0);
@@ -2031,6 +2054,7 @@ static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t ali
     if (exclusive && mutation.Overlaps(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+    if ((flags & GuestMapFixedFlag) != 0 && !AdmitMapping(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, -1, zero)) {
         EraseReservations(*addr, len);
         RecordProtection(*addr, len, prot);
@@ -2042,6 +2066,7 @@ static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t ali
 #else
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, alignment);
 #endif
+    if (!AdmitPlacedMapping(mapped, len)) return SCE_KERNEL_ERROR_ENOMEM;
     try {
 #ifdef _WIN32
         if (zero) {
@@ -2157,8 +2182,10 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
     const int placementFlags = flags & (GuestMapFixedFlag | 0x80 | 0x400000);
     flags = PlaceHintInReservation(*addr, len, placementFlags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+    if ((flags & GuestMapFixedFlag) != 0 && !AdmitMapping(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     ReplaceFixedOverlap(mutation, *addr, len, flags);
     void* mapped = MapPlaced(*addr, len, PROT_NONE, flags, alignment);
+    if (!AdmitPlacedMapping(mapped, len)) return SCE_KERNEL_ERROR_ENOMEM;
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(mapped, len);
     const int nativeProtection = LinuxProtFromSce(prot);
     const int nativeFlags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED;
@@ -2227,12 +2254,17 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
     flags = PlaceHintInReservation(*addr, len, placementFlags);
     void* mapped = nullptr;
     try {
-        if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) {
+        if (FixedNoOverwriteConflict(mutation, *addr, len, flags) ||
+            ((flags & GuestMapFixedFlag) != 0 && !AdmitMapping(*addr, len))) {
             CloseHandle(section);
             return SCE_KERNEL_ERROR_ENOMEM;
         }
         ReplaceFixedOverlap(mutation, *addr, len, flags);
         mapped = MapPlaced(*addr, len, PROT_NONE, flags, alignment);
+        if (!AdmitPlacedMapping(mapped, len)) {
+            CloseHandle(section);
+            return SCE_KERNEL_ERROR_ENOMEM;
+        }
 #if defined(ANYPS5_KYTY)
         NoteReplacing(mapped, len);
 #endif
@@ -2264,6 +2296,7 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
     if (*addr != nullptr) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(*addr, len);
     GuestAllocations::Mutation mutation;
     void* mapped = MapPlaced(*addr, len, PROT_NONE, 0, PS5_PAGE_SIZE);
+    if (!AdmitPlacedMapping(mapped, len)) return SCE_KERNEL_ERROR_ENOMEM;
     try {
 #if defined(_WIN32)
 #if defined(ANYPS5_KYTY)

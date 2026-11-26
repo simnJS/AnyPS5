@@ -808,11 +808,30 @@ bool TryWriteBackedQwords(uint64_t vaddr, const uint64_t* values, uint32_t count
 	return true;
 }
 
-void SetGpuRangeHooks(RangeHook map, RangeHook unmap) {
+static MapAdmission g_admit = nullptr;
+
+static bool AdmitMapping(std::uintptr_t address, std::size_t bytes) {
+	GuestDeliveryLock lock(HookMutex());
+	return g_admit == nullptr || g_admit(address, bytes);
+}
+
+bool SetGpuRangeHooks(RangeHook map, RangeHook unmap, MapAdmission admit) {
 	std::lock_guard lock(HookMutex());
+	if (map != nullptr && admit != nullptr) {
+		bool fits = true;
+		Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) { fits = fits && admit(start, size); });
+		if (!fits) return false;
+	}
+	g_admit = admit;
+	DirectMemorySetMapAdmission_nid_no_patch(admit != nullptr ? &AdmitMapping : nullptr);
 	g_map_hook = map;
 	g_unmap_hook = unmap;
 	if (map != nullptr) Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) { map(start, size); });
+	return true;
+}
+
+void RefuseGpuMappings() {
+	throw std::runtime_error("existing guest mappings exceed sparse mirror capacity");
 }
 
 uint64_t ProbeCalls() {

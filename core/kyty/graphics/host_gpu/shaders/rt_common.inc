@@ -25,10 +25,10 @@ layout(set = 0, binding = 0, std430) buffer MirrorState {
 
 const uint kInvalidNode = 0xffffffffu;
 
-bool Resident(uint block) {
+bool Resident(uint block, uint entry) {
 	const uint bit = 1u << (block & 31u);
 	const uint word = block >> 5;
-	if ((words[word] & bit) != 0) {
+	if ((entry & (1u << (block & 15u))) != 0) {
 		atomicOr(words[use_word - 64u + word], bit);
 		return true;
 	}
@@ -48,7 +48,7 @@ uint64_t GuestAddress(uint64_t offset, uint bytes) {
 	if (page == 0) return 0;
 	const uint64_t inside = offset & 0x3ffful;
 	if (inside + bytes > 0x4000ul) {
-		const uint64_t after = offset + 0x4000ul;
+		const uint64_t after = offset - inside + 0x4000ul;
 		if (after >= mirror_size || GuestPage(after) != page + 0x4000ul) return 0;
 	}
 	atomicAdd(host_accesses, 1u);
@@ -58,11 +58,18 @@ uint64_t GuestAddress(uint64_t offset, uint bytes) {
 uint64_t HostAddress(uint64_t va, uint bytes) {
 	const uint64_t offset = va - guest_base;
 	if (offset >= mirror_size || bytes > mirror_size - offset) return 0;
-	const uint first = uint(offset >> 16);
-	const uint last = uint((offset + bytes - 1u) >> 16);
-	const bool start = Resident(first);
-	const bool end = first == last ? start : Resident(last);
-	if (start && end) return mirror_base + va;
+	const uint64_t last_byte = offset + bytes - 1u;
+	const uint64_t packed = va >= extended_base ? va - extended_base + lower_size : va;
+	if (va < extended_base && (va >= lower_size || bytes > lower_size - va)) return 0;
+	const uint block = uint(packed >> 16);
+	const uint last_block = uint((packed + bytes - 1u) >> 16);
+	const uint entry = words[block >> 4];
+	const uint last_entry = (block >> 4) == (last_block >> 4) ? entry : words[last_block >> 4];
+	const bool start = Resident(block, entry);
+	const bool end = block == last_block ? start : Resident(last_block, last_entry);
+	const uint64_t first = (uint64_t(entry >> 16) << 24) | (offset & 0xfffffful);
+	const uint64_t last = (uint64_t(last_entry >> 16) << 24) | (last_byte & 0xfffffful);
+	if (start && end && last - first == bytes - 1u) return mirror_base + first;
 	return start || end ? 0 : GuestAddress(offset, bytes);
 }
 

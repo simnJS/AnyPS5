@@ -301,9 +301,24 @@ bool RenderContext::UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
-void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+bool RenderContext::AdmitMemory(uint64_t address, uint64_t size) {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return ReserveMirrorRange(address, size);
+}
+
+bool RenderContext::ReserveMirrorRange(uint64_t address, uint64_t size) {
+	auto& mirror = *m_buffer_cache.GetGuestMirror();
+	if (!mirror.Holds(address, size)) return false;
+	const auto end = address + size;
+	const bool previous = address > mirror.Base() && m_mapped_ranges.Contains(address - 1, 1);
+	const bool next = end < mirror.Base() + mirror.GuestSpan() && m_mapped_ranges.Contains(end, 1);
+	return mirror.MapWindows(address - previous, size + previous + next);
+}
+
+bool RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
+		if (!ReserveMirrorRange(vaddr, size)) return false;
 		m_mapped_ranges.Add(vaddr, size);
 		m_mapped_ranges_version++;
 		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
@@ -326,6 +341,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 			m_gpu->SendUrgentCommandSync(map);
 		}
 	}
+	return true;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -359,15 +375,34 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_guest_bvh_memory.erase(m_guest_bvh_memory.lower_bound(vaddr), m_guest_bvh_memory.lower_bound(vaddr + size));
 			std::erase_if(m_hle_tlases, [&](const HleTlas& tlas) { return tlas.header >= vaddr && tlas.header - vaddr < size; });
 		}
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
-		m_mapped_ranges_version++;
-		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
-		if (m_unmap_log.size() >= 4096) {
-			m_unmap_log_floor = m_unmap_log.front().version;
-			m_unmap_log.pop_front();
+		auto& mirror = *m_buffer_cache.GetGuestMirror();
+		std::vector<uint64_t> empty;
+		{
+			std::lock_guard lock(m_mapped_ranges_mutex);
+			m_mapped_ranges.Subtract(vaddr, size);
+			m_mapped_ranges_version++;
+			m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
+			if (m_unmap_log.size() >= 4096) {
+				m_unmap_log_floor = m_unmap_log.front().version;
+				m_unmap_log.pop_front();
+			}
+			m_unmap_log.push_back({m_mapped_ranges_version, vaddr, size});
+			if (mirror.Holds(vaddr, size)) {
+				const auto first = vaddr - ((vaddr - mirror.Base()) & (GuestMirror::WindowSize - 1));
+				for (auto window = first; window < vaddr + size; window += GuestMirror::WindowSize) {
+					if (mirror.Offset(window) != UINT64_MAX && !m_mapped_ranges.Intersects(window, GuestMirror::WindowSize)) {
+						empty.push_back(window);
+					}
+				}
+			}
 		}
-		m_unmap_log.push_back({m_mapped_ranges_version, vaddr, size});
+		if (!empty.empty()) {
+			m_buffer_cache.ReleaseWindowBlocks(empty);
+			std::lock_guard lock(m_mapped_ranges_mutex);
+			for (const auto window: empty) {
+				if (!m_mapped_ranges.Intersects(window, GuestMirror::WindowSize)) mirror.FreeWindow(window);
+			}
+		}
 	};
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
 		unmap();

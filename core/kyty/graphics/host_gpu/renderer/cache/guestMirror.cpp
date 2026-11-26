@@ -227,7 +227,7 @@ GuestMirror::ProbeResult GuestMirror::Probe(const GraphicContext& graphics, std:
 	return result;
 }
 
-GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes, uint64_t base)
+GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes, uint64_t base, uint64_t guest_span)
     : m_graphics(graphics), m_base(base) {
 	const auto probe = Probe(graphics, sizes);
 	if (probe.size == 0) {
@@ -239,14 +239,19 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 		m_size = 0;
 		return;
 	}
+	m_guest_span = guest_span != 0 ? guest_span : m_size;
+	if (guest_span != 0) {
+		m_windows.resize((guest_span + WindowSize - 1) / WindowSize);
+		m_guest_windows.resize((m_size + WindowSize - 1) / WindowSize);
+	}
 	m_shared_queue = graphics.sparse_queue == graphics.queue;
-	m_words        = ((m_size >> m_block_bits) + 63) / 64;
+	m_words        = ((m_guest_span >> m_block_bits) + 63) / 64;
 	m_bound        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
 	m_ready        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
-	m_owned        = std::make_unique<std::atomic<uint64_t>[]>(((m_size >> PageBits) + 63) / 64);
+	m_owned        = std::make_unique<std::atomic<uint64_t>[]>(((m_guest_span >> PageBits) + 63) / 64);
 	m_used.assign(m_words, 0);
 	m_device.assign(m_words, 0);
-	m_ages.resize(((m_size >> m_block_bits) + AgeChunkBlocks - 1) / AgeChunkBlocks);
+	m_ages.resize(((m_guest_span >> m_block_bits) + AgeChunkBlocks - 1) / AgeChunkBlocks);
 	vk::PhysicalDeviceVulkan13Properties properties13 {};
 	vk::PhysicalDeviceProperties2        properties {.pNext = &properties13};
 	graphics.physical_device.getProperties2(&properties);
@@ -303,7 +308,7 @@ bool GuestMirror::CreateBuffer() {
 	const vk::FenceCreateInfo         fence_info {};
 	vk::SemaphoreTypeCreateInfo       timeline {.semaphoreType = vk::SemaphoreType::eTimeline, .initialValue = 0};
 	const vk::SemaphoreCreateInfo     semaphore_info {.pNext = &timeline};
-	if (!std::has_single_bit(requirements.alignment) || m_memory_types == 0 ||
+	if (!std::has_single_bit(requirements.alignment) || requirements.alignment > WindowSize || m_memory_types == 0 ||
 	    device.createFence(&fence_info, nullptr, &m_fence) != vk::Result::eSuccess ||
 	    device.createSemaphore(&semaphore_info, nullptr, &m_semaphore) != vk::Result::eSuccess) {
 		m_description = fmt::format("no mirror: page of {} bytes, memory types 0x{:x}, or no timeline semaphore",
@@ -326,6 +331,88 @@ void GuestMirror::DestroyBuffer() {
 	m_fence     = nullptr;
 	m_semaphore = nullptr;
 	m_chunks.clear();
+}
+
+uint64_t GuestMirror::Offset(uint64_t address) const noexcept {
+	const auto relative = address - m_base;
+	if (relative >= m_guest_span) return UINT64_MAX;
+	if (m_windows.empty()) return relative;
+	const auto entry = std::atomic_ref<const uint32_t>(m_windows[relative >> WindowBits]).load(std::memory_order_acquire);
+	return entry == 0 ? UINT64_MAX : (uint64_t {entry - 1} << WindowBits) + (relative & (WindowSize - 1));
+}
+
+uint64_t GuestMirror::Address(uint64_t offset) const noexcept {
+	if (offset >= m_size) return UINT64_MAX;
+	if (m_guest_windows.empty()) return m_base + offset;
+	const auto entry = std::atomic_ref<const uint32_t>(m_guest_windows[offset >> WindowBits]).load(std::memory_order_acquire);
+	return entry == 0 ? UINT64_MAX : m_base + (uint64_t {entry - 1} << WindowBits) + (offset & (WindowSize - 1));
+}
+
+uint64_t GuestMirror::ContiguousSize(uint64_t address, uint64_t bytes) const noexcept {
+	const auto first = Offset(address);
+	if (first >= m_size) return 0;
+	bytes = std::min({bytes, m_size - first, m_guest_span - (address - m_base)});
+	auto contiguous = std::min(bytes, WindowRemaining(address));
+	while (contiguous < bytes && Offset(address + contiguous) == first + contiguous) {
+		contiguous += std::min(bytes - contiguous, WindowSize);
+	}
+	return contiguous;
+}
+
+void GuestMirror::FreeWindow(uint64_t address) {
+	std::lock_guard lock(m_windows_mutex);
+	const auto index = (address - m_base) >> WindowBits;
+	const auto entry = m_windows[index];
+	if (entry == 0) return;
+	std::atomic_ref<uint32_t>(m_windows[index]).store(0, std::memory_order_release);
+	std::atomic_ref<uint32_t>(m_guest_windows[entry - 1]).store(0, std::memory_order_release);
+}
+
+bool GuestMirror::MapWindows(uint64_t address, uint64_t size) {
+	if (!Holds(address, size)) return false;
+	if (m_windows.empty()) return true;
+	const uint32_t first = (address - m_base) >> WindowBits;
+	const uint32_t last = (address - m_base + size - 1) >> WindowBits;
+	if (first == last && InOneWindow(address, size)) return true;
+	std::lock_guard lock(m_windows_mutex);
+	const uint32_t count = last - first + 1;
+	const uint32_t slots = m_guest_windows.size();
+	const auto fits = [&](uint32_t slot) {
+		if (slot >= slots || count > slots - slot ||
+		    (uint64_t {slot} << WindowBits) + ((address - m_base) & (WindowSize - 1)) + size > m_size) return false;
+		for (uint32_t n = 0; n < count; ++n) {
+			if ((m_guest_windows[slot + n] != 0 && m_guest_windows[slot + n] != first + n + 1) ||
+			    (m_windows[first + n] != 0 && m_windows[first + n] != slot + n + 1)) return false;
+		}
+		return true;
+	};
+	uint32_t slot = first % slots;
+	if (first > 0 && m_windows[first - 1] != 0 && fits(m_windows[first - 1])) {
+		slot = m_windows[first - 1];
+	} else if (last + 1 < m_windows.size() && m_windows[last + 1] > count && fits(m_windows[last + 1] - count - 1)) {
+		slot = m_windows[last + 1] - count - 1;
+	}
+	for (uint32_t n = 0; n < count; ++n) {
+		if (m_windows[first + n] != 0) {
+			slot = m_windows[first + n] - 1 - n;
+			break;
+		}
+	}
+	if (!fits(slot)) {
+		slot = 0;
+		while (slot < slots && !fits(slot)) ++slot;
+	}
+	if (slot == slots) {
+		::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] refused guest range {:#x}+{:#x}: {} contiguous windows needed in {}\n",
+		                                       address, size, count, Gib(m_size)));
+		return false;
+	}
+	for (uint32_t n = 0; n < count; ++n) {
+		if (m_windows[first + n] != 0) continue;
+		std::atomic_ref<uint32_t>(m_guest_windows[slot + n]).store(first + n + 1, std::memory_order_release);
+		std::atomic_ref<uint32_t>(m_windows[first + n]).store(slot + n + 1, std::memory_order_release);
+	}
+	return true;
 }
 
 bool GuestMirror::IsBound(uint64_t vaddr) const noexcept {
@@ -510,7 +597,7 @@ void GuestMirror::Release(const Runs& runs) {
 
 void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh) {
 	if (m_size == 0 || size == 0 || UINT64_MAX - vaddr < size) return;
-	const uint64_t blocks = m_size >> m_block_bits;
+	const uint64_t blocks = m_guest_span >> m_block_bits;
 	if (vaddr < m_base) {
 		m_outside_blocks += ((std::min(vaddr + size, m_base) - vaddr + BlockSize() - 1) >> m_block_bits);
 		if (vaddr + size <= m_base) return;
@@ -685,8 +772,10 @@ void GuestMirror::Bind(const Command& command) {
 			}
 			uint64_t fresh = 1;
 			while (fresh < left && !m_block_slots.contains(block + fresh)) fresh++;
-			const auto [chunk, index, count] = Allocate(fresh);
-			m_binds.push_back({.resourceOffset = block << m_block_bits,
+			const auto offset = Offset(m_base + (block << m_block_bits));
+			const auto window_blocks = (WindowSize - (offset & (WindowSize - 1))) >> m_block_bits;
+			const auto [chunk, index, count] = Allocate(std::min(fresh, window_blocks));
+			m_binds.push_back({.resourceOffset = offset,
 			                   .size           = uint64_t {count} << m_block_bits,
 			                   .memory         = m_chunks[chunk].memory,
 			                   .memoryOffset   = uint64_t {index} << m_block_bits});
@@ -720,7 +809,12 @@ void GuestMirror::Unbind(const Command& command) {
 	m_binds.clear();
 	uint64_t blocks = 0;
 	for (const auto& run: command.runs) {
-		m_binds.push_back({.resourceOffset = run.first << m_block_bits, .size = run.count << m_block_bits});
+		for (uint64_t done = 0; done < run.count;) {
+			const auto offset = Offset(m_base + ((run.first + done) << m_block_bits));
+			const auto count = std::min(run.count - done, (WindowSize - (offset & (WindowSize - 1))) >> m_block_bits);
+			m_binds.push_back({.resourceOffset = offset, .size = count << m_block_bits});
+			done += count;
+		}
 	}
 	if (command.after.semaphore) {
 		const vk::SemaphoreWaitInfo wait {

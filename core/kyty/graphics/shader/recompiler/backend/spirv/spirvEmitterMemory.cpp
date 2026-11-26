@@ -191,7 +191,7 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
-uint32_t BdaPageIndex(EmitterState& state, uint32_t address) {
+uint32_t BdaPageIndex(EmitterState& state, uint32_t address, uint32_t shift = BufferCache::CACHING_PAGEBITS) {
 	const auto type     = TypeU64(state);
 	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
 	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
@@ -201,7 +201,7 @@ uint32_t BdaPageIndex(EmitterState& state, uint32_t address) {
 	                                        LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
 	                             address);
 	const auto page64   = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                             ConstantU64(state, BufferCache::CACHING_PAGEBITS));
+	                             ConstantU64(state, shift));
 	return Unary(state, spv::OpUConvert, TypeU32(state), page64);
 }
 
@@ -2241,7 +2241,7 @@ uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t siz
 	const auto crosses = Binary(state, spv::OpUGreaterThan, boolean,
 	                            Binary(state, spv::OpIAdd, u64, inside, Unary(state, spv::OpUConvert, u64, extent)),
 	                            ConstantU64(state, View::PageSize));
-	const auto after = Binary(state, spv::OpIAdd, u64, offset, ConstantU64(state, View::PageSize));
+	const auto after = Binary(state, spv::OpIAdd, u64, Binary(state, spv::OpISub, u64, offset, inside), ConstantU64(state, View::PageSize));
 	const auto next = entry_of(after, AndCondition(state, AndCondition(state, nonzero(entry), crosses),
 	                                               Binary(state, spv::OpULessThan, boolean, after, size)));
 	const auto follows = Binary(state, spv::OpIEqual, boolean, next,
@@ -2253,40 +2253,83 @@ uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t siz
 
 uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent, bool in_page) {
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
-	const auto host_bias = LoadMirrorMetadata64(state, 0);
+	const auto mirror_base = LoadMirrorMetadata64(state, 0);
 	const auto guest_base = LoadMirrorMetadata64(state, 8);
 	const auto size = LoadMirrorMetadata64(state, 16);
 	const auto offset = Binary(state, spv::OpISub, u64, address, guest_base);
 	const auto valid = AndCondition(state, active, BdaAddressRepresentable(state, address));
-	const auto inside = AndCondition(state, valid, Binary(state, spv::OpULessThan, boolean, offset, size));
-	const auto block = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64,
-	                         Select(state, u64, inside, offset, ConstantU64(state, 0)),
-	                         ConstantU32(state, BufferCache::MIRROR_BLOCK_BITS)));
+	const auto zero = ConstantU64(state, 0);
+	const auto span = Unary(state, spv::OpUConvert, u64, extent);
+	const auto last_byte = Binary(state, spv::OpIAdd, u64, offset,
+	                              Binary(state, spv::OpISub, u64, span, ConstantU64(state, 1)));
+	const auto last_address = Binary(state, spv::OpIAdd, u64, guest_base, last_byte);
+	const auto end_valid = in_page ? valid : AndCondition(state, valid, BdaAddressRepresentable(state, last_address));
+	const auto inside = AndCondition(state, end_valid, AndCondition(state,
+	    Binary(state, spv::OpULessThan, boolean, offset, size),
+	    Binary(state, spv::OpULessThan, boolean, last_byte, size)));
+	const auto block = BdaPageIndex(state, Select(state, u64, inside, address, zero), BufferCache::MIRROR_BLOCK_BITS);
+	const auto record = [&](uint32_t page) {
+		const auto index = Binary(state, spv::OpShiftRightLogical, u32, page, ConstantU32(state, 4));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, value, FaultElementPointer(state, Binary(state, spv::OpIAdd, u32,
+		    ConstantU32(state, BufferCache::RESIDENCY_OFFSET / 4), index)));
+		return value;
+	};
+	const auto resident = [&](uint32_t entry, uint32_t page) {
+		const auto bit = Binary(state, spv::OpBitwiseAnd, u32, page, ConstantU32(state, BufferCache::RESIDENCY_BLOCKS - 1));
+		const auto mask = Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1), bit);
+		return Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, entry, mask), ConstantU32(state, 0));
+	};
+	const auto translate = [&](uint32_t entry, uint32_t at) {
+		const auto slot = Binary(state, spv::OpShiftRightLogical, u32, entry, ConstantU32(state, BufferCache::RESIDENCY_BLOCKS));
+		return Binary(state, spv::OpBitwiseOr, u64,
+		    Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, slot), ConstantU32(state, GuestMirror::WindowBits)),
+		    Binary(state, spv::OpBitwiseAnd, u64, at, ConstantU64(state, GuestMirror::WindowSize - 1)));
+	};
+	const auto entry = record(block);
+	const auto translated = translate(entry, offset);
 	const auto index = Binary(state, spv::OpShiftRightLogical, u32, block, ConstantU32(state, 5));
 	const auto bit = Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1),
 	                        Binary(state, spv::OpBitwiseAnd, u32, block, ConstantU32(state, 31)));
 	const auto word = [&](uint64_t bitmap) {
 		return FaultElementPointer(state, Binary(state, spv::OpIAdd, u32, ConstantU32(state, bitmap / 4), index));
 	};
-	const auto holds = [&](uint32_t pointer) {
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpLoad, u32, value, pointer);
-		return Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, bit),
-		              ConstantU32(state, 0));
-	};
 	const auto mark = [&](uint32_t pointer) {
 		state.builder.AddFunction(spv::OpAtomicOr, u32, state.builder.AllocateId(), pointer,
 		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
 		                          bit);
 	};
-	const auto ready = AndCondition(state, inside, holds(word(BufferCache::RESIDENCY_OFFSET)));
+	const auto first_ready = AndCondition(state, inside, resident(entry, block));
+	auto ready = first_ready;
+	auto has_resident = first_ready;
+	if (!in_page) {
+		const auto crosses = Binary(state, spv::OpINotEqual, boolean,
+		    Binary(state, spv::OpShiftRightLogical, u64, offset, ConstantU32(state, BufferCache::MIRROR_BLOCK_BITS)),
+		    Binary(state, spv::OpShiftRightLogical, u64, last_byte, ConstantU32(state, BufferCache::MIRROR_BLOCK_BITS)));
+		const auto tail = EmitValueOrDefaultIfCondition(state, AndCondition(state, inside, crosses), u32, ConstantU32(state, 0), [&] {
+			const auto last_block = BdaPageIndex(state, last_address, BufferCache::MIRROR_BLOCK_BITS);
+			const auto last_entry = record(last_block);
+			const auto last_translated = translate(last_entry, last_byte);
+			const auto contiguous = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpISub, u64, last_translated, translated),
+			                               Binary(state, spv::OpISub, u64, last_byte, offset));
+			const auto last_ready = resident(last_entry, last_block);
+			EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, last_ready),
+			                [&] { RecordBdaPageBit(state, last_block, BufferCache::FAULT_BITMAP_OFFSET); });
+			EmitIfCondition(state, AndCondition(state, first_ready, AndCondition(state, contiguous, last_ready)),
+			                [&] { RecordBdaPageBit(state, last_block, BufferCache::USE_BITMAP_OFFSET); });
+			return Select(state, u32, last_ready, Select(state, u32, contiguous, ConstantU32(state, 2), ConstantU32(state, 1)), ConstantU32(state, 0));
+		});
+		ready = AndCondition(state, ready, Binary(state, spv::OpLogicalOr, boolean,
+		    Unary(state, spv::OpLogicalNot, boolean, crosses), Binary(state, spv::OpIEqual, boolean, tail, ConstantU32(state, 2))));
+		has_resident = Binary(state, spv::OpLogicalOr, boolean, first_ready, Binary(state, spv::OpINotEqual, boolean, tail, ConstantU32(state, 0)));
+	}
 	const auto use = word(BufferCache::USE_BITMAP_OFFSET);
 	const auto used = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAtomicLoad, u32, used, use, ConstantU32(state, spv::ScopeDevice),
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
 	const auto unused = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, used, bit), ConstantU32(state, 0));
 	EmitIfCondition(state, AndCondition(state, ready, unused), [&] { mark(use); });
-	const auto missed = AndCondition(state, inside, Unary(state, spv::OpLogicalNot, boolean, ready));
+	const auto missed = AndCondition(state, inside, Unary(state, spv::OpLogicalNot, boolean, has_resident));
 	const auto guest_page = EmitValueOrDefaultIfCondition(state, missed, u64, ConstantU64(state, 0), [&] {
 		mark(word(BufferCache::FAULT_BITMAP_OFFSET));
 		const auto guest = EmitGuestHostAddress(state, offset, size, extent, in_page);
@@ -2298,7 +2341,7 @@ uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t
 		});
 		return guest;
 	});
-	return Select(state, u64, ready, Binary(state, spv::OpIAdd, u64, host_bias, address), guest_page);
+	return Select(state, u64, ready, Binary(state, spv::OpIAdd, u64, mirror_base, translated), guest_page);
 }
 
 void DefineGetBdaPointerMasked(EmitterState& state) {

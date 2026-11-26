@@ -102,7 +102,8 @@ public:
 	void NoteFlip() noexcept { m_flip_number.fetch_add(1, std::memory_order_relaxed); }
 #endif
 	[[nodiscard]] bool UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const;
-	void               MapMemory(uint64_t vaddr, uint64_t size);
+	bool               AdmitMemory(uint64_t address, uint64_t size);
+	bool               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	bool               CacheSelfSizedBuffers(const ShaderStageRuntime& runtime);
@@ -120,6 +121,7 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	bool ReserveMirrorRange(uint64_t address, uint64_t size);
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages, bool bind_spans = false);
 	[[nodiscard]] bool AddRecordReach(const ShaderStageRuntime& runtime);

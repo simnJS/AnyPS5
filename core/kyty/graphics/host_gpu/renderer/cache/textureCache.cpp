@@ -3181,6 +3181,7 @@ bool BufferCache::SynchronizeRangeFromImage(uint64_t vaddr, uint64_t size) {
 	m_guest_mirror->ForEachOwned(address, image.info.data.size, [&](uint64_t begin, uint64_t end) {
 		if (begin == address + available) available = end - address;
 	});
+	available = m_guest_mirror->ContiguousSize(address, available);
 	if (available == 0) {
 		return false;
 	}

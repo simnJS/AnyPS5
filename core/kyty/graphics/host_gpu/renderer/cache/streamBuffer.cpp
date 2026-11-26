@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/guestMirror.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -146,11 +147,24 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
                MirrorWindow mirror)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
       m_handle_offset(cpu_address - mirror.base), m_device_address(mirror.address), m_buffer(mirror.buffer), m_size(size),
-      m_window(true) {
+      m_mirror(mirror.mirror), m_window(true) {
 	EXIT_IF(mirror.buffer == nullptr || size == 0 || mirror.address == 0);
 #if defined(ANYPS5_KYTY)
 	m_device_local = true;
 #endif
+}
+
+uint64_t Buffer::Offset(uint64_t address) const noexcept {
+	return m_mirror != nullptr ? m_mirror->Offset(address) : address - m_cpu_address + m_handle_offset;
+}
+
+uint64_t Buffer::GuestAddress(uint64_t offset) const noexcept {
+	return m_mirror != nullptr ? m_mirror->Address(offset) : m_cpu_address - m_handle_offset + offset;
+}
+
+bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
+	if (m_mirror != nullptr) return size != 0 && m_mirror->ContiguousSize(address, size) == size;
+	return address >= m_cpu_address && size <= Size() && address - m_cpu_address <= Size() - size;
 }
 
 Buffer::~Buffer() {

@@ -152,9 +152,8 @@ const char* CheckFill(GraphicContext& graphics, uint64_t address) {
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 	auto* mirror = cache.GetGuestMirror();
 	if (mirror == nullptr) return "the cache has no mirror";
-	if (!mirror->Holds(address, GuestBytes)) {
-		g_skipped = "the guest memory lies outside the mirror";
-		return nullptr;
+	if (!renderer.MapMemory(address, GuestBytes)) {
+		return "the high guest mapping was refused";
 	}
 
 	Random random(777u);
@@ -194,7 +193,7 @@ const char* CheckFill(GraphicContext& graphics, uint64_t address) {
 	const auto              base_job = [&](uint32_t view, uint32_t first, uint32_t step, uint32_t count, uint32_t key_words,
 	                          uint32_t profile) {
 		const auto& table = tables[view];
-		Slots::Job  job {.table       = mirror->DeviceAddress() + address + table.offset - mirror->Base(),
+		Slots::Job  job {.table       = mirror->DeviceAddress() + mirror->Offset(address + table.offset),
 		                 .slots       = 0,
 		                 .guest       = address + table.offset,
 		                 .table_words = static_cast<uint32_t>(table.bytes / 4u),
@@ -404,8 +403,9 @@ extern "C" int RunKytyImageHeapFillTest() {
 		std::fprintf(stderr, "%s: FAILED: could not create the allocator\n", Name);
 		return 1;
 	}
-	void* guest = nullptr;
-	if (sceKernelMapFlexibleMemory(&guest, GuestBytes, CpuReadWrite, 0) != 0 || guest == nullptr) {
+	constexpr uint64_t Fixture = 960 * GuestMirror::GiB - 3 * BufferCache::MIRROR_BLOCK_SIZE;
+	void* guest = reinterpret_cast<void*>(Fixture);
+	if (sceKernelMapFlexibleMemory(&guest, GuestBytes, CpuReadWrite, 0x90) != 0 || reinterpret_cast<uint64_t>(guest) != Fixture) {
 		std::fprintf(stderr, "%s: FAILED: could not map guest backing\n", Name);
 		return 1;
 	}

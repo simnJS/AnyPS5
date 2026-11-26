@@ -262,7 +262,7 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 	command.pipelineBarrier2(dependency);
 
 	const auto area = reader.current;
-	Common::UniqueFunction<void> scan = [&reader, mapped, offset, area, area_size, page_writes, base = m_buffer_cache.GetGuestMirror()->Base(),
+	Common::UniqueFunction<void> scan = [&reader, mapped, offset, area, area_size, page_writes,
 	                                     handler = std::move(handler)] {
 		reader.download.Invalidate(offset, area_size);
 		const auto* entries = std::bit_cast<const uint64_t*>(mapped);
@@ -271,8 +271,8 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 		std::vector<uint64_t> pages;
 		pages.reserve(count);
 		for (uint64_t index = 1; index <= count; ++index) {
-			pages.push_back(page_writes ? BufferCache::GuestAddress(entries[index] << BufferCache::CACHING_PAGEBITS)
-			                       : base + (entries[index] << BufferCache::MIRROR_BLOCK_BITS));
+			const auto shift = page_writes ? BufferCache::CACHING_PAGEBITS : BufferCache::MIRROR_BLOCK_BITS;
+			pages.push_back(BufferCache::GuestAddress(entries[index] << shift));
 		}
 		if (!pages.empty()) {
 			handler(pages);
