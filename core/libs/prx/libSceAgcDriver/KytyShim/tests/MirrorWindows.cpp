@@ -291,6 +291,12 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	take();
 	if (!taken.empty()) return "a heap table reports a GPU write before any was made";
 
+	buffers.NoteDeviceAddressUse();
+	take();
+	if (taken.size() != 1 || taken.front() != table_range) {
+		return "an indirect address write does not reach the heap before the write bitmap is read";
+	}
+
 	const auto [written, written_offset] = buffers.ObtainRange(address + WrittenAt, WrittenBytes, true);
 	if (written->Handle() != mirror->Handle()) return "a written range is not served from the mirror";
 	written->Fill(written_offset, WrittenBytes, GpuValue);

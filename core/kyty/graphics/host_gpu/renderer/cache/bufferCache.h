@@ -208,10 +208,15 @@ public:
 			if (size != 0) m_heap_tables.Add(base, size);
 		}
 	}
+	void NoteIndirectHeapWrites() noexcept { m_heap_writes_unbounded = !m_heap_tables.Empty(); }
 	template <typename Func>
 	void TakeHeapTableWrites(Func&& func) {
-		if (m_heap_table_writes.Empty()) return;
-		m_heap_table_writes.ForEach(func);
+		if (std::exchange(m_heap_writes_unbounded, false)) {
+			m_heap_tables.ForEach(func);
+		} else {
+			if (m_heap_table_writes.Empty()) return;
+			m_heap_table_writes.ForEach(func);
+		}
 		m_heap_table_writes.Clear();
 	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -273,6 +278,7 @@ public:
 	void BeginIndirectWrites() noexcept { m_indirect_writes_pending.fetch_add(1, std::memory_order_acq_rel); }
 	void EndIndirectWrites() noexcept { m_indirect_writes_pending.fetch_sub(1, std::memory_order_acq_rel); }
 	void NoteDeviceAddressUse() noexcept {
+		NoteIndirectHeapWrites();
 		m_device_address_pending = true;
 		if (m_device_address_hot != 0 &&
 		    m_readback_count - m_device_address_hot < HotReadbackLifetime) {
@@ -428,6 +434,7 @@ private:
 	bool                                              m_record_released = false;
 	RangeSet                                          m_heap_tables;
 	RangeSet                                          m_heap_table_writes;
+	bool                                              m_heap_writes_unbounded = false;
 	static constexpr size_t                           StaleRingSize = 32;
 	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};
 	std::atomic<uint32_t>                             m_stale_ring_next {0};
