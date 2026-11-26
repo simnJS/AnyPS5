@@ -331,7 +331,7 @@ uint32_t DefineBvhFunction(EmitterState& s, bool boxes) {
 	if (!boxes) {
 		require(triangle);
 		const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
-			const auto first = GetBdaPointer(s, address);
+			const auto first = GetBdaPointer(s, address, 64);
 			return EmitValueOrDefaultIfCondition(s, Binary(s, spv::OpINotEqual, b, first, ConstantU64(s, 0)), vec4,
 			                                     invalid, [&] { return Triangle(s, BvhNode(s, first), kind, bary, origin, direction); });
 		});
@@ -340,9 +340,9 @@ uint32_t DefineBvhFunction(EmitterState& s, bool boxes) {
 		return function;
 	}
 	const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
-		const auto first = GetBdaPointer(s, address);
+		const auto first = GetBdaPointer(s, address, 64);
 		const auto second  = EmitValueOrDefaultIfCondition(s, full, wide, ConstantU64(s, 0), [&] {
-			return GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address, ConstantU64(s, 64)));
+			return GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address, ConstantU64(s, 64)), 64);
 		});
 		const auto present = Binary(
 		    s, spv::OpLogicalAnd, b, Binary(s, spv::OpINotEqual, b, first, ConstantU64(s, 0)),

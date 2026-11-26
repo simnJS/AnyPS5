@@ -126,6 +126,7 @@ public:
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
 	void RequestDeviceRange(uint64_t vaddr, uint64_t size);
 	void ImportGuestMemory(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool GuestMemoryImported(uint64_t vaddr, uint64_t size) const { return m_host_view->Overlaps(vaddr, size); }
 	void ForgetGuestMemory(uint64_t vaddr, uint64_t size);
 	void EnsureRangeContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InMirror(const Buffer* buffer) const noexcept { return buffer != nullptr && buffer == m_storage.get(); }
@@ -182,7 +183,7 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	[[nodiscard]] StreamBuffer& GetTableUploadBuffer();
-	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
+	void               PrepareFaultBuffer(bool may_write = false);
 	void               ProcessFaultBuffer();
 	bool               ProcessHackMarks() { return m_fault_manager.ProcessHackMarkBuffer(); }
 	void               ProcessUseBuffer();
@@ -288,7 +289,10 @@ private:
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer);
-	[[nodiscard]] vk::Buffer UploadCopies(std::span<vk::BufferCopy> copies, uint64_t total_size);
+	[[nodiscard]] vk::Buffer UploadCopies(std::vector<vk::BufferCopy>& copies, uint64_t total_size);
+	void                     TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
+	void                     NotePromotion(uint64_t begin, uint64_t end);
+	[[nodiscard]] bool       IsResident(uint64_t vaddr) const noexcept;
 	void RecordUpload(std::span<const vk::BufferCopy> copies, vk::Buffer source);
 	void SynchronizeRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	[[nodiscard]] bool SynchronizeRangeFromImage(uint64_t vaddr, uint64_t size);
@@ -473,6 +477,15 @@ private:
 	std::unique_ptr<GuestMirror> m_guest_mirror;
 	std::unique_ptr<GuestHostView> m_host_view;
 	std::unique_ptr<Buffer>      m_storage;
+	struct Promoted {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	std::vector<Promoted>                             m_promoted;
+	std::vector<vk::BufferCopy>                       m_ordered_staged;
+	std::vector<std::pair<vk::Buffer, vk::BufferCopy>> m_ordered_direct;
+	uint64_t                                          m_guest_store_tick = 0;
 	GuestMirror::Runs            m_fresh;
 	GuestMirror::Runs            m_victims;
 	int64_t                      m_evict_check         = 0;

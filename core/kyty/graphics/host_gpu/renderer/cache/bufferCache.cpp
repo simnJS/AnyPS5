@@ -299,7 +299,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_storage = std::make_unique<Buffer>(
 	    m_graphics, m_scheduler, m_guest_mirror->Base(), m_guest_mirror->Size(),
 	    MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress(), m_guest_mirror->Base()});
-	m_host_view = std::make_unique<GuestHostView>(m_graphics, m_guest_mirror->Base(), m_guest_mirror->Size());
+	m_host_view = std::make_unique<GuestHostView>(m_graphics, m_scheduler, m_staging_buffer, m_guest_mirror->Base(),
+	                                              m_guest_mirror->Size());
 	const uint64_t metadata[] {m_guest_mirror->DeviceAddress() - m_guest_mirror->Base(), m_guest_mirror->Base(),
 	                           m_guest_mirror->Size(), 0,
 	                           FAULT_BITMAP_OFFSET / sizeof(uint32_t) | (USE_BITMAP_OFFSET / sizeof(uint32_t)) << 32u,
@@ -1322,6 +1323,106 @@ void BufferCache::ImportGuestMemory(uint64_t vaddr, uint64_t size) {
 	m_host_view->Import(vaddr, size);
 }
 
+void BufferCache::PrepareFaultBuffer(bool may_write) {
+	m_fault_manager.PrepareFaultBuffer();
+	m_host_view->Publish();
+	m_host_view->NoteReach();
+	if (may_write && m_host_view->Enabled()) m_guest_store_tick = m_scheduler.CurrentTick();
+}
+
+bool BufferCache::IsResident(uint64_t vaddr) const noexcept {
+	const auto block = (vaddr - m_guest_mirror->Base()) / MIRROR_BLOCK_SIZE;
+	return vaddr >= m_guest_mirror->Base() && block / 32 < m_residency_words.size() &&
+	       (m_residency_words[block / 32] >> (block % 32) & 1u) != 0;
+}
+
+void BufferCache::NotePromotion(uint64_t begin, uint64_t end) {
+	m_memory_tracker.MarkRegionAsCpuModified(begin, end - begin);
+	if (m_guest_store_tick == 0) return;
+	if (m_scheduler.GetMasterSemaphore().IsFree(m_guest_store_tick)) {
+		m_guest_store_tick = 0;
+		return;
+	}
+	m_promoted.push_back({begin, end, m_guest_store_tick});
+}
+
+void BufferCache::TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_t& total_size) {
+	if (m_promoted.empty()) return;
+	std::erase_if(m_promoted, [this](const Promoted& run) { return m_scheduler.GetMasterSemaphore().IsFree(run.tick); });
+	if (m_promoted.empty()) return;
+	const auto& buffer = *m_storage;
+	m_ordered_staged.clear();
+	m_ordered_direct.clear();
+	uint64_t   staged = 0;
+	const auto stage  = [&](uint64_t address, uint64_t bytes) {
+		if (bytes == 0) return;
+		if (!m_ordered_staged.empty() && m_ordered_staged.back().dstOffset + m_ordered_staged.back().size == buffer.Offset(address)) {
+			m_ordered_staged.back().size += bytes;
+		} else {
+			m_ordered_staged.emplace_back(staged, buffer.Offset(address), bytes);
+		}
+		staged += bytes;
+	};
+	const auto promoted = [this](uint64_t address) {
+		return std::ranges::any_of(m_promoted, [address](const Promoted& run) { return address >= run.begin && address < run.end; });
+	};
+	uint64_t ordered = 0;
+	for (const auto& copy: copies) {
+		const auto end = buffer.HandleOrigin() + copy.dstOffset + copy.size;
+		for (auto cursor = buffer.HandleOrigin() + copy.dstOffset; cursor < end;) {
+			const auto stop = std::min(end, Common::AlignDown(cursor, MIRROR_BLOCK_SIZE) + MIRROR_BLOCK_SIZE);
+			auto       done = cursor;
+			if (promoted(cursor)) {
+				m_host_view->ForEachSource(cursor, stop - cursor, [&](uint64_t begin, uint64_t bytes, vk::Buffer source, uint64_t offset) {
+					stage(done, begin - done);
+					m_ordered_direct.emplace_back(source, vk::BufferCopy {offset, buffer.Offset(begin), bytes});
+					ordered += bytes;
+					done = begin + bytes;
+				});
+			}
+			stage(done, stop - done);
+			cursor = stop;
+		}
+	}
+	if (m_ordered_direct.empty()) return;
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferRead |
+	                       vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	std::vector<vk::BufferCopy> regions;
+	for (size_t first = 0; first < m_ordered_direct.size();) {
+		regions.clear();
+		auto last = first;
+		for (; last < m_ordered_direct.size() && m_ordered_direct[last].first == m_ordered_direct[first].first; last++) {
+			regions.push_back(m_ordered_direct[last].second);
+		}
+		auto                    barriers = CopyBarriers(regions, false, before);
+		const vk::MemoryBarrier written {.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eMemoryWrite,
+		                                 .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1, &written,
+		                       static_cast<uint32_t>(barriers.size()), barriers.data(), 0, nullptr);
+		native.copyBuffer(m_ordered_direct[first].first, buffer.Handle(), static_cast<uint32_t>(regions.size()), regions.data());
+		for (auto& after: barriers) {
+			after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		}
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, static_cast<uint32_t>(barriers.size()), barriers.data(),
+		                       0, nullptr);
+		first = last;
+	}
+	m_host_view->NoteReach();
+	m_host_view->NoteOrderedCopy(ordered);
+	copies.assign(m_ordered_staged.begin(), m_ordered_staged.end());
+	total_size = staged;
+}
+
 void BufferCache::ForgetGuestMemory(uint64_t vaddr, uint64_t size) {
 	m_host_view->Forget(vaddr, size);
 }
@@ -1383,6 +1484,13 @@ void BufferCache::SetResident(uint64_t begin, uint64_t end, bool resident) {
 		const uint32_t mask = (~uint32_t {0} << low) & (~uint32_t {0} >> (31 - high));
 		auto& bits = m_residency_words[word];
 		const auto next = resident ? bits | mask : bits & ~mask;
+		for (auto fresh = next & ~bits; fresh != 0;) {
+			const auto start  = static_cast<uint32_t>(std::countr_zero(fresh));
+			const auto length = static_cast<uint32_t>(std::countr_one(fresh >> start));
+			const auto from   = m_guest_mirror->Base() + (word * 32 + start) * MIRROR_BLOCK_SIZE;
+			NotePromotion(from, from + length * MIRROR_BLOCK_SIZE);
+			fresh = start + length >= 32 ? 0 : fresh & ~((uint32_t {1} << (start + length)) - 1);
+		}
 		if (bits != next) {
 			bits = next;
 			changed = std::min(changed, word);
@@ -1513,8 +1621,12 @@ void BufferCache::SynchronizeRanges(std::span<const std::pair<uint64_t, uint64_t
 	    m_device_sync_pass);
 }
 
-vk::Buffer BufferCache::UploadCopies(std::span<vk::BufferCopy> copies, uint64_t total_size) {
+vk::Buffer BufferCache::UploadCopies(std::vector<vk::BufferCopy>& copies, uint64_t total_size) {
 	const auto& buffer = *m_storage;
+	if (copies.empty()) {
+		return nullptr;
+	}
+	TakeOrderedCopies(copies, total_size);
 	if (copies.empty()) {
 		return nullptr;
 	}
@@ -2815,11 +2927,18 @@ void BufferCache::TickGuestMirror() {
 	    stats.unbound_reads, used / MiB, budget / MiB, stats.requests,
 	    stats.requests != 0 ? static_cast<double>(stats.request_ns) / 1e6 / static_cast<double>(stats.requests) : 0.0,
 	    static_cast<double>(stats.request_longest_ns) / 1e6));
+	if (m_host_view->Enabled()) {
+		const auto host = m_host_view->Totals();
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-host-view] {} imports of guest memory ({:.1f} MiB), {} refused; {} unmaps waited for the GPU; {:.1f} MiB "
+		    "copied in command order into blocks bound behind a dispatch that stores by device address\n",
+		    host.imports, static_cast<double>(host.bytes) / static_cast<double>(MiB), host.refused, host.waits,
+		    static_cast<double>(host.ordered) / static_cast<double>(MiB)));
+	}
 }
 
 void BufferCache::RunGarbageCollector() {
 	m_gc_tick++;
-	m_host_view->Retire(m_scheduler.GetMasterSemaphore().KnownGpuTick(), m_scheduler.CurrentTick());
 	m_guest_mirror->Age(static_cast<uint32_t>(Frame()));
 	TickGuestMirror();
 	EvictOldBlocks();
@@ -2903,7 +3022,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 		EXIT("BufferCache: invalid GPU write range\n");
 	}
 	m_scheduler.Context().CollectHotPageWrites(vaddr, size);
-	m_guest_mirror->ForEachRequested(vaddr, size, [&](uint64_t start, uint64_t finish) {
+	const auto written = [&](uint64_t start, uint64_t finish) {
 		m_guest_mirror->Use(start, finish - start);
 		NoteWrite(start, finish - start);
 		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(start, finish - start, [&](uint64_t page, uint64_t bytes) {
@@ -2913,6 +3032,18 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 				NoteGpuModifiedChange(first, last - first, true);
 			}
 		});
+	};
+	m_guest_mirror->ForEachRequested(vaddr, size, [&](uint64_t start, uint64_t finish) {
+		uint64_t run = UINT64_MAX;
+		for (auto block = start; block < finish; block = std::min(finish, Common::AlignDown(block, MIRROR_BLOCK_SIZE) + MIRROR_BLOCK_SIZE)) {
+			if (IsResident(block)) {
+				if (run == UINT64_MAX) run = block;
+			} else if (run != UINT64_MAX) {
+				written(run, block);
+				run = UINT64_MAX;
+			}
+		}
+		if (run != UINT64_MAX) written(run, finish);
 	});
 }
 

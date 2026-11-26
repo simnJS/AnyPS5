@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/guestHostView.h"
 #include "graphics/host_gpu/renderer/cache/guestMirror.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
@@ -57,6 +58,7 @@ constexpr uint64_t    LeapBytes    = 0x200000;
 constexpr uint32_t    GpuValue     = 0x5eed1234u;
 
 std::string g_skipped;
+std::string g_unchecked;
 
 uint32_t Pattern(uint64_t index) {
 	return static_cast<uint32_t>(index * 2654435761u) ^ 0xa5a5a5a5u;
@@ -414,6 +416,90 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 	return failure;
 }
 
+const char* CheckRemap(GraphicContext& graphics, uint64_t address) {
+	constexpr uint64_t Page  = GuestHostView::PageSize;
+	constexpr uint64_t Bytes = 4 * Page;
+	constexpr uint64_t Half  = 2 * Page;
+	RenderContext    renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+	const auto* view = renderer.GetBufferCache().GetGuestHostView();
+	if (view == nullptr || !view->Enabled()) {
+		g_unchecked = "the device does not import host memory";
+		return nullptr;
+	}
+	auto* guest = reinterpret_cast<uint32_t*>(address);
+	for (uint64_t i = 0; i < GuestBytes / sizeof(uint32_t); ++i) guest[i] = Pattern(i);
+	renderer.MapMemory(address, Bytes);
+	renderer.PrepareBda(false, false);
+	AddressReader reader(graphics, scheduler, 16);
+	const auto    qword = [&](uint64_t device) {
+		reader.Record(scheduler, device, 8);
+		Finish(scheduler);
+		const auto words = reader.Words(8);
+		return words[0] | (uint64_t {words[1]} << 32u);
+	};
+	const auto entry = [&](uint64_t guest_address) -> uint64_t {
+		const auto offset = guest_address - renderer.GetBufferCache().GetGuestMirror()->Base();
+		const auto chunk  = qword(view->TableAddress() + (offset >> GuestHostView::ChunkBits) * sizeof(uint64_t));
+		if (chunk == 0) return 0;
+		return qword(chunk + ((offset >> GuestHostView::PageBits) & (GuestHostView::EntriesPerChunk - 1)) * sizeof(uint64_t));
+	};
+	const auto reads = [&](uint64_t guest_address) {
+		const auto page = entry(guest_address & ~(Page - 1));
+		if (page == 0 || page != view->Lookup(guest_address & ~(Page - 1))) return false;
+		reader.Record(scheduler, page + (guest_address & (Page - 1)), 8);
+		Finish(scheduler);
+		const auto words = reader.Words(8);
+		return std::memcmp(words.data(), reinterpret_cast<const void*>(guest_address), 8) == 0;
+	};
+	const auto verify = [&]() -> const char* {
+		if (view->Lookup(address) == 0 || view->Lookup(address + Half) == 0) {
+			g_unchecked = "the driver did not import the guest memory of the fixture";
+			return nullptr;
+		}
+		if (!reads(address) || !reads(address + Half) || !reads(address + Bytes - 8)) {
+			return "the table of guest pages does not lead to the guest memory mapped first";
+		}
+		if (entry(address + Bytes) != 0) return "the table holds a page beyond the mapping";
+		const auto mapped = view->Totals();
+		renderer.PrepareBda(false, false);
+		renderer.UnmapMemory(address, Half);
+		const auto parted = view->Totals();
+		if (parted.waits != mapped.waits + 1) return "an unmap did not wait for the submission that could reach its import";
+		if (parted.bytes != Half) return "an unmap of half an import did not leave the other half imported";
+		if (entry(address) != 0 || entry(address + Page) != 0 || view->Lookup(address) != 0) {
+			return "the table still leads to unmapped guest pages";
+		}
+		if (!reads(address + Half) || !reads(address + Bytes - 8)) return "the pages beside an unmapped range lost their guest memory";
+		for (uint64_t i = 0; i < Half / sizeof(uint32_t); ++i) guest[i] = ~Pattern(i);
+		renderer.MapMemory(address, Half);
+		renderer.PrepareBda(false, false);
+		const auto again = view->Totals();
+		if (again.bytes != Bytes || again.imports != parted.imports + 1 || again.refused != mapped.refused) {
+			return "a range mapped again beside its old neighbour is not imported once";
+		}
+		if (!reads(address) || !reads(address + Half - 8)) return "a range mapped again does not read its new guest memory";
+		if (!reads(address + Half)) return "mapping a range again lost the guest memory beside it";
+		renderer.UnmapMemory(address, Half);
+		if (view->Totals().imports != parted.imports || view->Totals().bytes != Half) return "an unmap released more than its own import";
+		if (entry(address) != 0 || !reads(address + Half) || !reads(address + Bytes - 8)) {
+			return "the second unmap of a range touched the pages beside it";
+		}
+		renderer.MapMemory(address, Half);
+		renderer.MapMemory(address, Half);
+		renderer.PrepareBda(false, false);
+		if (view->Totals().bytes != Bytes || !reads(address) || !reads(address + Half)) return "a range mapped twice is not imported once";
+		return nullptr;
+	};
+	const auto* failure = verify();
+	renderer.UnmapMemory(address, GuestBytes);
+	if (failure == nullptr && (view->Totals().imports != 0 || view->Totals().bytes != 0)) return "an unmap of everything left an import";
+	return failure;
+}
+
 }
 
 extern "C" int RunKytyMirrorWindowsTest() {
@@ -438,6 +524,7 @@ extern "C" int RunKytyMirrorWindowsTest() {
 	const auto  address = reinterpret_cast<uint64_t>(guest);
 	const auto* failure = CheckWindows(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckDispatch(graphics, address);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckRemap(graphics, address);
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", Name);
 		return 1;
@@ -450,6 +537,7 @@ extern "C" int RunKytyMirrorWindowsTest() {
 		std::printf("%s: skipped, %s\n", Name, g_skipped.c_str());
 		return 77;
 	}
+	if (!g_unchecked.empty()) std::printf("%s: %s, imports of guest memory not checked\n", Name, g_unchecked.c_str());
 	std::printf("%s: ok\n", Name);
 	return 0;
 }

@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace KytyShimTests {
 
@@ -166,10 +167,15 @@ private:
 				}
 			}
 		}
+		std::vector<const char*> enabled_extensions(required_extensions.begin(), required_extensions.end());
+		const bool host_memory = std::ranges::any_of(extensions.value, [](const auto& extension) {
+			return std::string_view(extension.extensionName.data()) == VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+		});
+		if (host_memory) enabled_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 		const vk::DeviceCreateInfo device_info {
 		    .pNext = &features13, .queueCreateInfoCount = queue_count, .pQueueCreateInfos = queue_infos.data(),
-		    .enabledExtensionCount = static_cast<uint32_t>(required_extensions.size()),
-		    .ppEnabledExtensionNames = required_extensions.data(),
+		    .enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size()),
+		    .ppEnabledExtensionNames = enabled_extensions.data(),
 		    .pEnabledFeatures = &core_features};
 		if (physical.createDevice(&device_info, nullptr, &graphics.device) != vk::Result::eSuccess) {
 			return false;
@@ -183,6 +189,13 @@ private:
 			graphics.physical_device_properties.limits.storageImageSampleCounts = vk::SampleCountFlagBits::e1;
 		}
 		graphics.physical_device_memory_properties = physical.getMemoryProperties();
+		if (host_memory) {
+			vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_properties {};
+			vk::PhysicalDeviceProperties2                     with_host {.pNext = &host_properties};
+			physical.getProperties2(&with_host);
+			graphics.external_memory_host_enabled = true;
+			graphics.host_pointer_alignment       = host_properties.minImportedHostPointerAlignment;
+		}
 		graphics.queue_family = main_family;
 		graphics.device.getQueue(graphics.queue_family, 0, &graphics.queue);
 		graphics.readback_family = readback_family;

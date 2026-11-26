@@ -15,6 +15,7 @@ layout(set = 0, binding = 0, std430) buffer MirrorState {
 	uint64_t rt_context;
 	uint fault_word;
 	uint use_word;
+	uint64_t host_table;
 	layout(offset = 256) uint words[];
 };
 
@@ -31,14 +32,33 @@ bool Resident(uint block) {
 	return false;
 }
 
+uint64_t GuestPage(uint64_t offset) {
+	if (host_table == 0) return 0;
+	const uint64_t chunk = U64Ref(host_table + ((offset >> 30) << 3)).v;
+	if (chunk == 0) return 0;
+	return U64Ref(chunk + (((offset >> 14) & 0xfffful) << 3)).v;
+}
+
+uint64_t GuestAddress(uint64_t offset, uint bytes) {
+	const uint64_t page = GuestPage(offset);
+	if (page == 0) return 0;
+	const uint64_t inside = offset & 0x3ffful;
+	if (inside + bytes > 0x4000ul) {
+		const uint64_t after = offset + 0x4000ul;
+		if (after >= mirror_size || GuestPage(after) != page + 0x4000ul) return 0;
+	}
+	return page + inside;
+}
+
 uint64_t HostAddress(uint64_t va, uint bytes) {
 	const uint64_t offset = va - guest_base;
 	if (offset >= mirror_size || bytes > mirror_size - offset) return 0;
 	const uint first = uint(offset >> 16);
 	const uint last = uint((offset + bytes - 1u) >> 16);
 	const bool start = Resident(first);
-	const bool end = first == last || Resident(last);
-	return start && end ? mirror_base + va : 0;
+	const bool end = first == last ? start : Resident(last);
+	if (start && end) return mirror_base + va;
+	return start || end ? 0 : GuestAddress(offset, bytes);
 }
 
 uint LoadGuestU32(uint64_t va) {

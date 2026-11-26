@@ -315,6 +315,14 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
 		m_bda_mapped_since_sync.emplace_back(vaddr, size);
 	}
+	if (m_buffer_cache.GuestMemoryImported(vaddr, size)) {
+		const auto forget = [this, vaddr, size] { m_buffer_cache.ForgetGuestMemory(vaddr, size); };
+		if (m_gpu == nullptr || m_gpu->IsStopping()) {
+			forget();
+		} else {
+			m_gpu->SendUrgentCommandSync(forget);
+		}
+	}
 	m_buffer_cache.ImportGuestMemory(vaddr, size);
 	if (m_texture_cache.HasPartialCandidates()) {
 		const auto map = [this, vaddr, size] { m_texture_cache.MapMemory(vaddr, size); };
@@ -1066,7 +1074,7 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
-	m_buffer_cache.PrepareFaultBuffer();
+	m_buffer_cache.PrepareFaultBuffer(may_write);
 	if (may_write) {
 		m_buffer_cache.NoteDeviceAddressUse();
 		m_indirect_write_tables.NotePendingWrites();
