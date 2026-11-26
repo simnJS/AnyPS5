@@ -43,6 +43,7 @@ struct Device {
 	std::string    name;
 
 	~Device() {
+		if (graphics.allocator) graphics.DestroyAllocator();
 		if (graphics.device) graphics.device.destroy();
 		if (graphics.instance) graphics.instance.destroy();
 	}
@@ -135,6 +136,7 @@ bool Open(Device& gpu, bool sparse, std::string& why) {
 	graphics.queue                            = graphics.device.getQueue(graphics.queue_family, 0);
 	graphics.sparse_buffers_enabled           = sparse;
 	if (sparse) graphics.sparse_queue = graphics.device.getQueue(graphics.sparse_family, 0);
+	Require(graphics.CreateAllocator(), "memory allocator");
 	gpu.name = graphics.physical_device_properties.deviceName.data();
 	return true;
 }

@@ -19,6 +19,9 @@
 #include <utility>
 #include <vector>
 
+VK_DEFINE_HANDLE(VmaAllocator)
+VK_DEFINE_HANDLE(VmaAllocation)
+
 namespace Libs::Graphics {
 
 struct GraphicContext;
@@ -129,7 +132,9 @@ private:
 		uint64_t         requested = 0;
 	};
 	struct Chunk {
-		vk::DeviceMemory memory = nullptr;
+		vk::DeviceMemory memory     = nullptr;
+		VmaAllocator     allocator  = nullptr;
+		VmaAllocation    allocation = nullptr;
 		uint32_t         used   = 0;
 		uint32_t         next   = 0;
 	};
@@ -190,7 +195,7 @@ private:
 	uint64_t        m_size           = 0;
 	uint64_t        m_base           = 0;
 	uint32_t        m_block_bits     = MinBlockBits;
-	uint32_t        m_memory_type    = 0;
+	uint32_t        m_memory_types   = 0;
 	uint64_t        m_device_address = 0;
 	std::string     m_description;
 	bool            m_shared_queue = false;

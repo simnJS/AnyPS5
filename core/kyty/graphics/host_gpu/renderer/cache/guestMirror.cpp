@@ -252,10 +252,10 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 	graphics.physical_device.getProperties2(&properties);
 	m_description = fmt::format(
 	    "sparse mirror of {} at guest address 0x{:x}, device address 0x{:x} to 0x{:x} (probe {:.1f} ms: {}), blocks of {} KiB, "
-	    "{} queue of family {}, memory type {}, every usage of the cache's buffers, shared with the readback family{}",
+	    "{} queue of family {}, memory types 0x{:x}, every usage of the cache's buffers, shared with the readback family{}",
 	    Gib(m_size), m_base, m_device_address, m_device_address + m_size, probe.ms, probe.trials, BlockSize() >> 10u,
 	    m_shared_queue ? "the work" : fmt::format("its own (index {})", graphics.sparse_queue_index),
-	    graphics.sparse_family, m_memory_type,
+	    graphics.sparse_family, m_memory_types,
 	    m_size > properties13.maxBufferSize ? fmt::format(", above maxBufferSize ({})", Gib(properties13.maxBufferSize))
 	                                        : std::string {});
 	auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
@@ -299,11 +299,11 @@ bool GuestMirror::CreateBuffer() {
 	m_device_address = device.getBufferAddress(&address_info);
 	m_block_bits     = std::max<uint32_t>(
         MinBlockBits, static_cast<uint32_t>(std::bit_width(std::max<uint64_t>(requirements.alignment, 1)) - 1));
-	m_memory_type = PickMemoryType(m_graphics.physical_device_memory_properties, requirements.memoryTypeBits);
+	m_memory_types = requirements.memoryTypeBits;
 	const vk::FenceCreateInfo         fence_info {};
 	vk::SemaphoreTypeCreateInfo       timeline {.semaphoreType = vk::SemaphoreType::eTimeline, .initialValue = 0};
 	const vk::SemaphoreCreateInfo     semaphore_info {.pNext = &timeline};
-	if (!std::has_single_bit(requirements.alignment) || m_memory_type == UINT32_MAX ||
+	if (!std::has_single_bit(requirements.alignment) || m_memory_types == 0 ||
 	    device.createFence(&fence_info, nullptr, &m_fence) != vk::Result::eSuccess ||
 	    device.createSemaphore(&semaphore_info, nullptr, &m_semaphore) != vk::Result::eSuccess) {
 		m_description = fmt::format("no mirror: page of {} bytes, memory types 0x{:x}, or no timeline semaphore",
@@ -318,7 +318,7 @@ void GuestMirror::DestroyBuffer() {
 	const auto device = m_graphics.device;
 	if (m_buffer) device.destroyBuffer(m_buffer);
 	for (auto& chunk: m_chunks) {
-		if (chunk.memory) device.freeMemory(chunk.memory);
+		if (chunk.allocation) vmaFreeMemory(chunk.allocator, chunk.allocation);
 	}
 	if (m_fence) device.destroyFence(m_fence);
 	if (m_semaphore) device.destroySemaphore(m_semaphore);
@@ -640,22 +640,32 @@ GuestMirror::Grant GuestMirror::Allocate(uint64_t wanted) {
 		m_chunks[slot.chunk].used++;
 		return {slot.chunk, slot.index, 1};
 	}
-	const vk::MemoryAllocateFlagsInfo flags {.flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
-	const vk::MemoryAllocateInfo      info {
-	         .pNext = &flags, .allocationSize = uint64_t {slots} << m_block_bits, .memoryTypeIndex = m_memory_type};
-	vk::DeviceMemory             memory;
-	const auto                   made = m_graphics.device.allocateMemory(&info, nullptr, &memory);
-	if (made != vk::Result::eSuccess) {
-		EXIT("[kyty-mirror] could not allocate %" PRIu64 " MiB for the mirror: %s\n", info.allocationSize >> 20u,
-		     vk::to_string(made).c_str());
+	const VkMemoryRequirements requirements {.size = uint64_t {slots} << m_block_bits, .alignment = BlockSize(),
+	                                         .memoryTypeBits = m_memory_types};
+	VmaAllocationCreateInfo allocation {};
+	allocation.flags          = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	allocation.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	Chunk chunk {.allocator = m_graphics.allocator};
+	VmaAllocationInfo info {};
+	auto result = vmaAllocateMemory(chunk.allocator, &requirements, &allocation, &chunk.allocation, &info);
+	if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && m_graphics.spill_allocator != nullptr) {
+		chunk.allocator = m_graphics.spill_allocator;
+		allocation.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+		result = vmaAllocateMemory(chunk.allocator, &requirements, &allocation, &chunk.allocation, &info);
 	}
+	if (result != VK_SUCCESS) {
+		EXIT("[kyty-mirror] could not allocate %" PRIu64 " MiB for the mirror: %s\n", requirements.size >> 20u,
+		     vk::to_string(static_cast<vk::Result>(result)).c_str());
+	}
+	EXIT_IF(info.offset != 0);
+	chunk.memory = info.deviceMemory;
 	if (!m_free_chunks.empty()) {
 		m_current_chunk = m_free_chunks.back();
 		m_free_chunks.pop_back();
-		m_chunks[m_current_chunk] = {memory, 0, 0};
+		m_chunks[m_current_chunk] = chunk;
 	} else {
 		m_current_chunk = static_cast<uint32_t>(m_chunks.size());
-		m_chunks.push_back({memory, 0, 0});
+		m_chunks.push_back(chunk);
 	}
 	m_chunk_count.fetch_add(1, std::memory_order_relaxed);
 	return Allocate(wanted);
@@ -734,7 +744,7 @@ void GuestMirror::Unbind(const Command& command) {
 	for (uint32_t index = 0; index < m_chunks.size(); index++) {
 		auto& chunk = m_chunks[index];
 		if (chunk.memory && chunk.used == 0) {
-			m_graphics.device.freeMemory(chunk.memory);
+			vmaFreeMemory(chunk.allocator, chunk.allocation);
 			chunk          = {};
 			emptied[index] = true;
 			m_free_chunks.push_back(index);
