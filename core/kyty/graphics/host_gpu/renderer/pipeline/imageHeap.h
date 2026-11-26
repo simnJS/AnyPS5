@@ -140,8 +140,11 @@ private:
 		uint64_t                                   synced  = 0;
 		uint64_t                                   ensured = 0;
 		uint32_t                                   idle    = 0;
+		uint32_t                                   gpu_all = 0;
 		bool                                       fresh   = true;
 		std::vector<std::pair<uint64_t, uint64_t>> written;
+		std::vector<std::pair<uint64_t, uint64_t>> gpu_written;
+		std::vector<std::pair<uint64_t, uint64_t>> gpu_carried;
 		std::vector<std::unique_ptr<View>>         views;
 	};
 
@@ -211,6 +214,8 @@ private:
 	void     Resize(Memory& memory, uint64_t base, uint64_t size);
 	void     WriteDescriptors();
 	void     Drop(Memory& memory);
+	void     WatchTables();
+	void     TakeGpuWrites();
 	uint32_t NewViewId(View* view);
 	View*    ViewById(uint32_t id) const;
 	void     ServiceMisses();
@@ -261,6 +266,7 @@ private:
 	uint64_t                                                            m_held_serial = 0;
 	std::deque<std::pair<uint64_t, uint32_t>>                           m_retired;
 	std::vector<std::pair<uint64_t, uint64_t>>                          m_runs;
+	std::vector<std::pair<uint64_t, uint64_t>>                          m_watched;
 	std::vector<uint32_t>                                               m_scratch;
 	std::vector<Image::HeapChange>                                      m_changes;
 	std::vector<std::pair<uint32_t, vk::DescriptorImageInfo>>           m_writes;

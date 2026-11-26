@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -56,6 +58,8 @@ constexpr uint64_t    GrowAt       = 0x40000;
 constexpr uint64_t    GrowBlock    = 0x10000;
 constexpr uint64_t    LeapBytes    = 0x200000;
 constexpr uint32_t    GpuValue     = 0x5eed1234u;
+constexpr uint64_t    TableAt      = 0x200;
+constexpr uint64_t    TableBytes   = 0x400;
 
 std::string g_skipped;
 std::string g_unchecked;
@@ -276,6 +280,17 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		return "a small range asked from the mirror does not read the guest bytes";
 	}
 
+	const std::pair<uint64_t, uint64_t>        table {address + WrittenAt + TableAt, TableBytes};
+	const std::pair<uint64_t, uint64_t>        table_range {table.first, table.first + table.second};
+	std::vector<std::pair<uint64_t, uint64_t>> taken;
+	const auto                                 take = [&] {
+		taken.clear();
+		buffers.TakeHeapTableWrites([&](uint64_t begin, uint64_t end) { taken.emplace_back(begin, end); });
+	};
+	buffers.WatchHeapTables(std::span(&table, 1));
+	take();
+	if (!taken.empty()) return "a heap table reports a GPU write before any was made";
+
 	const auto [written, written_offset] = buffers.ObtainRange(address + WrittenAt, WrittenBytes, true);
 	if (written->Handle() != mirror->Handle()) return "a written range is not served from the mirror";
 	written->Fill(written_offset, WrittenBytes, GpuValue);
@@ -293,6 +308,12 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		std::printf("%s: no readback queue on this device, its readback is not checked\n", Name);
 	}
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address + WrittenAt, WrittenBytes);
+	take();
+	if (taken.size() != 1 || taken.front() != table_range) {
+		return "a GPU write into a heap table is lost once its bytes are read back or discarded";
+	}
+	take();
+	if (!taken.empty()) return "a GPU write into a heap table is reported twice";
 
 	const auto [back, back_offset] = buffers.ObtainRange(address + NextAt, FirstBytes, false);
 	if (back->Handle() != mirror->Handle() || back_offset != address + NextAt - origin) {
@@ -311,11 +332,18 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	if (MemoryTracker::TakeWrittenUploadStats().uploads != 1) {
 		return "a written range is passed again although no page of it changed";
 	}
+	take();
+	if (taken.size() != 1 || taken.front() != table_range) {
+		return "a heap table misses a GPU write of a range written before";
+	}
+	buffers.WatchHeapTables({});
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address + WrittenAt, WrittenBytes);
 	(void)buffers.ObtainRange(address + WrittenAt, WrittenBytes, true);
 	if (MemoryTracker::TakeWrittenUploadStats().uploads != 1) {
 		return "a written range is not passed again after its pages changed";
 	}
+	take();
+	if (!taken.empty()) return "a GPU write is reported for a table that is no longer watched";
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address + WrittenAt, WrittenBytes);
 
 	if (mirror->AnyRequested(address + FarAt, WrittenBytes)) return "a block no range reached is requested";

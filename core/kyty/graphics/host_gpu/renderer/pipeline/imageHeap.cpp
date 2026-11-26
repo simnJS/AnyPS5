@@ -41,6 +41,7 @@ constexpr uint32_t CheckReportFrames    = 300;
 constexpr size_t   MaxChecks            = 256;
 constexpr size_t   MaxRangesPerView     = 32;
 constexpr uint32_t DirectoryGap         = 16;
+constexpr size_t   MaxGpuRuns           = 64;
 constexpr uint64_t StampBytes           = uint64_t {IR::ImageHeapCapacity} * sizeof(uint32_t);
 static_assert(Slots::ArmShift == IR::ImageHeapKindShift);
 static_assert(IR::ImageHeapCapacity - 1u <= Slots::IndexMask);
@@ -199,6 +200,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 			memory = m_memories.insert(m_memories.end(), std::make_unique<Memory>());
 		}
 		Resize(**memory, request.base, size);
+		WatchTables();
 	}
 	(*memory)->draw    = m_draw;
 	const auto profile = Profile(request.table ? *request.root : IR::ImageHeapResource(*request.root, 0u),
@@ -622,8 +624,11 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 		memory.base = base;
 		memory.size = size;
 	}
-	memory.fresh = true;
+	memory.fresh   = true;
+	memory.gpu_all = 0;
 	memory.written.clear();
+	memory.gpu_written.clear();
+	memory.gpu_carried.clear();
 	auto& scheduler = m_context.GetCommandScheduler();
 	for (auto& view: memory.views) {
 		view->count = std::min(view->limit, Probes(size, view->shape.first, view->shape.step));
@@ -736,9 +741,11 @@ void ImageHeap::SyncMemory(Memory& memory) {
 	if (memory.synced == m_draw) return;
 	memory.synced = m_draw;
 	auto&      cache = m_context.GetBufferCache();
-	const bool whole = memory.fresh || cache.HasGpuDirtyBytes(memory.base, memory.size);
+	const bool whole = memory.fresh || memory.gpu_all != 0u;
 	memory.fresh     = false;
+	memory.gpu_all   = memory.gpu_all != 0u ? memory.gpu_all - 1u : 0u;
 	m_runs.clear();
+	m_context.CollectHotPageWrites(memory.base, memory.size);
 	cache.ConsumeCpuWrites(CpuWriteConsumer::ImageHeapTables, memory.base, memory.size,
 	                       [&](uint64_t run, uint64_t bytes) {
 		                       m_runs.emplace_back(run, run + bytes);
@@ -753,6 +760,10 @@ void ImageHeap::SyncMemory(Memory& memory) {
 	                       });
 	m_runs.insert(m_runs.end(), memory.written.begin(), memory.written.end());
 	memory.written.clear();
+	m_runs.insert(m_runs.end(), memory.gpu_carried.begin(), memory.gpu_carried.end());
+	m_runs.insert(m_runs.end(), memory.gpu_written.begin(), memory.gpu_written.end());
+	std::swap(memory.gpu_carried, memory.gpu_written);
+	memory.gpu_written.clear();
 	bool needed = false;
 	for (const auto& view: memory.views) {
 		if (view->overflowed) continue;
@@ -884,26 +895,30 @@ void ImageHeap::PrepareGpu(CommandBuffer& buffer) {
 
 void ImageHeap::FlushDirectory(CommandBuffer& buffer) {
 	if (!m_directory.Dirty()) return;
-	auto&                       stream  = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	const auto                  buckets = m_directory.Buckets();
-	std::vector<vk::BufferCopy> copies;
-	uint32_t                    run_first = 0;
-	uint32_t                    run_end   = 0;
-	const auto                  emit      = [&] {
-		const auto bytes  = uint64_t {run_end - run_first} * sizeof(Slots::Bucket);
-		const auto offset = stream.Copy(buckets.data() + run_first, bytes, 16);
-		copies.push_back({offset, uint64_t {run_first} * sizeof(Slots::Bucket), bytes});
-	};
+	auto&                                      stream  = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	const auto                                 buckets = m_directory.Buckets();
+	std::vector<std::pair<uint32_t, uint32_t>> runs;
 	m_directory.TakeDirty([&](uint32_t first, uint32_t count) {
-		if (run_end != run_first && first <= run_end + DirectoryGap) {
-			run_end = first + count;
+		if (!runs.empty() && first <= runs.back().second + DirectoryGap) {
+			runs.back().second = first + count;
 			return;
 		}
-		if (run_end != run_first) emit();
-		run_first = first;
-		run_end   = first + count;
+		runs.emplace_back(first, first + count);
 	});
-	if (run_end != run_first) emit();
+	uint64_t total = 0;
+	for (const auto& [first, end]: runs) total += uint64_t {end - first} * sizeof(Slots::Bucket);
+	const auto [mapped, reserved] = stream.Map(total, 16);
+	EXIT_IF(mapped == nullptr);
+	std::vector<vk::BufferCopy> copies;
+	copies.reserve(runs.size());
+	uint64_t at = 0;
+	for (const auto& [first, end]: runs) {
+		const auto bytes = uint64_t {end - first} * sizeof(Slots::Bucket);
+		std::memcpy(mapped + at, buckets.data() + first, bytes);
+		copies.push_back({reserved + at, uint64_t {first} * sizeof(Slots::Bucket), bytes});
+		at += bytes;
+	}
+	stream.Commit();
 	const auto native = buffer.Handle();
 	GlobalBarrier(native, vk::PipelineStageFlagBits::eAllCommands, AnyAccess, vk::PipelineStageFlagBits::eTransfer,
 	              vk::AccessFlagBits::eTransferWrite);
@@ -930,12 +945,17 @@ ImageHeap::Ring& ImageHeap::CurrentRing() {
 
 void ImageHeap::Dispatch(CommandBuffer& buffer) {
 	if (m_jobs.empty()) return;
-	auto&      ring   = CurrentRing();
-	auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	const auto jobs   = stream.Copy(m_jobs.data(), m_jobs.size() * sizeof(Slots::Job), 16);
-	const auto groups = stream.Copy(m_groups.data(), m_groups.size() * sizeof(uint32_t), 16);
-	Slots::Push push {.jobs    = stream.BufferDeviceAddress() + jobs,
-	                  .groups  = stream.BufferDeviceAddress() + groups,
+	auto&      stream             = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	const auto job_bytes          = m_jobs.size() * sizeof(Slots::Job);
+	const auto group_bytes        = m_groups.size() * sizeof(uint32_t);
+	const auto [mapped, reserved] = stream.Map(job_bytes + group_bytes, 16);
+	EXIT_IF(mapped == nullptr);
+	std::memcpy(mapped, m_jobs.data(), job_bytes);
+	std::memcpy(mapped + job_bytes, m_groups.data(), group_bytes);
+	stream.Commit();
+	auto&       ring = CurrentRing();
+	Slots::Push push {.jobs    = stream.BufferDeviceAddress() + reserved,
+	                  .groups  = stream.BufferDeviceAddress() + reserved + job_bytes,
 	                  .buckets = m_buckets->BufferDeviceAddress(),
 	                  .ring    = ring.buffer->BufferDeviceAddress(),
 	                  .used    = m_used->BufferDeviceAddress(),
@@ -1194,6 +1214,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	}
 	if (stale) Repoint();
 	Requeue();
+	TakeGpuWrites();
 	for (auto* view: m_active) SyncMemory(view->memory);
 	for (const auto index: m_pending) {
 		if (m_elements[index].freed) continue;
@@ -1297,28 +1318,54 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 	std::erase_if(m_changes, other);
 	std::scoped_lock lock {m_mutex};
-	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
-		if (address >= memory->base + memory->size || memory->base >= address + size) {
-			return false;
-		}
-		Drop(*memory);
-		return true;
-	});
+	if (std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
+		    if (address >= memory->base + memory->size || memory->base >= address + size) {
+			    return false;
+		    }
+		    Drop(*memory);
+		    return true;
+	    }) != 0u) {
+		WatchTables();
+	}
 	if (ForEachChanged([&](uint32_t index) { Mark(index, State::Buried); })) Repoint();
 }
 
 void ImageHeap::RunGarbageCollector() {
 	++m_frame;
 	std::scoped_lock lock {m_mutex};
-	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
-		memory->idle = memory->draw > m_suspend_draw ? 0u : memory->idle + 1u;
-		if (memory->idle < (memory->size < MinTableBytes ? 1u : LargeTableIdleFrames)) {
-			return false;
-		}
-		Drop(*memory);
-		return true;
-	});
+	if (std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
+		    memory->idle = memory->draw > m_suspend_draw ? 0u : memory->idle + 1u;
+		    if (memory->idle < (memory->size < MinTableBytes ? 1u : LargeTableIdleFrames)) {
+			    return false;
+		    }
+		    Drop(*memory);
+		    return true;
+	    }) != 0u) {
+		WatchTables();
+	}
 	m_suspend_draw = m_draw;
+}
+
+void ImageHeap::WatchTables() {
+	m_watched.clear();
+	for (const auto& memory: m_memories) m_watched.emplace_back(memory->base, memory->size);
+	m_context.GetBufferCache().WatchHeapTables(m_watched);
+}
+
+void ImageHeap::TakeGpuWrites() {
+	m_context.GetBufferCache().TakeHeapTableWrites([&](uint64_t begin, uint64_t end) {
+		for (const auto& memory: m_memories) {
+			const auto first = std::max(begin, memory->base);
+			const auto last  = std::min(end, memory->base + memory->size);
+			if (first >= last) continue;
+			if (memory->gpu_written.size() >= MaxGpuRuns) {
+				memory->gpu_all = 2u;
+				memory->gpu_written.clear();
+				continue;
+			}
+			memory->gpu_written.emplace_back(first, last);
+		}
+	});
 }
 
 void ImageHeap::Drop(Memory& memory) {

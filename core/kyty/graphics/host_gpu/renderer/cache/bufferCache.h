@@ -202,6 +202,18 @@ public:
 		m_released_ranges.Clear();
 		m_record_released = true;
 	}
+	void WatchHeapTables(std::span<const std::pair<uint64_t, uint64_t>> tables) {
+		m_heap_tables.Clear();
+		for (const auto& [base, size]: tables) {
+			if (size != 0) m_heap_tables.Add(base, size);
+		}
+	}
+	template <typename Func>
+	void TakeHeapTableWrites(Func&& func) {
+		if (m_heap_table_writes.Empty()) return;
+		m_heap_table_writes.ForEach(func);
+		m_heap_table_writes.Clear();
+	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void SynchronizeBuffersInRanges(const RangeSet& ranges, bool all);
 	void ForceSynchronization(uint64_t vaddr, uint64_t size);
@@ -333,6 +345,11 @@ private:
 	void DrainHostCopies();
 	void NoteWrite(uint64_t vaddr, uint64_t size) {
 		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);
+		if (!m_heap_tables.Empty() && size != 0) {
+			m_heap_tables.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
+				m_heap_table_writes.Add(begin, end - begin);
+			});
+		}
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
 			m_pending_writes.emplace_back(vaddr, size);
 			for (const auto& hot: m_readback_hot) {
@@ -409,6 +426,8 @@ private:
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
+	RangeSet                                          m_heap_tables;
+	RangeSet                                          m_heap_table_writes;
 	static constexpr size_t                           StaleRingSize = 32;
 	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};
 	std::atomic<uint32_t>                             m_stale_ring_next {0};

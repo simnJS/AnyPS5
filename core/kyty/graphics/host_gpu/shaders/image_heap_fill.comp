@@ -63,7 +63,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Wor
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Slots {
 	uint v[];
 };
-layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Used {
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Used {
 	uint v[];
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer Ring {
@@ -151,7 +151,7 @@ void main() {
 			}
 			if (arm < arms) {
 				value = (arm << ArmShift) | (entry & IndexMask);
-				Used(pc.used).v[entry & IndexMask] = pc.frame;
+				atomicExchange(Used(pc.used).v[entry & IndexMask], pc.frame);
 			} else {
 				miss = true;
 			}
