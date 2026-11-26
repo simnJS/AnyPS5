@@ -227,6 +227,7 @@ kyty_embed_shader(gpu_tiler_shaders indirect_thread_dispatch indirect_thread_dis
 kyty_embed_shader(gpu_tiler_shaders buffer_scatter buffer_scatter.comp)
 kyty_embed_shader(gpu_tiler_shaders occlusion_counters occlusion_counters.comp)
 kyty_embed_shader(gpu_tiler_shaders check_compare check_compare.comp)
+kyty_embed_shader(gpu_tiler_shaders image_heap_fill image_heap_fill.comp)
 foreach(name IN ITEMS rt_tlas_walk rt_blas_walk hle_tlas hle_blas_refit)
     kyty_embed_shader(gpu_tiler_shaders ${name} ${name}.comp)
 endforeach()

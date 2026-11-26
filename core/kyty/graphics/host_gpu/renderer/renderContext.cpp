@@ -40,7 +40,7 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache, this),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_image_heap(*this, m_page_manager), m_pipeline_cache(graphics, &m_image_heap, shader_store) {
+      m_image_heap(*this), m_pipeline_cache(graphics, &m_image_heap, shader_store) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_ray_tracing = std::make_unique<RayTracing>(*this);
 #if defined(ANYPS5_KYTY)
@@ -102,11 +102,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write) {
 		const auto owner   = m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
 		const bool texture = m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		const bool heap    = m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 		m_strict_watch.InvalidateMemory(fault_vaddr, fault_size);
 		if (!GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
 			m_page_manager.NoteWriteFault(fault_vaddr);
-			BufferCache::CountWriteFault(owner, texture || heap);
+			BufferCache::CountWriteFault(owner, texture);
 		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, true);
@@ -121,7 +120,6 @@ void RenderContext::CollectHotPageWrites(uint64_t vaddr, uint64_t size) {
 		    auto& self = *static_cast<RenderContext*>(context);
 		    self.m_buffer_cache.InvalidateMemory(begin, end - begin, true);
 		    self.m_texture_cache.InvalidateMemory(begin, end - begin);
-		    self.m_image_heap.InvalidateMemory(begin, end - begin);
 		    self.m_strict_watch.InvalidateMemory(begin, end - begin);
 	    },
 	    this, vaddr, size);
@@ -169,7 +167,6 @@ void RenderContext::WriteFromCompletion(void* destination, const void* data,
 			if (m_page_manager.IsWatched(page)) {
 				m_buffer_cache.InvalidateUnlessGpuModified(vaddr, size);
 				m_texture_cache.InvalidateMemory(vaddr, size);
-				m_image_heap.InvalidateMemory(vaddr, size);
 				break;
 			}
 		}
@@ -203,7 +200,6 @@ void RenderContext::WriteQwordsFromCompletion(void* destination, const uint64_t*
 			if (m_page_manager.IsWatched(address & ~(TRACKER_PAGE_SIZE - 1))) {
 				m_buffer_cache.InvalidateUnlessGpuModified(address, sizeof(uint64_t));
 				m_texture_cache.InvalidateMemory(address, sizeof(uint64_t));
-				m_image_heap.InvalidateMemory(address, sizeof(uint64_t));
 			}
 		}
 		return;
@@ -249,7 +245,6 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
-	m_image_heap.InvalidateMemory(vaddr, size);
 	m_strict_watch.InvalidateMemory(vaddr, size);
 	return true;
 }
@@ -261,7 +256,6 @@ bool RenderContext::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
-	m_image_heap.InvalidateMemory(vaddr, size);
 	m_strict_watch.InvalidateMemory(vaddr, size);
 	return true;
 }

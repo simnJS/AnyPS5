@@ -33,8 +33,8 @@ struct GuestRange {
 };
 
 enum class DirtySource { Cpu, Gpu };
-enum class CpuWriteConsumer : uint32_t { IndirectWriteTables, BufferTables };
-constexpr size_t CPU_WRITE_CONSUMERS = 2;
+enum class CpuWriteConsumer : uint32_t { IndirectWriteTables, BufferTables, ImageHeapTables };
+constexpr size_t CPU_WRITE_CONSUMERS = 3;
 using RegionBits = Common::BitArray<TRACKER_REGION_PAGES>;
 static_assert(sizeof(RegionBits) == TRACKER_REGION_PAGES / 8);
 
