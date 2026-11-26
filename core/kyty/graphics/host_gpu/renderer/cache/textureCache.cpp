@@ -3751,7 +3751,7 @@ void TextureCache::NoteMetaFill(uint64_t address, uint64_t size, uint32_t value,
 	}
 	Common::ScopedLock pending {m_pending_meta_lock};
 	DropPendingMetaClearsLocked(address, size);
-	m_pending_meta_clears[address] = {size, m_gc_tick, value, in_memory, backing_stamp};
+	m_pending_meta_clears[address] = {size, m_gc_pass.load(std::memory_order_relaxed), value, in_memory, backing_stamp};
 	std::array<uint64_t, 64> granules {};
 	AddPendingMetaGranules(granules, address, size);
 	for (size_t word = 0; word < granules.size(); ++word) {
@@ -3939,9 +3939,10 @@ void TextureCache::ApplyPendingMetaClears(const ImageInfo& info, MetaDataInfo& m
 		}
 	}
 	const auto last = m_pending_meta_clears.lower_bound(range.End());
+	const auto pass = m_gc_pass.load(std::memory_order_relaxed);
 	for (auto it = first; slice != 0 && it != last; ++it) {
 		const auto [address, pending] = *it;
-		if (m_gc_tick - pending.tick > 1 || (info.metadata.stencil_compressed && ((pending.value >> 8u) & 0x3u) != 0)) {
+		if (pass - pending.tick > 1 || (info.metadata.stencil_compressed && ((pending.value >> 8u) & 0x3u) != 0)) {
 			continue;
 		}
 		uint64_t backing_stamp = 0;
@@ -4034,14 +4035,27 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+uint64_t TextureCache::AdvanceGcTick() {
+	const auto now = std::chrono::steady_clock::now();
+	const auto elapsed_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_gc_time).count();
+	const uint64_t step = elapsed_ms >= 16 ? static_cast<uint64_t>(elapsed_ms) / 16 : 1;
+	if (elapsed_ms >= 16) {
+		m_last_gc_time += std::chrono::milliseconds(static_cast<int64_t>(step * 16));
+	}
+	m_gc_tick += step;
+	return m_gc_tick - 1;
+}
+
 void TextureCache::RunGarbageCollector() {
 	Common::ScopedLock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	const uint64_t pass = m_gc_pass.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint64_t tick = AdvanceGcTick();
 	{
 		Common::ScopedLock pending {m_pending_meta_lock};
 		for (auto it = m_pending_meta_clears.begin(); it != m_pending_meta_clears.end();) {
 			const auto next = std::next(it);
-			if (m_gc_tick - it->second.tick > 1) {
+			if (pass - it->second.tick > 1) {
 				ErasePendingMetaClearsLocked(it, next);
 			}
 			it = next;

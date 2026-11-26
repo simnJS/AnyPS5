@@ -3159,9 +3159,10 @@ void BufferCache::CollectStaleBuffers(uint64_t tick) {
 	static constexpr uint64_t StalePeriod   = 8;
 	static constexpr size_t   StaleVisitMax = 64;
 	static constexpr size_t   StaleFreeMax  = 16;
-	if (tick < StaleAge || tick % StalePeriod != 0) {
+	if (tick < StaleAge || tick - m_last_stale_tick < StalePeriod) {
 		return;
 	}
+	m_last_stale_tick = tick;
 	std::vector<BufferId> stale;
 	std::vector<BufferId> kept;
 	m_lru_cache.ForEachItemBelow(tick - StaleAge, [&](BufferId id) {
@@ -3318,9 +3319,21 @@ uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQu
 	return deleted + SplitUnmappedBuffers(vaddr, size, free_blocks, splits);
 }
 
+uint64_t BufferCache::AdvanceGcTick() {
+	const auto now = std::chrono::steady_clock::now();
+	const auto elapsed_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_gc_time).count();
+	const uint64_t step = elapsed_ms >= 16 ? static_cast<uint64_t>(elapsed_ms) / 16 : 1;
+	if (elapsed_ms >= 16) {
+		m_last_gc_time += std::chrono::milliseconds(static_cast<int64_t>(step * 16));
+	}
+	m_gc_tick += step;
+	return m_gc_tick - 1;
+}
+
 void BufferCache::RunGarbageCollector() {
 	ServeInPlaceConversions();
-	const auto tick = m_gc_tick++;
+	const auto tick = AdvanceGcTick();
 	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		const auto budget = m_graphics.GetTotalMemoryBudget();

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <bitset>
 #include <map>
 #include <memory>
@@ -516,6 +517,10 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	void             UpdateMemoryThresholds(uint64_t budget_bytes);
 	uint64_t         m_gc_tick                = 0;
+	std::atomic<uint64_t> m_gc_pass {0};
+	std::chrono::steady_clock::time_point m_last_gc_time KYTY_GUARDED_BY(m_lock) {
+	    std::chrono::steady_clock::now()};
+	[[nodiscard]] uint64_t AdvanceGcTick() KYTY_REQUIRES(m_lock);
 	std::atomic<uint32_t> m_partial_candidates {0};
 	uint64_t         m_image_set_epoch        = 0;
 	static constexpr uint64_t ImageSetChangeHistory = 1024;
@@ -536,6 +541,7 @@ private:
 
 	friend struct TextureCacheTestAccess;
 	friend struct VramBudgetTestAccess;
+	friend struct VramTimeAgingTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
 	friend class ImageHeap;
