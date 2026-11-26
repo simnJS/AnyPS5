@@ -251,7 +251,7 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 		std::memcpy(mapped, words.data(), sizeof(words));
 	});
 	target->CopyFrom(scheduler.Current(), *upload, uploaded, destination, sizeof(words));
-	const auto consume = [&](uint32_t late_value) {
+	const auto consume = [&](uint32_t late_value, uint32_t replacement = 0u) {
 		heap.BeginDraw();
 		IR::ImageHeapView view;
 		if (!heap.Acquire(request, view) || view.kinds.size() != 1) return std::vector<uint32_t> {};
@@ -266,6 +266,18 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 			heap.BeginDraw();
 			if (!heap.Acquire(request, view)) return std::vector<uint32_t> {};
 			heap.Rebind(renderer.GetRenderExecutor());
+			if (replacement != 0u) {
+				const auto write_again = [&] {
+					const auto [target, offset] = buffers.ObtainRange(address, sizeof(uint32_t), true);
+					target->Fill(offset, sizeof(uint32_t), replacement);
+				};
+				write_again();
+				if (!heap.CheckTableWrites() || !heap.TakeReplay()) return std::vector<uint32_t> {};
+				heap.BeginDraw();
+				if (!heap.Acquire(request, view)) return std::vector<uint32_t> {};
+				heap.Rebind(renderer.GetRenderExecutor());
+				write_again();
+			}
 		}
 		if (heap.CheckTableWrites()) return std::vector<uint32_t> {};
 		const auto tick = scheduler.CurrentTick();
@@ -277,7 +289,7 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	};
 	const auto initial = consume(0);
 	const auto late = consume(second);
-	const auto novel = consume(third);
+	const auto novel = consume(second, third);
 	if (novel.empty() || initial.empty() || novel[0] == 0u || novel[0] == initial[0] ||
 	    novel[0] == initial[8] || novel[8] != initial[8]) return "a new descriptor missed its only draw";
 	const auto [mirror, offset] = buffers.ObtainRange(address, sizeof(words), false, false, ObtainFrom::Mirror);
@@ -296,7 +308,14 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	if (disjoint != indirect || heap.FillGroups() != groups || buffers.HeapBitmapBytes() - inspected != 4u) {
 		return "a disjoint shader write did more than inspect the watched bitmap word";
 	}
+	heap.BeginDraw();
+	IR::ImageHeapView producer_view;
+	if (!heap.Acquire(request, producer_view)) return "could not prepare the heap for a writing draw";
+	heap.Rebind(renderer.GetRenderExecutor());
+	const auto producer_tick = scheduler.CurrentTick();
 	renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
+	if (heap.CheckTableWrites() || scheduler.CurrentTick() != producer_tick) return "a writing draw waited on its own write";
+	heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
 	mirror->Fill(offset, sizeof(uint32_t), third);
 	buffers.GetFaultBuffer()->Fill(bitmap_word, 4, 1u << (page % 32u));
 	const auto bitmap_hit = consume(0);
@@ -524,11 +543,11 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		            static_cast<unsigned long long>(mirror->BlockSize() >> 10u));
 	}
 
-	if (const auto* failure = CheckHeapConsumer(renderer, address + MirroredAt, reader)) return failure;
+	const auto* failure = CheckHeapConsumer(renderer, address + MirroredAt, reader);
 	Finish(scheduler);
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address, GuestBytes);
 	(void)buffers.DropFreedRange(address, GuestBytes);
-	return nullptr;
+	return failure;
 }
 
 const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {

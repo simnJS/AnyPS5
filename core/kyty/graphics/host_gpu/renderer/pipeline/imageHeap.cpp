@@ -197,7 +197,8 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	KYTY_PROFILER_FUNCTION();
 	const auto size = request.size & ~uint64_t {3};
 	const auto* mirror = m_context.GetBufferCache().GetGuestMirror();
-	if (!GuestRange {request.base, size}.Valid() || mirror == nullptr || !mirror->Holds(request.base, size) || size / 4u > UINT32_MAX - 8u ||
+	if (!GuestRange {request.base, request.size}.Valid() || mirror == nullptr ||
+	    !mirror->Holds(request.base, request.size) || size / 4u > UINT32_MAX - 8u ||
 	    request.first >= size || request.step / 4u > UINT32_MAX || request.root == nullptr ||
 	    request.count == 0u || request.step == 0u ||
 	    ((request.base | request.first | request.step) & 3u) != 0u) {
@@ -744,6 +745,7 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	if (memory.snapshot) scheduler.DeferOperation([snapshot = std::move(memory.snapshot)] {});
 	memory.fallback_draw = 0;
+	memory.fallback_valid = false;
 	for (auto& view: memory.views) {
 		view->count = std::min(view->limit, Probes(size, view->shape.first, view->shape.step));
 		view->full  = true;
@@ -824,6 +826,7 @@ void ImageHeap::UpdateProbes(Memory& memory) {
 	memory.written.clear();
 	m_runs.insert(m_runs.end(), memory.gpu_written.begin(), memory.gpu_written.end());
 	memory.gpu_written.clear();
+	if (whole || !m_runs.empty()) memory.fallback_valid = false;
 	for (const auto& view: memory.views) {
 		if (whole) view->discover = true;
 		if (whole || m_frame - view->filled >= RefillFrames) view->full = true;
@@ -1419,7 +1422,9 @@ void ImageHeap::RetryProfile(uint32_t profile) {
 }
 
 void ImageHeap::SaveFallback(Memory& memory) {
-	if (memory.fallback_draw == m_draw) return;
+	memory.fallback_draw = m_draw;
+	m_have_fallback = true;
+	if (memory.fallback_valid) return;
 	auto& cache = m_context.GetBufferCache();
 	auto& scheduler = m_context.GetCommandScheduler();
 	memory.fallback.resize(memory.size / 4u);
@@ -1435,8 +1440,7 @@ void ImageHeap::SaveFallback(Memory& memory) {
 		download.buffer->Invalidate(download.offset, memory.size);
 		std::memcpy(memory.fallback.data(), download.mapped, memory.size);
 	}
-	memory.fallback_draw = m_draw;
-	m_have_fallback = true;
+	memory.fallback_valid = true;
 }
 
 bool ImageHeap::ReadFallback(uint64_t address, std::span<uint32_t> words) const {
@@ -1469,8 +1473,9 @@ bool ImageHeap::TakeGpuWrites(bool snapshot) {
 			const auto last  = std::min(end, memory->base + memory->size);
 			if (first >= last) continue;
 			memory->synced = 0;
-			if (snapshot && !memory->snapshot && (memory->fallback_draw == m_draw ||
-			    std::ranges::any_of(m_active, [&](const View* view) { return &view->memory == memory.get(); })) && std::ranges::find(changed, memory.get()) == changed.end()) {
+			const bool selected = memory->fallback_draw == m_draw ||
+			    std::ranges::any_of(m_active, [&](const View* view) { return &view->memory == memory.get(); });
+			if (snapshot && selected && std::ranges::find(changed, memory.get()) == changed.end()) {
 				changed.push_back(memory.get());
 			}
 			if (memory->gpu_written.size() >= MaxGpuRuns) {
@@ -1481,14 +1486,24 @@ bool ImageHeap::TakeGpuWrites(bool snapshot) {
 			memory->gpu_written.emplace_back(first, last);
 		}
 	});
+	bool retry = false;
 	for (auto* memory: changed) {
 		const auto [source, offset] = cache.ObtainRange(memory->base, memory->size, false, false, ObtainFrom::Mirror);
-		memory->snapshot = HostBuffer(m_context, memory->size);
-		memory->snapshot->CopyFrom(scheduler.Current(), *source, offset, 0, memory->size);
-		memory->snapshot_tick = scheduler.CurrentTick();
+		auto latest = HostBuffer(m_context, memory->size);
+		latest->CopyFrom(scheduler.Current(), *source, offset, 0, memory->size);
+		const auto tick = scheduler.CurrentTick();
+		if (memory->snapshot) {
+			scheduler.Wait(tick);
+			latest->Invalidate(0, memory->size);
+			memory->snapshot->Invalidate(0, memory->size);
+			if (std::memcmp(latest->Mapped().data(), memory->snapshot->Mapped().data(), memory->size) == 0) continue;
+		}
+		memory->snapshot = std::move(latest);
+		memory->snapshot_tick = tick;
 		memory->fresh = true;
+		retry = true;
 	}
-	return !changed.empty();
+	return retry;
 }
 
 void ImageHeap::Drop(Memory& memory) {

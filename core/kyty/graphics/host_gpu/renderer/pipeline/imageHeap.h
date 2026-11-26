@@ -150,6 +150,7 @@ private:
 		std::unique_ptr<Buffer>                    snapshot;
 		uint64_t                                   snapshot_tick = 0;
 		uint64_t                                   fallback_draw = 0;
+		bool                                       fallback_valid = false;
 		std::vector<uint32_t>                      fallback;
 		std::vector<std::pair<uint64_t, uint64_t>> written;
 		std::vector<std::pair<uint64_t, uint64_t>> gpu_written;
