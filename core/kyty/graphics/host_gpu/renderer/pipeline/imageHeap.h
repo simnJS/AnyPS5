@@ -32,6 +32,7 @@ public:
 
 	void BeginDraw();
 	uint64_t FillGroups() const { return m_stats.groups; }
+	uint64_t LateMisses() const { return m_stats.late; }
 	bool ReadFallback(uint64_t address, std::span<uint32_t> words) const override;
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;

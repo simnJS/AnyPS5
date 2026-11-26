@@ -29,10 +29,6 @@
 
 namespace Libs::Graphics {
 
-struct ImageHeapTestAccess {
-	static uint64_t Late(const ImageHeap& heap) { return heap.m_stats.late; }
-};
-
 struct MirrorWindowsTestAccess {
 	static bool ReadBack(BufferCache& cache, uint64_t address, uint64_t size) {
 		std::vector<vk::BufferCopy> copies;
@@ -283,7 +279,7 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	if (initial.empty() || initial.front() == 0 || initial[8] == 0 || initial.front() == initial[8]) {
 		return "the two seeded descriptors did not produce distinct slots at their first draw";
 	}
-	if (ImageHeapTestAccess::Late(heap) != 0u) return "a CPU-written table reported a missing key";
+	if (heap.LateMisses() != 0u) return "a CPU-written table reported a missing key";
 
 	auto groups = heap.FillGroups();
 	if (!cpu_write(address, words)) return "identical CPU table write failed";
@@ -301,7 +297,7 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	if (produced.empty() || produced[0] != initial[8] || produced[8] != initial[8]) {
 		return "a resident key written by the GPU during the preparation missed its own draw";
 	}
-	if (ImageHeapTestAccess::Late(heap) != 0u) return "a resident key was reported missing";
+	if (heap.LateMisses() != 0u) return "a resident key was reported missing";
 
 	const auto novel = consume({third});
 	if (novel.empty() || novel[0] != 0u || novel[8] != initial[8]) return "an unknown key did not fall back to slot zero";
@@ -309,7 +305,7 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	if (served.empty() || served[0] == 0u || served[0] == initial[0] || served[0] == initial[8] || served[8] != initial[8]) {
 		return "a key missed by the in-stream fill was not served at its next draw";
 	}
-	if (ImageHeapTestAccess::Late(heap) != 1u) return "the missing key was not counted once";
+	if (heap.LateMisses() != 1u) return "the missing key was not counted once";
 
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address, sizeof(words));
 	if (!cpu_write(address, words)) return "CPU table rewrite failed";
@@ -433,12 +429,12 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 		upload_table(32u, 32u);
 		words[0] = first;
 		sized.size = sizeof(words);
-		const auto late = ImageHeapTestAccess::Late(heap);
+		const auto late = heap.LateMisses();
 		const auto grown = consume_at(sized, sizeof(words), {}, 1u);
 		if (grown.empty() || grown[0] != 0u || grown[8] != 0u) return "an unknown key in a regrown table did not fall back to slot zero";
 		const auto resized = consume_at(sized, sizeof(words), {}, 1u);
 		if (resized.empty() || resized[0] != 0u || resized[8] == 0u || resized[8] == initial[0] || resized[8] == initial[8] ||
-		    ImageHeapTestAccess::Late(heap) != late + 1u) {
+		    heap.LateMisses() != late + 1u) {
 			return "the key of a regrown table was not served at its next draw";
 		}
 	}
