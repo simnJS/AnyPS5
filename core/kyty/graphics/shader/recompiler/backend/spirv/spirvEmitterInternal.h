@@ -652,9 +652,9 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
-uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent);
+uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent, bool in_page = false);
 uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset);
-uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t size, uint32_t extent);
+uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t size, uint32_t extent, bool in_page);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBdaLoads(EmitterState& state);
 uint32_t RayStatsEnabled(EmitterState& state);

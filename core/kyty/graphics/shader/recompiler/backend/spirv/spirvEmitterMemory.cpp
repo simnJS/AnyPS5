@@ -2210,7 +2210,7 @@ uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset) {
 	return PackU64(state, load(offset / 4), load(offset / 4 + 1));
 }
 
-uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t size, uint32_t extent) {
+uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t size, uint32_t extent, bool in_page) {
 	using View = GuestHostView;
 	const auto u64 = TypeU64(state), boolean = TypeBool(state);
 	const auto zero = ConstantU64(state, 0);
@@ -2235,6 +2235,9 @@ uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t siz
 	};
 	const auto entry = entry_of(offset, ConstantBool(state, true));
 	const auto inside = Binary(state, spv::OpBitwiseAnd, u64, offset, ConstantU64(state, View::PageSize - 1));
+	if (in_page) {
+		return Select(state, u64, nonzero(entry), Binary(state, spv::OpIAdd, u64, entry, inside), zero);
+	}
 	const auto crosses = Binary(state, spv::OpUGreaterThan, boolean,
 	                            Binary(state, spv::OpIAdd, u64, inside, Unary(state, spv::OpUConvert, u64, extent)),
 	                            ConstantU64(state, View::PageSize));
@@ -2248,7 +2251,7 @@ uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t siz
 	return Select(state, u64, usable, Binary(state, spv::OpIAdd, u64, entry, inside), zero);
 }
 
-uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent) {
+uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent, bool in_page) {
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
 	const auto host_bias = LoadMirrorMetadata64(state, 0);
 	const auto guest_base = LoadMirrorMetadata64(state, 8);
@@ -2280,7 +2283,14 @@ uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t
 	const auto missed = AndCondition(state, inside, Unary(state, spv::OpLogicalNot, boolean, ready));
 	const auto guest_page = EmitValueOrDefaultIfCondition(state, missed, u64, ConstantU64(state, 0), [&] {
 		mark(word(BufferCache::FAULT_BITMAP_OFFSET));
-		return EmitGuestHostAddress(state, offset, size, extent);
+		const auto guest = EmitGuestHostAddress(state, offset, size, extent, in_page);
+		EmitIfCondition(state, Binary(state, spv::OpINotEqual, boolean, guest, ConstantU64(state, 0)), [&] {
+			state.builder.AddFunction(spv::OpAtomicIAdd, u32, state.builder.AllocateId(),
+			                          FaultElementPointer(state, ConstantU32(state, BufferCache::HOST_ACCESS_OFFSET / 4)),
+			                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
+			                          ConstantU32(state, 1));
+		});
+		return guest;
 	});
 	return Select(state, u64, ready, Binary(state, spv::OpIAdd, u64, host_bias, address), guest_page);
 }
@@ -2325,7 +2335,7 @@ void DefineBdaLoads(EmitterState& state) {
 			EmitLabel(state, state.builder.AllocateId());
 			const auto body = [&]() {
 				const auto host = EmitMirrorDeviceAddress(state, address, ConstantBool(state, true),
-				                                          ConstantU32(state, sizeof(uint32_t)));
+				                                          ConstantU32(state, sizeof(uint32_t)), true);
 				const auto present = Binary(state, spv::OpINotEqual, boolean, host, ConstantU64(state, 0));
 				return EmitValueOrDefaultIfCondition(state, present, u32, MissingBdaDword(state),
 				    [&] { return EmitBdaPointerLoad(state, host, coherent != 0u); });

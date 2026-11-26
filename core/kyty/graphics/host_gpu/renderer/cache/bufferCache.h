@@ -59,6 +59,7 @@ public:
 	static constexpr uint64_t MIRROR_BITMAP_SIZE = GuestMirror::LargestSize / MIRROR_BLOCK_SIZE / 8;
 	static constexpr uint64_t RT_CONTEXT_OFFSET = 3 * sizeof(uint64_t);
 	static constexpr uint64_t HOST_TABLE_OFFSET = 8 * sizeof(uint64_t);
+	static constexpr uint64_t HOST_ACCESS_OFFSET = HOST_TABLE_OFFSET + sizeof(uint64_t);
 	static constexpr uint64_t RESIDENCY_OFFSET = 256;
 	static constexpr uint64_t FAULT_BITMAP_OFFSET = RESIDENCY_OFFSET + MIRROR_BITMAP_SIZE;
 	static constexpr uint64_t USE_BITMAP_OFFSET = FAULT_BITMAP_OFFSET + MIRROR_BITMAP_SIZE;
@@ -133,6 +134,8 @@ public:
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
 	void RequestDeviceRange(uint64_t vaddr, uint64_t size);
 	void RequestUnimportedRanges(const RangeSet& mapped, uint64_t mapping_epoch);
+	void RequestUnimportedRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t ImportGeneration();
 	void ImportGuestMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool GuestMemoryImported(uint64_t vaddr, uint64_t size) const { return m_host_view->Overlaps(vaddr, size); }
 	void ForgetGuestMemory(uint64_t vaddr, uint64_t size);
@@ -571,6 +574,10 @@ private:
 	bool                                              m_guest_stores = false;
 	std::array<uint64_t, 3>                           m_unimported_layout {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 	uint64_t                                          m_unimported_bytes = 0;
+	std::unique_ptr<Buffer>                           m_host_access_download;
+	uint64_t                                          m_host_accesses     = 0;
+	uint32_t                                          m_host_access_seen  = 0;
+	bool                                              m_host_access_read  = false;
 	GuestMirror::Runs            m_fresh;
 	GuestMirror::Runs            m_victims;
 	int64_t                      m_evict_check         = 0;

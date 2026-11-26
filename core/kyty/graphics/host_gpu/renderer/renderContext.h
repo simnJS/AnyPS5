@@ -183,6 +183,7 @@ private:
 		BufferCache::SetRegions regions;
 		std::array<uint64_t, 3> compared_in {};
 		std::array<uint64_t, 3> synced_in {};
+		std::array<uint64_t, 3> bound_in {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 		uint32_t                replaced = 0;
 		std::vector<std::pair<uint64_t, uint64_t>> written;
 	};

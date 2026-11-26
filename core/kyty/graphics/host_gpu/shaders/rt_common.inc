@@ -19,6 +19,7 @@ layout(set = 0, binding = 0, std430) buffer MirrorState {
 	uint64_t extended_base;
 	uint64_t lower_size;
 	uint64_t host_table;
+	uint host_accesses;
 	layout(offset = 256) uint words[];
 };
 
@@ -50,6 +51,7 @@ uint64_t GuestAddress(uint64_t offset, uint bytes) {
 		const uint64_t after = offset + 0x4000ul;
 		if (after >= mirror_size || GuestPage(after) != page + 0x4000ul) return 0;
 	}
+	atomicAdd(host_accesses, 1u);
 	return page + inside;
 }
 

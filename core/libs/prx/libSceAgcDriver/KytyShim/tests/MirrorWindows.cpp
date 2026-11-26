@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
 #include "kernel/memory.h"
 #include "prx/libkernel/include/Api.hpp"
 
@@ -810,6 +811,91 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 	return failure;
 }
 
+const char* CheckTableReach(GraphicContext& graphics, uint64_t address) {
+	using Reach = ShaderRecompiler::Decoder::RecordReach;
+	RenderContext    renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+	auto&       buffers = renderer.GetBufferCache();
+	auto*       mirror  = buffers.GetGuestMirror();
+	const auto* view    = buffers.GetGuestHostView();
+	const auto  block   = mirror->BlockSize();
+	const auto  tables  = Common::AlignUp(address, block);
+	const auto  bare    = tables + 2 * block;
+	const auto  kept    = tables + 4 * block;
+	if (kept + block > address + GuestBytes) {
+		g_unchecked = "the fixture is too small for the blocks of a reach read from a table";
+		return nullptr;
+	}
+	auto* guest = reinterpret_cast<uint32_t*>(address);
+	for (uint64_t i = 0; i < GuestBytes / sizeof(uint32_t); ++i) guest[i] = Pattern(i);
+	const auto vsharp = [](uint64_t at, uint64_t base, uint32_t stride, uint32_t records) {
+		const std::array<uint32_t, 4> words {static_cast<uint32_t>(base), static_cast<uint32_t>((base >> 32u) & 0xffffu) | (stride << 16u),
+		                                     records, 0u};
+		std::memcpy(reinterpret_cast<void*>(at), words.data(), sizeof(words));
+	};
+	constexpr uint32_t RecordBytes = 16;
+	const auto         header      = tables + 0x100;
+	const auto         records     = tables + 0x200;
+	const auto         pointers    = tables + 0x300;
+	vsharp(tables, header, 4, 2);
+	vsharp(tables + 0x10, records, RecordBytes, 2);
+	vsharp(tables + 0x20, pointers, 16, 2);
+	const std::array<uint32_t, 2> range {0u, 2u};
+	std::memcpy(reinterpret_cast<void*>(header), range.data(), sizeof(range));
+	const std::array<uint32_t, 8> rows {1u, 0u, 4u, 0u, 1u, 0u, 4u, 1u};
+	std::memcpy(reinterpret_cast<void*>(records), rows.data(), sizeof(rows));
+	vsharp(pointers, bare, 4, 2);
+	vsharp(pointers + 16, kept, 4, 2);
+	Reach reach;
+	reach.header        = {0, 0};
+	reach.records       = {2, 0};
+	reach.pointers      = {4, 0};
+	reach.record_size   = RecordBytes;
+	reach.threads_field = 0;
+	reach.first_field   = 4;
+	reach.stride_field  = 8;
+	reach.pointer_field = 12;
+	reach.attributes.push_back({Reach::None, 4, 8});
+	ShaderModule module {};
+	module.info.stage                 = ShaderType::Compute;
+	module.info.info.uses_dma         = true;
+	module.info.info.dma_bounded      = false;
+	module.info.info.dma_record_reach = reach.Pack();
+	ShaderRecompiler::IR::ResourceSnapshot resources;
+	resources.user_data = {static_cast<uint32_t>(tables),        static_cast<uint32_t>(tables >> 32u),
+	                       static_cast<uint32_t>(tables + 0x10), static_cast<uint32_t>((tables + 0x10) >> 32u),
+	                       static_cast<uint32_t>(tables + 0x20), static_cast<uint32_t>((tables + 0x20) >> 32u)};
+	const ShaderStageRuntime  stage {&module, &resources};
+	const ShaderStageRuntime* dispatch = &stage;
+	renderer.MapMemory(address, GuestBytes);
+	renderer.PrepareBda(false, false);
+	AddressReader reader(graphics, scheduler, 8);
+	Buffer        bitmap(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(uint32_t));
+	const auto    verify = [&]() -> const char* {
+		buffers.ForgetGuestMemory(bare, block);
+		const bool imports = view != nullptr && view->Lookup(kept) != 0;
+		if (view != nullptr && view->Lookup(bare) != 0) return "a block kept its import after it was dropped";
+		if (mirror->AnyRequested(bare, block) || mirror->AnyRequested(kept, block)) return "the blocks of the table reach are bound before the dispatch";
+		if (!renderer.SynchronizeDmaFootprint(std::span {&dispatch, 1})) return "the reach read from a table was not found";
+		renderer.PrepareBda(false, false);
+		if (!mirror->Requested(bare, 8)) return "a reach read from a table left a mapped block without an import out of the mirror";
+		if (imports && mirror->AnyRequested(kept, block)) return "a reach read from a table bound an imported block";
+		reader.Record(scheduler, mirror->DeviceAddress() + bare - mirror->Base(), 8);
+		Finish(scheduler);
+		if (!ReadsPattern(reader.Words(8), (bare - address) / sizeof(uint32_t)) || !IsResident(scheduler, buffers, bitmap, bare)) {
+			return "a block bound for a reach read from a table does not hold its guest memory";
+		}
+		return nullptr;
+	};
+	const auto* failure = verify();
+	Finish(scheduler);
+	renderer.UnmapMemory(address, GuestBytes);
+	return failure;
+}
+
 const char* CheckCut(GraphicContext& graphics, uint64_t address) {
 	RenderContext    renderer(graphics);
 	CommandProcessor producer(renderer, 0);
@@ -980,6 +1066,7 @@ extern "C" int RunKytyMirrorWindowsTest() {
 	if (failure == nullptr && g_skipped.empty()) failure = CheckDispatch(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckRemap(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckCut(graphics, address);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckTableReach(graphics, address);
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", Name);
 		return 1;

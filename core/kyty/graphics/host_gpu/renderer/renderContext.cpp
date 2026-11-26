@@ -660,9 +660,27 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 			}
 		}
 	}
-	if (bind_spans) {
-		for (const auto& [begin, end]: m_dma_spans) {
+	for (const auto& [begin, end]: m_dma_spans) {
+		if (bind_spans) {
 			m_buffer_cache.RequestDeviceRange(begin, end - begin);
+		} else {
+			m_buffer_cache.RequestUnimportedRange(begin, end - begin);
+		}
+	}
+	const std::array bound_layout {m_mapped_ranges_version, m_buffer_cache.RegistrationEpoch(), m_buffer_cache.ImportGeneration()};
+	for (auto* table: m_dma_sets) {
+		if (table->bound_in == bound_layout) {
+			continue;
+		}
+		const auto requested = m_buffer_cache.RegisterEpoch();
+		table->ranges.ForEach([this](uint64_t first, uint64_t last) {
+			m_mapped_ranges.ForEachInRange(first, last - first, [this](uint64_t start, uint64_t end) {
+				m_buffer_cache.RequestUnimportedRange(start, end - start);
+			});
+		});
+		table->bound_in = bound_layout;
+		if (m_buffer_cache.RegisterEpoch() != requested) {
+			table->synced_in = {};
 		}
 	}
 	const auto reach_layout = ReachLayout();
@@ -987,6 +1005,7 @@ bool RenderContext::AddBufferTable(const ShaderBufferResource& table) {
 			}
 		}
 		entries.synced_in = {};
+		entries.bound_in  = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 	}
 	m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) { m_dma_spans.emplace_back(start, end); });
 	if (std::ranges::find(m_dma_sets, &entries) == m_dma_sets.end()) {

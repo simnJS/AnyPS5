@@ -1427,6 +1427,17 @@ void BufferCache::PrepareFaultBuffer(bool may_write) {
 	m_guest_stores = m_guest_stores || (may_write && m_host_view->Enabled());
 }
 
+uint64_t BufferCache::ImportGeneration() {
+	m_host_view->Publish();
+	return m_host_view->Generation();
+}
+
+void BufferCache::RequestUnimportedRange(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !m_guest_mirror->Holds(vaddr, size)) return;
+	m_host_view->Publish();
+	m_host_view->ForEachGap(vaddr, size, [this](uint64_t from, uint64_t to) { RequestDeviceRange(from, to - from); });
+}
+
 void BufferCache::RequestUnimportedRanges(const RangeSet& mapped, uint64_t mapping_epoch) {
 	const std::array layout {mapping_epoch, RegistrationEpoch(), m_host_view->Generation()};
 	if (layout == m_unimported_layout) return;
@@ -3052,10 +3063,28 @@ void BufferCache::TickGuestMirror() {
 		::Log::WriteToConsoleAndLog(fmt::format(
 		    "[kyty-host-view] {} imports of guest memory ({:.1f} MiB), {} refused; {} unmaps waited for the GPU; {:.1f} MiB "
 		    "copied in command order into blocks bound behind a dispatch that stores by device address; {:.1f} MiB of mapped "
-		    "memory without an import bound for the dispatches whose reach is not known\n",
+		    "memory without an import bound for the dispatches whose reach is not known; {} shader accesses went to guest "
+		    "memory through an import ({:.2f} per frame)\n",
 		    host.imports, static_cast<double>(host.bytes) / static_cast<double>(MiB), host.refused, host.waits,
 		    static_cast<double>(host.ordered) / static_cast<double>(MiB),
-		    static_cast<double>(m_unimported_bytes) / static_cast<double>(MiB)));
+		    static_cast<double>(m_unimported_bytes) / static_cast<double>(MiB), m_host_accesses, per(m_host_accesses)));
+		m_host_accesses = 0;
+		if (!m_host_access_read) {
+			if (!m_host_access_download) {
+				m_host_access_download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+				                                                  vk::BufferUsageFlagBits::eTransferDst, 16);
+			}
+			m_host_access_download->CopyFrom(m_scheduler.Current(), *GetFaultBuffer(), HOST_ACCESS_OFFSET, 0, sizeof(uint32_t));
+			m_host_access_read = true;
+			m_scheduler.DeferHostOperation([this] {
+				m_host_access_download->Invalidate(0, sizeof(uint32_t));
+				uint32_t value = 0;
+				std::memcpy(&value, m_host_access_download->Mapped().data(), sizeof(value));
+				m_host_accesses += static_cast<uint32_t>(value - m_host_access_seen);
+				m_host_access_seen = value;
+				m_host_access_read = false;
+			});
+		}
 	}
 }
 
