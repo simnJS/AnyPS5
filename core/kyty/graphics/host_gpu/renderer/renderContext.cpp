@@ -1131,7 +1131,7 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync, BdaWriteTracking 
 	m_buffer_cache.PrepareFaultBuffer(may_write);
 	if (may_write) {
 		m_buffer_cache.NoteDeviceAddressUse(tracking);
-		m_indirect_write_tables.NotePendingWrites();
+		m_indirect_write_tables.TrackWriteBitmap();
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	if (full_sync) {
