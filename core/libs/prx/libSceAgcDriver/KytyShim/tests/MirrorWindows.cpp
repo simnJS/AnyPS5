@@ -69,7 +69,9 @@ public:
 	AddressReader(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t bytes)
 	    : m_graphics(graphics),
 	      m_jobs(graphics, scheduler, MemoryUsage::Upload, 0,
-	             vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress, 32),
+	             vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress, Slots * SlotBytes),
+	      m_data(graphics, scheduler, MemoryUsage::Upload, 0,
+	             vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress, Slots * SlotBytes),
 	      m_out(graphics, scheduler, MemoryUsage::Download, 0,
 	            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress |
 	                vk::BufferUsageFlagBits::eTransferDst,
@@ -91,15 +93,27 @@ public:
 	}
 
 	void Record(CommandScheduler& scheduler, vk::DeviceAddress source, uint64_t bytes) {
+		Copy(scheduler, source, m_out.BufferDeviceAddress(), bytes);
+	}
+
+	void Store(CommandScheduler& scheduler, vk::DeviceAddress destination, const uint32_t* words, uint64_t bytes) {
+		const auto slot = m_slot % Slots * SlotBytes;
+		std::memcpy(m_data.Mapped().data() + slot, words, bytes);
+		m_data.Flush(slot, bytes);
+		Copy(scheduler, m_data.BufferDeviceAddress() + slot, destination, bytes);
+	}
+
+	void Copy(CommandScheduler& scheduler, vk::DeviceAddress source, vk::DeviceAddress destination, uint64_t bytes) {
 		struct Job {
 			uint64_t source;
 			uint64_t destination;
 			uint32_t size;
 			uint32_t pad0;
 			uint64_t pad1;
-		} job {source, m_out.BufferDeviceAddress(), static_cast<uint32_t>(bytes), 0, 0};
-		std::memcpy(m_jobs.Mapped().data(), &job, sizeof(job));
-		m_jobs.Flush(0, sizeof(job));
+		} job {source, destination, static_cast<uint32_t>(bytes), 0, 0};
+		const auto slot = m_slot++ % Slots * SlotBytes;
+		std::memcpy(m_jobs.Mapped().data() + slot, &job, sizeof(job));
+		m_jobs.Flush(slot, sizeof(job));
 		auto& command = scheduler.Current();
 		command.EndRendering();
 		const auto        native = command.Handle();
@@ -111,7 +125,7 @@ public:
 			uint64_t jobs;
 			uint32_t count;
 			uint32_t pad;
-		} push {m_jobs.BufferDeviceAddress(), 1, 0};
+		} push {m_jobs.BufferDeviceAddress() + slot, 1, 0};
 		native.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 		native.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		native.dispatch(1, 1, 1);
@@ -129,9 +143,14 @@ public:
 	}
 
 private:
+	static constexpr uint64_t Slots     = 8;
+	static constexpr uint64_t SlotBytes = 32;
+
 	GraphicContext&    m_graphics;
 	Buffer             m_jobs;
+	Buffer             m_data;
 	Buffer             m_out;
+	uint64_t           m_slot = 0;
 	vk::PipelineLayout m_layout   = nullptr;
 	vk::Pipeline       m_pipeline = nullptr;
 };
@@ -398,20 +417,99 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 		return !mirror->Requested(source, 8) && mirror->Totals().bound_blocks == bound &&
 		       !IsResident(scheduler, buffers, bitmap, source);
 	};
+	const auto* view     = buffers.GetGuestHostView();
+	const auto  imported = [&](uint64_t source) { return view != nullptr && view->Lookup(source) != 0; };
+	const auto  binds    = [&](uint64_t source) {
+		if (prepare() || !mirror->Requested(source, 8)) return false;
+		reader.Record(scheduler, mirror->DeviceAddress() + source - mirror->Base(), 8);
+		Finish(scheduler);
+		return ReadsPattern(reader.Words(8), (source - address) / sizeof(uint32_t)) && IsResident(scheduler, buffers, bitmap, source);
+	};
 	const auto verify = [&]() -> const char* {
 		if (!reads(first)) return "the first dispatch did not read both sides of its DMA window";
 		const auto unknown = boundary + block;
 		if (mirror->Requested(unknown, 8)) return "a bounded dispatch requested an unrelated block";
 		module.info.info.dma_bounded = false;
 		module.info.info.dma_windows.clear();
-		if (!leaves(unknown)) return "a dispatch with no known reach bound mapped memory it cannot reach";
 		const auto added = boundary + 2 * block;
+		if (!imported(unknown)) {
+			if (!binds(unknown)) return "a dispatch with no known reach left mapped memory without an import out of the mirror";
+			if (mirror->Requested(added, 8)) return "the dispatch requested an unmapped block";
+			renderer.MapMemory(added, block);
+			if (!binds(added)) return "a dispatch with no known reach left a newly mapped block without an import out of the mirror";
+			return nullptr;
+		}
+		if (!leaves(unknown)) return "a dispatch with no known reach bound imported memory it cannot reach";
 		if (mirror->Requested(added, 8)) return "the dispatch requested an unmapped block";
 		renderer.MapMemory(added, block);
-		if (!leaves(added)) return "a dispatch with no known reach bound a newly mapped block";
+		if (!leaves(added)) return "a dispatch with no known reach bound a newly mapped block that is imported";
+		buffers.ForgetGuestMemory(unknown, block);
+		if (imported(unknown) || !imported(added)) return "dropping the import of one block touched its neighbours";
+		if (!binds(unknown)) return "a dispatch with no known reach did not bind a mapped block that lost its import";
+		if (mirror->Requested(added, 8)) return "binding a block without an import bound an imported one";
 		return nullptr;
 	};
 	const auto* failure = verify();
+	renderer.UnmapMemory(address, GuestBytes);
+	return failure;
+}
+
+const char* CheckCut(GraphicContext& graphics, uint64_t address) {
+	RenderContext    renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+	auto&       buffers = renderer.GetBufferCache();
+	auto*       mirror  = buffers.GetGuestMirror();
+	const auto* view    = buffers.GetGuestHostView();
+	if (view == nullptr || !view->Enabled()) {
+		g_unchecked = "the device does not import host memory";
+		return nullptr;
+	}
+	const auto block  = mirror->BlockSize();
+	const auto stored = Common::AlignUp(address + block, block);
+	const auto read   = stored + 2 * block;
+	if (read + block > address + GuestBytes) {
+		g_unchecked = "the fixture is too small for the blocks of the cut";
+		return nullptr;
+	}
+	auto* guest = reinterpret_cast<uint32_t*>(address);
+	for (uint64_t i = 0; i < GuestBytes / sizeof(uint32_t); ++i) guest[i] = Pattern(i);
+	renderer.MapMemory(address, GuestBytes);
+	AddressReader reader(graphics, scheduler, 16);
+	const auto    verify = [&]() -> const char* {
+		renderer.PrepareBda(true, false);
+		if (view->Lookup(stored) == 0 || view->Lookup(read) == 0) {
+			g_unchecked = "the driver did not import the guest memory of the fixture";
+			return nullptr;
+		}
+		Finish(scheduler);
+		const std::array<uint32_t, 4> fresh {GpuValue, GpuValue + 1, GpuValue + 2, GpuValue + 3};
+		reader.Store(scheduler, view->Lookup(stored), fresh.data(), sizeof(fresh));
+		(void)buffers.ObtainRange(stored, sizeof(fresh), false, false, ObtainFrom::Mirror);
+		reader.Record(scheduler, mirror->DeviceAddress() + stored - mirror->Base(), sizeof(fresh));
+		Finish(scheduler);
+		const auto words = reader.Words(sizeof(fresh));
+		if (std::memcmp(words.data(), fresh.data(), sizeof(fresh)) != 0) {
+			return "a block bound after a cut submission missed the store recorded behind the cut";
+		}
+		if (std::memcmp(reinterpret_cast<const void*>(stored), fresh.data(), sizeof(fresh)) != 0) {
+			return "a store through an import did not reach guest memory";
+		}
+		renderer.PrepareBda(false, false);
+		Finish(scheduler);
+		reader.Record(scheduler, view->Lookup(read), 16);
+		const auto waits = view->Totals().waits;
+		renderer.UnmapMemory(read, block);
+		if (view->Totals().waits != waits + 1) return "an unmap behind a cut did not wait for the submission that reads its import";
+		if (view->Lookup(read) != 0) return "an unmap behind a cut left its import";
+		if (!ReadsPattern(reader.Words(16), (read - address) / sizeof(uint32_t))) return "a read recorded before an unmap did not finish first";
+		return nullptr;
+	};
+	const auto* failure = verify();
+	Finish(scheduler);
+	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address, GuestBytes);
 	renderer.UnmapMemory(address, GuestBytes);
 	return failure;
 }
@@ -525,6 +623,7 @@ extern "C" int RunKytyMirrorWindowsTest() {
 	const auto* failure = CheckWindows(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckDispatch(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckRemap(graphics, address);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckCut(graphics, address);
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", Name);
 		return 1;

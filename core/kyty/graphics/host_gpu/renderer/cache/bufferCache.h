@@ -125,6 +125,7 @@ public:
 	static void            NoteStagedCommandProcessorRead();
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
 	void RequestDeviceRange(uint64_t vaddr, uint64_t size);
+	void RequestUnimportedRanges(const RangeSet& mapped, uint64_t mapping_epoch);
 	void ImportGuestMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool GuestMemoryImported(uint64_t vaddr, uint64_t size) const { return m_host_view->Overlaps(vaddr, size); }
 	void ForgetGuestMemory(uint64_t vaddr, uint64_t size);
@@ -485,7 +486,9 @@ private:
 	std::vector<Promoted>                             m_promoted;
 	std::vector<vk::BufferCopy>                       m_ordered_staged;
 	std::vector<std::pair<vk::Buffer, vk::BufferCopy>> m_ordered_direct;
-	uint64_t                                          m_guest_store_tick = 0;
+	bool                                              m_guest_stores = false;
+	std::array<uint64_t, 3>                           m_unimported_layout {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+	uint64_t                                          m_unimported_bytes = 0;
 	GuestMirror::Runs            m_fresh;
 	GuestMirror::Runs            m_victims;
 	int64_t                      m_evict_check         = 0;

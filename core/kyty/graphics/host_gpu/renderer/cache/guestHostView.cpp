@@ -23,11 +23,8 @@ constexpr auto TableUsage   = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceA
 
 uint32_t PickType(const vk::PhysicalDeviceMemoryProperties& memory, uint32_t bits) {
 	constexpr auto wanted = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
-	for (uint32_t pass = 0; pass < 2; pass++) {
-		for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
-			if ((bits & (1u << type)) == 0) continue;
-			if (pass == 1 || (memory.memoryTypes[type].propertyFlags & wanted) == wanted) return type;
-		}
+	for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
+		if ((bits & (1u << type)) != 0 && (memory.memoryTypes[type].propertyFlags & wanted) == wanted) return type;
 	}
 	return UINT32_MAX;
 }
@@ -51,13 +48,14 @@ GuestHostView::GuestHostView(GraphicContext& graphics, CommandScheduler& schedul
 		const auto features = properties.externalMemoryProperties.externalMemoryFeatures;
 		if (!(features & vk::ExternalMemoryFeatureFlagBits::eImportable)) {
 			missing = "the device cannot import host memory for a buffer read by device address";
+		} else if (features & vk::ExternalMemoryFeatureFlagBits::eDedicatedOnly) {
+			missing = "the device only takes such a buffer as a dedicated allocation, which a host pointer cannot be";
 		}
-		m_dedicated = static_cast<bool>(features & vk::ExternalMemoryFeatureFlagBits::eDedicatedOnly);
 	}
 	if (missing != nullptr) {
 		::Log::WriteToConsoleAndLog(fmt::format(
-		    "[kyty-host-view] guest memory is not imported: {}; a shader that reaches a block of the mirror before it is "
-		    "bound reads zero there\n",
+		    "[kyty-host-view] guest memory is not imported: {}; a dispatch whose reach is not known binds all mapped "
+		    "guest memory in the mirror first\n",
 		    missing));
 		return;
 	}
@@ -107,8 +105,8 @@ void GuestHostView::Refuse(uint64_t guest, uint64_t bytes, const char* why) {
 	if (m_refusal_logged) return;
 	m_refusal_logged = true;
 	::Log::WriteToConsoleAndLog(fmt::format(
-	    "[kyty-host-view] guest memory 0x{:x} + 0x{:x} is not imported: {}; a shader that reaches it before its block of "
-	    "the mirror is bound reads zero there\n",
+	    "[kyty-host-view] guest memory 0x{:x} + 0x{:x} is not imported: {}; a dispatch whose reach is not known binds it "
+	    "in the mirror first\n",
 	    guest, bytes, why));
 }
 
@@ -150,18 +148,15 @@ bool GuestHostView::ImportPiece(uint8_t* host, uint64_t guest, uint64_t bytes, I
 	vk::MemoryRequirements requirements {};
 	device.getBufferMemoryRequirements(import.buffer, &requirements);
 	const auto type = PickType(m_graphics.physical_device_memory_properties, requirements.memoryTypeBits & properties.memoryTypeBits);
-	if (type == UINT32_MAX || requirements.size > bytes || (m_dedicated && requirements.size != bytes)) {
+	if (type == UINT32_MAX || requirements.size > bytes) {
 		Destroy(import);
 		Refuse(guest, bytes,
-		       type == UINT32_MAX ? "no memory type takes both the buffer and its host pages"
+		       type == UINT32_MAX ? "no memory type the host can see takes both the buffer and its host pages"
 		                          : "the buffer does not fit the size of its host pages");
 		return false;
 	}
 	const vk::ImportMemoryHostPointerInfoEXT imported {.handleType = ImportHandle, .pHostPointer = host};
-	const vk::MemoryDedicatedAllocateInfo    dedicated {.pNext = &imported, .buffer = import.buffer};
-	const vk::MemoryAllocateFlagsInfo        flags {
-	           .pNext = m_dedicated ? static_cast<const void*>(&dedicated) : static_cast<const void*>(&imported),
-	           .flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
+	const vk::MemoryAllocateFlagsInfo        flags {.pNext = &imported, .flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
 	const vk::MemoryAllocateInfo allocate {.pNext = &flags, .allocationSize = bytes, .memoryTypeIndex = type};
 	if (device.allocateMemory(&allocate, nullptr, &import.memory) != vk::Result::eSuccess ||
 	    device.bindBufferMemory(import.buffer, import.memory, 0) != vk::Result::eSuccess) {
@@ -260,46 +255,42 @@ void GuestHostView::WriteEntries(const Imported& import, bool present) {
 
 void GuestHostView::Publish() {
 	if (!m_arrived.load(std::memory_order_acquire)) return;
-	std::vector<Imported> arrivals;
+	std::vector<Imported> taken;
+	std::vector<Imported> late;
 	{
 		std::lock_guard lock(m_mutex);
-		arrivals.swap(m_arrivals);
+		for (auto& import: m_arrivals) {
+			bool held = false;
+			ForEachSource(import.guest, import.bytes, [&](uint64_t, uint64_t, vk::Buffer, uint64_t) { held = true; });
+			if (held) {
+				late.push_back(import);
+			} else {
+				m_imports.emplace(import.guest, import);
+				taken.push_back(import);
+			}
+		}
+		m_arrivals.clear();
 		m_arrived.store(false, std::memory_order_release);
 	}
-	for (auto& import: arrivals) {
-		bool taken = false;
-		ForEachSource(import.guest, import.bytes, [&](uint64_t, uint64_t, vk::Buffer, uint64_t) { taken = true; });
-		if (taken) {
-			Refuse(import.guest, import.bytes, "an import of an earlier mapping still holds its range");
-			Destroy(import);
-			continue;
-		}
+	for (auto& import: late) {
+		Refuse(import.guest, import.bytes, "an import of an earlier mapping still holds its range");
+		Destroy(import);
+	}
+	for (const auto& import: taken) {
 		WriteEntries(import, true);
 		m_stats.bytes += import.bytes;
-		std::lock_guard lock(m_mutex);
-		m_imports.emplace(import.guest, import);
 	}
-}
-
-void GuestHostView::NoteReach() noexcept {
-	if (!m_imports.empty()) m_reach_tick = m_scheduler.CurrentTick();
+	if (!taken.empty()) m_generation++;
 }
 
 void GuestHostView::WaitReaders() {
-	if (m_reach_tick == 0) return;
-	const auto current = m_scheduler.CurrentTick();
-	if (m_reach_tick >= current && m_scheduler.Active()) {
+	if (!m_reached) return;
+	if (m_scheduler.Active()) {
 		m_scheduler.Finish();
-		m_stats.waits++;
-		m_reach_tick = 0;
-		return;
-	}
-	const auto tick = std::min(m_reach_tick, current - 1);
-	if (tick != 0 && !m_scheduler.IsFree(tick)) {
+	} else if (const auto tick = m_scheduler.CurrentTick() - 1; tick != 0 && !m_scheduler.IsFree(tick)) {
 		m_scheduler.Wait(tick);
-		m_stats.waits++;
 	}
-	if (m_reach_tick < current) m_reach_tick = 0;
+	m_stats.waits++;
 }
 
 void GuestHostView::Forget(uint64_t vaddr, uint64_t size) {
@@ -322,6 +313,7 @@ void GuestHostView::Forget(uint64_t vaddr, uint64_t size) {
 		WriteEntries(import, false);
 		m_stats.bytes -= import.bytes;
 	}
+	m_generation++;
 	WaitReaders();
 	std::vector<Imported> kept;
 	for (auto& import: doomed) {
@@ -332,11 +324,13 @@ void GuestHostView::Forget(uint64_t vaddr, uint64_t size) {
 		if (guest < begin) ImportRun(host, guest, begin - guest, kept);
 		if (guest + bytes > end) ImportRun(host + (end - guest), end, guest + bytes - end, kept);
 	}
+	{
+		std::lock_guard lock(m_mutex);
+		for (const auto& import: kept) m_imports.emplace(import.guest, import);
+	}
 	for (const auto& import: kept) {
 		WriteEntries(import, true);
 		m_stats.bytes += import.bytes;
-		std::lock_guard lock(m_mutex);
-		m_imports.emplace(import.guest, import);
 	}
 }
 

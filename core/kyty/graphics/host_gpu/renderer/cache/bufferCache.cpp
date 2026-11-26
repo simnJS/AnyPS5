@@ -1327,7 +1327,21 @@ void BufferCache::PrepareFaultBuffer(bool may_write) {
 	m_fault_manager.PrepareFaultBuffer();
 	m_host_view->Publish();
 	m_host_view->NoteReach();
-	if (may_write && m_host_view->Enabled()) m_guest_store_tick = m_scheduler.CurrentTick();
+	m_guest_stores = m_guest_stores || (may_write && m_host_view->Enabled());
+}
+
+void BufferCache::RequestUnimportedRanges(const RangeSet& mapped, uint64_t mapping_epoch) {
+	const std::array layout {mapping_epoch, RegistrationEpoch(), m_host_view->Generation()};
+	if (layout == m_unimported_layout) return;
+	uint64_t bytes = 0;
+	mapped.ForEachInRange(m_guest_mirror->Base(), m_guest_mirror->Size(), [&](uint64_t begin, uint64_t end) {
+		m_host_view->ForEachGap(begin, end - begin, [&](uint64_t from, uint64_t to) {
+			RequestDeviceRange(from, to - from);
+			bytes += to - from;
+		});
+	});
+	m_unimported_bytes  = bytes;
+	m_unimported_layout = layout;
 }
 
 bool BufferCache::IsResident(uint64_t vaddr) const noexcept {
@@ -1338,12 +1352,7 @@ bool BufferCache::IsResident(uint64_t vaddr) const noexcept {
 
 void BufferCache::NotePromotion(uint64_t begin, uint64_t end) {
 	m_memory_tracker.MarkRegionAsCpuModified(begin, end - begin);
-	if (m_guest_store_tick == 0) return;
-	if (m_scheduler.GetMasterSemaphore().IsFree(m_guest_store_tick)) {
-		m_guest_store_tick = 0;
-		return;
-	}
-	m_promoted.push_back({begin, end, m_guest_store_tick});
+	if (m_guest_stores) m_promoted.push_back({begin, end, m_scheduler.CurrentTick()});
 }
 
 void BufferCache::TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_t& total_size) {
@@ -1551,7 +1560,8 @@ bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_writte
 		    NoteUpload(address, bytes);
 	    },
 	    [&]() noexcept {
-		    RecordUpload(copies, UploadCopies(copies, total_size));
+		    const auto source = UploadCopies(copies, total_size);
+		    RecordUpload(copies, source);
 		    copies.clear();
 		    total_size = 0;
 	    },
@@ -1615,7 +1625,8 @@ void BufferCache::SynchronizeRanges(std::span<const std::pair<uint64_t, uint64_t
 	    },
 	    [&]() noexcept {
 		    for (size_t index = 0; index < ranges.size(); index++) {
-			    RecordUpload(m_span_copies[index], UploadCopies(m_span_copies[index], m_span_sizes[index]));
+			    const auto source = UploadCopies(m_span_copies[index], m_span_sizes[index]);
+			    RecordUpload(m_span_copies[index], source);
 		    }
 	    },
 	    m_device_sync_pass);
@@ -2931,9 +2942,11 @@ void BufferCache::TickGuestMirror() {
 		const auto host = m_host_view->Totals();
 		::Log::WriteToConsoleAndLog(fmt::format(
 		    "[kyty-host-view] {} imports of guest memory ({:.1f} MiB), {} refused; {} unmaps waited for the GPU; {:.1f} MiB "
-		    "copied in command order into blocks bound behind a dispatch that stores by device address\n",
+		    "copied in command order into blocks bound behind a dispatch that stores by device address; {:.1f} MiB of mapped "
+		    "memory without an import bound for the dispatches whose reach is not known\n",
 		    host.imports, static_cast<double>(host.bytes) / static_cast<double>(MiB), host.refused, host.waits,
-		    static_cast<double>(host.ordered) / static_cast<double>(MiB)));
+		    static_cast<double>(host.ordered) / static_cast<double>(MiB),
+		    static_cast<double>(m_unimported_bytes) / static_cast<double>(MiB)));
 	}
 }
 

@@ -50,7 +50,8 @@ public:
 	void Import(uint64_t vaddr, uint64_t size);
 	void Publish();
 	void Forget(uint64_t vaddr, uint64_t size);
-	void NoteReach() noexcept;
+	void NoteReach() noexcept { m_reached = true; }
+	[[nodiscard]] uint64_t Generation() const noexcept { return m_generation; }
 	void NoteOrderedCopy(uint64_t bytes) noexcept { m_stats.ordered += bytes; }
 
 	template <typename Func>
@@ -63,6 +64,16 @@ public:
 			const auto  end    = std::min(vaddr + size, import.guest + import.bytes);
 			func(begin, end - begin, import.buffer, begin - import.guest);
 		}
+	}
+
+	template <typename Func>
+	void ForEachGap(uint64_t vaddr, uint64_t size, Func&& func) const {
+		auto done = vaddr;
+		ForEachSource(vaddr, size, [&](uint64_t begin, uint64_t bytes, vk::Buffer, uint64_t) {
+			if (done < begin) func(done, begin);
+			done = begin + bytes;
+		});
+		if (done < vaddr + size) func(done, vaddr + size);
 	}
 
 private:
@@ -89,12 +100,12 @@ private:
 	uint64_t                             m_base       = 0;
 	uint64_t                             m_size       = 0;
 	uint64_t                             m_alignment  = 0;
-	bool                                 m_dedicated  = false;
 	std::unique_ptr<Buffer>              m_root;
 	std::vector<std::unique_ptr<Buffer>> m_chunks;
 	std::map<uint64_t, Imported>         m_imports;
 	std::vector<uint64_t>                m_words;
-	uint64_t                             m_reach_tick = 0;
+	uint64_t                             m_generation = 0;
+	bool                                 m_reached    = false;
 	Stats                                m_stats;
 
 	mutable std::mutex    m_mutex;

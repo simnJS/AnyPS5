@@ -1080,6 +1080,9 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 		m_indirect_write_tables.NotePendingWrites();
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	if (full_sync) {
+		m_buffer_cache.RequestUnimportedRanges(m_mapped_ranges, m_mapped_ranges_version);
+	}
 	const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(),
 	                                      m_buffer_cache.RegisterEpoch(), m_mapped_ranges_version};
 	const bool same_layout = epochs[1] == m_bda_sync_epochs[1] && epochs[2] == m_bda_sync_epochs[2];
