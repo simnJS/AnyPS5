@@ -1324,16 +1324,7 @@ uint64_t BufferCache::Frame() const noexcept {
 	return m_resources != nullptr ? m_resources->FlipNumber() : m_gc_tick;
 }
 
-void BufferCache::RequestMappedDispatchRanges(const RangeSet& mapped, uint64_t mapping_epoch) {
-	const std::array layout {mapping_epoch, RegistrationEpoch()};
-	if (layout == m_dispatch_layout) return;
-	mapped.ForEachInRange(m_guest_mirror->Base(), m_guest_mirror->Size(), [&](uint64_t begin, uint64_t end) {
-		RequestRange(begin, end - begin, true);
-	});
-	m_dispatch_layout = layout;
-}
-
-void BufferCache::RequestRange(uint64_t vaddr, uint64_t size, bool prefer_host) {
+void BufferCache::RequestRange(uint64_t vaddr, uint64_t size) {
 	static_assert(GuestMirror::PageBits == CACHING_PAGEBITS);
 	if (!m_guest_mirror->Holds(vaddr, size)) {
 		EXIT("[kyty-mirror] the GPU uses 0x%" PRIx64 " + 0x%" PRIx64 ", outside the mirror of 0x%" PRIx64
@@ -1345,8 +1336,8 @@ void BufferCache::RequestRange(uint64_t vaddr, uint64_t size, bool prefer_host) 
 		return;
 	}
 	m_fresh.clear();
-	m_guest_mirror->NoteRange(vaddr, size, &m_fresh, prefer_host);
-	if (!prefer_host && !m_fresh.empty() && vaddr < m_fresh.front().first && vaddr + size <= m_fresh.back().second) {
+	m_guest_mirror->NoteRange(vaddr, size, &m_fresh);
+	if (!m_fresh.empty() && vaddr < m_fresh.front().first && vaddr + size <= m_fresh.back().second) {
 		auto last = m_fresh.back().second;
 		if (std::find(m_growth_ends.begin(), m_growth_ends.end(), m_fresh.front().first) != m_growth_ends.end()) {
 			const auto leap = std::min(StreamLeap, m_guest_mirror->Base() + m_guest_mirror->Size() - last);

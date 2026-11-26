@@ -39,8 +39,6 @@ namespace Libs::Graphics {
 
 struct ShaderBufferResource;
 
-enum class BdaSync { KnownReach, Registered, Mapped };
-
 class GuestGpu;
 
 class RenderContext {
@@ -109,7 +107,7 @@ public:
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	bool               CacheSelfSizedBuffers(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
-	void               PrepareBda(bool may_write, BdaSync sync = BdaSync::Registered);
+	void               PrepareBda(bool may_write, bool full_sync = true);
 	void               PrepareHackMarks();
 	void               RunGarbageCollector();
 	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);

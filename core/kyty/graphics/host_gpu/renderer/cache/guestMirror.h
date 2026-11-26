@@ -100,7 +100,7 @@ public:
 	[[nodiscard]] uint64_t OutsideBlocks() const noexcept { return m_outside_blocks; }
 	[[nodiscard]] bool     SharedQueue() const noexcept { return m_shared_queue; }
 
-	void               NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh = nullptr, bool prefer_host = false);
+	void               NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh = nullptr);
 	void               Own(uint64_t vaddr, uint64_t size, Runs* fresh = nullptr);
 	void               Use(uint64_t vaddr, uint64_t size) noexcept;
 	void               NoteDevice(uint64_t vaddr, uint64_t size) noexcept;
@@ -119,7 +119,6 @@ private:
 	struct Run {
 		uint64_t first = 0;
 		uint64_t count = 0;
-		bool prefer_host = false;
 	};
 	enum class Kind : uint8_t { Bind, Unbind };
 	struct Command {
@@ -133,7 +132,6 @@ private:
 		vk::DeviceMemory memory = nullptr;
 		uint32_t         used   = 0;
 		uint32_t         next   = 0;
-		bool             host   = false;
 	};
 	struct Slot {
 		uint32_t chunk = 0;
@@ -151,7 +149,7 @@ private:
 	void               Bind(const Command& command);
 	void               Unbind(const Command& command);
 	void               Execute(std::vector<vk::SparseMemoryBind>& binds, const char* what, uint64_t signal);
-	[[nodiscard]] Grant Allocate(uint64_t wanted, bool host);
+	[[nodiscard]] Grant Allocate(uint64_t wanted);
 	void               Free(Slot slot);
 	void               Post(Command&& command);
 	[[nodiscard]] bool AllSet(const std::atomic<uint64_t>* bits, uint32_t shift, uint64_t vaddr, uint64_t size) const noexcept;
@@ -193,7 +191,6 @@ private:
 	uint64_t        m_base           = 0;
 	uint32_t        m_block_bits     = MinBlockBits;
 	uint32_t        m_memory_type    = 0;
-	uint32_t        m_host_type      = UINT32_MAX;
 	uint64_t        m_device_address = 0;
 	std::string     m_description;
 	bool            m_shared_queue = false;
@@ -217,8 +214,8 @@ private:
 	vk::Fence                          m_fence     = nullptr;
 	vk::Semaphore                      m_semaphore = nullptr;
 	std::vector<Chunk>                 m_chunks;
-	std::array<uint32_t, 2>            m_current_chunks {UINT32_MAX, UINT32_MAX};
-	std::array<std::vector<Slot>, 2>   m_free_slots;
+	uint32_t                           m_current_chunk = UINT32_MAX;
+	std::vector<Slot>                  m_free_slots;
 	std::vector<uint32_t>              m_free_chunks;
 	std::unordered_map<uint64_t, Slot> m_block_slots;
 	std::vector<vk::SparseMemoryBind>  m_binds;

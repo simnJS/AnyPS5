@@ -374,15 +374,27 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 	AddressReader reader(graphics, scheduler, 8);
 	Buffer bitmap(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(uint32_t));
 	auto& buffers = renderer.GetBufferCache();
-	const auto reads = [&](uint64_t source) {
+	const auto prepare = [&]() {
 		const auto synced = renderer.SynchronizeDmaFootprint(std::span {&dispatch, 1});
-		renderer.PrepareBda(false, synced ? BdaSync::KnownReach : BdaSync::Mapped);
-		if (!mirror->Requested(source, 8)) return false;
+		renderer.PrepareBda(false, !synced);
+		return synced;
+	};
+	const auto reads = [&](uint64_t source) {
+		if (!prepare() || !mirror->Requested(source, 8)) return false;
 		reader.Record(scheduler, mirror->DeviceAddress() + source - mirror->Base(), 8);
 		Finish(scheduler);
 		return ReadsPattern(reader.Words(8), (source - address) / sizeof(uint32_t)) &&
 		       mirror->Ready(source, 8) && IsResident(scheduler, buffers, bitmap, source) &&
 		       IsResident(scheduler, buffers, bitmap, source + 7);
+	};
+	const auto leaves = [&](uint64_t source) {
+		mirror->WaitIdle();
+		const auto bound = mirror->Totals().bound_blocks;
+		if (prepare()) return false;
+		Finish(scheduler);
+		mirror->WaitIdle();
+		return !mirror->Requested(source, 8) && mirror->Totals().bound_blocks == bound &&
+		       !IsResident(scheduler, buffers, bitmap, source);
 	};
 	const auto verify = [&]() -> const char* {
 		if (!reads(first)) return "the first dispatch did not read both sides of its DMA window";
@@ -390,11 +402,11 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 		if (mirror->Requested(unknown, 8)) return "a bounded dispatch requested an unrelated block";
 		module.info.info.dma_bounded = false;
 		module.info.info.dma_windows.clear();
-		if (!reads(unknown)) return "a dynamic address missed on the first dispatch";
+		if (!leaves(unknown)) return "a dispatch with no known reach bound mapped memory it cannot reach";
 		const auto added = boundary + 2 * block;
 		if (mirror->Requested(added, 8)) return "the dispatch requested an unmapped block";
 		renderer.MapMemory(added, block);
-		if (!reads(added)) return "a dynamic address missed a newly mapped block";
+		if (!leaves(added)) return "a dispatch with no known reach bound a newly mapped block";
 		return nullptr;
 	};
 	const auto* failure = verify();
