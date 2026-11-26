@@ -27,7 +27,7 @@ public:
 		m_pending_writes   = false;
 		return pending;
 	}
-	void NoteWrites(std::span<const uint64_t> pages, bool heap_collected = false);
+	void NoteWrites(std::span<const uint64_t> pages);
 
 	[[nodiscard]] static GuestRange TargetRange(const ShaderBufferResource& target);
 	[[nodiscard]] static std::vector<GuestRange> CoalesceTargets(std::vector<GuestRange> ranges);

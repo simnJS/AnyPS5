@@ -29,6 +29,10 @@
 
 namespace Libs::Graphics {
 
+struct ImageHeapTestAccess {
+	static uint64_t Late(const ImageHeap& heap) { return heap.m_stats.late; }
+};
+
 struct MirrorWindowsTestAccess {
 	static bool ReadBack(BufferCache& cache, uint64_t address, uint64_t size) {
 		std::vector<vk::BufferCopy> copies;
@@ -206,7 +210,7 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	auto& scheduler = renderer.GetCommandScheduler();
 	auto& buffers   = renderer.GetBufferCache();
 	auto& graphics  = renderer.GetGraphics();
-	constexpr uint32_t first = 0x10000, second = 0x20000, third = 0x30000;
+	constexpr uint32_t first = 0x10000, second = 0x20000, third = 0x30000, fourth = 0x40000;
 	std::array<uint32_t, 16> words {};
 	words[0] = first;
 	words[1] = static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u;
@@ -215,10 +219,12 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	words[8] = second;
 	renderer.MapMemory(address, sizeof(words));
 	const std::array<uint32_t, 16> empty_table {};
-	if (!Libs::LibKernel::Memory::TryWriteBacking(address, empty_table.data(), sizeof(words))) {
-		return "could not clear the descriptor table in guest backing";
-	}
-	buffers.InvalidateMemory(address, sizeof(words));
+	const auto cpu_write = [&](uint64_t at, const std::array<uint32_t, 16>& table) {
+		if (!Libs::LibKernel::Memory::TryWriteBacking(at, table.data(), sizeof(table))) return false;
+		buffers.InvalidateMemory(at, sizeof(table));
+		return true;
+	};
+	if (!cpu_write(address, empty_table)) return "could not clear the descriptor table in guest backing";
 
 	vk::DescriptorSetLayout empty;
 	const vk::DescriptorSetLayoutCreateInfo empty_info {};
@@ -229,6 +235,28 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout_info, nullptr, &layout), "consumer layout");
 	const IR::ImageResource root {.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D};
 	const IR::ImageHeapRequest request {.base = address, .size = sizeof(words), .step = 32, .count = 2, .root = &root};
+	bool waited = false;
+	const auto consume_at = [&](const IR::ImageHeapRequest& wanted, uint64_t bytes, std::initializer_list<uint32_t> writes,
+	                            size_t kinds) {
+		IR::ImageHeapView view;
+		const auto        tick = scheduler.CurrentTick();
+		heap.BeginDraw();
+		if (!heap.Acquire(wanted, view) || view.kinds.size() != kinds) return std::vector<uint32_t> {};
+		heap.Rebind(renderer.GetRenderExecutor());
+		for (const auto value: writes) {
+			const auto [buffer, offset] = buffers.ObtainRange(wanted.base, sizeof(uint32_t), true);
+			buffer->Fill(offset, sizeof(uint32_t), value);
+		}
+		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+		waited |= scheduler.CurrentTick() != tick;
+		reader.Record(scheduler, view.slots, bytes);
+		Finish(scheduler);
+		return reader.Words(bytes);
+	};
+	const auto consume = [&](std::initializer_list<uint32_t> writes = {}) {
+		return consume_at(request, sizeof(words), writes, 1u);
+	};
+
 	heap.BeginDraw();
 	IR::ImageHeapView empty_view;
 	auto outside = request;
@@ -241,115 +269,59 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	auto cpu_request = request;
 	cpu_request.step = sizeof(words);
 	if (!heap.Acquire(cpu_request, empty_view) || !empty_view.kinds.empty()) return "unexpected initial CPU kind";
-	if (!Libs::LibKernel::Memory::TryWriteBacking(address, words.data(), sizeof(words))) return "CPU table write failed";
-	buffers.InvalidateMemory(address, sizeof(words));
-	heap.BeginDraw();
-	const auto cpu_tick = scheduler.CurrentTick();
-	if (!heap.Acquire(cpu_request, empty_view) || empty_view.kinds.size() != 1) return "CPU writes did not rearm an empty view";
-	if (scheduler.CurrentTick() != cpu_tick) return "a CPU-written table waited for the GPU queue";
-	heap.Rebind(renderer.GetRenderExecutor());
-	if (heap.CheckTableWrites()) return "CPU discovery required a second draw";
-	heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
-	reader.Record(scheduler, empty_view.slots, sizeof(uint32_t));
-	Finish(scheduler);
-	const auto shared_slot = reader.Words(sizeof(uint32_t)).front();
-	if (shared_slot == 0u) return "the first CPU descriptor used slot zero";
+	if (!cpu_write(address, words)) return "CPU table write failed";
+	const auto armed = consume_at(cpu_request, sizeof(uint32_t), {}, 1u);
+	if (armed.empty() || armed.front() == 0u) return "the first CPU descriptor used slot zero at its first draw";
 	auto unfiltered = root;
 	unfiltered.unfiltered_access_only = true;
 	auto other_request = cpu_request;
 	other_request.root = &unfiltered;
-	heap.BeginDraw();
-	if (!heap.Acquire(other_request, empty_view) || empty_view.kinds.size() != 1u) return "the second profile missed the descriptor";
-	heap.Rebind(renderer.GetRenderExecutor());
-	if (heap.CheckTableWrites()) return "a second profile replayed a stable table";
-	heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
-	reader.Record(scheduler, empty_view.slots, sizeof(uint32_t));
-	Finish(scheduler);
-	if (reader.Words(sizeof(uint32_t)).front() != shared_slot) return "equivalent image bindings occupied different slots";
-	if (!Libs::LibKernel::Memory::TryWriteBacking(address, empty_table.data(), sizeof(words))) return "CPU table reset failed";
-	buffers.InvalidateMemory(address, sizeof(words));
-	heap.BeginDraw();
-	if (!heap.Acquire(request, empty_view) || !empty_view.kinds.empty()) return "unexpected kind for an empty table";
-	const auto [target, destination] = buffers.ObtainRange(address, sizeof(words), true);
-	const auto [upload, uploaded] = buffers.UploadHeapData(sizeof(words), [&](uint8_t* mapped, uint64_t) {
-		std::memcpy(mapped, words.data(), sizeof(words));
-	});
-	target->CopyFrom(scheduler.Current(), *upload, uploaded, destination, sizeof(words));
-	const auto consume = [&](std::initializer_list<uint32_t> writes) {
-		IR::ImageHeapView view;
-		auto write = writes.begin();
-		for (;;) {
-			heap.BeginDraw();
-			if (!heap.Acquire(request, view) || view.kinds.size() != 1u) return std::vector<uint32_t> {};
-			heap.Rebind(renderer.GetRenderExecutor());
-			if (write == writes.end()) break;
-			auto& stream = buffers.GetUtilityBuffer(MemoryUsage::Stream);
-			if (stream.Map(stream.Size(), 16).first == nullptr) return std::vector<uint32_t> {};
-			stream.Commit();
-			const auto [buffer, offset] = buffers.ObtainRange(address, sizeof(uint32_t), true);
-			buffer->Fill(offset, sizeof(uint32_t), *write++);
-			const auto tick = scheduler.CurrentTick();
-			if (!heap.CheckTableWrites() || scheduler.CurrentTick() != tick || !heap.TakeReplay()) return std::vector<uint32_t> {};
-			if (heap.FrozenReplay()) {
-				heap.BeginDraw();
-				if (heap.Acquire(request, view) || write != writes.end()) return std::vector<uint32_t> {};
-				std::vector<uint32_t> frozen(words.size());
-				if (!heap.ReadFallback(address, frozen) || heap.CheckTableWrites() || heap.TakeReplay()) return std::vector<uint32_t> {};
-				return frozen;
-			}
-		}
-		if (heap.CheckTableWrites()) return std::vector<uint32_t> {};
-		const auto tick = scheduler.CurrentTick();
-		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
-		if (scheduler.CurrentTick() != tick) return std::vector<uint32_t> {};
-		reader.Record(scheduler, view.slots, sizeof(words));
-		Finish(scheduler);
-		return reader.Words(sizeof(words));
-	};
-	const auto initial = consume({});
-	const auto late = consume({second});
-	const auto novel = consume({second, second, third});
-	const auto frozen = consume({first, second, third, 0x50000u});
-	if (frozen.size() != words.size() || frozen[0] != 0x50000u || frozen[8] != second) {
-		return "the final materialization did not use the fourth producer's bytes";
+	const auto shared = consume_at(other_request, sizeof(uint32_t), {}, 1u);
+	if (shared.empty() || shared.front() != armed.front()) return "equivalent image bindings occupied different slots";
+
+	const auto initial = consume();
+	if (initial.empty() || initial.front() == 0 || initial[8] == 0 || initial.front() == initial[8]) {
+		return "the two seeded descriptors did not produce distinct slots at their first draw";
 	}
-	if (novel.empty() || initial.empty() || novel[0] == 0u || novel[0] == initial[0] ||
-	    novel[0] == initial[8] || novel[8] != initial[8]) return "a new descriptor missed its only draw";
+	if (ImageHeapTestAccess::Late(heap) != 0u) return "a CPU-written table reported a missing key";
+
+	auto groups = heap.FillGroups();
+	if (!cpu_write(address, words)) return "identical CPU table write failed";
+	if (consume() != initial || heap.FillGroups() != groups) return "a page rewritten with the same bytes refilled its slots";
+
+	auto swapped = words;
+	swapped[0]   = second;
+	if (!cpu_write(address, swapped)) return "CPU key change failed";
+	const auto changed = consume();
+	if (changed.empty() || changed[0] != initial[8] || changed[8] != initial[8]) return "a changed CPU key missed its first draw";
+	if (!cpu_write(address, words)) return "CPU key restore failed";
+	if (consume() != initial) return "a restored CPU key missed its first draw";
+
+	const auto produced = consume({second});
+	if (produced.empty() || produced[0] != initial[8] || produced[8] != initial[8]) {
+		return "a resident key written by the GPU during the preparation missed its own draw";
+	}
+	if (ImageHeapTestAccess::Late(heap) != 0u) return "a resident key was reported missing";
+
+	const auto novel = consume({third});
+	if (novel.empty() || novel[0] != 0u || novel[8] != initial[8]) return "an unknown key did not fall back to slot zero";
+	const auto served = consume();
+	if (served.empty() || served[0] == 0u || served[0] == initial[0] || served[0] == initial[8] || served[8] != initial[8]) {
+		return "a key missed by the in-stream fill was not served at its next draw";
+	}
+	if (ImageHeapTestAccess::Late(heap) != 1u) return "the missing key was not counted once";
+
+	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address, sizeof(words));
+	if (!cpu_write(address, words)) return "CPU table rewrite failed";
+	if (consume() != initial) return "CPU bytes equal to the last CPU copy did not replace a GPU-written key";
+
 	const auto [mirror, offset] = buffers.ObtainRange(address, sizeof(words), false, false, ObtainFrom::Mirror);
-	renderer.PrepareBda(true, false);
-	mirror->Fill(offset, sizeof(uint32_t), first);
-	const auto indirect = consume({});
-	const auto packed = address >= Libs::LibKernel::Memory::kExtendedMemoryBase
-	                        ? address - Libs::LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE : address;
-	const auto page = packed / BufferCache::CACHING_PAGESIZE;
-	const auto bitmap_word = BufferCache::WRITE_BITMAP_OFFSET + page / 32u * 4u;
 	renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
-	buffers.GetFaultBuffer()->Fill(bitmap_word, 4, 1u << ((page + 1u) % 32u));
-	const auto groups = heap.FillGroups();
-	const auto inspected = buffers.HeapBitmapBytes();
-	const auto disjoint = consume({});
-	if (disjoint != indirect || heap.FillGroups() != groups || buffers.HeapBitmapBytes() - inspected != 4u) {
-		return "a disjoint shader write did more than inspect the watched bitmap word";
-	}
-	heap.BeginDraw();
-	IR::ImageHeapView producer_view;
-	if (!heap.Acquire(request, producer_view)) return "could not prepare the heap for a writing draw";
-	heap.Rebind(renderer.GetRenderExecutor());
-	const auto producer_tick = scheduler.CurrentTick();
-	renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
-	if (heap.CheckTableWrites() || scheduler.CurrentTick() != producer_tick) return "a writing draw waited on its own write";
-	heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
-	mirror->Fill(offset, sizeof(uint32_t), third);
-	buffers.GetFaultBuffer()->Fill(bitmap_word, 4, 1u << (page % 32u));
-	const auto bitmap_hit = consume({});
-	if (bitmap_hit.empty() || bitmap_hit[0] != novel[0]) return "the written page did not reach its first consumer";
-	renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
-	heap.BeginDraw();
-	RangeSet collected;
-	buffers.CollectHeapWritePages(collected);
-	bool dirty = !collected.Empty();
-	buffers.TakeHeapTableWrites([&](uint64_t, uint64_t) { dirty = true; });
-	if (dirty) return "a consumed page bit invalidated the table again";
+	mirror->Fill(offset, sizeof(uint32_t), second);
+	const auto indirect = consume();
+	if (indirect.empty() || indirect[0] != initial[8]) return "a consumer missed a write by address of unknown reach";
+	if (!cpu_write(address, words) || consume() != initial) return "CPU bytes did not replace a key written by address";
+
 	const auto prepare_writer = [&](uint64_t base, bool bounded) {
 		const std::array<uint32_t, 4> code {0x7e020280u, 0xdc708000u, bounded ? 1u : 0x007f0000u, 0xbf810000u};
 		IR::ResourceSnapshot resources;
@@ -401,120 +373,74 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 		const ShaderStageRuntime* stages[] {&stage};
 		if (compiled.spirv.empty() || !renderer.CacheSelfSizedBuffers(stage)) return "missing compiled write reach";
 		renderer.PrepareShaderBda(stages, true);
-		heap.BeginDraw();
-		if (buffers.HeapBitmapReady(address, sizeof(words))) return "the compiled writer waited on a disjoint table";
+		groups = heap.FillGroups();
+		if (consume() != initial || heap.FillGroups() != groups) return "a compiled writer refilled a disjoint table";
 	}
 	if (!prepare_writer(address + 4u * BufferCache::CACHING_PAGESIZE, true)) return "no bound for a base-relative pixel store";
-	heap.BeginDraw();
-	if (buffers.HeapBitmapReady(address, sizeof(words))) return "a writer whose reach misses the table flagged it";
-	const auto reach_bytes = buffers.HeapBitmapBytes();
-	const auto reach = consume({});
-	if (reach != bitmap_hit || buffers.HeapBitmapBytes() != reach_bytes) {
-		return "a writer whose reach misses the table made its consumer read the bitmap";
-	}
+	groups = heap.FillGroups();
+	if (consume() != initial || heap.FillGroups() != groups) return "a writer whose reach misses the table refilled it";
 	if (!prepare_writer(address, true)) return "missing store window";
-	heap.BeginDraw();
-	if (!buffers.HeapBitmapReady(address, sizeof(words))) return "a bounded store missed its watched table";
-	buffers.CollectHeapWritePages(collected);
+	if (consume() != initial || heap.FillGroups() == groups) return "a bounded store did not refill its watched table";
+	groups = heap.FillGroups();
 	if (!prepare_writer(address, false)) return "a full vector address incorrectly acquired a store window";
-	heap.BeginDraw();
-	if (!buffers.HeapBitmapReady(address, sizeof(words))) return "an unknown store did not request the bitmap";
+	if (consume() != initial || heap.FillGroups() == groups) return "an unknown store did not refill the watched tables";
 	const auto collect_tick = scheduler.CurrentTick();
 	buffers.ProcessWriteBuffer([](std::span<const uint64_t>) {});
 	if (scheduler.CurrentTick() != collect_tick) return "the frame collection of the write bitmap waited for the GPU queue";
-	bool converted = false;
-	buffers.TakeHeapTableWrites([&](uint64_t begin, uint64_t end) { converted |= begin <= address && address + sizeof(words) <= end; });
-	if (!converted || buffers.HeapBitmapReady(address, sizeof(words))) {
-		return "the frame collection dropped a pending bitmap check of a table";
-	}
-	{
-		heap.BeginDraw();
-		const auto [noted, noted_at] = buffers.ObtainRange(address, sizeof(uint32_t), true);
-		noted->Fill(noted_at, sizeof(uint32_t), first);
-		IR::ImageHeapView view;
-		if (!heap.Acquire(request, view)) return "could not prepare an unannounced mirror write";
-		heap.Rebind(renderer.GetRenderExecutor());
-		constexpr uint32_t fourth = 0x40000;
-		const auto [unannounced, at] = buffers.ObtainRange(address, sizeof(words), false, false, ObtainFrom::Mirror);
-		unannounced->Fill(at, sizeof(uint32_t), fourth);
-		if (heap.CheckTableWrites()) return "an unannounced mirror write replayed the draw";
-		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
-		Finish(scheduler);
-		const auto served = consume({});
-		if (served.empty() || served[0] == 0u || served[0] == initial[0] || served[0] == initial[8] ||
-		    served[0] == novel[0] || served[8] != initial[8]) {
-			return "a key missed by the in-stream fill was not served at its next draw";
-		}
-	}
 	{
 		const auto other = address + 0x1000u;
 		renderer.MapMemory(other, sizeof(words));
-		if (!Libs::LibKernel::Memory::TryWriteBacking(other, words.data(), sizeof(words))) return "second CPU table write failed";
-		buffers.InvalidateMemory(other, sizeof(words));
+		if (!cpu_write(other, words)) return "second CPU table write failed";
 		auto other_request = request;
 		other_request.base = other;
-		IR::ImageHeapView view;
-		heap.BeginDraw();
-		const auto first_tick = scheduler.CurrentTick();
-		if (!heap.Acquire(other_request, view) || view.kinds.size() != 1 || scheduler.CurrentTick() != first_tick) {
-			return "a new CPU table was not discovered without waiting";
-		}
+		if (consume_at(other_request, sizeof(words), {}, 1u) != initial) return "a new CPU table missed its first draw";
 		heap.RunGarbageCollector();
 		heap.RunGarbageCollector();
-		heap.BeginDraw();
-		const auto again_tick = scheduler.CurrentTick();
-		if (!heap.Acquire(other_request, view) || scheduler.CurrentTick() != again_tick) {
-			return "a CPU table taken up again after the collector waited for the GPU queue";
-		}
+		if (consume_at(other_request, sizeof(words), {}, 1u) != initial) return "a CPU table taken up again missed its draw";
 	}
 	{
 		const auto other = address + 0x3000u;
 		renderer.MapMemory(other, sizeof(words));
-		if (!Libs::LibKernel::Memory::TryWriteBacking(other, empty_table.data(), sizeof(words))) return "could not clear the unwatched backing";
-		buffers.InvalidateMemory(other, sizeof(words));
+		if (!cpu_write(other, empty_table)) return "could not clear the unwatched backing";
 		const auto [device, at] = buffers.ObtainRange(other, sizeof(words), false, false, ObtainFrom::Mirror);
 		renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
 		const auto upload_table = [&](uint64_t start, size_t bytes) {
-			const auto [source, offset] = buffers.UploadHeapData(bytes, [&](uint8_t* dest, uint64_t) {
+			const auto [source, source_offset] = buffers.UploadHeapData(bytes, [&](uint8_t* dest, uint64_t) {
 				std::memcpy(dest, words.data(), bytes);
 			});
-			device->CopyFrom(scheduler.Current(), *source, offset, at + start, bytes);
+			device->CopyFrom(scheduler.Current(), *source, source_offset, at + start, bytes);
 		};
 		upload_table(0, sizeof(words));
 		auto unseen = request;
 		unseen.base = other;
 		unseen.step = 48u;
 		unseen.count = 1u;
-		heap.BeginDraw();
-		IR::ImageHeapView view;
-		if (!heap.Acquire(unseen, view) || view.kinds.size() != 1u) return "the first consumer read the unwatched zero backing";
-		heap.Rebind(renderer.GetRenderExecutor());
-		if (heap.CheckTableWrites()) return "unwatched producer replayed its consumer";
-		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
-		reader.Record(scheduler, view.slots, 4u);
-		Finish(scheduler);
-		if (reader.Words(4u).front() != initial[0]) return "the first unwatched descriptor got the wrong slot";
-		if (!Libs::LibKernel::Memory::TryWriteBacking(other, empty_table.data(), sizeof(words))) return "could not reset the resize table";
-		buffers.InvalidateMemory(other, sizeof(words));
-		heap.BeginDraw();
+		const auto resident = consume_at(unseen, sizeof(uint32_t), {}, 0u);
+		if (resident.empty() || resident.front() != 0u) return "a table the CPU cannot read armed a kind before its first draw";
+		const auto known = consume_at(unseen, sizeof(uint32_t), {}, 1u);
+		if (known.empty() || known.front() != initial[0]) return "a key reported by the in-stream fill did not arm its shape";
 		auto sized = request;
 		sized.base = other;
-		if (!heap.Acquire(sized, view)) return "could not certify the resize table";
+		if (!cpu_write(other, empty_table)) return "could not reset the resize table";
+		heap.BeginDraw();
+		IR::ImageHeapView view;
+		if (!heap.Acquire(sized, view)) return "could not read the resize table";
 		heap.BeginDraw();
 		sized.size = 32u;
 		if (!heap.Acquire(sized, view)) return "could not shrink the resize table";
 		renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
 		words[0] = 0x60000u;
 		upload_table(32u, 32u);
-		heap.BeginDraw();
+		words[0] = first;
 		sized.size = sizeof(words);
-		if (!heap.Acquire(sized, view)) return "could not extend the resize table";
-		heap.Rebind(renderer.GetRenderExecutor());
-		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
-		reader.Record(scheduler, view.slots, sizeof(words));
-		Finish(scheduler);
-		const auto resized = reader.Words(sizeof(words));
-		if (resized[0] != 0u || resized[8] == 0u || resized[8] == initial[0] || resized[8] == initial[8]) return "regrowth reused the discarded tail provenance";
+		const auto late = ImageHeapTestAccess::Late(heap);
+		const auto grown = consume_at(sized, sizeof(words), {}, 1u);
+		if (grown.empty() || grown[0] != 0u || grown[8] != 0u) return "an unknown key in a regrown table did not fall back to slot zero";
+		const auto resized = consume_at(sized, sizeof(words), {}, 1u);
+		if (resized.empty() || resized[0] != 0u || resized[8] == 0u || resized[8] == initial[0] || resized[8] == initial[8] ||
+		    ImageHeapTestAccess::Late(heap) != late + 1u) {
+			return "the key of a regrown table was not served at its next draw";
+		}
 	}
 	const auto bytes = buffers.GetUtilityBuffer(MemoryUsage::Stream).Size() + sizeof(uint32_t);
 	const auto tick  = scheduler.CurrentTick();
@@ -528,11 +454,8 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	graphics.device.destroyPipelineLayout(layout);
 	graphics.device.destroyDescriptorSetLayout(empty);
 	if (!large_ok) return "a heap upload larger than the stream lost its tick or its last word";
-	if (initial.empty() || initial.front() == 0 || initial[8] == 0 || initial.front() == initial[8]) {
-		return "the two seeded descriptors did not produce distinct slots";
-	}
-	if (late.empty() || late.front() != initial[8]) return "a consumer missed a mirror write after rebind";
-	if (indirect.empty() || indirect.front() != initial.front()) return "a consumer missed an indirect address write";
+	if (waited) return "an image heap draw advanced the GPU queue tick";
+	(void)fourth;
 	return nullptr;
 }
 
@@ -633,8 +556,11 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 
 	buffers.NoteDeviceAddressUse();
 	take();
+	if (!taken.empty()) return "an indirect address write reaches the heap before its draw is recorded";
+	buffers.BeginHeapDraw();
+	take();
 	if (taken.size() != 1 || taken.front() != table_range) {
-		return "an indirect address write does not reach the heap before the write bitmap is read";
+		return "an indirect address write does not reach the heap at the next draw";
 	}
 
 	const auto [written, written_offset] = buffers.ObtainRange(address + WrittenAt, WrittenBytes, true);

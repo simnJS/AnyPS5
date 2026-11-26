@@ -99,6 +99,10 @@ constexpr uint32_t KeyHash(const KeyWordArray& words, uint32_t profile) {
 	return hash;
 }
 
+constexpr bool NullKey(const KeyWordArray& words) {
+	return words[0] == 0u && (words[1] & 0xffu) == 0u;
+}
+
 inline KeyWordArray ReadKey(std::span<const uint32_t> table, uint64_t slot, uint32_t key_words) {
 	KeyWordArray words {};
 	for (uint32_t word = 0; word < key_words && slot + word < table.size(); ++word) {
@@ -234,6 +238,7 @@ struct Lookup {
 
 inline Lookup Resolve(const Directory& directory, const KeyWordArray& words, uint32_t profile,
                       std::span<const uint32_t> kinds) {
+	if (NullKey(words)) return {};
 	const auto* bucket = directory.Find(words, profile);
 	if (bucket == nullptr) return {.slot = 0u, .miss = true};
 	if (bucket->value == 0u) return {};

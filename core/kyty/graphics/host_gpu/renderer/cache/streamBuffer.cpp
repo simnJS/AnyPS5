@@ -231,18 +231,12 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	                       0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
-	vk::PipelineStageFlags stages = vk::PipelineStageFlagBits::eAllCommands;
-	vk::AccessFlags access = MEMORY_ACCESS;
-	if (Usage() == MemoryUsage::Download) {
-		stages |= vk::PipelineStageFlagBits::eHost;
-		access |= vk::AccessFlagBits::eHostRead;
-	}
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, MEMORY_ACCESS),
-	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, access),
+	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS),
 	};
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       stages,
+	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 

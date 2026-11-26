@@ -45,9 +45,7 @@ enum class ObtainFrom : uint8_t {
 
 enum class BdaWriteTracking : uint8_t { Unknown, PageBitmap, ExplicitRanges };
 
-enum class HeapProducer : uint8_t { Image, Occlusion };
-
-enum class HeapWriteSource : uint8_t { Immediate, Shader, Collected };
+enum class HeapWriteSource : uint8_t { Immediate, Shader };
 
 class BufferCache {
 public:
@@ -148,7 +146,7 @@ public:
 	void ImportGuestMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool GuestMemoryImported(uint64_t vaddr, uint64_t size) const { return m_host_view->Overlaps(vaddr, size); }
 	void ForgetGuestMemory(uint64_t vaddr, uint64_t size);
-	void EnsureRangeContents(uint64_t vaddr, uint64_t size, RangeSet* uploaded = nullptr);
+	void EnsureRangeContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InMirror(const Buffer* buffer) const noexcept { return buffer != nullptr && buffer == m_storage.get(); }
 	[[nodiscard]] std::pair<uint64_t, uint64_t> OwnedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainRange(uint64_t vaddr, uint64_t size, bool is_written,
@@ -211,9 +209,6 @@ public:
 	bool               ProcessHackMarks() { return m_fault_manager.ProcessHackMarkBuffer(); }
 	void               ProcessUseBuffer();
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
-		BeginHeapDraw();
-		m_heap_bitmap_ready.ForEach([&](uint64_t begin, uint64_t end) { m_heap_table_writes.Add(begin, end - begin); });
-		m_heap_bitmap_ready.Clear();
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
 	void NoteGpuWrites(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate);
@@ -229,11 +224,7 @@ public:
 	}
 	void WatchHeapTables(std::span<const std::pair<uint64_t, uint64_t>> tables) {
 		m_heap_tables.Clear();
-		if (tables.empty()) {
-			m_heap_bitmap_pending.Clear();
-			m_heap_bitmap_ready.Clear();
-			m_heap_shader_writes.Clear();
-		}
+		if (tables.empty()) m_heap_shader_writes.Clear();
 		for (const auto& [base, size]: tables) {
 			if (size != 0) m_heap_tables.Add(base, size);
 		}
@@ -247,32 +238,22 @@ public:
 		}
 	}
 	void NoteHeapShaderWrites() {
-		m_heap_tables.ForEach([&](uint64_t begin, uint64_t end) { m_heap_bitmap_pending.Add(begin, end - begin); });
+		m_heap_tables.ForEach([&](uint64_t begin, uint64_t end) { m_heap_shader_writes.Add(begin, end - begin); });
 	}
-	void NoteHeapShaderWrites(uint64_t vaddr, uint64_t size) {
-		if (!m_heap_tables.Empty() && size != 0) {
-			m_heap_tables.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
-				m_heap_bitmap_pending.Add(begin, end - begin);
-			});
-		}
+	void NoteHeapShaderWrites(uint64_t vaddr, uint64_t size) { NoteHeapTransfer(vaddr, size, HeapWriteSource::Shader); }
+	void BeginHeapDraw() {
+		if (m_heap_shader_writes.Empty()) return;
+		m_heap_shader_writes.ForEach([&](uint64_t begin, uint64_t end) { m_heap_table_writes.Add(begin, end - begin); });
+		m_heap_shader_writes.Clear();
 	}
-	[[nodiscard]] bool HeapBitmapReady(uint64_t vaddr, uint64_t size) const {
-		return !m_heap_bitmap_ready.Empty() && m_heap_bitmap_ready.Intersects(vaddr, size);
-	}
-	void CopyHeapTable(Buffer& destination, uint64_t offset, uint64_t address, uint64_t size);
-	void BeginHeapDraw(bool replay = false);
-	bool PrepareHeapPublication(HeapProducer producer, uint64_t serial, uint64_t version, uint64_t address, uint64_t size);
-	void CollectHeapWritePages(RangeSet& written);
-	uint64_t HeapBitmapBytes() const noexcept { return m_heap_bitmap_bytes; }
-	uint64_t HeapBitmapWaits() const noexcept { return m_heap_bitmap_waits; }
+	using HeapTableBytes = std::function<void(uint64_t, std::span<const uint8_t>)>;
+	void UploadHeapTable(uint64_t vaddr, uint64_t size, const HeapTableBytes& uploaded);
+	[[nodiscard]] bool RequestHeapTable(uint64_t vaddr, uint64_t size);
+	void FinishHostCopies();
 	template <typename Func>
 	void TakeHeapTableWrites(Func&& func) {
-		if (std::exchange(m_heap_writes_unbounded, false)) {
-			m_heap_tables.ForEach(func);
-		} else {
-			if (m_heap_table_writes.Empty()) return;
-			m_heap_table_writes.ForEach(func);
-		}
+		if (m_heap_table_writes.Empty()) return;
+		m_heap_table_writes.ForEach(func);
 		m_heap_table_writes.Clear();
 	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -334,11 +315,7 @@ public:
 	void BeginIndirectWrites() noexcept { m_indirect_writes_pending.fetch_add(1, std::memory_order_acq_rel); }
 	void EndIndirectWrites() noexcept { m_indirect_writes_pending.fetch_sub(1, std::memory_order_acq_rel); }
 	void NoteDeviceAddressUse(BdaWriteTracking tracking = BdaWriteTracking::Unknown) noexcept {
-		if (tracking == BdaWriteTracking::PageBitmap) {
-			NoteHeapShaderWrites();
-		} else if (tracking == BdaWriteTracking::Unknown) {
-			m_heap_writes_unbounded = !m_heap_tables.Empty();
-		}
+		if (tracking != BdaWriteTracking::ExplicitRanges) NoteHeapShaderWrites();
 		m_device_address_pending = true;
 		if (m_device_address_hot != 0 &&
 		    m_readback_count - m_device_address_hot < HotReadbackLifetime) {
@@ -371,7 +348,7 @@ private:
 
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
-	[[nodiscard]] bool SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, RangeSet* uploaded = nullptr);
+	[[nodiscard]] bool SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(std::vector<vk::BufferCopy>& copies, uint64_t total_size);
 	void                     TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
 	void                     NotePromotion(uint64_t begin, uint64_t end);
@@ -415,7 +392,7 @@ private:
 	void DrainHostCopies();
 	void NoteWrite(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate) {
 		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);
-		if (writer != HeapWriteSource::Collected) NoteHeapTransfer(vaddr, size, writer);
+		NoteHeapTransfer(vaddr, size, writer);
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
 			m_pending_writes.emplace_back(vaddr, size);
 			for (const auto& hot: m_readback_hot) {
@@ -495,17 +472,7 @@ private:
 	RangeSet                                          m_heap_tables;
 	RangeSet                                          m_heap_table_writes;
 	RangeSet                                          m_heap_shader_writes;
-	RangeSet                                          m_heap_bitmap_pending;
-	RangeSet                                          m_heap_bitmap_ready;
-	uint64_t                                          m_heap_bitmap_bytes = 0;
-	uint64_t                                          m_heap_bitmap_waits = 0;
-	struct Publication {
-		HeapProducer producer;
-		uint64_t serial, version, address, size;
-		bool operator==(const Publication&) const = default;
-	};
-	std::vector<Publication>                          m_heap_publications;
-	bool                                              m_heap_writes_unbounded = false;
+	std::vector<uint8_t>                              m_heap_bytes;
 	static constexpr size_t                           StaleRingSize = 32;
 	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};
 	std::atomic<uint32_t>                             m_stale_ring_next {0};

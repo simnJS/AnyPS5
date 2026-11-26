@@ -121,9 +121,9 @@ void main() {
 			hash        = Mix(hash ^ words[word]);
 		}
 		Buckets buckets = Buckets(pc.buckets);
-		bool    found   = false;
+		bool    found   = words[0] == 0u && (words[1] & 0xffu) == 0u;
 		uint    entry   = 0u;
-		for (uint distance = 0u; distance < MaxDistance; distance++) {
+		for (uint distance = 0u; !found && distance < MaxDistance; distance++) {
 			const uint at = (hash + distance) & BucketMask;
 			const uint owner = buckets.v[at].profile;
 			if (owner == EmptyProfile) {

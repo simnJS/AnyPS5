@@ -2324,7 +2324,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	m_context.GetOcclusionQueries().WriteForReaders();
-	if (m_context.GetImageHeap().CheckTableWrites()) return;
 	if (state.ps_active) {
 		PrepareDrawRayTracing(m_context, buffer, bindings.pixel);
 	}
@@ -2506,23 +2505,15 @@ struct TableNormalDraw {
 }
 
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
-	m_context.GetCommandScheduler().PopPendingOperations();
-	Common::LockGuard lock(m_context.GetMutex());
-	bool result;
-	do {
-		result = DrawIndexOnce(buffer, args);
-	} while (m_context.GetImageHeap().TakeReplay());
-	return result;
-}
-
-bool RenderExecutor::DrawIndexOnce(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	const TableNormalDraw table_normal {*this, args.indirect, true, TableCount::TableSampleStart()};
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
+	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
@@ -2614,23 +2605,15 @@ bool RenderExecutor::DrawIndexOnce(CommandBuffer& buffer, const DrawIndexArgs& a
 }
 
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
-	m_context.GetCommandScheduler().PopPendingOperations();
-	Common::LockGuard lock(m_context.GetMutex());
-	bool result;
-	do {
-		result = DrawAutoOnce(buffer, args);
-	} while (m_context.GetImageHeap().TakeReplay());
-	return result;
-}
-
-bool RenderExecutor::DrawAutoOnce(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	const TableNormalDraw table_normal {*this, args.indirect, false, TableCount::TableSampleStart()};
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
+	Common::LockGuard lock(m_context.GetMutex());
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}

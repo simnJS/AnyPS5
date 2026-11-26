@@ -31,17 +31,8 @@ public:
 	[[nodiscard]] static vk::DescriptorSetLayout CreateLayout(vk::Device device);
 
 	void BeginDraw();
-	bool CheckTableWrites();
-	bool FrozenReplay() const;
-	uint64_t FillGroups() const { return m_check_stats.groups; }
+	uint64_t FillGroups() const { return m_stats.groups; }
 	bool ReadFallback(uint64_t address, std::span<uint32_t> words) const override;
-	bool ReplayPending() const { return m_retry; }
-	bool TakeReplay() {
-		const bool replay = std::exchange(m_retry, false);
-		m_replaying        = replay;
-		m_attempt          = replay ? m_attempt + 1u : 0u;
-		return replay;
-	}
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
 	bool AcquireList(const ShaderRecompiler::IR::ImageHeapList& list,
@@ -143,7 +134,6 @@ private:
 		std::unique_ptr<Buffer> buffer;
 		std::vector<Range>      pending;
 		std::vector<Range>      found;
-		std::vector<Range>      gpu_found;
 		bool                    full         = true;
 		bool                    clear        = true;
 		bool                    discover     = true;
@@ -153,31 +143,22 @@ private:
 	};
 
 	struct Memory {
-		uint64_t                                   base    = 0;
-		uint64_t                                   size    = 0;
-		uint64_t                                   draw    = 0;
-		uint64_t                                   synced  = 0;
+		uint64_t                                   base     = 0;
+		uint64_t                                   size     = 0;
+		uint64_t                                   draw     = 0;
+		uint64_t                                   synced   = 0;
 		uint64_t                                   prepared = 0;
-		uint32_t                                   idle    = 0;
-		bool                                       gpu_all = false;
-		bool                                       fresh   = true;
-		std::unique_ptr<Buffer>                    snapshot;
-		std::unique_ptr<Buffer>                    admitted_snapshot;
-		uint64_t                                   snapshot_tick = 0;
-		RangeSet                                   cpu_bytes;
 		uint64_t                                   fallback_draw = 0;
-		bool                                       fallback_valid = false;
-		std::vector<uint32_t>                      fallback;
+		uint32_t                                   idle     = 0;
+		bool                                       gpu_all  = false;
+		bool                                       cpu_all  = false;
+		bool                                       fresh    = true;
+		std::vector<uint32_t>                      words;
+		RangeSet                                   gpu_bytes;
+		std::vector<std::pair<uint64_t, uint64_t>> unread;
 		std::vector<std::pair<uint64_t, uint64_t>> written;
 		std::vector<std::pair<uint64_t, uint64_t>> gpu_written;
 		std::vector<std::unique_ptr<View>>         views;
-	};
-
-	struct Remembered {
-		uint64_t base  = 0;
-		uint64_t size  = 0;
-		uint32_t frame = 0;
-		RangeSet cpu_bytes;
 	};
 
 	struct List {
@@ -203,18 +184,22 @@ private:
 		std::vector<uint32_t>   expected;
 	};
 
-	struct WaitStats {
-		uint64_t discovery       = 0;
-		uint64_t fallback        = 0;
-		uint64_t snapshot        = 0;
-		uint64_t cpu_discoveries = 0;
-		uint64_t cpu_probes      = 0;
-		uint64_t gpu_discoveries = 0;
-		uint64_t gpu_probes      = 0;
+	struct Stats {
+		uint64_t reads           = 0;
+		uint64_t read_bytes      = 0;
+		uint64_t changed_bytes   = 0;
+		uint64_t unchanged       = 0;
+		uint64_t unstable        = 0;
+		uint64_t discoveries     = 0;
+		uint64_t probes          = 0;
+		uint64_t fills           = 0;
+		uint64_t groups          = 0;
 		uint64_t late            = 0;
-		uint64_t replays         = 0;
+		uint64_t null_misses     = 0;
+		uint64_t ring_overflows  = 0;
 		uint64_t overflows       = 0;
 		uint64_t fallback_reads  = 0;
+		uint64_t stale_fallbacks = 0;
 		uint32_t reported        = 0;
 	};
 
@@ -225,8 +210,6 @@ private:
 		uint64_t late       = 0;
 		uint64_t extras     = 0;
 		uint64_t misses     = 0;
-		uint64_t overflows  = 0;
-		uint64_t groups     = 0;
 		uint32_t reported   = 0;
 	};
 
@@ -234,18 +217,18 @@ private:
 	Shape&   FindShape(uint64_t step, uint64_t first, uint32_t profile);
 	Shape&   ListShape(uint32_t profile);
 	void     Discover(View& view);
-	void     DiscoverOnGpu(Memory& memory);
-	Refusal  Admit(View& view, const ImageHeapSlots::KeyWordArray& words);
-	Refusal  AdmitKey(Shape& shape, const ImageHeapSlots::KeyWordArray& words);
+	Refusal  AdmitKey(Shape& shape, const ImageHeapSlots::KeyWordArray& words, uint32_t& kind);
 	void     Refuse(View& view, Refusal refusal);
 	void     AdmitLate(const ImageHeapSlots::Miss& miss);
-	void     ApplyGpuWrite(uint64_t begin, uint64_t end, std::vector<Memory*>* changed);
-	void     LearnProvenance(Memory& memory, uint64_t begin, std::span<const uint8_t> bytes);
+	void     ApplyGpuWrite(uint64_t begin, uint64_t end);
+	void     ApplyBytes(Memory& memory, uint64_t address, std::span<const uint8_t> bytes, bool uploaded);
+	void     ReadStable(Memory& memory, uint64_t begin, uint64_t end);
+	bool     Unchanged(const Memory& memory, uint64_t begin, uint64_t end) const;
+	void     Upload(uint64_t begin, uint64_t end);
+	void     UseFallback(Memory& memory);
 	void     Report();
-	void     AppendJobs(View& view, uint32_t id, const std::vector<Range>* ranges);
+	void     AppendJobs(View& view);
 	void     AdvanceSweep();
-	void     RetryProfile(uint32_t profile);
-	void     SaveFallback(Memory& memory);
 	uint32_t InternList(Shape& shape, uint32_t kind, const Key& key);
 	uint32_t Entry(const Key& key, uint32_t kind, bool table);
 	bool     Arm(Shape& shape, uint32_t kind, const DescriptorValue& value, uint32_t limit, uint32_t& arm);
@@ -273,16 +256,17 @@ private:
 	void     WriteDescriptors();
 	void     Drop(Memory& memory);
 	void     WatchTables();
-	bool     TakeGpuWrites(bool snapshot = false);
+	void     TakeGpuWrites();
 	void     ServiceMisses();
 	void     Service(Ring& ring);
 	void     SyncMemory(Memory& memory);
 	void     UpdateProbes(Memory& memory);
 	void     AddBytes(View& view, uint64_t begin, uint64_t end, bool discover);
+	void     Repend(const Key& key, uint32_t profile);
 	void     RecordFills(CommandBuffer& buffer);
-	void     PrepareGpu(CommandBuffer& buffer);
+	void     PrepareGpu();
 	void     FlushDirectory(CommandBuffer& buffer);
-	void     Dispatch(CommandBuffer& buffer, Buffer* feedback = nullptr);
+	void     Dispatch(CommandBuffer& buffer);
 	Ring&    CurrentRing();
 	void     Snapshot(CommandBuffer& buffer, std::unique_ptr<Buffer>& target);
 	bool     StepSweep();
@@ -293,7 +277,6 @@ private:
 	RenderContext&                                                      m_context;
 	std::mutex                                                          m_mutex;
 	std::vector<std::unique_ptr<Memory>>                                m_memories;
-	std::vector<Remembered>                                             m_remembered;
 	std::unordered_map<ShapeKey, std::unique_ptr<Shape>, ShapeKeyHash> m_shapes;
 	std::vector<Shape*>                                                 m_shape_ids;
 	std::unordered_map<uint32_t, std::unique_ptr<Shape>>               m_list_shapes;
@@ -304,7 +287,6 @@ private:
 	uint64_t                                                            m_admission_draw = 0;
 	uint64_t                                                            m_suspend_draw = 0;
 	uint32_t                                                            m_frame        = 1;
-	uint32_t                                                            m_attempt      = 0;
 	uint32_t                                                            m_capacity_epoch = 0;
 	bool                                                                m_capacity_changed = false;
 	std::vector<ShaderRecompiler::IR::ImageResource>                    m_profiles;
@@ -336,10 +318,8 @@ private:
 	std::vector<uint32_t>                                               m_groups;
 	std::vector<View*>                                                  m_cleared;
 	std::vector<Range>                                                  m_ranges;
-	std::vector<View*>                                                  m_batch;
-	std::vector<Memory*>                                                m_changed;
-	RangeSet                                                            m_bitmap_writes;
-	std::unique_ptr<Buffer>                                             m_discovery_ring;
+	RangeSet                                                            m_unread;
+	std::vector<uint8_t>                                                m_bytes;
 	std::deque<Ring>                                                    m_rings;
 	std::vector<std::unique_ptr<Buffer>>                                m_free_rings;
 	std::unique_ptr<Buffer>                                             m_buckets;
@@ -355,14 +335,10 @@ private:
 	std::vector<uint32_t>                                               m_candidates;
 	std::vector<uint32_t>                                               m_stamps;
 	bool                                                                m_check = false;
-	bool                                                                m_retry = false;
-	bool                                                                m_replaying = false;
-	bool                                                                m_keep_snapshots = false;
-	bool                                                                m_have_snapshots = false;
 	bool                                                                m_have_fallback = false;
 	std::deque<Check>                                                   m_checks;
 	CheckStats                                                          m_check_stats;
-	WaitStats                                                           m_stats;
+	Stats                                                               m_stats;
 	vk::DescriptorSetLayout                                             m_layout = nullptr;
 	vk::DescriptorPool                                                  m_pool   = nullptr;
 	vk::DescriptorSet                                                   m_set    = nullptr;

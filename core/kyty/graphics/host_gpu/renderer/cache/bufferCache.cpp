@@ -1315,105 +1315,62 @@ void BufferCache::CacheFaultedMemory(uint64_t vaddr, uint64_t size) {
 	m_guest_mirror->NoteDevice(vaddr, size);
 }
 
-bool BufferCache::PrepareHeapPublication(HeapProducer producer, uint64_t serial, uint64_t version,
-                                         uint64_t address, uint64_t size) {
-	if (m_heap_tables.Empty() || !m_heap_tables.Intersects(address, size)) return true;
-	const Publication publication {producer, serial, version, address, size};
-	if (std::ranges::find(m_heap_publications, publication) != m_heap_publications.end()) {
-		return !m_scheduler.Context().GetImageHeap().FrozenReplay();
+void BufferCache::FinishHostCopies() {
+	DrainHostCopies();
+	if (auto* copies = m_scheduler.HostCopies(); copies != nullptr && m_protect_jobs != 0) {
+		copies->WaitFor(m_protect_jobs);
+		m_protect_jobs = 0;
 	}
-	m_heap_publications.push_back(publication);
-	return true;
 }
 
-void BufferCache::CopyHeapTable(Buffer& destination, uint64_t offset, uint64_t address, uint64_t size) {
-	destination.CopyFrom(m_scheduler.Current(), *m_storage, m_storage->Offset(address), offset, size);
+bool BufferCache::RequestHeapTable(uint64_t vaddr, uint64_t size) {
+	const bool owned = m_guest_mirror->Owned(vaddr, size);
+	RequestDeviceRange(vaddr, size);
+	return owned;
 }
 
-void BufferCache::BeginHeapDraw(bool replay) {
-	if (replay) {
-		m_heap_shader_writes.Clear();
-		m_heap_bitmap_pending.Clear();
-		return;
-	}
-	m_heap_publications.clear();
-	if (!m_heap_bitmap_pending.Empty()) {
-		m_heap_bitmap_pending.ForEach([&](uint64_t begin, uint64_t end) { m_heap_bitmap_ready.Add(begin, end - begin); });
-		m_heap_bitmap_pending.Clear();
-	}
-	if (m_heap_shader_writes.Empty()) return;
-	m_heap_shader_writes.ForEach([&](uint64_t begin, uint64_t end) { m_heap_table_writes.Add(begin, end - begin); });
-	m_heap_shader_writes.Clear();
-}
-
-void BufferCache::CollectHeapWritePages(RangeSet& written) {
-	if (m_heap_bitmap_ready.Empty()) return;
-	if (m_heap_tables.Empty()) {
-		m_heap_bitmap_ready.Clear();
-		return;
-	}
-	RangeSet words;
-	m_heap_bitmap_ready.ForEach([&](uint64_t begin, uint64_t end) {
-		const auto packed = begin >= LibKernel::Memory::kExtendedMemoryBase
-		                        ? begin - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE : begin;
-		const auto first = packed / (32 * CACHING_PAGESIZE);
-		const auto last = (packed + (end - begin) - 1u) / (32 * CACHING_PAGESIZE);
-		words.Add(first * 4u, (last - first + 1u) * 4u);
-	});
-	m_heap_bitmap_ready.Clear();
-	uint64_t bytes = 0;
-	std::vector<vk::BufferCopy> copies;
-	words.ForEach([&](uint64_t begin, uint64_t end) {
-		copies.emplace_back(WRITE_BITMAP_OFFSET + begin, bytes, end - begin);
-		bytes += end - begin;
-	});
-	m_heap_bitmap_bytes += bytes;
-	auto download = m_download_buffer.MapDownload(bytes, 4);
-	auto& command = m_scheduler.Current();
-	auto* bitmap = GetFaultBuffer();
-	for (auto& copy: copies) copy.dstOffset += download.offset;
-	command.EndRendering();
-	const auto native = command.Handle();
-	const vk::MemoryBarrier before {.srcAccessMask = vk::AccessFlagBits::eMemoryWrite, .dstAccessMask = vk::AccessFlagBits::eTransferRead};
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
-	                       {}, 1, &before, 0, nullptr, 0, nullptr);
-	native.copyBuffer(bitmap->Handle(), download.buffer->Handle(), static_cast<uint32_t>(copies.size()), copies.data());
-	const vk::MemoryBarrier after {.srcAccessMask = vk::AccessFlagBits::eTransferWrite, .dstAccessMask = vk::AccessFlagBits::eHostRead};
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
-	                       {}, 1, &after, 0, nullptr, 0, nullptr);
-	m_scheduler.Wait(m_scheduler.CurrentTick());
-	++m_heap_bitmap_waits;
-	download.buffer->Invalidate(download.offset, bytes);
-	std::vector<uint64_t> consumed;
-	for (const auto& copy: copies) {
-		for (uint64_t at = 0; at < copy.size; at += 4u) {
-			uint32_t bits;
-			std::memcpy(&bits, download.mapped + (copy.dstOffset - download.offset) + at, sizeof(bits));
-			const auto page = ((copy.srcOffset - WRITE_BITMAP_OFFSET + at) / 4u) * 32u;
-			const auto before = consumed.size();
-			bool hit = false;
-			while (bits != 0u) {
-				const auto address = GuestAddress((page + std::countr_zero(bits)) * CACHING_PAGESIZE);
-				consumed.push_back(address);
-				m_heap_tables.ForEachInRange(address, CACHING_PAGESIZE, [&](uint64_t begin, uint64_t end) {
-					hit = true;
-					written.Add(begin, end - begin);
-				});
-				bits &= bits - 1u;
-			}
-			if (hit) {
-				bitmap->Fill(copy.srcOffset + at, 4, 0);
-			} else {
-				consumed.resize(before);
-			}
-		}
-	}
-	if (!consumed.empty()) m_scheduler.Context().GetIndirectWriteTables().NoteWrites(consumed, true);
-}
-
-void BufferCache::EnsureRangeContents(uint64_t vaddr, uint64_t size, RangeSet* uploaded) {
+void BufferCache::UploadHeapTable(uint64_t vaddr, uint64_t size, const HeapTableBytes& uploaded) {
 	RequestRange(vaddr, size);
-	(void)SynchronizeRange(vaddr, size, false, false, uploaded);
+	if (!m_memory_tracker.IsRegionCpuModified(vaddr, size)) return;
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, false,
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    copies.emplace_back(total_size, m_storage->Offset(address), bytes);
+		    total_size += bytes;
+		    NoteUpload(address, bytes);
+	    },
+	    [&]() noexcept {
+		    if (copies.empty()) return;
+		    FinishHostCopies();
+		    m_heap_bytes.resize(total_size);
+		    for (const auto& copy: copies) {
+			    const auto address = m_storage->HandleOrigin() + copy.dstOffset;
+			    if (!LibKernel::Memory::CopySparseMemory(address, m_heap_bytes.data() + copy.srcOffset, copy.size)) {
+				    EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			    }
+			    uploaded(address, std::span<const uint8_t>(m_heap_bytes.data() + copy.srcOffset, copy.size));
+		    }
+		    Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+		    g_write_block_stats.uploaded.fetch_add(total_size, std::memory_order_relaxed);
+		    const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 16,
+		                                     vk::BufferUsageFlagBits::eTransferSrc,
+		                                     [&](uint8_t* mapped, uint64_t base_offset) {
+			                                     std::memcpy(mapped, m_heap_bytes.data(), total_size);
+			                                     for (auto& copy: copies) copy.srcOffset += base_offset;
+		                                     },
+		                                     !m_upload_batching);
+		    RecordUpload(copies, source.first->Handle());
+		    copies.clear();
+		    total_size = 0;
+	    },
+	    m_device_sync_pass);
+}
+
+void BufferCache::EnsureRangeContents(uint64_t vaddr, uint64_t size) {
+	RequestRange(vaddr, size);
+	(void)SynchronizeRange(vaddr, size, false, false);
 }
 
 std::pair<uint64_t, uint64_t> BufferCache::OwnedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const {
@@ -1666,7 +1623,7 @@ bool BufferCache::NoImageStartsAt(uint64_t vaddr) const noexcept {
 	       !m_texture_cache.m_registered_pages.Any(pages.first, pages.last_exclusive);
 }
 
-bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, RangeSet* uploaded) {
+bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer) {
 	if (!is_written && !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		if (is_texel_buffer && !NoImageStartsAt(vaddr)) {
 			return SynchronizeRangeFromImage(vaddr, size);
