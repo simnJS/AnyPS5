@@ -1307,7 +1307,28 @@ void BufferCache::CacheFaultedMemory(uint64_t vaddr, uint64_t size) {
 	m_guest_mirror->NoteDevice(vaddr, size);
 }
 
-void BufferCache::BeginHeapDraw() {
+bool BufferCache::PrepareHeapPublication(HeapProducer producer, uint64_t serial, uint64_t version,
+                                         uint64_t address, uint64_t size) {
+	if (m_heap_tables.Empty() || !m_heap_tables.Intersects(address, size)) return true;
+	const Publication publication {producer, serial, version, address, size};
+	if (std::ranges::find(m_heap_publications, publication) != m_heap_publications.end()) {
+		return !m_scheduler.Context().GetImageHeap().FrozenReplay();
+	}
+	m_heap_publications.push_back(publication);
+	return true;
+}
+
+void BufferCache::CopyHeapTable(Buffer& destination, uint64_t offset, uint64_t address, uint64_t size) {
+	destination.CopyFrom(m_scheduler.Current(), *m_storage, m_storage->Offset(address), offset, size);
+}
+
+void BufferCache::BeginHeapDraw(bool replay) {
+	if (replay) {
+		m_heap_shader_writes.Clear();
+		m_heap_bitmap_pending.Clear();
+		return;
+	}
+	m_heap_publications.clear();
 	if (!m_heap_bitmap_pending.Empty()) {
 		m_heap_bitmap_pending.ForEach([&](uint64_t begin, uint64_t end) { m_heap_bitmap_ready.Add(begin, end - begin); });
 		m_heap_bitmap_pending.Clear();
@@ -1379,12 +1400,12 @@ void BufferCache::CollectHeapWritePages(RangeSet& written) {
 			}
 		}
 	}
-	if (!consumed.empty()) m_scheduler.Context().GetIndirectWriteTables().NoteWrites(consumed);
+	if (!consumed.empty()) m_scheduler.Context().GetIndirectWriteTables().NoteWrites(consumed, true);
 }
 
-void BufferCache::EnsureRangeContents(uint64_t vaddr, uint64_t size) {
+void BufferCache::EnsureRangeContents(uint64_t vaddr, uint64_t size, RangeSet* uploaded) {
 	RequestRange(vaddr, size);
-	(void)SynchronizeRange(vaddr, size, false, false);
+	(void)SynchronizeRange(vaddr, size, false, false, uploaded);
 }
 
 std::pair<uint64_t, uint64_t> BufferCache::OwnedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const {
@@ -1618,7 +1639,7 @@ bool BufferCache::NoImageStartsAt(uint64_t vaddr) const noexcept {
 	       !m_texture_cache.m_registered_pages.Any(pages.first, pages.last_exclusive);
 }
 
-bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer) {
+bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, RangeSet* uploaded) {
 	if (!is_written && !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		if (is_texel_buffer && !NoImageStartsAt(vaddr)) {
 			return SynchronizeRangeFromImage(vaddr, size);
@@ -1631,6 +1652,11 @@ bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_writte
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    if (uploaded != nullptr) {
+			    const auto first = std::max(address, vaddr);
+			    const auto last  = std::min(address + bytes, vaddr + size);
+			    if (first < last) uploaded->Add(first, last - first);
+		    }
 		    copies.emplace_back(total_size, m_storage->Offset(address), bytes);
 		    total_size += bytes;
 		    NoteUpload(address, bytes);
@@ -3112,7 +3138,7 @@ void BufferCache::ProcessUseBuffer() {
 	});
 }
 
-void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
+void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size, HeapWriteSource writer) {
 	m_gpu_write_generation++;
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
@@ -3120,7 +3146,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	m_scheduler.Context().CollectHotPageWrites(vaddr, size);
 	const auto written = [&](uint64_t start, uint64_t finish) {
 		m_guest_mirror->Use(start, finish - start);
-		NoteWrite(start, finish - start);
+		NoteWrite(start, finish - start, writer);
 		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(start, finish - start, [&](uint64_t page, uint64_t bytes) {
 			const auto first = std::max(page, start);
 			const auto last  = std::min(page + bytes, finish);

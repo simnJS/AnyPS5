@@ -161,12 +161,16 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 
 void IndirectWriteTables::NotePendingWrites() noexcept {
 	m_context.GetBufferCache().NoteHeapShaderWrites();
+	TrackWriteBitmap();
+}
+
+void IndirectWriteTables::TrackWriteBitmap() noexcept {
 	if (!std::exchange(m_pending_writes, true)) {
 		m_context.GetBufferCache().BeginIndirectWrites();
 	}
 }
 
-void IndirectWriteTables::NoteWrites(std::span<const uint64_t> pages) {
+void IndirectWriteTables::NoteWrites(std::span<const uint64_t> pages, bool heap_collected) {
 	RangeSet written;
 	for (const auto page: pages) {
 		written.Add(page, BufferCache::CACHING_PAGESIZE);
@@ -177,7 +181,7 @@ void IndirectWriteTables::NoteWrites(std::span<const uint64_t> pages) {
 		if (!m_context.IsMapped(begin, end - begin)) {
 			return;
 		}
-		buffer_cache.NoteGpuWrites(begin, end - begin);
+		buffer_cache.NoteGpuWrites(begin, end - begin, heap_collected ? HeapWriteSource::Collected : HeapWriteSource::Immediate);
 		texture_cache.InvalidateMemoryFromGPU(begin, end - begin);
 	};
 	written.ForEach([&](uint64_t start, uint64_t end) {

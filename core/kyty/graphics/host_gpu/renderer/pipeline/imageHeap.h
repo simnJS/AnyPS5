@@ -32,13 +32,14 @@ public:
 
 	void BeginDraw();
 	bool CheckTableWrites();
+	bool FrozenReplay() const;
 	uint64_t FillGroups() const { return m_check_stats.groups; }
 	bool ReadFallback(uint64_t address, std::span<uint32_t> words) const override;
 	bool ReplayPending() const { return m_retry; }
 	bool TakeReplay() {
 		const bool replay = std::exchange(m_retry, false);
 		m_replaying        = replay;
-		m_attempt += replay ? 1u : 0u;
+		m_attempt          = replay ? m_attempt + 1u : 0u;
 		return replay;
 	}
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
@@ -161,7 +162,7 @@ private:
 		bool                                       gpu_all = false;
 		bool                                       fresh   = true;
 		std::unique_ptr<Buffer>                    snapshot;
-		std::unique_ptr<Buffer>                    previous;
+		std::unique_ptr<Buffer>                    admitted_snapshot;
 		uint64_t                                   snapshot_tick = 0;
 		RangeSet                                   cpu_bytes;
 		uint64_t                                   fallback_draw = 0;

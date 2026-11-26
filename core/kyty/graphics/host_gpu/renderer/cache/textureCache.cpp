@@ -3209,6 +3209,7 @@ bool BufferCache::SynchronizeRangeFromImage(uint64_t vaddr, uint64_t size) {
 	     copy_size != image.info.data.size)) {
 		return false;
 	}
+	if (!PrepareHeapPublication(HeapProducer::Image, image.serial, image.gpu_write_sequence, address, copy_size)) return true;
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	InvalidateCopyFeedback(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);

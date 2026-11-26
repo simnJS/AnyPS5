@@ -45,7 +45,9 @@ enum class ObtainFrom : uint8_t {
 
 enum class BdaWriteTracking : uint8_t { Unknown, PageBitmap, ExplicitRanges };
 
-enum class HeapWriteSource : uint8_t { Immediate, Shader };
+enum class HeapProducer : uint8_t { Image, Occlusion };
+
+enum class HeapWriteSource : uint8_t { Immediate, Shader, Collected };
 
 class BufferCache {
 public:
@@ -134,7 +136,7 @@ public:
 	void ImportGuestMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool GuestMemoryImported(uint64_t vaddr, uint64_t size) const { return m_host_view->Overlaps(vaddr, size); }
 	void ForgetGuestMemory(uint64_t vaddr, uint64_t size);
-	void EnsureRangeContents(uint64_t vaddr, uint64_t size);
+	void EnsureRangeContents(uint64_t vaddr, uint64_t size, RangeSet* uploaded = nullptr);
 	[[nodiscard]] bool InMirror(const Buffer* buffer) const noexcept { return buffer != nullptr && buffer == m_storage.get(); }
 	[[nodiscard]] std::pair<uint64_t, uint64_t> OwnedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainRange(uint64_t vaddr, uint64_t size, bool is_written,
@@ -202,7 +204,7 @@ public:
 		m_heap_bitmap_ready.Clear();
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
-	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
+	void NoteGpuWrites(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate);
 	template <typename Func>
 	void ConsumeCpuWrites(CpuWriteConsumer consumer, uint64_t vaddr, uint64_t size, Func&& func) {
 		m_memory_tracker.ConsumeCpuWrites(consumer, vaddr, size, std::forward<Func>(func));
@@ -245,7 +247,9 @@ public:
 	[[nodiscard]] bool HeapBitmapReady(uint64_t vaddr, uint64_t size) const {
 		return !m_heap_bitmap_ready.Empty() && m_heap_bitmap_ready.Intersects(vaddr, size);
 	}
-	void BeginHeapDraw();
+	void CopyHeapTable(Buffer& destination, uint64_t offset, uint64_t address, uint64_t size);
+	void BeginHeapDraw(bool replay = false);
+	bool PrepareHeapPublication(HeapProducer producer, uint64_t serial, uint64_t version, uint64_t address, uint64_t size);
 	void CollectHeapWritePages(RangeSet& written);
 	uint64_t HeapBitmapBytes() const noexcept { return m_heap_bitmap_bytes; }
 	uint64_t HeapBitmapWaits() const noexcept { return m_heap_bitmap_waits; }
@@ -352,7 +356,7 @@ private:
 
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
-	[[nodiscard]] bool SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer);
+	[[nodiscard]] bool SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, RangeSet* uploaded = nullptr);
 	[[nodiscard]] vk::Buffer UploadCopies(std::vector<vk::BufferCopy>& copies, uint64_t total_size);
 	void                     TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
 	void                     NotePromotion(uint64_t begin, uint64_t end);
@@ -396,7 +400,7 @@ private:
 	void DrainHostCopies();
 	void NoteWrite(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate) {
 		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);
-		NoteHeapTransfer(vaddr, size, writer);
+		if (writer != HeapWriteSource::Collected) NoteHeapTransfer(vaddr, size, writer);
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
 			m_pending_writes.emplace_back(vaddr, size);
 			for (const auto& hot: m_readback_hot) {
@@ -480,6 +484,12 @@ private:
 	RangeSet                                          m_heap_bitmap_ready;
 	uint64_t                                          m_heap_bitmap_bytes = 0;
 	uint64_t                                          m_heap_bitmap_waits = 0;
+	struct Publication {
+		HeapProducer producer;
+		uint64_t serial, version, address, size;
+		bool operator==(const Publication&) const = default;
+	};
+	std::vector<Publication>                          m_heap_publications;
 	bool                                              m_heap_writes_unbounded = false;
 	static constexpr size_t                           StaleRingSize = 32;
 	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};

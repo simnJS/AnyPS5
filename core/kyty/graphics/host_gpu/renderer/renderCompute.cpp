@@ -71,7 +71,7 @@ static bool PrepareSelfSizedBuffers(RenderContext& context, const ShaderStageRun
 	if (stage.module->info.info.self_sized_buffers.empty() || !context.CacheSelfSizedBuffers(stage)) {
 		return false;
 	}
-	context.GetIndirectWriteTables().NotePendingWrites();
+	context.GetIndirectWriteTables().TrackWriteBitmap();
 	return true;
 }
 
@@ -586,10 +586,8 @@ void RenderExecutor::DispatchDirectOnce(CommandBuffer& buffer, uint32_t thread_g
 		if (program.info.uses_dma) {
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
-			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
 			const bool address_writes = MayWriteThroughDeviceAddresses(program);
-			m_context.PrepareBda(address_writes, !reach_synchronized,
-			                     m_context.ReachWriteTracking(reach_synchronized, address_writes));
+			m_context.PrepareShaderBda(std::span {&dma_stage, 1}, address_writes);
 			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}
@@ -967,10 +965,8 @@ void RenderExecutor::DispatchIndirectThreadsOnce(CommandBuffer& buffer, uint64_t
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
 		const bool address_writes = MayWriteThroughDeviceAddresses(program);
-		m_context.PrepareBda(address_writes, !reach_synchronized,
-		                     m_context.ReachWriteTracking(reach_synchronized, address_writes));
+		m_context.PrepareShaderBda(std::span {&dma_stage, 1}, address_writes);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			m_context.GetBufferCache().RequestFlushForReadbacks();
 		}
@@ -1112,10 +1108,8 @@ void RenderExecutor::DispatchIndirectOnce(CommandBuffer& buffer, uint64_t args_a
 		if (program.info.uses_dma) {
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
-			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
 			const bool address_writes = MayWriteThroughDeviceAddresses(program);
-			m_context.PrepareBda(address_writes, !reach_synchronized,
-			                     m_context.ReachWriteTracking(reach_synchronized, address_writes));
+			m_context.PrepareShaderBda(std::span {&dma_stage, 1}, address_writes);
 			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}

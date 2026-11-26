@@ -568,6 +568,7 @@ public:
 			m_info.dma_tables.clear();
 			m_info.dma_record_tables.clear();
 		}
+		if (m_program.has_address_writes && !m_unbounded_write) m_info.dma_windows = std::move(m_write_windows);
 		LinkIndirectWriteTables();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
@@ -4748,34 +4749,39 @@ private:
 		return RegIndex(high->Arg(0).ScalarRegister()) == reg + 1u;
 	}
 
-	void NoteDmaWindow(const Inst& inst, const MemoryInfo& memory) {
+	bool NoteDmaWindow(const Inst& inst, const MemoryInfo& memory) {
+		const bool write = AddressOpcodeInfoOf(inst.GetOpcode()).access == AddressAccess::Write;
+		auto& windows = write ? m_write_windows : m_info.dma_windows;
 		constexpr uint64_t MaxAccessBytes = 16;
 		constexpr uint64_t MaxWindowBytes = 16u << 20u;
 		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
 		uint32_t    reg    = 0;
 		if (memory.address_is_full || inst.NumArgs() < 2u || handle == nullptr ||
 		    !UserDataBasePair(*handle, reg)) {
-			NoteUnbounded(InReach(m_decoded.record_reach.read_pcs, inst.Flags<MemoryFlags>().pc) ||
-			              InBvhReach(inst.Flags<MemoryFlags>().pc) || NoteHitDerivedRead(inst, memory));
-			return;
+			if (!write) {
+				NoteUnbounded(InReach(m_decoded.record_reach.read_pcs, inst.Flags<MemoryFlags>().pc) ||
+				              InBvhReach(inst.Flags<MemoryFlags>().pc) || NoteHitDerivedRead(inst, memory));
+			}
+			return false;
 		}
 		const auto bits = PossibleU32Bits(inst.Arg(1));
 		if (bits >= MaxWindowBytes) {
-			NoteUnbounded();
-			return;
+			if (!write) NoteUnbounded();
+			return false;
 		}
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(memory.offset));
 		const auto first     = std::min<int64_t>(immediate, 0);
 		const auto last      = static_cast<uint64_t>(std::max<int64_t>(immediate, 0)) + bits +
 		                       MaxAccessBytes;
-		for (auto& window: m_info.dma_windows) {
+		for (auto& window: windows) {
 			if (window.base_register == reg) {
 				window.first = std::min(window.first, first);
 				window.last  = std::max(window.last, last);
-				return;
+				return true;
 			}
 		}
-		m_info.dma_windows.push_back({reg, first, last});
+		windows.push_back({reg, first, last});
+		return true;
 	}
 
 	void NoteDmaDescriptorTable(const Inst& handle, bool covered) {
@@ -5599,6 +5605,12 @@ private:
 				           DerivesFromMemory(*handle)) {
 					CollectDmaBase(*handle, true);
 					m_program.has_address_writes = true;
+					uint32_t low, high;
+					if (UserDataRegister(handle->Arg(0), low) && UserDataRegister(handle->Arg(1), high) && high == low + 1u) {
+						m_write_windows.push_back({low, 0, uint64_t {UINT32_MAX} + 16u});
+					} else {
+						m_unbounded_write = true;
+					}
 				} else if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                               : ResourceKind::Buffer) ||
 				           !memory.SupportsIndirectBufferLoad(op)) {
@@ -5661,6 +5673,7 @@ private:
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
+				m_unbounded_write |= !NoteDmaWindow(inst, memory);
 			}
 			handle           = inst.Arg(0).Resolve().TryInstruction();
 			m_dma_tracked = true;
@@ -5780,6 +5793,8 @@ private:
 	std::vector<IndirectWriteTable>            m_indirect_write_tables;
 	bool                                       m_shader_writes = false;
 	bool                                       m_dma_unbounded = false;
+	std::vector<ShaderInfo::DmaWindow>         m_write_windows;
+	bool                                       m_unbounded_write = false;
 	bool                                       m_dma_uncovered = false;
 	std::vector<const Inst*>                   m_ray_query_alphas;
 	std::unordered_map<const Inst*, Roots> m_roots;

@@ -428,10 +428,16 @@ bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
 		uint32_t low  = 0;
 		uint32_t high = 0;
 		if (!value(buffer.base_low_register, low) || !value(buffer.base_high_register, high)) {
+			if (buffer.written) m_buffer_cache.NoteHeapShaderWrites();
+			written |= buffer.written;
 			continue;
 		}
 		written |= buffer.written;
 		const auto base = low | (uint64_t {high & 0xffffu} << 32u);
+		if (buffer.written) {
+			const auto first = Common::AlignDown(base, 4u);
+			m_buffer_cache.NoteHeapShaderWrites(first, base - first + uint64_t {UINT32_MAX} + 16u);
+		}
 		if (base == 0) {
 			continue;
 		}
@@ -1061,6 +1067,41 @@ bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 	}
 	m_ray_tracing->AnnounceWalks(m_walk_blases);
 	return true;
+}
+
+void RenderContext::PrepareShaderBda(std::span<const ShaderStageRuntime* const> stages, bool may_write) {
+	const bool synchronized = SynchronizeDmaFootprint(stages);
+	const auto track_writes = [&](const ShaderStageRuntime* stage) {
+		const auto& program = stage->module->info;
+		if (std::ranges::any_of(program.info.buffers, [](const auto& buffer) { return buffer.indirect_write_table; })) {
+			return false;
+		}
+		if (!program.has_address_writes) return true;
+		if (program.info.dma_windows.empty()) {
+			return false;
+		}
+		const auto& user = stage->resources->user_data;
+		for (const auto& window: program.info.dma_windows) {
+			const auto index = uint64_t {window.base_register} - program.user_data_base;
+			if (window.base_register < program.user_data_base || index + 1u >= user.size()) {
+				return false;
+			}
+			const auto base = user[index] | (uint64_t {user[index + 1u]} << 32u);
+			const auto before = static_cast<uint64_t>(-window.first) + 8u;
+			if (base < before || base > UINT64_MAX - window.last) {
+				return false;
+			}
+			m_buffer_cache.NoteHeapShaderWrites(base - before, before + window.last);
+			const auto buffer_base = base & UINT64_C(0x0000ffffffffffff);
+			if (base != buffer_base) {
+				const auto first = buffer_base > before ? buffer_base - before : 0;
+				m_buffer_cache.NoteHeapShaderWrites(first, buffer_base + window.last - first);
+			}
+		}
+		return true;
+	};
+	const bool bounded = !may_write || std::ranges::all_of(stages, track_writes);
+	PrepareBda(may_write, !synchronized, bounded ? BdaWriteTracking::ExplicitRanges : BdaWriteTracking::PageBitmap);
 }
 
 void RenderContext::PrepareBda(bool may_write, bool full_sync, BdaWriteTracking tracking) {

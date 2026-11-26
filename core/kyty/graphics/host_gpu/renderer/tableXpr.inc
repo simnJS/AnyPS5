@@ -1509,10 +1509,9 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 		stages[count++] = &table.runtimes[st];
 	}
 	if (count == 0) return;
-	const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {stages.data(), count});
 	const bool writes = (pair.programs[0] != nullptr && pair.programs[0]->has_address_writes) ||
 	                    (pair.programs[1] != nullptr && pair.programs[1]->has_address_writes);
-	m_context.PrepareBda(writes, !reach_synchronized, m_context.ReachWriteTracking(reach_synchronized, writes));
+	m_context.PrepareShaderBda(std::span {stages.data(), count}, writes);
 }
 
 bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_buffer,

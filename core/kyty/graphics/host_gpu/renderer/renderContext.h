@@ -109,16 +109,7 @@ public:
 	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
 	void               PrepareBda(bool may_write, bool full_sync = true, BdaWriteTracking tracking = BdaWriteTracking::Unknown);
 	void               PrepareHackMarks();
-	[[nodiscard]] BdaWriteTracking ReachWriteTracking(bool reach_synchronized, bool may_write) {
-		if (!reach_synchronized) return BdaWriteTracking::PageBitmap;
-		if (may_write) {
-			for (const auto& [begin, end]: m_dma_spans) m_buffer_cache.NoteHeapShaderWrites(begin, end - begin);
-			for (const auto* table: m_dma_sets) {
-				table->ranges.ForEach([&](uint64_t begin, uint64_t end) { m_buffer_cache.NoteHeapShaderWrites(begin, end - begin); });
-			}
-		}
-		return BdaWriteTracking::ExplicitRanges;
-	}
+	void PrepareShaderBda(std::span<const ShaderStageRuntime* const> stages, bool may_write);
 	void               RunGarbageCollector();
 	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);
 	void ForgetHleTlas(uint64_t header);

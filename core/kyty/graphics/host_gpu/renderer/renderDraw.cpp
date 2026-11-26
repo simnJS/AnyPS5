@@ -2297,10 +2297,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	m_context.GetOcclusionQueries().WriteForReaders();
+	if (m_context.GetImageHeap().CheckTableWrites()) return;
 	if (state.ps_active) {
 		PrepareDrawRayTracing(m_context, buffer, bindings.pixel);
 	}
-	if (m_context.GetImageHeap().CheckTableWrites()) return;
 	auto vk_buffer = buffer.Handle();
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
