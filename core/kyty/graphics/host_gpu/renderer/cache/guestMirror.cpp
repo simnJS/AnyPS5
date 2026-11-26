@@ -300,6 +300,15 @@ bool GuestMirror::CreateBuffer() {
 	m_block_bits     = std::max<uint32_t>(
         MinBlockBits, static_cast<uint32_t>(std::bit_width(std::max<uint64_t>(requirements.alignment, 1)) - 1));
 	m_memory_type = PickMemoryType(m_graphics.physical_device_memory_properties, requirements.memoryTypeBits);
+	const auto& memory = m_graphics.physical_device_memory_properties;
+	for (uint32_t type = 0; type < memory.memoryTypeCount; ++type) {
+		if ((requirements.memoryTypeBits & (1u << type)) != 0 &&
+		    (memory.memoryTypes[type].propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+		    !(memory.memoryHeaps[memory.memoryTypes[type].heapIndex].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+			m_host_type = type;
+			break;
+		}
+	}
 	const vk::FenceCreateInfo         fence_info {};
 	vk::SemaphoreTypeCreateInfo       timeline {.semaphoreType = vk::SemaphoreType::eTimeline, .initialValue = 0};
 	const vk::SemaphoreCreateInfo     semaphore_info {.pNext = &timeline};
@@ -508,7 +517,7 @@ void GuestMirror::Release(const Runs& runs) {
 	if (!blocks.empty()) Post({.kind = Kind::Unbind, .runs = std::move(blocks)});
 }
 
-void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh) {
+void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh, bool prefer_host) {
 	if (m_size == 0 || size == 0 || UINT64_MAX - vaddr < size) return;
 	const uint64_t blocks = m_size >> m_block_bits;
 	if (vaddr < m_base) {
@@ -543,10 +552,11 @@ void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh) {
 		}
 		if (m_pending.empty()) m_first_pending = Now();
 		m_pending_blocks++;
-		if (!m_pending.empty() && m_pending.back().first + m_pending.back().count == block) {
+		if (!m_pending.empty() && m_pending.back().first + m_pending.back().count == block &&
+		    m_pending.back().prefer_host == prefer_host) {
 			m_pending.back().count++;
 		} else {
-			m_pending.push_back({block, 1});
+			m_pending.push_back({block, 1, prefer_host});
 		}
 	}
 }
@@ -624,25 +634,27 @@ void GuestMirror::BinderThread(std::stop_token stop) {
 	}
 }
 
-GuestMirror::Grant GuestMirror::Allocate(uint64_t wanted) {
+GuestMirror::Grant GuestMirror::Allocate(uint64_t wanted, bool host) {
+	auto& current = m_current_chunks[host];
+	auto& free_slots = m_free_slots[host];
 	const auto slots = static_cast<uint32_t>(std::max<uint64_t>(ChunkBytes >> m_block_bits, 1));
-	if (m_current_chunk != UINT32_MAX && m_chunks[m_current_chunk].next < slots) {
-		auto&      chunk = m_chunks[m_current_chunk];
+	if (current != UINT32_MAX && m_chunks[current].next < slots) {
+		auto&      chunk = m_chunks[current];
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(wanted, slots - chunk.next));
 		const auto first = chunk.next;
 		chunk.next += count;
 		chunk.used += count;
-		return {m_current_chunk, first, count};
+		return {current, first, count};
 	}
-	if (!m_free_slots.empty()) {
-		const auto slot = m_free_slots.back();
-		m_free_slots.pop_back();
+	if (!free_slots.empty()) {
+		const auto slot = free_slots.back();
+		free_slots.pop_back();
 		m_chunks[slot.chunk].used++;
 		return {slot.chunk, slot.index, 1};
 	}
 	const vk::MemoryAllocateFlagsInfo flags {.flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
 	const vk::MemoryAllocateInfo      info {
-	         .pNext = &flags, .allocationSize = uint64_t {slots} << m_block_bits, .memoryTypeIndex = m_memory_type};
+	         .pNext = &flags, .allocationSize = uint64_t {slots} << m_block_bits, .memoryTypeIndex = host ? m_host_type : m_memory_type};
 	vk::DeviceMemory             memory;
 	const auto                   made = m_graphics.device.allocateMemory(&info, nullptr, &memory);
 	if (made != vk::Result::eSuccess) {
@@ -650,15 +662,15 @@ GuestMirror::Grant GuestMirror::Allocate(uint64_t wanted) {
 		     vk::to_string(made).c_str());
 	}
 	if (!m_free_chunks.empty()) {
-		m_current_chunk = m_free_chunks.back();
+		current = m_free_chunks.back();
 		m_free_chunks.pop_back();
-		m_chunks[m_current_chunk] = {memory, 0, 0};
+		m_chunks[current] = {memory, 0, 0, host};
 	} else {
-		m_current_chunk = static_cast<uint32_t>(m_chunks.size());
-		m_chunks.push_back({memory, 0, 0});
+		current = static_cast<uint32_t>(m_chunks.size());
+		m_chunks.push_back({memory, 0, 0, host});
 	}
 	m_chunk_count.fetch_add(1, std::memory_order_relaxed);
-	return Allocate(wanted);
+	return Allocate(wanted, host);
 }
 
 void GuestMirror::Bind(const Command& command) {
@@ -675,7 +687,7 @@ void GuestMirror::Bind(const Command& command) {
 			}
 			uint64_t fresh = 1;
 			while (fresh < left && !m_block_slots.contains(block + fresh)) fresh++;
-			const auto [chunk, index, count] = Allocate(fresh);
+			const auto [chunk, index, count] = Allocate(fresh, run.prefer_host && m_host_type != UINT32_MAX);
 			m_binds.push_back({.resourceOffset = block << m_block_bits,
 			                   .size           = uint64_t {count} << m_block_bits,
 			                   .memory         = m_chunks[chunk].memory,
@@ -735,21 +747,24 @@ void GuestMirror::Unbind(const Command& command) {
 		auto& chunk = m_chunks[index];
 		if (chunk.memory && chunk.used == 0) {
 			m_graphics.device.freeMemory(chunk.memory);
+			auto& current = m_current_chunks[chunk.host];
 			chunk          = {};
 			emptied[index] = true;
 			m_free_chunks.push_back(index);
 			m_chunk_count.fetch_sub(1, std::memory_order_relaxed);
-			if (m_current_chunk == index) m_current_chunk = UINT32_MAX;
+			if (current == index) current = UINT32_MAX;
 		}
 	}
-	std::erase_if(m_free_slots, [&](const Slot& slot) { return emptied[slot.chunk]; });
+	for (auto& slots: m_free_slots) {
+		std::erase_if(slots, [&](const Slot& slot) { return emptied[slot.chunk]; });
+	}
 	m_unbound_blocks.fetch_add(blocks, std::memory_order_relaxed);
 	m_bound_blocks.fetch_sub(std::min(blocks, m_bound_blocks.load(std::memory_order_relaxed)), std::memory_order_relaxed);
 }
 
 void GuestMirror::Free(Slot slot) {
 	m_chunks[slot.chunk].used--;
-	m_free_slots.push_back(slot);
+	m_free_slots[m_chunks[slot.chunk].host].push_back(slot);
 }
 
 void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* what, uint64_t signal) {

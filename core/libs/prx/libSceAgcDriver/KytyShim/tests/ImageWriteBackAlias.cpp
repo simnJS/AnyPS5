@@ -413,7 +413,7 @@ const char* CheckLargerRequestOverGpuWrites(GraphicContext& graphics, uint64_t a
 	const auto tick = scheduler.CurrentTick();
 	scheduler.Wait(tick);
 	scheduler.WaitPriorityOperations(tick);
-	(void)buffers.DropFreedRange(address, requested_info.data.size, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, requested_info.data.size);
 	if (found_layers != RequestedLayers) return "the larger request found no image with its layers";
 	readback.Invalidate(0, RequestedWords * sizeof(uint32_t));
 	std::vector<uint32_t> actual(RequestedWords);
@@ -509,7 +509,7 @@ const char* CheckLargerRequestOverInvalidatedWrites(GraphicContext& graphics, ui
 	const auto tick = scheduler.CurrentTick();
 	scheduler.Wait(tick);
 	scheduler.WaitPriorityOperations(tick);
-	(void)buffers.DropFreedRange(address, requested_info.data.size, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, requested_info.data.size);
 	if (!stale) return "the guest write did not invalidate the GPU-written image";
 	if (found_layers != RequestedLayers) return "the larger request found no image with its layers";
 	if (samples != 1) return nullptr;

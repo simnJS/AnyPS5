@@ -123,6 +123,7 @@ public:
 	static void            NoteStagedCommandProcessorRead();
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
 	void RequestDeviceRange(uint64_t vaddr, uint64_t size);
+	void RequestMappedDispatchRanges(const RangeSet& mapped, uint64_t mapping_epoch);
 	void EnsureRangeContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InMirror(const Buffer* buffer) const noexcept { return buffer != nullptr && buffer == m_storage.get(); }
 	[[nodiscard]] std::pair<uint64_t, uint64_t> OwnedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const;
@@ -269,7 +270,7 @@ private:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedRange(uint64_t vaddr, uint64_t size, bool is_written,
 	                                                                   bool       is_texel_buffer,
 	                                                                   ObtainFrom from = ObtainFrom::Any);
-	void                   RequestRange(uint64_t vaddr, uint64_t size);
+	void                   RequestRange(uint64_t vaddr, uint64_t size, bool prefer_host = false);
 	void                   SetResident(uint64_t begin, uint64_t end, bool resident);
 	void                   NoteBlockRegions(uint64_t begin, uint64_t end, bool insert);
 	[[nodiscard]] bool     Holds(uint64_t vaddr, uint64_t size) const noexcept { return m_guest_mirror->Owned(vaddr, size); }
@@ -468,6 +469,7 @@ private:
 	std::unique_ptr<GuestMirror> m_guest_mirror;
 	std::unique_ptr<Buffer>      m_storage;
 	GuestMirror::Runs            m_fresh;
+	std::array<uint64_t, 2>      m_dispatch_layout {UINT64_MAX, UINT64_MAX};
 	GuestMirror::Runs            m_victims;
 	int64_t                      m_evict_check         = 0;
 	uint64_t                     m_guest_mirror_line   = 0;

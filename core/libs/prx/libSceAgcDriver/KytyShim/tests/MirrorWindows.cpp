@@ -140,6 +140,17 @@ void Finish(CommandScheduler& scheduler) {
 	scheduler.WaitPriorityOperations(tick);
 }
 
+bool IsResident(CommandScheduler& scheduler, BufferCache& buffers, Buffer& bitmap, uint64_t guest) {
+	const auto block = (guest - buffers.GetGuestMirror()->Base()) / BufferCache::MIRROR_BLOCK_SIZE;
+	bitmap.CopyFrom(scheduler.Current(), *buffers.GetFaultBuffer(),
+	                BufferCache::RESIDENCY_OFFSET + (block / 32) * sizeof(uint32_t), 0, sizeof(uint32_t));
+	Finish(scheduler);
+	bitmap.Invalidate(0, sizeof(uint32_t));
+	uint32_t bits;
+	std::memcpy(&bits, bitmap.Mapped().data(), sizeof(bits));
+	return (bits & (uint32_t {1} << (block % 32))) != 0;
+}
+
 bool ReadsPattern(const std::vector<uint32_t>& words, uint64_t first) {
 	for (size_t index = 0; index < words.size(); index++) {
 		if (words[index] != Pattern(first + index)) return false;
@@ -199,16 +210,7 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 
 	AddressReader reader(graphics, scheduler, JoinedBytes);
 	Buffer bitmap(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(uint32_t));
-	const auto resident = [&](uint64_t guest) {
-		const auto block = (guest - origin) / BufferCache::MIRROR_BLOCK_SIZE;
-		bitmap.CopyFrom(scheduler.Current(), *buffers.GetFaultBuffer(),
-		                BufferCache::RESIDENCY_OFFSET + (block / 32) * sizeof(uint32_t), 0, sizeof(uint32_t));
-		Finish(scheduler);
-		bitmap.Invalidate(0, sizeof(uint32_t));
-		uint32_t bits;
-		std::memcpy(&bits, bitmap.Mapped().data(), sizeof(bits));
-		return (bits & (uint32_t {1} << (block % 32))) != 0;
-	};
+	const auto resident = [&](uint64_t guest) { return IsResident(scheduler, buffers, bitmap, guest); };
 	reader.Record(scheduler, mirror->DeviceAddress() + address - origin, FirstBytes);
 	Finish(scheduler);
 	if (!mirror->Ready(address, FirstBytes)) return "a submission went without binding its blocks";
@@ -341,6 +343,60 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	return nullptr;
 }
 
+const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+	auto* mirror = renderer.GetBufferCache().GetGuestMirror();
+	const auto block = mirror->BlockSize();
+	const auto boundary = Common::AlignUp(address + block, block);
+	const auto end = address + GuestBytes;
+	if (boundary + 3 * block > end) {
+		g_skipped = "the dispatch fixture needs four sparse blocks";
+		return nullptr;
+	}
+
+	auto* guest = reinterpret_cast<uint32_t*>(address);
+	for (uint64_t i = 0; i < GuestBytes / sizeof(uint32_t); ++i) guest[i] = Pattern(i);
+	renderer.MapMemory(address, boundary + 2 * block - address);
+	ShaderModule module {};
+	module.info.stage = ShaderType::Compute;
+	module.info.info.uses_dma = true;
+	module.info.info.dma_bounded = true;
+	module.info.info.dma_windows.push_back({0, 0, 8});
+	const auto first = boundary - sizeof(uint32_t);
+	ShaderRecompiler::IR::ResourceSnapshot resources;
+	resources.user_data = {static_cast<uint32_t>(first), static_cast<uint32_t>(first >> 32)};
+	const ShaderStageRuntime stage {&module, &resources};
+	const ShaderStageRuntime* dispatch = &stage;
+	AddressReader reader(graphics, scheduler, 8);
+	Buffer bitmap(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(uint32_t));
+	auto& buffers = renderer.GetBufferCache();
+	const auto reads = [&](uint64_t source) {
+		const auto synced = renderer.SynchronizeDmaFootprint(std::span {&dispatch, 1});
+		renderer.PrepareBda(false, synced ? BdaSync::KnownReach : BdaSync::Mapped);
+		if (!mirror->Requested(source, 8)) return false;
+		reader.Record(scheduler, mirror->DeviceAddress() + source - mirror->Base(), 8);
+		Finish(scheduler);
+		return ReadsPattern(reader.Words(8), (source - address) / sizeof(uint32_t)) &&
+		       mirror->Ready(source, 8) && IsResident(scheduler, buffers, bitmap, source) &&
+		       IsResident(scheduler, buffers, bitmap, source + 7);
+	};
+	if (!reads(first)) return "the first dispatch did not read both sides of its DMA window";
+	const auto unknown = boundary + block;
+	if (mirror->Requested(unknown, 8)) return "a bounded dispatch requested an unrelated block";
+	module.info.info.dma_bounded = false;
+	module.info.info.dma_windows.clear();
+	if (!reads(unknown)) return "a dynamic address missed on the first dispatch";
+	const auto added = boundary + 2 * block;
+	if (mirror->Requested(added, 8)) return "the dispatch requested an unmapped block";
+	renderer.MapMemory(added, block);
+	if (!reads(added)) return "a dynamic address missed a newly mapped block";
+	return nullptr;
+}
+
 }
 
 extern "C" int RunKytyMirrorWindowsTest() {
@@ -364,6 +420,7 @@ extern "C" int RunKytyMirrorWindowsTest() {
 	}
 	const auto  address = reinterpret_cast<uint64_t>(guest);
 	const auto* failure = CheckWindows(graphics, address);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckDispatch(graphics, address);
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", Name);
 		return 1;

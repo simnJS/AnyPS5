@@ -278,7 +278,7 @@ const char* ProbeRendererShutdown(GraphicContext& graphics) {
 	CommandProcessor processor(renderer, 0);
 	processor.Reset();
 	scheduler.Begin(processor.GetCtx(), processor.GetUcfg(), processor.GetShCtx());
-	scheduler.SetSubmitHook([](void* data, Libs::Graphics::CommandBuffer&) {
+	scheduler.SetSubmitHook([](void* data, Libs::Graphics::CommandBuffer&, Libs::Graphics::SubmitInfo&) {
 		auto& completion = *static_cast<Completion*>(data);
 		if (!GuestGpu::IsGpuThread() && !completion.finishing) {
 			completion.finishing = true;

@@ -2803,6 +2803,12 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 #endif
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
+			if (program.stage == ShaderType::Compute && program.info.uses_dma) {
+				const auto* mirror = m_context.GetBufferCache().GetGuestMirror();
+				if (mirror->Holds(address, size) && !mirror->Requested(address, size)) {
+					m_context.GetBufferCache().RequestDeviceRange(address, size);
+				}
+			}
 			source = {address, size};
 		}
 	}
@@ -3043,7 +3049,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (dma_stage_count != 0) {
 		const bool reach_synchronized =
 		    m_context.SynchronizeDmaFootprint(std::span {dma_stages.data(), dma_stage_count});
-		m_context.PrepareBda(dma_write, !reach_synchronized);
+		m_context.PrepareBda(dma_write, reach_synchronized ? BdaSync::KnownReach : BdaSync::Registered);
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);

@@ -490,6 +490,17 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 }
 
 bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages) {
+	if (stages.size() == 1 && stages.front()->module->info.stage == ShaderType::Compute) {
+		const auto& info = stages.front()->module->info.info;
+		if (info.dma_bounded && !info.dma_windows.empty() && info.dma_tables.empty() &&
+		    info.dma_record_tables.empty() && info.self_sized_buffers.empty() &&
+		    !info.ray_query && !info.bvh && SynchronizeDmaReach(stages, true)) {
+			return true;
+		}
+		if (!info.ray_query_reach.empty()) (void)SynchronizeDmaReach(stages);
+		m_bda_unbounded_ops++;
+		return false;
+	}
 	constexpr int JoinedRuns = 6;
 	for (const auto* stage: stages) {
 		const auto& program = stage->module->info;
@@ -511,7 +522,7 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 	return true;
 }
 
-bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages) {
+bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages, bool bind_spans) {
 	constexpr uint64_t MaxBufferBytes = uint64_t {256} * 1024 * 1024;
 	constexpr uint64_t WaveRecords = 64;
 	m_dma_spans.clear();
@@ -554,7 +565,8 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 			if (!base_of(window.base_register, base)) {
 				return false;
 			}
-			const auto before = static_cast<uint64_t>(-window.first) + 4u;
+			const auto before = static_cast<uint64_t>(-window.first) + (bind_spans ? 8u : 4u);
+			if (bind_spans && (base < before || base > UINT64_MAX - window.last)) return false;
 			const auto start  = base > before ? base - before : 0;
 			add(start, std::min(base, UINT64_MAX - window.last) + window.last - start);
 		}
@@ -639,6 +651,11 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 				}
 				add(descriptor.Base48(), descriptor.GetSize());
 			}
+		}
+	}
+	if (bind_spans) {
+		for (const auto& [begin, end]: m_dma_spans) {
+			m_buffer_cache.RequestDeviceRange(begin, end - begin);
 		}
 	}
 	const auto reach_layout = ReachLayout();
@@ -1045,7 +1062,7 @@ bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 	return true;
 }
 
-void RenderContext::PrepareBda(bool may_write, bool full_sync) {
+void RenderContext::PrepareBda(bool may_write, BdaSync sync) {
 	[[maybe_unused]] static const bool logged = [] {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
@@ -1056,10 +1073,13 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 		m_indirect_write_tables.NotePendingWrites();
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	if (sync == BdaSync::Mapped) {
+		m_buffer_cache.RequestMappedDispatchRanges(m_mapped_ranges, m_mapped_ranges_version);
+	}
 	const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(),
 	                                      m_buffer_cache.RegisterEpoch(), m_mapped_ranges_version};
 	const bool same_layout = epochs[1] == m_bda_sync_epochs[1] && epochs[2] == m_bda_sync_epochs[2];
-	if (full_sync && (epochs != m_bda_sync_epochs || m_buffer_cache.HasKeptPages()) &&
+	if (sync != BdaSync::KnownReach && (epochs != m_bda_sync_epochs || m_buffer_cache.HasKeptPages()) &&
 	    (!same_layout || m_bda_synced_generation != m_bda_generation)) {
 		m_bda_synced_generation = m_bda_generation;
 		for (const auto& [vaddr, size]: m_bda_mapped_since_sync) {

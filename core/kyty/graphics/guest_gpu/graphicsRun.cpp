@@ -2272,7 +2272,7 @@ void CommandProcessor::EmitHleRefitArgs() {
 				(void)cache.ObtainRange(refit[i], sizes[i], true);
 			}
 		}
-		context.PrepareBda(true, false);
+		context.PrepareBda(true, BdaSync::Mapped);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		context.GetRayTracing()->RecordHleRefit(command.Handle(), refit, {}, 2, true);
@@ -2334,7 +2334,7 @@ void CommandProcessor::EmitHleRefit() {
 				(void)cache.ObtainRange(blas + header_bytes, size - header_bytes, true);
 			}
 		}
-		context.PrepareBda(true, false);
+		context.PrepareBda(true, BdaSync::Mapped);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		context.GetRayTracing()->RecordHleRefit(command.Handle(), refit, geometries, header_layout);
@@ -2482,7 +2482,7 @@ void CommandProcessor::EmitHleTlas() {
 			context.NoteHleTlas(build.header, size, build.count != 0 ? blases : std::vector<uint64_t> {});
 			recorded[index] = 1;
 		}
-		context.PrepareBda(true, false);
+		context.PrepareBda(true, BdaSync::Mapped);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		for (size_t index = 0; index < builds.size(); index++) {

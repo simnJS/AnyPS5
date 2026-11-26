@@ -39,6 +39,8 @@ namespace Libs::Graphics {
 
 struct ShaderBufferResource;
 
+enum class BdaSync { KnownReach, Registered, Mapped };
+
 class GuestGpu;
 
 class RenderContext {
@@ -107,7 +109,7 @@ public:
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	bool               CacheSelfSizedBuffers(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
-	void               PrepareBda(bool may_write, bool full_sync = true);
+	void               PrepareBda(bool may_write, BdaSync sync = BdaSync::Registered);
 	void               PrepareHackMarks();
 	void               RunGarbageCollector();
 	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);
@@ -120,7 +122,7 @@ public:
 
 private:
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
-	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages);
+	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages, bool bind_spans = false);
 	[[nodiscard]] bool AddRecordReach(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool AddRayTracingReach(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool RayQueryTableVsharp(const ShaderStageRuntime& runtime, uint32_t table,

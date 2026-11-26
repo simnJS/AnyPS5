@@ -579,7 +579,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
 			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), reach_synchronized ? BdaSync::KnownReach : BdaSync::Mapped);
 			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}
@@ -947,7 +947,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
 		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), reach_synchronized ? BdaSync::KnownReach : BdaSync::Mapped);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			m_context.GetBufferCache().RequestFlushForReadbacks();
 		}
@@ -1079,7 +1079,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
 			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), reach_synchronized ? BdaSync::KnownReach : BdaSync::Mapped);
 			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}
