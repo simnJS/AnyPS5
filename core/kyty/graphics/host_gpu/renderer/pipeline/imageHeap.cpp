@@ -460,10 +460,12 @@ void ImageHeap::Unlink(List& list, size_t slot, uint32_t entry) {
 void ImageHeap::Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots, Buffer& device,
                        size_t& dirty_begin, size_t& dirty_end) {
 	if (dirty_begin == dirty_end) return;
-	const auto words  = std::span(slots).subspan(dirty_begin, dirty_end - dirty_begin);
-	auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	const auto offset = stream.Copy(words.data(), words.size_bytes(), sizeof(uint32_t));
-	device.CopyFrom(buffer, stream, offset, dirty_begin * sizeof(uint32_t), words.size_bytes());
+	const auto words = std::span(slots).subspan(dirty_begin, dirty_end - dirty_begin);
+	const auto [source, offset] = m_context.GetBufferCache().UploadHeapData(
+	    words.size_bytes(), [&](uint8_t* mapped, uint64_t) {
+		    std::memcpy(mapped, words.data(), words.size_bytes());
+	    });
+	device.CopyFrom(buffer, *source, offset, dirty_begin * sizeof(uint32_t), words.size_bytes());
 	dirty_begin = dirty_end = 0;
 }
 
@@ -892,8 +894,7 @@ void ImageHeap::PrepareGpu(CommandBuffer& buffer) {
 
 void ImageHeap::FlushDirectory(CommandBuffer& buffer) {
 	if (!m_directory.Dirty()) return;
-	auto&                                      stream  = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	const auto                                 buckets = m_directory.Buckets();
+	const auto buckets = m_directory.Buckets();
 	std::vector<std::pair<uint32_t, uint32_t>> runs;
 	m_directory.TakeDirty([&](uint32_t first, uint32_t count) {
 		if (!runs.empty() && first <= runs.back().second + DirectoryGap) {
@@ -904,22 +905,21 @@ void ImageHeap::FlushDirectory(CommandBuffer& buffer) {
 	});
 	uint64_t total = 0;
 	for (const auto& [first, end]: runs) total += uint64_t {end - first} * sizeof(Slots::Bucket);
-	const auto [mapped, reserved] = stream.Map(total, 16);
-	EXIT_IF(mapped == nullptr);
 	std::vector<vk::BufferCopy> copies;
 	copies.reserve(runs.size());
-	uint64_t at = 0;
-	for (const auto& [first, end]: runs) {
-		const auto bytes = uint64_t {end - first} * sizeof(Slots::Bucket);
-		std::memcpy(mapped + at, buckets.data() + first, bytes);
-		copies.push_back({reserved + at, uint64_t {first} * sizeof(Slots::Bucket), bytes});
-		at += bytes;
-	}
-	stream.Commit();
+	const auto upload = m_context.GetBufferCache().UploadHeapData(total, [&](uint8_t* mapped, uint64_t offset) {
+		uint64_t at = 0;
+		for (const auto& [first, end]: runs) {
+			const auto bytes = uint64_t {end - first} * sizeof(Slots::Bucket);
+			std::memcpy(mapped + at, buckets.data() + first, bytes);
+			copies.push_back({offset + at, uint64_t {first} * sizeof(Slots::Bucket), bytes});
+			at += bytes;
+		}
+	});
 	const auto native = buffer.Handle();
 	GlobalBarrier(native, vk::PipelineStageFlagBits::eAllCommands, AnyAccess, vk::PipelineStageFlagBits::eTransfer,
 	              vk::AccessFlagBits::eTransferWrite);
-	native.copyBuffer(stream.Handle(), m_buckets->Handle(), static_cast<uint32_t>(copies.size()), copies.data());
+	native.copyBuffer(upload.first->Handle(), m_buckets->Handle(), static_cast<uint32_t>(copies.size()), copies.data());
 	GlobalBarrier(native, vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite,
 	              vk::PipelineStageFlagBits::eAllCommands, AnyAccess);
 }
@@ -942,17 +942,16 @@ ImageHeap::Ring& ImageHeap::CurrentRing() {
 
 void ImageHeap::Dispatch(CommandBuffer& buffer) {
 	if (m_jobs.empty()) return;
-	auto&      stream             = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	const auto job_bytes          = m_jobs.size() * sizeof(Slots::Job);
-	const auto group_bytes        = m_groups.size() * sizeof(uint32_t);
-	const auto [mapped, reserved] = stream.Map(job_bytes + group_bytes, 16);
-	EXIT_IF(mapped == nullptr);
-	std::memcpy(mapped, m_jobs.data(), job_bytes);
-	std::memcpy(mapped + job_bytes, m_groups.data(), group_bytes);
-	stream.Commit();
+	const auto job_bytes   = m_jobs.size() * sizeof(Slots::Job);
+	const auto group_bytes = m_groups.size() * sizeof(uint32_t);
+	const auto [source, offset] = m_context.GetBufferCache().UploadHeapData(
+	    job_bytes + group_bytes, [&](uint8_t* mapped, uint64_t) {
+		    std::memcpy(mapped, m_jobs.data(), job_bytes);
+		    std::memcpy(mapped + job_bytes, m_groups.data(), group_bytes);
+	    });
 	auto&       ring = CurrentRing();
-	Slots::Push push {.jobs    = stream.BufferDeviceAddress() + reserved,
-	                  .groups  = stream.BufferDeviceAddress() + reserved + job_bytes,
+	Slots::Push push {.jobs    = source->BufferDeviceAddress() + offset,
+	                  .groups  = source->BufferDeviceAddress() + offset + job_bytes,
 	                  .buckets = m_buckets->BufferDeviceAddress(),
 	                  .ring    = ring.buffer->BufferDeviceAddress(),
 	                  .used    = m_used->BufferDeviceAddress(),

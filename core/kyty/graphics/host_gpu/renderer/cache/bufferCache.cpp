@@ -1777,6 +1777,13 @@ vk::DeviceAddress BufferCache::TableUpload(const void* data, uint64_t size) {
 	return m_table_upload->BufferDeviceAddress() + m_table_upload->Copy(data, size, 16);
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::UploadHeapData(
+    uint64_t size, const std::function<void(uint8_t*, uint64_t)>& write) {
+	return UploadMemory(m_graphics, m_scheduler, m_stream_buffer, size, 16,
+	                    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eShaderDeviceAddress |
+	                        vk::BufferUsageFlagBits::eStorageBuffer, write, false);
+}
+
 uint64_t BufferCache::StreamUpload(const void* data, uint64_t size, uint64_t alignment) {
 	auto* copies = m_scheduler.HostCopies();
 	if (copies == nullptr || !m_stream_buffer.IsCoherent() || !GuestGpu::IsGpuThread()) {

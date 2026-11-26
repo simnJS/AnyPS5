@@ -227,10 +227,15 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 		if (!heap.Acquire(request, view) || view.kinds.size() != 1) return std::vector<uint32_t> {};
 		heap.Rebind(renderer.GetRenderExecutor());
 		if (write_during_preparation) {
+			auto& stream = buffers.GetUtilityBuffer(MemoryUsage::Stream);
+			if (stream.Map(stream.Size(), 16).first == nullptr) return std::vector<uint32_t> {};
+			stream.Commit();
 			const auto [buffer, offset] = buffers.ObtainRange(address, sizeof(uint32_t), true);
 			buffer->Fill(offset, sizeof(uint32_t), second);
 		}
+		const auto tick = scheduler.CurrentTick();
 		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+		if (scheduler.CurrentTick() != tick) return std::vector<uint32_t> {};
 		reader.Record(scheduler, view.slots, sizeof(words));
 		Finish(scheduler);
 		return reader.Words(sizeof(words));
@@ -242,8 +247,18 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	renderer.PrepareBda(true, false);
 	mirror->Fill(offset, sizeof(uint32_t), first);
 	const auto indirect = consume(false);
+	const auto bytes = buffers.GetUtilityBuffer(MemoryUsage::Stream).Size() + sizeof(uint32_t);
+	const auto tick  = scheduler.CurrentTick();
+	const auto [large, start] = buffers.UploadHeapData(bytes, [&](uint8_t* mapped, uint64_t) {
+		std::memcpy(mapped + bytes - sizeof(second), &second, sizeof(second));
+	});
+	reader.Record(scheduler, large->BufferDeviceAddress() + start + bytes - sizeof(second), sizeof(second));
+	const bool same_tick = scheduler.CurrentTick() == tick;
+	Finish(scheduler);
+	const bool large_ok = same_tick && reader.Words(sizeof(second)).front() == second;
 	graphics.device.destroyPipelineLayout(layout);
 	graphics.device.destroyDescriptorSetLayout(empty);
+	if (!large_ok) return "a heap upload larger than the stream lost its tick or its last word";
 	if (initial.empty() || initial.front() == 0 || initial[8] == 0 || initial.front() == initial[8]) {
 		return "the two seeded descriptors did not produce distinct slots";
 	}

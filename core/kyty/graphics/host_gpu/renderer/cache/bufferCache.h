@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -156,6 +157,8 @@ public:
 	[[nodiscard]] std::optional<uint64_t> FindStreamCopy(uint64_t vaddr, uint64_t size);
 	void NoteStreamCopy(uint64_t vaddr, uint64_t size, uint64_t offset);
 	void SetStreamInPlace(bool in_place) noexcept { m_stream_in_place = in_place; }
+	[[nodiscard]] std::pair<Buffer*, uint64_t> UploadHeapData(
+	    uint64_t size, const std::function<void(uint8_t*, uint64_t)>& write);
 	[[nodiscard]] uint64_t StreamUpload(const void* data, uint64_t size, uint64_t alignment);
 	[[nodiscard]] vk::DeviceAddress TableUpload(const void* data, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
