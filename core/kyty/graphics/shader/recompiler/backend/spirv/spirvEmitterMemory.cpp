@@ -2313,6 +2313,8 @@ uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t
 			const auto contiguous = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpISub, u64, last_translated, translated),
 			                               Binary(state, spv::OpISub, u64, last_byte, offset));
 			const auto last_ready = resident(last_entry, last_block);
+			EmitIfCondition(state, AndCondition(state, last_ready, Unary(state, spv::OpLogicalNot, boolean, first_ready)),
+			                [&] { mark(word(BufferCache::FAULT_BITMAP_OFFSET)); });
 			EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, last_ready),
 			                [&] { RecordBdaPageBit(state, last_block, BufferCache::FAULT_BITMAP_OFFSET); });
 			EmitIfCondition(state, AndCondition(state, first_ready, AndCondition(state, contiguous, last_ready)),

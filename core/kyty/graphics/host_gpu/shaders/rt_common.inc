@@ -1,6 +1,7 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
+#extension GL_KHR_memory_scope_semantics : require
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32Ref { uint v; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4Ref { uvec4 v; };
@@ -29,7 +30,8 @@ bool Resident(uint block, uint entry) {
 	const uint bit = 1u << (block & 31u);
 	const uint word = block >> 5;
 	if ((entry & (1u << (block & 15u))) != 0) {
-		atomicOr(words[use_word - 64u + word], bit);
+		const uint used = atomicLoad(words[use_word - 64u + word], gl_ScopeDevice, gl_StorageSemanticsNone, gl_SemanticsRelaxed);
+		if ((used & bit) == 0) atomicOr(words[use_word - 64u + word], bit);
 		return true;
 	}
 	atomicOr(words[fault_word - 64u + word], bit);
@@ -58,16 +60,19 @@ uint64_t GuestAddress(uint64_t offset, uint bytes) {
 uint64_t HostAddress(uint64_t va, uint bytes) {
 	const uint64_t offset = va - guest_base;
 	if (offset >= mirror_size || bytes > mirror_size - offset) return 0;
-	const uint64_t last_byte = offset + bytes - 1u;
 	const uint64_t packed = va >= extended_base ? va - extended_base + lower_size : va;
 	if (va < extended_base && (va >= lower_size || bytes > lower_size - va)) return 0;
 	const uint block = uint(packed >> 16);
-	const uint last_block = uint((packed + bytes - 1u) >> 16);
 	const uint entry = words[block >> 4];
-	const uint last_entry = (block >> 4) == (last_block >> 4) ? entry : words[last_block >> 4];
 	const bool start = Resident(block, entry);
-	const bool end = block == last_block ? start : Resident(last_block, last_entry);
 	const uint64_t first = (uint64_t(entry >> 16) << 24) | (offset & 0xfffffful);
+	if (bytes <= 0x10000u - (uint(packed) & 0xffffu)) {
+		return start ? mirror_base + first : GuestAddress(offset, bytes);
+	}
+	const uint64_t last_byte = offset + bytes - 1u;
+	const uint last_block = uint((packed + bytes - 1u) >> 16);
+	const uint last_entry = (block >> 4) == (last_block >> 4) ? entry : words[last_block >> 4];
+	const bool end = Resident(last_block, last_entry);
 	const uint64_t last = (uint64_t(last_entry >> 16) << 24) | (last_byte & 0xfffffful);
 	if (start && end && last - first == bytes - 1u) return mirror_base + first;
 	return start || end ? 0 : GuestAddress(offset, bytes);

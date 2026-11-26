@@ -3610,7 +3610,14 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::CollectSpanRanges(uint64_t span, uint64_t bytes, std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
-	m_guest_mirror->ForEachRequested(span, bytes, [&](uint64_t start, uint64_t finish) { ranges.emplace_back(start, finish - start); });
+	m_guest_mirror->ForEachRequested(span, bytes, [&](uint64_t start, uint64_t finish) {
+		while (start < finish) {
+			const auto length = m_guest_mirror->ContiguousSize(start, finish - start);
+			EXIT_IF(length == 0);
+			ranges.emplace_back(start, length);
+			start += length;
+		}
+	});
 }
 
 }

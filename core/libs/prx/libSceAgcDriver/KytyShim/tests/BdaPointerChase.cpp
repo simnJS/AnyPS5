@@ -19,8 +19,8 @@
 
 namespace {
 
-constexpr std::uint64_t GuestBase = 0x201400000;
 constexpr std::uint64_t Block = 0x10000;
+constexpr std::uint64_t GuestBase = (960ull << 30) - 4 * Block;
 constexpr std::uint64_t ShaderHeader = GuestBase + 0x100;
 constexpr std::uint64_t ShaderCode = GuestBase + 0x800;
 constexpr std::uint64_t Commands = GuestBase + 0x7000;
