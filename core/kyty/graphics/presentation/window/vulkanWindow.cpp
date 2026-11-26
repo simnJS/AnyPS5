@@ -707,6 +707,17 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.indirect_draws_enabled = device_features.multiDrawIndirect == VK_TRUE &&
 	                                  device_features.drawIndirectFirstInstance == VK_TRUE &&
 	                                  features12.drawIndirectCount == VK_TRUE;
+	{
+		const auto families = physical_device.getQueueFamilyProperties();
+		graphics.partial_textures_enabled =
+		    supported2.features.sparseBinding == VK_TRUE && supported2.features.sparseResidencyImage2D == VK_TRUE &&
+		    physical_device.getProperties().sparseProperties.residencyNonResidentStrict == VK_TRUE &&
+		    queue_family < families.size() &&
+		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		device_features.sparseBinding          = graphics.partial_textures_enabled ? VK_TRUE : VK_FALSE;
+		device_features.sparseResidencyImage2D = graphics.partial_textures_enabled ? VK_TRUE : VK_FALSE;
+		LOGF("Vulkan partially resident textures: %s\n", graphics.partial_textures_enabled ? "true" : "false");
+	}
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported2.features.shaderFloat64 && float_controls.shaderSignedZeroInfNanPreserveFloat64;

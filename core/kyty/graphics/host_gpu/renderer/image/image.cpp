@@ -13,7 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
+#include <vector>
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -50,6 +53,26 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 [[nodiscard]] bool HasFormatFeature(vk::FormatProperties      properties,
                                     vk::FormatFeatureFlagBits feature) {
 	return static_cast<bool>(properties.optimalTilingFeatures & feature);
+}
+
+[[nodiscard]] static uint32_t PartialFirstLevel(GraphicContext& graphics, const ImageInfo& info,
+                                         const vk::ImageCreateInfo& create) {
+	static const uint64_t threshold_mb = [] {
+		const char* value = std::getenv("KYTY_PARTIAL_TEXTURE_MB");
+		return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : UINT64_MAX;
+	}();
+	if (threshold_mb == 0 || !graphics.partial_textures_enabled || !graphics.CanReportMemoryUsage() ||
+	    !info.IsBlock() || create.imageType != vk::ImageType::e2D || create.samples != vk::SampleCountFlagBits::e1 ||
+	    create.mipLevels < 3 || std::max(create.extent.width, create.extent.height) < 512) {
+		return 0;
+	}
+	const auto     memory = graphics.GetDeviceLocalBudget();
+	const uint64_t start  = threshold_mb != UINT64_MAX ? std::min(threshold_mb, UINT64_MAX >> 20u) << 20u
+	                                                   : memory.budget - memory.reserve;
+	if (memory.budget == 0 || memory.usage < start) {
+		return 0;
+	}
+	return memory.usage >= start + (memory.budget - std::min(memory.budget, start)) / 2u ? 2u : 1u;
 }
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
@@ -287,6 +310,18 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	std::vector<vk::BufferImageCopy> resident;
+	if (backing.first_resident_level != 0) {
+		for (const auto& copy: copies) {
+			if (copy.imageSubresource.mipLevel >= backing.first_resident_level) {
+				resident.push_back(copy);
+			}
+		}
+		if (resident.empty()) {
+			return;
+		}
+		copies = resident;
+	}
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -321,9 +356,33 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	command.pipelineBarrier2(dependency);
 }
 
+void Image::RequireResident(const Image& source) const {
+	if (IsPartiallyResident() || source.IsPartiallyResident()) {
+		EXIT("Image: a transfer reaches the omitted levels of a partially resident image "
+		     "(guest 0x%016" PRIx64 ", source 0x%016" PRIx64 ")\n",
+		     info.data.address, source.info.data.address);
+	}
+}
+
+bool Image::MakeResident() {
+	if (!IsPartiallyResident()) {
+		return true;
+	}
+	if (!m_graphics.BindOmittedLevels(backing)) {
+		return false;
+	}
+	for (const auto& cached: views) {
+		m_retired_views.push_back(cached.view);
+	}
+	views.clear();
+	HeapChanged();
+	return true;
+}
+
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
                      uint64_t offset, uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	RequireResident(*this);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
@@ -383,6 +442,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	RequireResident(source);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	uint32_t       base_depth = source.backing.extent.depth;
@@ -440,6 +500,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	        destination_range.base_level >= backing.mip_levels ||
 	        source_range.base_layer >= source.backing.layers ||
 	        destination_range.base_layer >= backing.layers);
+	RequireResident(source);
 	const auto layers       = std::min({source_range.layer_count, destination_range.layer_count,
 	                                    source.backing.layers - source_range.base_layer,
 	                                    backing.layers - destination_range.base_layer});
@@ -499,6 +560,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
+	RequireResident(source);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
 	const auto     source_aspect =
@@ -599,6 +661,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
+	RequireResident(source);
 	m_scheduler.EndRendering();
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);
@@ -749,7 +812,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
+	const auto first_level = PartialFirstLevel(graphics, info, create);
+	if ((first_level == 0 || !graphics.CreatePartialImage(create, first_level, backing)) &&
+	    !graphics.CreateImage(create, backing)) {
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
@@ -785,6 +850,9 @@ Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
 	for (const auto& cached: views) {
 		m_graphics.device.destroyImageView(cached.view, nullptr);
+	}
+	for (const auto view: m_retired_views) {
+		m_graphics.device.destroyImageView(view, nullptr);
 	}
 	if (backing.image != nullptr) {
 		m_graphics.DeleteImage(backing);

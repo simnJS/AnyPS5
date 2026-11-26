@@ -57,6 +57,7 @@ constexpr std::string_view Names[] = {
     "KYTY_LOCK_STATS_PERIOD",
     "KYTY_NATIVE_RT",
     "KYTY_OCCLUSION_QUERIES",
+    "KYTY_PARTIAL_TEXTURE_MB",
     "KYTY_PERF_OVERLAY",
     "KYTY_PGO_DIR",
     "KYTY_PGO_DUMP_SECONDS",

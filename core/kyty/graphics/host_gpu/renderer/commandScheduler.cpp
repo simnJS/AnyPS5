@@ -624,6 +624,9 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 	submit.AddSignal(m_master.Handle(), tick);
+	if (const auto sparse = graphics.FlushSparseBinds(); sparse != 0) {
+		submit.AddWait(graphics.SparseBindSemaphore(), sparse);
+	}
 
 	vk::TimelineSemaphoreSubmitInfo timeline_info {};
 	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;

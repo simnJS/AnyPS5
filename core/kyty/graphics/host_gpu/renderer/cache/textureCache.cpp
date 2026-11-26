@@ -1202,6 +1202,8 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
+	MakeResident(source);
+	MakeResident(destination);
 	TrackImage(destination_id);
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
@@ -1245,6 +1247,8 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
+	MakeResident(source);
+	MakeResident(destination);
 	TrackImage(destination_id);
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
@@ -1663,7 +1667,25 @@ bool TextureCache::CanDownload(const Image& image) const {
 	       info.LinearSize() != 0;
 }
 
-void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+void TextureCache::MakeResident(Image& image) {
+	if (!image.IsPartiallyResident()) {
+		return;
+	}
+	const auto omitted = image.backing.first_resident_level;
+	if (!image.MakeResident()) {
+		EXIT("TextureCache: could not back the omitted levels of image 0x%016" PRIx64 "\n",
+		     image.info.data.address);
+	}
+	const auto [source, source_offset] =
+	    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+	if (source == nullptr) {
+		EXIT("TextureCache: failed to obtain the upload source of omitted levels\n");
+	}
+	UploadImage(image, *source, source_offset, omitted);
+}
+
+void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset,
+                               uint32_t level_end) {
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info        = image.info;
 	const auto  binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
@@ -1674,14 +1696,18 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
 		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
-		const auto copies = info.BufferCopies(linear.offset);
+		auto       copies = info.BufferCopies(linear.offset);
+		std::erase_if(copies, [level_end](const vk::BufferImageCopy& copy) {
+			return copy.imageSubresource.mipLevel >= level_end;
+		});
+		EXIT_IF(copies.empty());
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;
 	}
 
 	if (destination.backing.samples != 1 || info.resources.layers == 0 ||
-	    info.data.size % info.resources.layers != 0 ||
+	    info.data.size % info.resources.layers != 0 || level_end != UINT32_MAX ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");
 	}
@@ -2761,6 +2787,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 	}
 	RefreshImage(id);
+	if (desc.type != BindingType::Texture || image.ReachesOmittedLevels(desc.view_info)) {
+		MakeResident(image);
+	}
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
@@ -2792,6 +2821,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		image.StateChanged();
 	}
 	RefreshImage(id);
+	MakeResident(image);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
 	return image.FindView(desc.view_info);
@@ -2834,6 +2864,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 		m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
 	}
 	RefreshImage(id);
+	MakeResident(image);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
 		const auto association = AssociateStencil(id, desc.info.stencil);
@@ -2974,6 +3005,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
+	MakeResident(image);
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -3037,6 +3069,7 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
                                              uint32_t layer, uint32_t layers,
                                              const vk::ClearValue* clear,
                                              const CommandRecorder& command) {
+	MakeResident(image);
 	ImageViewInfo view {};
 	view.format      = format;
 	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
@@ -3068,6 +3101,7 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
+	MakeResident(image);
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.linear_slice_stride != 0 ? info.linear_slice_stride
@@ -3139,6 +3173,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                  uint64_t destination_size, uint32_t levels) {
+	MakeResident(image);
 	if (UploadBinding(image) == BindingType::DepthTarget) {
 		EXIT_IF(destination_size != image.info.data.size || levels != image.info.resources.levels);
 		DownloadDepth(image, destination, destination_offset);

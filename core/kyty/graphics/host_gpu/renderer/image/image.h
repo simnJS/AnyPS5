@@ -71,6 +71,13 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	[[nodiscard]] bool IsPartiallyResident() const noexcept { return backing.first_resident_level != 0; }
+	[[nodiscard]] bool ReachesOmittedLevels(const ImageViewInfo& view) const noexcept {
+		return IsPartiallyResident() &&
+		       (static_cast<bool>(view.usage & ~vk::ImageUsageFlagBits::eSampled) ||
+		        view.base_level + view.level_count <= backing.first_resident_level);
+	}
+	[[nodiscard]] bool MakeResident();
 
 	[[nodiscard]] static uint64_t CpuDirtyEpoch() noexcept {
 		return s_cpu_dirty_epoch.load(std::memory_order_relaxed);
@@ -262,8 +269,11 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
+	void RequireResident(const Image& source) const;
+
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
+	std::vector<vk::ImageView> m_retired_views;
 	uint64_t          m_maybe_cpu_hash  = 0;
 	bool              m_cpu_dirty       = false;
 	bool              m_maybe_cpu_dirty = false;

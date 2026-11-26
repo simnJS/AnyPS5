@@ -1,4 +1,5 @@
 #include "TestVulkanDevice.h"
+#include "TextureCacheTestAccess.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -22,18 +23,6 @@ namespace Libs::Graphics {
 struct BufferCacheTestAccess {
 	static void DiscardGpuWrites(BufferCache& cache, uint64_t address, uint64_t size) {
 		cache.DiscardGpuWrites(address, size);
-	}
-};
-
-struct TextureCacheTestAccess {
-	static ImageId Create(TextureCache& cache, const ImageInfo& info) {
-		Common::ScopedLock lock {cache.m_lock};
-		return cache.InsertImage(info);
-	}
-
-	static bool QueueDownload(TextureCache& cache, ImageId image) {
-		Common::ScopedLock lock {cache.m_lock};
-		return cache.DownloadImageMemory(image);
 	}
 };
 

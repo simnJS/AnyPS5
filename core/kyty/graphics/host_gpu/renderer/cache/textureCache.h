@@ -386,7 +386,9 @@ private:
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void UploadImage(Image& image, Buffer& source, uint64_t source_offset,
+	                 uint32_t level_end = UINT32_MAX);
+	void MakeResident(Image& image);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

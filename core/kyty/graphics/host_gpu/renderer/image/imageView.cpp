@@ -275,6 +275,13 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 }
 
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+	if (ReachesOmittedLevels(view_info)) {
+		EXIT("Image: view mip=%u+%u usage=0x%x reaches the omitted levels 0..%u of a partially "
+		     "resident image\n",
+		     view_info.base_level, view_info.level_count,
+		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage),
+		     backing.first_resident_level - 1u);
+	}
 	const auto& image      = backing;
 	auto        normalized = view_info;
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
@@ -333,6 +340,12 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;
+	}
+	if (image.first_resident_level > normalized.base_level) {
+		const auto last     = normalized.base_level + normalized.level_count - 1u;
+		const auto resident = static_cast<float>(std::min(image.first_resident_level, last));
+		min_lod.minLod      = std::max(min_lod.minLod, resident);
+		usage.pNext         = &min_lod;
 	}
 	vk::ImageViewCreateInfo create {};
 	create.pNext                           = &usage;

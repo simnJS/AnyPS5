@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace KytyShimTests {
 
@@ -15,7 +16,7 @@ struct TestVulkanDevice {
 	vk::detail::DynamicLoader loader;
 	Libs::Graphics::GraphicContext graphics;
 
-	const char* Initialize(bool require_tiling = false) {
+	const char* Initialize(bool require_tiling = false, bool partial_textures = false) {
 		if (!loader.success()) {
 			return "Vulkan loader unavailable";
 		}
@@ -36,7 +37,7 @@ struct TestVulkanDevice {
 			return "Vulkan device enumeration failed";
 		}
 		for (const auto device : devices.value) {
-			if (InitializeDevice(device, require_tiling)) {
+			if (InitializeDevice(device, require_tiling, partial_textures)) {
 				return nullptr;
 			}
 		}
@@ -56,7 +57,7 @@ struct TestVulkanDevice {
 	}
 
 private:
-	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling) {
+	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool partial_textures) {
 		vk::PhysicalDeviceVulkan12Properties limits {};
 		vk::PhysicalDeviceVulkan11Properties properties11 {.pNext = &limits};
 		vk::PhysicalDeviceProperties2 properties {.pNext = &properties11};
@@ -76,8 +77,12 @@ private:
 			return false;
 		}
 		const auto extensions = physical.enumerateDeviceExtensionProperties(nullptr);
-		const std::array required_extensions {
+		std::vector<const char*> required_extensions {
 		    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
+		if (partial_textures) {
+			required_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+			required_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+		}
 		if (extensions.result != vk::Result::eSuccess ||
 		    !std::ranges::all_of(required_extensions, [&extensions](const char* extension) {
 			    return std::ranges::any_of(extensions.value, [extension](const auto& properties) {
@@ -86,7 +91,8 @@ private:
 		    })) {
 			return false;
 		}
-		vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness {};
+		vk::PhysicalDeviceImageViewMinLodFeaturesEXT supported_min_lod {};
+		vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness {.pNext = partial_textures ? &supported_min_lod : nullptr};
 		vk::PhysicalDeviceVulkan12Features supported12 {.pNext = &supported_robustness};
 		vk::PhysicalDeviceVulkan11Features supported11 {.pNext = &supported12};
 		vk::PhysicalDeviceVulkan13Features supported13 {.pNext = &supported11};
@@ -103,7 +109,16 @@ private:
 		    !supported13.synchronization2 || !supported13.dynamicRendering) {
 			return false;
 		}
-		vk::PhysicalDeviceRobustness2FeaturesEXT robustness {.nullDescriptor = VK_TRUE};
+		if (partial_textures &&
+		    (!supported.features.sparseBinding || !supported.features.sparseResidencyImage2D ||
+		     !supported_min_lod.minLod ||
+		     !properties.properties.sparseProperties.residencyNonResidentStrict ||
+		     !(family->queueFlags & vk::QueueFlagBits::eSparseBinding))) {
+			return false;
+		}
+		vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod {.minLod = VK_TRUE};
+		vk::PhysicalDeviceRobustness2FeaturesEXT robustness {.pNext = partial_textures ? &min_lod : nullptr,
+		                                                     .nullDescriptor = VK_TRUE};
 		vk::PhysicalDeviceVulkan12Features features12 {
 		    .pNext = &robustness,
 		    .storageBuffer8BitAccess = require_tiling,
@@ -120,7 +135,9 @@ private:
 		const vk::PhysicalDeviceFeatures core_features {
 		    .sampleRateShading = VK_TRUE,
 		    .shaderStorageImageMultisample = supported.features.shaderStorageImageMultisample,
-		    .shaderInt64 = VK_TRUE};
+		    .shaderInt64 = VK_TRUE,
+		    .sparseBinding = partial_textures,
+		    .sparseResidencyImage2D = partial_textures};
 		const float priority = 1.0f;
 		const vk::DeviceQueueCreateInfo queue_info {
 		    .queueFamilyIndex = static_cast<uint32_t>(family - families.begin()),
@@ -145,6 +162,8 @@ private:
 		graphics.queue_family = queue_info.queueFamilyIndex;
 		graphics.device.getQueue(graphics.queue_family, 0, &graphics.queue);
 		graphics.occlusion_queries_enabled = true;
+		graphics.memory_budget_ext_enabled = partial_textures;
+		graphics.partial_textures_enabled = partial_textures;
 		return true;
 	}
 };

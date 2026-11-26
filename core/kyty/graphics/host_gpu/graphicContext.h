@@ -29,6 +29,7 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               partial_textures_enabled              = false;
 	bool                               host_import_enabled                   = false;
 	uint64_t                           host_import_alignment                 = 0;
 	bool                               compute_subgroup_size_control_enabled = false;
@@ -131,6 +132,13 @@ struct GraphicContext {
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 
+	struct DeviceLocalBudget {
+		uint64_t usage   = 0;
+		uint64_t budget  = 0;
+		uint64_t reserve = 0;
+	};
+	[[nodiscard]] DeviceLocalBudget GetDeviceLocalBudget() const;
+
 	struct HeapUsage {
 		uint64_t usage        = 0;
 		uint64_t budget       = 0;
@@ -139,6 +147,10 @@ struct GraphicContext {
 	};
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	[[nodiscard]] bool     CreatePartialImage(const vk::ImageCreateInfo& info, uint32_t first_level, VulkanImage& image);
+	[[nodiscard]] bool     BindOmittedLevels(VulkanImage& image);
+	[[nodiscard]] uint64_t FlushSparseBinds();
+	[[nodiscard]] vk::Semaphore SparseBindSemaphore() const noexcept { return m_sparse_semaphore; }
 	void                   DeleteImage(VulkanImage& image);
 
 	uint32_t screen_width  = 0;
@@ -152,6 +164,20 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+
+	struct SparseBind {
+		vk::Image                              image = nullptr;
+		std::vector<vk::SparseImageMemoryBind> levels;
+		std::vector<vk::SparseMemoryBind>      tails;
+	};
+	[[nodiscard]] bool QueueLevelBinds(VulkanImage& image, uint32_t first_level, uint32_t end_level,
+	                                   bool bind_tail, bool within_budget, VmaAllocation& allocation);
+	void               WaitSparseBinds(vk::Image image);
+
+	std::mutex              m_sparse_mutex;
+	std::vector<SparseBind> m_sparse_pending;
+	vk::Semaphore           m_sparse_semaphore = nullptr;
+	uint64_t                m_sparse_value     = 0;
 };
 
 struct VulkanImageState {
@@ -176,7 +202,9 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	VmaAllocation                omitted_allocation = nullptr;
 	bool recyclable = false;
+	uint32_t first_resident_level = 0;
 };
 
 
