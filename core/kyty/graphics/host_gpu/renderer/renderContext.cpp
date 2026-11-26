@@ -306,9 +306,24 @@ bool RenderContext::AdmitMemory(uint64_t address, uint64_t size) {
 	return ReserveMirrorRange(address, size);
 }
 
+void RenderContext::CancelMemoryAdmission(uint64_t address, uint64_t size) {
+	auto& mirror = *m_buffer_cache.GetGuestMirror();
+	if (!mirror.Holds(address, size)) return;
+	const auto cancel = [this, &mirror, address, size] {
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		const auto first = address - ((address - mirror.Base()) & (GuestMirror::WindowSize - 1));
+		for (auto window = first; window < address + size; window += GuestMirror::WindowSize) {
+			const auto bytes = std::min(GuestMirror::WindowSize, mirror.GuestSpan() - (window - mirror.Base()));
+			if (!m_mapped_ranges.Intersects(window, bytes) && !mirror.AnyRequested(window, bytes)) mirror.FreeWindow(window);
+		}
+	};
+	if (m_gpu == nullptr || m_gpu->IsStopping()) cancel();
+	else m_gpu->SendUrgentCommandSync(cancel);
+}
+
 bool RenderContext::ReserveMirrorRange(uint64_t address, uint64_t size) {
 	auto& mirror = *m_buffer_cache.GetGuestMirror();
-	if (!mirror.Holds(address, size)) return false;
+	if (!GuestRange{address, size}.Valid() || !mirror.Holds(address, size)) return false;
 	const auto end = address + size;
 	const bool previous = address > mirror.Base() && m_mapped_ranges.Contains(address - 1, 1);
 	const bool next = end < mirror.Base() + mirror.GuestSpan() && m_mapped_ranges.Contains(end, 1);

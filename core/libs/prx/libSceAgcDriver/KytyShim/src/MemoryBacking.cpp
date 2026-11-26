@@ -809,20 +809,35 @@ bool TryWriteBackedQwords(uint64_t vaddr, const uint64_t* values, uint32_t count
 }
 
 static MapAdmission g_admit = nullptr;
+static RangeHook g_cancel = nullptr;
+
+static void CancelMapping(std::uintptr_t address, std::size_t bytes) {
+	GuestDeliveryLock lock(HookMutex());
+	if (g_cancel != nullptr) g_cancel(address, bytes);
+}
 
 static bool AdmitMapping(std::uintptr_t address, std::size_t bytes) {
 	GuestDeliveryLock lock(HookMutex());
 	return g_admit == nullptr || g_admit(address, bytes);
 }
 
-bool SetGpuRangeHooks(RangeHook map, RangeHook unmap, MapAdmission admit) {
+bool SetGpuRangeHooks(RangeHook map, RangeHook unmap, MapAdmission admit, RangeHook cancel) {
 	std::lock_guard lock(HookMutex());
 	if (map != nullptr && admit != nullptr) {
-		bool fits = true;
-		Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) { fits = fits && admit(start, size); });
-		if (!fits) return false;
+		uint64_t refused = UINT64_MAX;
+		Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) {
+			if (refused == UINT64_MAX && !admit(start, size)) refused = start;
+		});
+		if (refused != UINT64_MAX) {
+			if (cancel != nullptr) Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) {
+				if (start < refused) cancel(start, size);
+			});
+			return false;
+		}
 	}
 	g_admit = admit;
+	g_cancel = cancel;
+	DirectMemorySetMapCancellation_nid_no_patch(cancel != nullptr ? &CancelMapping : nullptr);
 	DirectMemorySetMapAdmission_nid_no_patch(admit != nullptr ? &AdmitMapping : nullptr);
 	g_map_hook = map;
 	g_unmap_hook = unmap;

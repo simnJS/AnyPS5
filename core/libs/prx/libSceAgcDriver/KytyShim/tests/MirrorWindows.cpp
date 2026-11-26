@@ -24,6 +24,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <stdexcept>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -761,6 +762,18 @@ const char* CheckCapacity(GraphicContext& graphics, uint64_t address) {
 	} mappings;
 	if (!renderer.MapMemory(extended, page)) return "could not translate an extended guest address";
 	const auto keep = mirror.Offset(extended);
+	if (!renderer.AdmitMemory(extended + page, page)) return "could not admit a page beside a live mapping";
+	renderer.CancelMemoryAdmission(extended + page, page);
+	if (mirror.Offset(extended) != keep) return "cancelling a neighbouring page lost a live mapping";
+	const auto boundary = 880 * GuestMirror::GiB;
+	void* misaligned = reinterpret_cast<void*>(boundary - 1);
+	try {
+		sceKernelMapFlexibleMemory(&misaligned, page, CpuReadWrite, 0x90);
+		return "the kernel accepted an unaligned fixed placement";
+	} catch (const std::invalid_argument&) {
+		if (mirror.Offset(boundary - 1) != UINT64_MAX || mirror.Offset(boundary) != UINT64_MAX)
+			return "failed host placement retained a provisional window";
+	}
 	uint64_t refused = 0;
 	for (uint64_t n = 0; n <= 32; ++n) {
 		const auto base = 900 * GuestMirror::GiB + n * GuestMirror::WindowSize;

@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GUESTMIRROR_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/cache/mirrorWindowTable.h"
 #include "common/threadSafety.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -13,6 +14,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -79,8 +81,8 @@ public:
 
 	[[nodiscard]] bool               Available() const noexcept { return m_size != 0; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
-	static constexpr uint32_t WindowBits = 24;
-	static constexpr uint64_t WindowSize = uint64_t {1} << WindowBits;
+	static constexpr uint32_t WindowBits = MirrorWindowTable::WindowBits;
+	static constexpr uint64_t WindowSize = MirrorWindowTable::WindowSize;
 	[[nodiscard]] uint64_t GuestSpan() const noexcept { return m_guest_span; }
 	[[nodiscard]] uint64_t Offset(uint64_t address) const noexcept;
 	[[nodiscard]] uint64_t Address(uint64_t offset) const noexcept;
@@ -208,9 +210,7 @@ private:
 
 	GraphicContext& m_graphics;
 	uint64_t        m_guest_span = 0;
-	std::vector<uint32_t> m_windows;
-	std::vector<uint32_t> m_guest_windows;
-	std::mutex m_windows_mutex;
+	std::optional<MirrorWindowTable> m_windows;
 	uint64_t        m_size           = 0;
 	uint64_t        m_base           = 0;
 	uint32_t        m_block_bits     = MinBlockBits;

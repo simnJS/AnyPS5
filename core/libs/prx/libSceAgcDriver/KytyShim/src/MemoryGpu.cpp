@@ -27,7 +27,13 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 }
 
 static bool AdmitGpuRange(uint64_t address, uint64_t size) {
-	return !IsGpuAddressRange(address, size) || GetGpuResources().AdmitMemory(address, size);
+	return Graphics::AdmitGuestMapping(address, size, [](uint64_t start, uint64_t bytes) {
+		return GetGpuResources().AdmitMemory(start, bytes);
+	});
+}
+
+static void CancelGpuAdmission(uint64_t address, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(address, size)) g_gpu_resources->CancelMemoryAdmission(address, size);
 }
 
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -36,8 +42,8 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
-	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return;
-	g_gpu_resources->UnmapMemory(vaddr, size);
+	if (g_gpu_resources == nullptr) return;
+	Graphics::ForEachGpuUnmap(vaddr, size, [](uint64_t start, uint64_t bytes) { g_gpu_resources->UnmapMemory(start, bytes); });
 }
 
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
@@ -300,7 +306,7 @@ void InstallGpuResources(Graphics::RenderContext* resources) {
 	if (resources != nullptr && g_gpu_resources != nullptr) Shim::Fail("KytyShim memory: InstallGpuResources called twice\n");
 	if (resources == nullptr) Shim::SetGpuRangeHooks(nullptr, nullptr);
 	g_gpu_resources = resources;
-	if (resources != nullptr && !Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange, &AdmitGpuRange)) {
+	if (resources != nullptr && !Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange, &AdmitGpuRange, &CancelGpuAdmission)) {
 		g_gpu_resources = nullptr;
 		Shim::RefuseGpuMappings();
 	}

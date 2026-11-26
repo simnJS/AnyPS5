@@ -103,6 +103,7 @@ public:
 #endif
 	[[nodiscard]] bool UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const;
 	bool               AdmitMemory(uint64_t address, uint64_t size);
+	void               CancelMemoryAdmission(uint64_t address, uint64_t size);
 	bool               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);

@@ -240,10 +240,7 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 		return;
 	}
 	m_guest_span = guest_span != 0 ? guest_span : m_size;
-	if (guest_span != 0) {
-		m_windows.resize((guest_span + WindowSize - 1) / WindowSize);
-		m_guest_windows.resize((m_size + WindowSize - 1) / WindowSize);
-	}
+	if (guest_span != 0) m_windows.emplace(guest_span, m_size);
 	m_shared_queue = graphics.sparse_queue == graphics.queue;
 	m_words        = ((m_guest_span >> m_block_bits) + 63) / 64;
 	m_bound        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
@@ -334,18 +331,14 @@ void GuestMirror::DestroyBuffer() {
 }
 
 uint64_t GuestMirror::Offset(uint64_t address) const noexcept {
-	const auto relative = address - m_base;
-	if (relative >= m_guest_span) return UINT64_MAX;
-	if (m_windows.empty()) return relative;
-	const auto entry = std::atomic_ref<const uint32_t>(m_windows[relative >> WindowBits]).load(std::memory_order_acquire);
-	return entry == 0 ? UINT64_MAX : (uint64_t {entry - 1} << WindowBits) + (relative & (WindowSize - 1));
+	if (address < m_base || address - m_base >= m_guest_span) return UINT64_MAX;
+	return m_windows ? m_windows->Offset(address - m_base) : address - m_base;
 }
 
 uint64_t GuestMirror::Address(uint64_t offset) const noexcept {
 	if (offset >= m_size) return UINT64_MAX;
-	if (m_guest_windows.empty()) return m_base + offset;
-	const auto entry = std::atomic_ref<const uint32_t>(m_guest_windows[offset >> WindowBits]).load(std::memory_order_acquire);
-	return entry == 0 ? UINT64_MAX : m_base + (uint64_t {entry - 1} << WindowBits) + (offset & (WindowSize - 1));
+	const auto relative = m_windows ? m_windows->GuestOffset(offset) : offset;
+	return relative < m_guest_span ? m_base + relative : UINT64_MAX;
 }
 
 uint64_t GuestMirror::ContiguousSize(uint64_t address, uint64_t bytes) const noexcept {
@@ -360,59 +353,15 @@ uint64_t GuestMirror::ContiguousSize(uint64_t address, uint64_t bytes) const noe
 }
 
 void GuestMirror::FreeWindow(uint64_t address) {
-	std::lock_guard lock(m_windows_mutex);
-	const auto index = (address - m_base) >> WindowBits;
-	const auto entry = m_windows[index];
-	if (entry == 0) return;
-	std::atomic_ref<uint32_t>(m_windows[index]).store(0, std::memory_order_release);
-	std::atomic_ref<uint32_t>(m_guest_windows[entry - 1]).store(0, std::memory_order_release);
+	if (m_windows && address >= m_base) m_windows->Free(address - m_base);
 }
 
 bool GuestMirror::MapWindows(uint64_t address, uint64_t size) {
 	if (!Holds(address, size)) return false;
-	if (m_windows.empty()) return true;
-	const uint32_t first = (address - m_base) >> WindowBits;
-	const uint32_t last = (address - m_base + size - 1) >> WindowBits;
-	if (first == last && InOneWindow(address, size)) return true;
-	std::lock_guard lock(m_windows_mutex);
-	const uint32_t count = last - first + 1;
-	const uint32_t slots = m_guest_windows.size();
-	const auto fits = [&](uint32_t slot) {
-		if (slot >= slots || count > slots - slot ||
-		    (uint64_t {slot} << WindowBits) + ((address - m_base) & (WindowSize - 1)) + size > m_size) return false;
-		for (uint32_t n = 0; n < count; ++n) {
-			if ((m_guest_windows[slot + n] != 0 && m_guest_windows[slot + n] != first + n + 1) ||
-			    (m_windows[first + n] != 0 && m_windows[first + n] != slot + n + 1)) return false;
-		}
-		return true;
-	};
-	uint32_t slot = first % slots;
-	if (first > 0 && m_windows[first - 1] != 0 && fits(m_windows[first - 1])) {
-		slot = m_windows[first - 1];
-	} else if (last + 1 < m_windows.size() && m_windows[last + 1] > count && fits(m_windows[last + 1] - count - 1)) {
-		slot = m_windows[last + 1] - count - 1;
-	}
-	for (uint32_t n = 0; n < count; ++n) {
-		if (m_windows[first + n] != 0) {
-			slot = m_windows[first + n] - 1 - n;
-			break;
-		}
-	}
-	if (!fits(slot)) {
-		slot = 0;
-		while (slot < slots && !fits(slot)) ++slot;
-	}
-	if (slot == slots) {
-		::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] refused guest range {:#x}+{:#x}: {} contiguous windows needed in {}\n",
-		                                       address, size, count, Gib(m_size)));
-		return false;
-	}
-	for (uint32_t n = 0; n < count; ++n) {
-		if (m_windows[first + n] != 0) continue;
-		std::atomic_ref<uint32_t>(m_guest_windows[slot + n]).store(first + n + 1, std::memory_order_release);
-		std::atomic_ref<uint32_t>(m_windows[first + n]).store(slot + n + 1, std::memory_order_release);
-	}
-	return true;
+	if (!m_windows || m_windows->Map(address - m_base, size)) return true;
+	::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] refused guest range {:#x}+{:#x}: no contiguous space in {}\n",
+	                                       address, size, Gib(m_size)));
+	return false;
 }
 
 bool GuestMirror::IsBound(uint64_t vaddr) const noexcept {

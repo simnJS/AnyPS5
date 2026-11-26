@@ -16,7 +16,7 @@ using RangeHook = void (*)(uint64_t vaddr, uint64_t size);
 bool TryWriteBackedRuns(uint64_t vaddr, const void* data, uint64_t size);
 bool TryWriteBackedQwords(uint64_t vaddr, const uint64_t* values, uint32_t count, uint64_t stride);
 using MapAdmission = bool (*)(uint64_t, uint64_t);
-bool SetGpuRangeHooks(RangeHook map, RangeHook unmap, MapAdmission admit = nullptr);
+bool SetGpuRangeHooks(RangeHook map, RangeHook unmap, MapAdmission admit = nullptr, RangeHook cancel = nullptr);
 [[noreturn]] void RefuseGpuMappings();
 [[nodiscard]] uint64_t ProbeCalls();
 void EnableView();
