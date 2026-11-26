@@ -738,17 +738,13 @@ void ImageHeap::AddBytes(View& view, uint64_t begin, uint64_t end) {
 }
 
 void ImageHeap::SyncMemory(Memory& memory) {
-	if (memory.synced == m_draw) return;
-	memory.synced = m_draw;
-	auto&      cache = m_context.GetBufferCache();
-	const bool whole = memory.fresh || memory.gpu_all != 0u;
-	memory.fresh     = false;
-	memory.gpu_all   = memory.gpu_all != 0u ? memory.gpu_all - 1u : 0u;
-	m_runs.clear();
+	if (memory.prepared == m_draw) return;
+	memory.prepared = m_draw;
+	auto& cache = m_context.GetBufferCache();
 	m_context.CollectHotPageWrites(memory.base, memory.size);
 	cache.ConsumeCpuWrites(CpuWriteConsumer::ImageHeapTables, memory.base, memory.size,
 	                       [&](uint64_t run, uint64_t bytes) {
-		                       m_runs.emplace_back(run, run + bytes);
+		                       memory.written.emplace_back(run, run + bytes);
 		                       const auto first = Common::AlignDown(run, TRACKER_PAGE_SIZE);
 		                       const auto last  = Common::AlignUp(run + bytes, TRACKER_PAGE_SIZE);
 		                       for (const auto& other: m_memories) {
@@ -758,13 +754,22 @@ void ImageHeap::SyncMemory(Memory& memory) {
 			                       }
 		                       }
 	                       });
+	cache.EnsureRangeContents(memory.base, memory.size);
+}
+
+void ImageHeap::UpdateProbes(Memory& memory) {
+	if (memory.synced == m_draw) return;
+	memory.synced = m_draw;
+	const bool whole = memory.fresh || memory.gpu_all != 0u;
+	memory.fresh = false;
+	if (memory.gpu_all != 0u) --memory.gpu_all;
+	m_runs.clear();
 	m_runs.insert(m_runs.end(), memory.written.begin(), memory.written.end());
 	memory.written.clear();
 	m_runs.insert(m_runs.end(), memory.gpu_carried.begin(), memory.gpu_carried.end());
 	m_runs.insert(m_runs.end(), memory.gpu_written.begin(), memory.gpu_written.end());
 	std::swap(memory.gpu_carried, memory.gpu_written);
 	memory.gpu_written.clear();
-	bool needed = false;
 	for (const auto& view: memory.views) {
 		if (view->overflowed) continue;
 		if (whole || m_frame - view->filled >= RefillFrames) view->full = true;
@@ -775,15 +780,11 @@ void ImageHeap::SyncMemory(Memory& memory) {
 				if (first < last) AddBytes(*view, first - memory.base, last - memory.base);
 			}
 		}
-		needed |= view->full || !view->pending.empty();
-	}
-	if (needed) {
-		cache.EnsureRangeContents(memory.base, memory.size);
-		memory.ensured = m_draw;
 	}
 }
 
 void ImageHeap::RecordFills(CommandBuffer& buffer) {
+	TakeGpuWrites();
 	m_jobs.clear();
 	m_groups.clear();
 	m_cleared.clear();
@@ -792,12 +793,8 @@ void ImageHeap::RecordFills(CommandBuffer& buffer) {
 	for (auto* view: m_active) {
 		if (view->overflowed) continue;
 		auto& memory = view->memory;
-		SyncMemory(memory);
+		UpdateProbes(memory);
 		if (!view->full && view->pending.empty()) continue;
-		if (memory.ensured != m_draw) {
-			cache.EnsureRangeContents(memory.base, memory.size);
-			memory.ensured = m_draw;
-		}
 		Slots::Job job {.table       = mirror->DeviceAddress() + (memory.base - mirror->Base()),
 		                .slots       = view->buffer->BufferDeviceAddress(),
 		                .table_words = static_cast<uint32_t>(memory.size / 4u),
@@ -1214,7 +1211,6 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	}
 	if (stale) Repoint();
 	Requeue();
-	TakeGpuWrites();
 	for (auto* view: m_active) SyncMemory(view->memory);
 	for (const auto index: m_pending) {
 		if (m_elements[index].freed) continue;

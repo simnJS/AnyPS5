@@ -195,6 +195,63 @@ bool BackingHolds(uint64_t address, uint64_t bytes, uint32_t value) {
 	return Libs::LibKernel::Memory::TryReadBacking(address, words.data(), bytes) && AllWords(words, value);
 }
 
+const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, AddressReader& reader) {
+	namespace IR = ShaderRecompiler::IR;
+	auto& heap      = renderer.GetImageHeap();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& buffers   = renderer.GetBufferCache();
+	auto& graphics  = renderer.GetGraphics();
+	constexpr uint32_t first = 0x10000, second = 0x20000;
+	std::array<uint32_t, 16> words {};
+	words[0] = first;
+	words[1] = static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u;
+	words[3] = (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u) | IR::ShaderImageIdentitySwizzle;
+	std::copy_n(words.begin(), 8, words.begin() + 8);
+	words[8] = second;
+	renderer.MapMemory(address, sizeof(words));
+	std::memcpy(reinterpret_cast<void*>(address), words.data(), sizeof(words));
+	buffers.InvalidateMemory(address, sizeof(words));
+
+	vk::DescriptorSetLayout empty;
+	const vk::DescriptorSetLayoutCreateInfo empty_info {};
+	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&empty_info, nullptr, &empty), "empty set layout");
+	const std::array sets {empty, graphics.image_heap_layout};
+	const vk::PipelineLayoutCreateInfo layout_info {.setLayoutCount = 2, .pSetLayouts = sets.data()};
+	vk::PipelineLayout layout;
+	RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout_info, nullptr, &layout), "consumer layout");
+	const IR::ImageResource root {.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D};
+	const IR::ImageHeapRequest request {.base = address, .size = sizeof(words), .step = 32, .count = 2, .root = &root};
+	const auto consume = [&](bool write_during_preparation) {
+		heap.BeginDraw();
+		IR::ImageHeapView view;
+		if (!heap.Acquire(request, view) || view.kinds.size() != 1) return std::vector<uint32_t> {};
+		heap.Rebind(renderer.GetRenderExecutor());
+		if (write_during_preparation) {
+			const auto [buffer, offset] = buffers.ObtainRange(address, sizeof(uint32_t), true);
+			buffer->Fill(offset, sizeof(uint32_t), second);
+		}
+		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+		reader.Record(scheduler, view.slots, sizeof(words));
+		Finish(scheduler);
+		return reader.Words(sizeof(words));
+	};
+	const auto initial = consume(false);
+	const auto late    = consume(true);
+	(void)consume(false);
+	const auto [mirror, offset] = buffers.ObtainRange(address, sizeof(words), false, false, ObtainFrom::Mirror);
+	renderer.PrepareBda(true, false);
+	mirror->Fill(offset, sizeof(uint32_t), first);
+	const auto indirect = consume(false);
+	graphics.device.destroyPipelineLayout(layout);
+	graphics.device.destroyDescriptorSetLayout(empty);
+	if (initial.empty() || initial.front() == 0 || initial[8] == 0 || initial.front() == initial[8]) {
+		return "the two seeded descriptors did not produce distinct slots";
+	}
+	if (late.empty() || late.front() != initial[8]) return "a consumer missed a mirror write after rebind";
+	if (indirect.empty() || indirect.front() != initial.front()) return "a consumer missed an indirect address write";
+	return nullptr;
+}
+
 const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	RenderContext    renderer(graphics);
 	CommandProcessor producer(renderer, 0);
@@ -392,6 +449,7 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		            static_cast<unsigned long long>(mirror->BlockSize() >> 10u));
 	}
 
+	if (const auto* failure = CheckHeapConsumer(renderer, address + MirroredAt, reader)) return failure;
 	Finish(scheduler);
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address, GuestBytes);
 	(void)buffers.DropFreedRange(address, GuestBytes);

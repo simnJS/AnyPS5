@@ -138,7 +138,7 @@ private:
 		uint64_t                                   size    = 0;
 		uint64_t                                   draw    = 0;
 		uint64_t                                   synced  = 0;
-		uint64_t                                   ensured = 0;
+		uint64_t                                   prepared = 0;
 		uint32_t                                   idle    = 0;
 		uint32_t                                   gpu_all = 0;
 		bool                                       fresh   = true;
@@ -221,6 +221,7 @@ private:
 	void     ServiceMisses();
 	void     Service(Ring& ring);
 	void     SyncMemory(Memory& memory);
+	void     UpdateProbes(Memory& memory);
 	void     AddBytes(View& view, uint64_t begin, uint64_t end);
 	void     AddProbe(View& view, uint32_t slot);
 	void     RecordFills(CommandBuffer& buffer);
