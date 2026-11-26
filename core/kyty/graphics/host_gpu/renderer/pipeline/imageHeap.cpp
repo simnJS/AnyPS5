@@ -552,7 +552,7 @@ ImageHeap::Refusal ImageHeap::Admit(View& view, const Slots::KeyWordArray& words
 ImageHeap::Refusal ImageHeap::AdmitKey(Shape& shape, const Slots::KeyWordArray& words) {
 	const auto& profile = m_profiles[shape.profile];
 	const bool table = m_table_profiles[shape.profile];
-	const Key key {.value = {.dwords = words, .dword_count = 8u}, .profile = shape.profile};
+	const Key key {.value = {.dwords = words, .dword_count = 8u}, .profile = m_key_profiles[shape.profile]};
 	const auto* known = m_directory.Find(key.value.dwords, shape.profile);
 	if (known != nullptr && (known->flags & Slots::NegativeFlag) != 0u) return Refusal::None;
 	auto value = key.value;
@@ -572,7 +572,12 @@ ImageHeap::Refusal ImageHeap::AdmitKey(Shape& shape, const Slots::KeyWordArray& 
 	}
 	const auto index = Entry(key, kind, true);
 	if (index != 0u && m_elements[index].table && !m_elements[index].freed) {
-		m_elements[index].born = m_frame;
+		auto& element = m_elements[index];
+		element.born = m_frame;
+		if (std::ranges::find(element.table_profiles, shape.profile) == element.table_profiles.end()) {
+			element.table_profiles.push_back(shape.profile);
+			element.hashed = false;
+		}
 		Hash(index);
 	}
 	if (index == 0u || !m_elements[index].hashed) return Refusal::Capacity;
@@ -609,6 +614,7 @@ void ImageHeap::AdmitLate(const Slots::Miss& miss) {
 
 uint32_t ImageHeap::InternList(Shape& shape, uint32_t kind, const Key& key) {
 	const auto index = Entry(key, kind, false);
+	if (index == 0u) return 0u;
 	uint32_t   arm   = 0;
 	(void)Arm(shape, kind, key.value, UINT32_MAX, arm);
 	++m_elements[index].refs;
@@ -633,10 +639,7 @@ uint32_t ImageHeap::Entry(const Key& key, uint32_t kind, bool table) {
 	}
 	const auto index   = found->second;
 	auto&      element = m_elements[index];
-	if (table && !element.table) {
-		element.table = true;
-		if (element.resolved) Hash(index);
-	}
+	if (table) element.table = true;
 	return index;
 }
 
@@ -658,13 +661,19 @@ bool ImageHeap::Arm(Shape& shape, uint32_t kind, const DescriptorValue& value, u
 void ImageHeap::Hash(uint32_t index) {
 	auto& element = m_elements[index];
 	if (element.hashed) return;
-	if (m_directory.Insert(element.key.value.dwords, element.key.profile,
-	                       index | element.kind << Slots::KindShift, 0u)) {
+	const auto publish = [&](uint32_t profile) {
+		return m_directory.Insert(element.key.value.dwords, profile, index | element.kind << Slots::KindShift, 0u);
+	};
+	if (std::ranges::all_of(element.table_profiles, publish)) {
 		element.hashed = true;
 		return;
 	}
+	for (const auto profile: element.table_profiles) {
+		(void)m_directory.Erase(element.key.value.dwords, profile);
+		Invalidate(profile);
+	}
+	element.table_profiles.clear();
 	element.table = false;
-	Invalidate(element.key.profile);
 	Settle(index);
 }
 
@@ -816,17 +825,16 @@ void ImageHeap::Mark(uint32_t index, State state) {
 	}
 	if (!element.table) return;
 	element.table = false;
-	if (element.hashed) {
-		element.hashed = false;
-		(void)m_directory.Erase(element.key.value.dwords, element.key.profile);
+	for (const auto profile: element.table_profiles) {
+		if (element.hashed) (void)m_directory.Erase(element.key.value.dwords, profile);
+		if (state != State::Stale &&
+		    m_directory.Insert(element.key.value.dwords, profile, 0u, Slots::NegativeFlag | Slots::DeadFlag)) {
+			m_dead.emplace_back(element.key.value.dwords, profile);
+		}
+		Invalidate(profile);
 	}
-	if (state == State::Stale) {
-		m_requeue.push_back(index);
-	} else if (m_directory.Insert(element.key.value.dwords, element.key.profile, 0u,
-	                              Slots::NegativeFlag | Slots::DeadFlag)) {
-		m_dead.emplace_back(element.key.value.dwords, element.key.profile);
-	}
-	Invalidate(element.key.profile);
+	element.hashed = false;
+	if (state == State::Stale) m_requeue.push_back(index);
 	Settle(index);
 }
 
@@ -874,9 +882,21 @@ void ImageHeap::Requeue() {
 	for (const auto index: m_requeue) {
 		const auto key  = m_elements[index].key;
 		const auto kind = m_elements[index].kind;
+		auto profiles = std::move(m_elements[index].table_profiles);
 		const auto replacement = Entry(key, kind, true);
-		if (replacement != 0u && m_elements[replacement].table) Hash(replacement);
-		if (replacement == 0u || !m_elements[replacement].hashed) RetryProfile(key.profile);
+		if (replacement != 0u) {
+			auto& element = m_elements[replacement];
+			for (const auto profile: profiles) {
+				if (std::ranges::find(element.table_profiles, profile) == element.table_profiles.end()) {
+					element.table_profiles.push_back(profile);
+				}
+			}
+			element.hashed = false;
+			Hash(replacement);
+		}
+		if (replacement == 0u || !m_elements[replacement].hashed) {
+			for (const auto profile: profiles) RetryProfile(profile);
+		}
 	}
 	m_requeue.clear();
 }
@@ -1333,12 +1353,14 @@ bool ImageHeap::StepSweep() {
 				}
 				element.evicting = true;
 				element.hashed   = false;
-				(void)m_directory.Erase(element.key.value.dwords, element.key.profile);
+				for (const auto profile: element.table_profiles) {
+					(void)m_directory.Erase(element.key.value.dwords, profile);
+					invalidate[profile] = true;
+				}
 				if (const auto found = m_index.find(element.key);
 				    found != m_index.end() && found->second == index) {
 					m_index.erase(found);
 				}
-				invalidate[element.key.profile] = true;
 				m_candidates.push_back(index);
 			}
 			for (uint32_t profile = 0; profile < invalidate.size(); ++profile) {
@@ -1375,7 +1397,7 @@ bool ImageHeap::StepSweep() {
 					continue;
 				}
 				element.table = false;
-				Invalidate(element.key.profile);
+				for (const auto profile: element.table_profiles) Invalidate(profile);
 				Settle(index);
 			}
 			m_candidates.clear();
@@ -1402,9 +1424,10 @@ void ImageHeap::PurgeDirectory() {
 	                    [&](const Slots::Bucket& bucket) {
 		                    const auto index   = bucket.value & Slots::IndexMask;
 		                    auto&      element = m_elements[index];
-		                    element.hashed     = false;
-		                    element.table      = false;
-		                    Invalidate(element.key.profile);
+		                    std::erase(element.table_profiles, bucket.profile);
+		                    element.table  = !element.table_profiles.empty();
+		                    element.hashed = element.table;
+		                    Invalidate(bucket.profile);
 		                    Settle(index);
 	                    });
 }
@@ -1559,7 +1582,6 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		m_writes.push_back({index, {nullptr, binding.image_view,
 		                             binding.image_view ? binding.layout : vk::ImageLayout::eGeneral}});
-		element.resolved = true;
 		if (element.table) Hash(index);
 	}
 	m_pending.clear();

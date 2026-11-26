@@ -1493,6 +1493,7 @@ void BufferCache::TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_
 				m_host_view->ForEachSource(cursor, stop - cursor, [&](uint64_t begin, uint64_t bytes, vk::Buffer source, uint64_t offset) {
 					stage(done, begin - done);
 					m_ordered_direct.emplace_back(source, vk::BufferCopy {offset, buffer.Offset(begin), bytes});
+					NoteHeapTransfer(begin, bytes);
 					ordered += bytes;
 					done = begin + bytes;
 				});
@@ -1663,17 +1664,20 @@ bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_writte
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    if (uploaded != nullptr) {
-			    const auto first = std::max(address, vaddr);
-			    const auto last  = std::min(address + bytes, vaddr + size);
-			    if (first < last) uploaded->Add(first, last - first);
-		    }
 		    copies.emplace_back(total_size, m_storage->Offset(address), bytes);
 		    total_size += bytes;
 		    NoteUpload(address, bytes);
 	    },
 	    [&]() noexcept {
 		    const auto source = UploadCopies(copies, total_size);
+		    if (uploaded != nullptr) {
+			    for (const auto& copy: copies) {
+				    const auto address = m_storage->HandleOrigin() + copy.dstOffset;
+				    const auto first = std::max(address, vaddr);
+				    const auto last = std::min<uint64_t>(address + copy.size, vaddr + size);
+				    if (first < last) uploaded->Add(first, last - first);
+			    }
+		    }
 		    RecordUpload(copies, source);
 		    copies.clear();
 		    total_size = 0;

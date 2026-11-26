@@ -2257,7 +2257,8 @@ uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t
 	const auto guest_base = LoadMirrorMetadata64(state, 8);
 	const auto size = LoadMirrorMetadata64(state, 16);
 	const auto offset = Binary(state, spv::OpISub, u64, address, guest_base);
-	const auto inside = AndCondition(state, active, Binary(state, spv::OpULessThan, boolean, offset, size));
+	const auto valid = AndCondition(state, active, BdaAddressRepresentable(state, address));
+	const auto inside = AndCondition(state, valid, Binary(state, spv::OpULessThan, boolean, offset, size));
 	const auto block = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64,
 	                         Select(state, u64, inside, offset, ConstantU64(state, 0)),
 	                         ConstantU32(state, BufferCache::MIRROR_BLOCK_BITS)));

@@ -100,6 +100,7 @@ private:
 	};
 
 	struct Element {
+		std::vector<uint32_t> table_profiles;
 		Key      key;
 		ImageId  image;
 		uint64_t serial   = 0;
@@ -109,7 +110,6 @@ private:
 		State    state    = State::Live;
 		bool     table    = false;
 		bool     hashed   = false;
-		bool     resolved = false;
 		bool     freed    = false;
 		bool     evicting = false;
 	};
