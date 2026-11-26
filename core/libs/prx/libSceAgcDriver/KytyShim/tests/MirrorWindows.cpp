@@ -384,17 +384,22 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 		       mirror->Ready(source, 8) && IsResident(scheduler, buffers, bitmap, source) &&
 		       IsResident(scheduler, buffers, bitmap, source + 7);
 	};
-	if (!reads(first)) return "the first dispatch did not read both sides of its DMA window";
-	const auto unknown = boundary + block;
-	if (mirror->Requested(unknown, 8)) return "a bounded dispatch requested an unrelated block";
-	module.info.info.dma_bounded = false;
-	module.info.info.dma_windows.clear();
-	if (!reads(unknown)) return "a dynamic address missed on the first dispatch";
-	const auto added = boundary + 2 * block;
-	if (mirror->Requested(added, 8)) return "the dispatch requested an unmapped block";
-	renderer.MapMemory(added, block);
-	if (!reads(added)) return "a dynamic address missed a newly mapped block";
-	return nullptr;
+	const auto verify = [&]() -> const char* {
+		if (!reads(first)) return "the first dispatch did not read both sides of its DMA window";
+		const auto unknown = boundary + block;
+		if (mirror->Requested(unknown, 8)) return "a bounded dispatch requested an unrelated block";
+		module.info.info.dma_bounded = false;
+		module.info.info.dma_windows.clear();
+		if (!reads(unknown)) return "a dynamic address missed on the first dispatch";
+		const auto added = boundary + 2 * block;
+		if (mirror->Requested(added, 8)) return "the dispatch requested an unmapped block";
+		renderer.MapMemory(added, block);
+		if (!reads(added)) return "a dynamic address missed a newly mapped block";
+		return nullptr;
+	};
+	const auto* failure = verify();
+	renderer.UnmapMemory(address, GuestBytes);
+	return failure;
 }
 
 }
