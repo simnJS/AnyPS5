@@ -824,8 +824,25 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 	return failure;
 }
 
-const char* CheckTableReach(GraphicContext& graphics, uint64_t address) {
+const char* CheckTableReach(GraphicContext& graphics, uint64_t address, bool at_end) {
 	using Reach = ShaderRecompiler::Decoder::RecordReach;
+	const auto mirror_base = graphics.mirror_base;
+	const auto mirror_size = graphics.mirror_size;
+	struct Restore {
+		GraphicContext& graphics;
+		uint64_t        base;
+		uint64_t        size;
+		~Restore() {
+			graphics.mirror_base = base;
+			graphics.mirror_size = size;
+		}
+	} restore {graphics, mirror_base, mirror_size};
+	if (at_end) {
+		constexpr uint64_t Block = BufferCache::MIRROR_BLOCK_SIZE;
+		const auto         end   = Common::AlignUp(address, Block) + 3 * Block;
+		graphics.mirror_base     = Common::AlignDown(address, GuestMirror::GiB);
+		graphics.mirror_size     = end - graphics.mirror_base;
+	}
 	RenderContext    renderer(graphics);
 	CommandProcessor producer(renderer, 0);
 	producer.Reset();
@@ -837,9 +854,14 @@ const char* CheckTableReach(GraphicContext& graphics, uint64_t address) {
 	const auto  block   = mirror->BlockSize();
 	const auto  tables  = Common::AlignUp(address, block);
 	const auto  bare    = tables + 2 * block;
-	const auto  kept    = tables + 4 * block;
-	if (kept + block > address + GuestBytes) {
+	const auto  kept    = at_end ? tables : tables + 4 * block;
+	const auto  first   = at_end ? bare + block - sizeof(uint32_t) : bare;
+	if (tables + 5 * block > address + GuestBytes) {
 		g_unchecked = "the fixture is too small for the blocks of a reach read from a table";
+		return nullptr;
+	}
+	if (at_end && (!mirror->Available() || mirror->Base() + mirror->Size() != bare + block)) {
+		g_unchecked = "the device gave no mirror that ends inside the fixture";
 		return nullptr;
 	}
 	auto* guest = reinterpret_cast<uint32_t*>(address);
@@ -860,8 +882,8 @@ const char* CheckTableReach(GraphicContext& graphics, uint64_t address) {
 	std::memcpy(reinterpret_cast<void*>(header), range.data(), sizeof(range));
 	const std::array<uint32_t, 8> rows {1u, 0u, 4u, 0u, 1u, 0u, 4u, 1u};
 	std::memcpy(reinterpret_cast<void*>(records), rows.data(), sizeof(rows));
-	vsharp(pointers, bare, 4, 2);
-	vsharp(pointers + 16, kept, 4, 2);
+	vsharp(pointers, first, 4, 2);
+	vsharp(pointers + 16, at_end ? first : kept, 4, 2);
 	Reach reach;
 	reach.header        = {0, 0};
 	reach.records       = {2, 0};
@@ -891,14 +913,20 @@ const char* CheckTableReach(GraphicContext& graphics, uint64_t address) {
 		buffers.ForgetGuestMemory(bare, block);
 		const bool imports = view != nullptr && view->Lookup(kept) != 0;
 		if (view != nullptr && view->Lookup(bare) != 0) return "a block kept its import after it was dropped";
-		if (mirror->AnyRequested(bare, block) || mirror->AnyRequested(kept, block)) return "the blocks of the table reach are bound before the dispatch";
+		if (mirror->AnyRequested(bare, block) || (!at_end && mirror->AnyRequested(kept, block))) {
+			return "the blocks of the table reach are bound before the dispatch";
+		}
 		if (!renderer.SynchronizeDmaFootprint(std::span {&dispatch, 1})) return "the reach read from a table was not found";
 		renderer.PrepareBda(false, false);
-		if (!mirror->Requested(bare, 8)) return "a reach read from a table left a mapped block without an import out of the mirror";
-		if (imports && mirror->AnyRequested(kept, block)) return "a reach read from a table bound an imported block";
-		reader.Record(scheduler, mirror->DeviceAddress() + bare - mirror->Base(), 8);
+		const uint64_t bytes = at_end ? sizeof(uint32_t) : 8;
+		if (!mirror->Requested(first, bytes)) {
+			return at_end ? "a reach that crosses the end of the mirror left its last word inside out of the mirror"
+			              : "a reach read from a table left a mapped block without an import out of the mirror";
+		}
+		if (!at_end && imports && mirror->AnyRequested(kept, block)) return "a reach read from a table bound an imported block";
+		reader.Record(scheduler, mirror->DeviceAddress() + first - mirror->Base(), bytes);
 		Finish(scheduler);
-		if (!ReadsPattern(reader.Words(8), (bare - address) / sizeof(uint32_t)) || !IsResident(scheduler, buffers, bitmap, bare)) {
+		if (!ReadsPattern(reader.Words(bytes), (first - address) / sizeof(uint32_t)) || !IsResident(scheduler, buffers, bitmap, first)) {
 			return "a block bound for a reach read from a table does not hold its guest memory";
 		}
 		return nullptr;
@@ -1079,7 +1107,8 @@ extern "C" int RunKytyMirrorWindowsTest() {
 	if (failure == nullptr && g_skipped.empty()) failure = CheckDispatch(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckRemap(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckCut(graphics, address);
-	if (failure == nullptr && g_skipped.empty()) failure = CheckTableReach(graphics, address);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckTableReach(graphics, address, false);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckTableReach(graphics, address, true);
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", Name);
 		return 1;

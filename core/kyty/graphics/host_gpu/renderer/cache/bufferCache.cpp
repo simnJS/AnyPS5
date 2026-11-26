@@ -1433,9 +1433,12 @@ uint64_t BufferCache::ImportGeneration() {
 }
 
 void BufferCache::RequestUnimportedRange(uint64_t vaddr, uint64_t size) {
-	if (size == 0 || !m_guest_mirror->Holds(vaddr, size)) return;
+	if (size == 0 || UINT64_MAX - vaddr < size) return;
+	const auto begin = std::max(vaddr, m_guest_mirror->Base());
+	const auto end   = std::min(vaddr + size, m_guest_mirror->Base() + m_guest_mirror->Size());
+	if (begin >= end) return;
 	m_host_view->Publish();
-	m_host_view->ForEachGap(vaddr, size, [this](uint64_t from, uint64_t to) { RequestDeviceRange(from, to - from); });
+	m_host_view->ForEachGap(begin, end - begin, [this](uint64_t from, uint64_t to) { RequestDeviceRange(from, to - from); });
 }
 
 void BufferCache::RequestUnimportedRanges(const RangeSet& mapped, uint64_t mapping_epoch) {
