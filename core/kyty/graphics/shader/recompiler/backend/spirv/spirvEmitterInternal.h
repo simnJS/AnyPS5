@@ -654,6 +654,7 @@ void EmitProgram(EmitterState& state);
 
 uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active);
 uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset);
+uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBdaLoads(EmitterState& state);
 uint32_t RayStatsEnabled(EmitterState& state);

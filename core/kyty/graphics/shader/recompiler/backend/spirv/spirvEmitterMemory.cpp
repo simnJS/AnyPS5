@@ -2210,6 +2210,42 @@ uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset) {
 	return PackU64(state, load(offset / 4), load(offset / 4 + 1));
 }
 
+uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset) {
+	using View = GuestHostView;
+	const auto u64 = TypeU64(state), boolean = TypeBool(state);
+	const auto zero = ConstantU64(state, 0);
+	const auto load = [&](uint32_t pointer) {
+		const auto high = Binary(state, spv::OpIAdd, u64, pointer, ConstantU64(state, sizeof(uint32_t)));
+		return PackU64(state, EmitBdaPointerLoad(state, pointer, false), EmitBdaPointerLoad(state, high, false));
+	};
+	const auto nonzero = [&](uint32_t value) { return Binary(state, spv::OpINotEqual, boolean, value, zero); };
+	const auto slot = [&](uint32_t table, uint32_t index) {
+		return Binary(state, spv::OpIAdd, u64, table,
+		              Binary(state, spv::OpShiftLeftLogical, u64, index, ConstantU32(state, 3)));
+	};
+	const auto table = LoadMirrorMetadata64(state, BufferCache::HOST_TABLE_OFFSET);
+	const auto chunk = EmitValueOrDefaultIfCondition(state, nonzero(table), u64, zero, [&] {
+		return load(slot(table, Binary(state, spv::OpShiftRightLogical, u64, offset, ConstantU32(state, View::ChunkBits))));
+	});
+	const auto page = Binary(state, spv::OpBitwiseAnd, u64,
+	                         Binary(state, spv::OpShiftRightLogical, u64, offset, ConstantU32(state, View::PageBits)),
+	                         ConstantU64(state, View::EntriesPerChunk - 1));
+	const auto entry = EmitValueOrDefaultIfCondition(state, nonzero(chunk), u64, zero, [&] { return load(slot(chunk, page)); });
+	const auto inside = Binary(state, spv::OpBitwiseAnd, u64, offset, ConstantU64(state, View::PageSize - 1));
+	const auto tail = Binary(state, spv::OpUGreaterThan, boolean, inside, ConstantU64(state, View::PageSize - View::SafeTail));
+	const auto last = Binary(state, spv::OpIEqual, boolean, page, ConstantU64(state, View::EntriesPerChunk - 1));
+	const auto check = AndCondition(state, AndCondition(state, nonzero(entry), tail), Unary(state, spv::OpLogicalNot, boolean, last));
+	const auto next = EmitValueOrDefaultIfCondition(state, check, u64, zero, [&] {
+		return load(slot(chunk, Binary(state, spv::OpIAdd, u64, page, ConstantU64(state, 1))));
+	});
+	const auto follows = Binary(state, spv::OpIEqual, boolean, next,
+	                            Binary(state, spv::OpIAdd, u64, entry, ConstantU64(state, View::PageSize)));
+	const auto usable = AndCondition(state, nonzero(entry),
+	                                 Binary(state, spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, tail),
+	                                        AndCondition(state, Unary(state, spv::OpLogicalNot, boolean, last), follows)));
+	return Select(state, u64, usable, Binary(state, spv::OpIAdd, u64, entry, inside), zero);
+}
+
 uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active) {
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
 	const auto host_bias = LoadMirrorMetadata64(state, 0);
@@ -2239,9 +2275,12 @@ uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t
 	};
 	const auto ready = AndCondition(state, inside, holds(word(BufferCache::RESIDENCY_OFFSET)));
 	EmitIfCondition(state, ready, [&] { mark(word(BufferCache::USE_BITMAP_OFFSET)); });
-	EmitIfCondition(state, AndCondition(state, inside, Unary(state, spv::OpLogicalNot, boolean, ready)),
-	                [&] { mark(word(BufferCache::FAULT_BITMAP_OFFSET)); });
-	return Select(state, u64, ready, Binary(state, spv::OpIAdd, u64, host_bias, address), ConstantU64(state, 0));
+	const auto missed = AndCondition(state, inside, Unary(state, spv::OpLogicalNot, boolean, ready));
+	const auto guest_page = EmitValueOrDefaultIfCondition(state, missed, u64, ConstantU64(state, 0), [&] {
+		mark(word(BufferCache::FAULT_BITMAP_OFFSET));
+		return EmitGuestHostAddress(state, offset);
+	});
+	return Select(state, u64, ready, Binary(state, spv::OpIAdd, u64, host_bias, address), guest_page);
 }
 
 void DefineGetBdaPointerMasked(EmitterState& state) {

@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/guestHostView.h"
 #include "graphics/host_gpu/renderer/cache/guestMirror.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -50,6 +51,7 @@ public:
 	static constexpr uint64_t MIRROR_BLOCK_SIZE = uint64_t {1} << MIRROR_BLOCK_BITS;
 	static constexpr uint64_t MIRROR_BITMAP_SIZE = GuestMirror::LargestSize / MIRROR_BLOCK_SIZE / 8;
 	static constexpr uint64_t RT_CONTEXT_OFFSET = 3 * sizeof(uint64_t);
+	static constexpr uint64_t HOST_TABLE_OFFSET = 5 * sizeof(uint64_t);
 	static constexpr uint64_t RESIDENCY_OFFSET = 256;
 	static constexpr uint64_t FAULT_BITMAP_OFFSET = RESIDENCY_OFFSET + MIRROR_BITMAP_SIZE;
 	static constexpr uint64_t USE_BITMAP_OFFSET = FAULT_BITMAP_OFFSET + MIRROR_BITMAP_SIZE;
@@ -123,6 +125,8 @@ public:
 	static void            NoteStagedCommandProcessorRead();
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
 	void RequestDeviceRange(uint64_t vaddr, uint64_t size);
+	void ImportGuestMemory(uint64_t vaddr, uint64_t size);
+	void ForgetGuestMemory(uint64_t vaddr, uint64_t size);
 	void EnsureRangeContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InMirror(const Buffer* buffer) const noexcept { return buffer != nullptr && buffer == m_storage.get(); }
 	[[nodiscard]] std::pair<uint64_t, uint64_t> OwnedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const;
@@ -244,6 +248,7 @@ public:
 	[[nodiscard]] bool CommitWriteTicks();
 	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
 	[[nodiscard]] GuestMirror* GetGuestMirror() noexcept { return m_guest_mirror.get(); }
+	[[nodiscard]] const GuestHostView* GetGuestHostView() const noexcept { return m_host_view.get(); }
 	void RequestFlushForReadbacks() noexcept {
 		if ((m_device_address_hot != 0 &&
 		     m_readback_count - m_device_address_hot < HotReadbackLifetime) ||
@@ -466,6 +471,7 @@ private:
 	void                      SubmitGuestMirror(SubmitInfo& submit);
 	void                      TickGuestMirror();
 	std::unique_ptr<GuestMirror> m_guest_mirror;
+	std::unique_ptr<GuestHostView> m_host_view;
 	std::unique_ptr<Buffer>      m_storage;
 	GuestMirror::Runs            m_fresh;
 	GuestMirror::Runs            m_victims;

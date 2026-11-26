@@ -315,6 +315,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
 		m_bda_mapped_since_sync.emplace_back(vaddr, size);
 	}
+	m_buffer_cache.ImportGuestMemory(vaddr, size);
 	if (m_texture_cache.HasPartialCandidates()) {
 		const auto map = [this, vaddr, size] { m_texture_cache.MapMemory(vaddr, size); };
 		if (m_gpu == nullptr || m_gpu->IsStopping()) {
@@ -347,6 +348,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.ForgetCommandBuffers(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
+		m_buffer_cache.ForgetGuestMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		m_strict_watch.UnmapMemory(vaddr, size);

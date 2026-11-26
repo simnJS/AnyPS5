@@ -2300,6 +2300,7 @@ void CommandProcessor::EmitHleRefit() {
 		std::vector<RayTracing::HleRefitGeometry> geometries;
 		geometries.reserve(refs.size());
 		uint64_t last_vertices = 0;
+		uint64_t last_vertices_end = 0;
 		for (const auto& ref: refs) {
 			if (ref.blas == 0 || ref.table == 0) {
 				continue;
@@ -2312,11 +2313,14 @@ void CommandProcessor::EmitHleRefit() {
 			std::memcpy(geometry.matrix.data(), &entry[14], sizeof(geometry.matrix));
 			ShaderBufferResource vsharp;
 			std::memcpy(vsharp.fields, geometry.vsharp.data(), sizeof(vsharp.fields));
-			if (vsharp.Base48() != 0 && vsharp.Base48() != last_vertices && vsharp.GetSize() != 0) {
+			const auto vertices_end = vsharp.Base48() + vsharp.GetSize();
+			if (vsharp.Base48() != 0 && vsharp.GetSize() != 0 &&
+			    (vsharp.Base48() != last_vertices || vertices_end > last_vertices_end)) {
 				if (!cache.PrepareDeviceAddressRead(vsharp.Base48(), vsharp.GetSize())) {
 					continue;
 				}
-				last_vertices = vsharp.Base48();
+				last_vertices     = vsharp.Base48();
+				last_vertices_end = vertices_end;
 			}
 			geometries.push_back(geometry);
 		}

@@ -299,9 +299,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_storage = std::make_unique<Buffer>(
 	    m_graphics, m_scheduler, m_guest_mirror->Base(), m_guest_mirror->Size(),
 	    MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress(), m_guest_mirror->Base()});
+	m_host_view = std::make_unique<GuestHostView>(m_graphics, m_guest_mirror->Base(), m_guest_mirror->Size());
 	const uint64_t metadata[] {m_guest_mirror->DeviceAddress() - m_guest_mirror->Base(), m_guest_mirror->Base(),
 	                           m_guest_mirror->Size(), 0,
-	                           FAULT_BITMAP_OFFSET / sizeof(uint32_t) | (USE_BITMAP_OFFSET / sizeof(uint32_t)) << 32u};
+	                           FAULT_BITMAP_OFFSET / sizeof(uint32_t) | (USE_BITMAP_OFFSET / sizeof(uint32_t)) << 32u,
+	                           m_host_view->TableAddress()};
+	static_assert(sizeof(metadata) == HOST_TABLE_OFFSET + sizeof(uint64_t) && sizeof(metadata) <= RESIDENCY_OFFSET);
 	const auto source = m_staging_buffer.Copy(metadata, sizeof(metadata), alignof(uint64_t));
 	GetFaultBuffer()->CopyFrom(m_scheduler.Current(), m_staging_buffer, source, 0, sizeof(metadata));
 	m_residency_words.resize((m_guest_mirror->Size() / MIRROR_BLOCK_SIZE + 31) / 32);
@@ -322,6 +325,7 @@ BufferCache::~BufferCache() {
 		}
 	});
 	m_storage.reset();
+	m_host_view.reset();
 	m_guest_mirror.reset();
 	if (m_scatter_pipeline) {
 		m_graphics.device.destroyPipeline(m_scatter_pipeline);
@@ -1312,6 +1316,14 @@ std::pair<uint64_t, uint64_t> BufferCache::OwnedRun(uint64_t vaddr, uint64_t siz
 		if (begin <= vaddr && vaddr + size <= end) found = {begin, end};
 	});
 	return found;
+}
+
+void BufferCache::ImportGuestMemory(uint64_t vaddr, uint64_t size) {
+	m_host_view->Import(vaddr, size);
+}
+
+void BufferCache::ForgetGuestMemory(uint64_t vaddr, uint64_t size) {
+	m_host_view->Forget(vaddr, size);
 }
 
 void BufferCache::RequestDeviceRange(uint64_t vaddr, uint64_t size) {
@@ -2807,6 +2819,7 @@ void BufferCache::TickGuestMirror() {
 
 void BufferCache::RunGarbageCollector() {
 	m_gc_tick++;
+	m_host_view->Retire(m_scheduler.GetMasterSemaphore().KnownGpuTick(), m_scheduler.CurrentTick());
 	m_guest_mirror->Age(static_cast<uint32_t>(Frame()));
 	TickGuestMirror();
 	EvictOldBlocks();
