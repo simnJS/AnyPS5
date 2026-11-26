@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/shaders/guest_apertures.inc"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
@@ -306,6 +307,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress(), m_guest_mirror->Base(), m_guest_mirror.get()});
 	m_host_view = std::make_unique<GuestHostView>(m_graphics, m_scheduler, m_staging_buffer, m_guest_mirror->Base(),
 	                                              m_guest_mirror->GuestSpan());
+	static_assert(LOWER_ADDRESS_SIZE == (1ull << GUEST_LOWER_SIZE_BITS));
+	static_assert(LibKernel::Memory::kExtendedMemoryBase == (1ull << GUEST_EXTENDED_BASE_BITS));
+	static_assert(LibKernel::Memory::kExtendedMemorySize == (1ull << GUEST_EXTENDED_SIZE_BITS));
 	const uint64_t metadata[] {m_guest_mirror->DeviceAddress(), m_guest_mirror->Base(),
 	                           m_guest_mirror->GuestSpan(), 0,
 	                           FAULT_BITMAP_OFFSET / sizeof(uint32_t) | (USE_BITMAP_OFFSET / sizeof(uint32_t)) << 32u,

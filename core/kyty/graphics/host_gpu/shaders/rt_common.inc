@@ -2,6 +2,8 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
 
+#include "guest_apertures.inc"
+
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32Ref { uint v; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4Ref { uvec4 v; };
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64Ref { uint64_t v; };
@@ -23,6 +25,9 @@ layout(set = 0, binding = 0, std430) buffer MirrorState {
 	layout(offset = 256) uint words[];
 };
 
+const uint64_t LowerAddressSize = 1ul << GUEST_LOWER_SIZE_BITS;
+const uint64_t ExtendedAddressBase = 1ul << GUEST_EXTENDED_BASE_BITS;
+const uint64_t ExtendedAddressSize = 1ul << GUEST_EXTENDED_SIZE_BITS;
 const uint kInvalidNode = 0xffffffffu;
 
 bool Resident(uint block, uint entry) {
@@ -59,9 +64,9 @@ uint64_t HostAddress(uint64_t va, uint bytes) {
 	if (va < guest_base) return 0;
 	const uint64_t offset = va - guest_base;
 	uint block = uint(va >> 16);
-	if (va >= lower_size) {
-		if (va < extended_base || offset >= mirror_size || bytes > mirror_size - offset) return 0;
-		block -= uint((extended_base - lower_size) >> 16);
+	if (va >= LowerAddressSize) {
+		if ((va >> GUEST_EXTENDED_SIZE_BITS) != (ExtendedAddressBase >> GUEST_EXTENDED_SIZE_BITS)) return 0;
+		block -= uint((ExtendedAddressBase - LowerAddressSize) >> 16);
 	}
 	const uint entry = words[block >> 4];
 	const bool start = Resident(block, entry);
@@ -69,7 +74,8 @@ uint64_t HostAddress(uint64_t va, uint bytes) {
 	if (bytes <= 0x10000u - (uint(va) & 0xffffu)) {
 		return start ? mirror_base + first : GuestAddress(offset, bytes);
 	}
-	if (va < lower_size && bytes > lower_size - va) return 0;
+	const uint64_t end_address = va < LowerAddressSize ? LowerAddressSize : ExtendedAddressBase + ExtendedAddressSize;
+	if (bytes > end_address - va) return 0;
 	const uint64_t last_byte = offset + bytes - 1u;
 	const uint last_block = block + uint(((va & 0xfffful) + bytes - 1u) >> 16);
 	const uint last_entry = (block >> 4) == (last_block >> 4) ? entry : words[last_block >> 4];
