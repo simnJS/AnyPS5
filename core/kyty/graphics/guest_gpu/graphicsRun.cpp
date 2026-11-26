@@ -2272,7 +2272,7 @@ void CommandProcessor::EmitHleRefitArgs() {
 				(void)cache.ObtainRange(refit[i], sizes[i], true);
 			}
 		}
-		context.PrepareBda(true, false);
+		context.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		context.GetRayTracing()->RecordHleRefit(command.Handle(), refit, {}, 2, true);
@@ -2338,7 +2338,7 @@ void CommandProcessor::EmitHleRefit() {
 				(void)cache.ObtainRange(blas + header_bytes, size - header_bytes, true);
 			}
 		}
-		context.PrepareBda(true, false);
+		context.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		context.GetRayTracing()->RecordHleRefit(command.Handle(), refit, geometries, header_layout);
@@ -2482,11 +2482,12 @@ void CommandProcessor::EmitHleTlas() {
 			}
 			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
 			cache.InvalidateUnlessGpuModified(build.header, sizeof(header));
+			cache.NoteHeapTransfer(build.header, 256u);
 			(void)cache.ObtainRange(build.header + 256u, size - 256u, true);
 			context.NoteHleTlas(build.header, size, build.count != 0 ? blases : std::vector<uint64_t> {});
 			recorded[index] = 1;
 		}
-		context.PrepareBda(true, false);
+		context.PrepareBda(true, false, BdaWriteTracking::ExplicitRanges);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		for (size_t index = 0; index < builds.size(); index++) {

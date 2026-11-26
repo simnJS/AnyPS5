@@ -3212,6 +3212,7 @@ bool BufferCache::SynchronizeRangeFromImage(uint64_t vaddr, uint64_t size) {
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	InvalidateCopyFeedback(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	NoteHeapTransfer(address, copy_size);
 	return true;
 }
 

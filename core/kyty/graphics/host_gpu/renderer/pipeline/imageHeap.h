@@ -29,7 +29,12 @@ public:
 
 	[[nodiscard]] static vk::DescriptorSetLayout CreateLayout(vk::Device device);
 
-	void BeginDraw() { ++m_draw; }
+	void BeginDraw();
+	bool CheckTableWrites();
+	uint64_t FillGroups() const { return m_check_stats.groups; }
+	bool ReadFallback(uint64_t address, std::span<uint32_t> words) const override;
+	bool ReplayPending() const { return m_retry; }
+	bool TakeReplay() { return std::exchange(m_retry, false); }
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
 	bool AcquireList(const ShaderRecompiler::IR::ImageHeapList& list,
@@ -121,7 +126,6 @@ private:
 		Shape&                  shape;
 		uint64_t                limit   = 0;
 		uint64_t                count   = 0;
-		uint32_t                id      = 0;
 		uint32_t                arms    = 0;
 		uint32_t                written = 0;
 		uint32_t                filled  = 0;
@@ -130,6 +134,7 @@ private:
 		std::vector<Range>      pending;
 		bool                    full       = true;
 		bool                    clear      = true;
+		bool                    discover   = true;
 		bool                    overflowed = false;
 	};
 
@@ -140,11 +145,14 @@ private:
 		uint64_t                                   synced  = 0;
 		uint64_t                                   prepared = 0;
 		uint32_t                                   idle    = 0;
-		uint32_t                                   gpu_all = 0;
+		bool                                       gpu_all = false;
 		bool                                       fresh   = true;
+		std::unique_ptr<Buffer>                    snapshot;
+		uint64_t                                   snapshot_tick = 0;
+		uint64_t                                   fallback_draw = 0;
+		std::vector<uint32_t>                      fallback;
 		std::vector<std::pair<uint64_t, uint64_t>> written;
 		std::vector<std::pair<uint64_t, uint64_t>> gpu_written;
-		std::vector<std::pair<uint64_t, uint64_t>> gpu_carried;
 		std::vector<std::unique_ptr<View>>         views;
 	};
 
@@ -161,7 +169,6 @@ private:
 	struct Ring {
 		std::unique_ptr<Buffer> buffer;
 		uint64_t                tick = 0;
-		std::vector<uint32_t>   views;
 	};
 
 	struct Check {
@@ -180,14 +187,19 @@ private:
 		uint64_t extras     = 0;
 		uint64_t misses     = 0;
 		uint64_t overflows  = 0;
+		uint64_t groups     = 0;
 		uint32_t reported   = 0;
 	};
 
 	uint32_t Profile(const ShaderRecompiler::IR::ImageResource& root, bool table);
 	Shape&   FindShape(uint64_t step, uint64_t first, uint32_t profile);
 	Shape&   ListShape(uint32_t profile);
-	void     Seed(View& view);
-	void     Intern(View& view, uint32_t kind, const Key& key);
+	void     Discover(View& view);
+	void     Admit(View& view, const ImageHeapSlots::KeyWordArray& words);
+	void     AppendJobs(View& view);
+	void     AdvanceSweep();
+	void     RetryProfile(uint32_t profile);
+	void     SaveFallback(Memory& memory);
 	uint32_t InternList(Shape& shape, uint32_t kind, const Key& key);
 	uint32_t Entry(const Key& key, uint32_t kind, bool table);
 	bool     Arm(Shape& shape, uint32_t kind, const DescriptorValue& value, uint32_t limit, uint32_t& arm);
@@ -215,19 +227,16 @@ private:
 	void     WriteDescriptors();
 	void     Drop(Memory& memory);
 	void     WatchTables();
-	void     TakeGpuWrites();
-	uint32_t NewViewId(View* view);
-	View*    ViewById(uint32_t id) const;
+	bool     TakeGpuWrites(bool snapshot = false);
 	void     ServiceMisses();
 	void     Service(Ring& ring);
 	void     SyncMemory(Memory& memory);
 	void     UpdateProbes(Memory& memory);
 	void     AddBytes(View& view, uint64_t begin, uint64_t end);
-	void     AddProbe(View& view, uint32_t slot);
 	void     RecordFills(CommandBuffer& buffer);
 	void     PrepareGpu(CommandBuffer& buffer);
 	void     FlushDirectory(CommandBuffer& buffer);
-	void     Dispatch(CommandBuffer& buffer);
+	void     Dispatch(CommandBuffer& buffer, Buffer* feedback = nullptr);
 	Ring&    CurrentRing();
 	void     Snapshot(CommandBuffer& buffer, std::unique_ptr<Buffer>& target);
 	bool     StepSweep();
@@ -243,9 +252,8 @@ private:
 	std::unordered_map<ListKey, List, ListKeyHash>                      m_lists;
 	std::vector<View*>                                                  m_active;
 	std::vector<List*>                                                  m_active_lists;
-	std::vector<View*>                                                  m_views;
-	std::vector<uint32_t>                                               m_free_views;
 	uint64_t                                                            m_draw         = 1;
+	uint64_t                                                            m_admission_draw = 0;
 	uint64_t                                                            m_suspend_draw = 0;
 	uint32_t                                                            m_frame        = 1;
 	std::vector<ShaderRecompiler::IR::ImageResource>                    m_profiles;
@@ -277,6 +285,7 @@ private:
 	std::vector<uint32_t>                                               m_groups;
 	std::vector<View*>                                                  m_cleared;
 	std::vector<Range>                                                  m_ranges;
+	std::unique_ptr<Buffer>                                             m_discovery_ring;
 	std::deque<Ring>                                                    m_rings;
 	std::vector<std::unique_ptr<Buffer>>                                m_free_rings;
 	std::unique_ptr<Buffer>                                             m_buckets;
@@ -292,6 +301,10 @@ private:
 	std::vector<uint32_t>                                               m_candidates;
 	std::vector<uint32_t>                                               m_stamps;
 	bool                                                                m_check = false;
+	bool                                                                m_retry = false;
+	bool                                                                m_keep_snapshots = false;
+	bool                                                                m_have_snapshots = false;
+	bool                                                                m_have_fallback = false;
 	std::deque<Check>                                                   m_checks;
 	CheckStats                                                          m_check_stats;
 	vk::DescriptorSetLayout                                             m_layout = nullptr;

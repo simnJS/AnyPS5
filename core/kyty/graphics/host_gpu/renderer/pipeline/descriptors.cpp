@@ -374,7 +374,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 				return cache.ObtainRangeWithProvenWrites(address, size, writes);
 			}
 		}
-		return cache.ObtainRange(address, size, resource.written, resource.formatted);
+		return cache.ObtainRange(address, size, resource.written, resource.formatted, ObtainFrom::Any, HeapWriteSource::Shader);
 	}();
 	if (counters) {
 		queries.NoteReadTarget(address, size, *buffer, offset);
@@ -3049,7 +3049,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (dma_stage_count != 0) {
 		const bool reach_synchronized =
 		    m_context.SynchronizeDmaFootprint(std::span {dma_stages.data(), dma_stage_count});
-		m_context.PrepareBda(dma_write, !reach_synchronized);
+		m_context.PrepareBda(dma_write, !reach_synchronized, BdaWriteTracking::PageBitmap);
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);

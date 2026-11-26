@@ -15,6 +15,9 @@ layout(set = 0, binding = 0, std430) buffer MirrorState {
 	uint64_t rt_context;
 	uint fault_word;
 	uint use_word;
+	uint64_t write_word;
+	uint64_t extended_base;
+	uint64_t lower_size;
 	uint64_t host_table;
 	layout(offset = 256) uint words[];
 };

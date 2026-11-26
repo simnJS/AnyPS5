@@ -1063,14 +1063,14 @@ bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 	return true;
 }
 
-void RenderContext::PrepareBda(bool may_write, bool full_sync) {
+void RenderContext::PrepareBda(bool may_write, bool full_sync, BdaWriteTracking tracking) {
 	[[maybe_unused]] static const bool logged = [] {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
 	m_buffer_cache.PrepareFaultBuffer(may_write);
 	if (may_write) {
-		m_buffer_cache.NoteDeviceAddressUse();
+		m_buffer_cache.NoteDeviceAddressUse(tracking);
 		m_indirect_write_tables.NotePendingWrites();
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);

@@ -160,7 +160,7 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 }
 
 void IndirectWriteTables::NotePendingWrites() noexcept {
-	m_context.GetBufferCache().NoteIndirectHeapWrites();
+	m_context.GetBufferCache().NoteHeapShaderWrites();
 	if (!std::exchange(m_pending_writes, true)) {
 		m_context.GetBufferCache().BeginIndirectWrites();
 	}

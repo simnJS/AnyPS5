@@ -1512,7 +1512,7 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {stages.data(), count});
 	const bool writes = (pair.programs[0] != nullptr && pair.programs[0]->has_address_writes) ||
 	                    (pair.programs[1] != nullptr && pair.programs[1]->has_address_writes);
-	m_context.PrepareBda(writes, !reach_synchronized);
+	m_context.PrepareBda(writes, !reach_synchronized, BdaWriteTracking::PageBitmap);
 }
 
 bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_buffer,

@@ -107,7 +107,7 @@ public:
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	bool               CacheSelfSizedBuffers(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
-	void               PrepareBda(bool may_write, bool full_sync = true);
+	void               PrepareBda(bool may_write, bool full_sync = true, BdaWriteTracking tracking = BdaWriteTracking::Unknown);
 	void               PrepareHackMarks();
 	void               RunGarbageCollector();
 	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);

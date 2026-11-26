@@ -44,6 +44,18 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer State {
 layout(buffer_reference, std430, buffer_reference_align = 16) coherent buffer CoherentU32x4 { uvec4 v; };
 layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer CoherentU32 { uint v; };
 
+uint64_t WriteAddress(uint64_t va, uint bytes) {
+	const uint64_t host = HostAddress(va, bytes);
+	if (host != 0) {
+		const uint64_t packed = va >= extended_base ? va - extended_base + lower_size : va;
+		const uint first = uint(packed >> 14u);
+		const uint last = uint((packed + bytes - 1u) >> 14u);
+		atomicOr(words[uint(write_word) - 64u + (first >> 5u)], 1u << (first & 31u));
+		if (last != first) atomicOr(words[uint(write_word) - 64u + (last >> 5u)], 1u << (last & 31u));
+	}
+	return host;
+}
+
 void LoadBoxes(uint64_t host, out vec3 lo[4], out vec3 hi[4]) {
 	uint words[24];
 	for (uint i = 0; i < 6; i++) {
@@ -157,7 +169,7 @@ void VertexJob(uint job_index) {
 			out_v[k * 3 + 1] = q.y;
 			out_v[k * 3 + 2] = q.z;
 		}
-		const uint64_t host = HostAddress(node, 60u);
+		const uint64_t host = WriteAddress(node, 60u);
 		if (host != 0) {
 			for (uint w = 0; w < 12; w += 4) {
 				U32x4Ref(host + w * 4).v =
@@ -223,7 +235,7 @@ void ArgumentsJob(uint job_index) {
 	for (uint g = gl_LocalInvocationID.x; g < geometries; g += gl_WorkGroupSize.x) {
 		const uint     first = LoadGuestU32(first_table + uint64_t(g) * 4);
 		const uint     end   = g + 1u < geometries ? LoadGuestU32(first_table + uint64_t(g + 1u) * 4) : node_count;
-		const uint64_t host  = HostAddress(ArgumentSlot(blas, g), 16u);
+		const uint64_t host  = WriteAddress(ArgumentSlot(blas, g), 16u);
 		if (host != 0) {
 			const uvec4 old   = U32x4Ref(host).v;
 			const uint  signs = (old.x >> 31) | ((old.y >> 31) << 1) | ((old.z >> 31) << 2) | ((old.w >> 31) << 3);
@@ -244,7 +256,7 @@ void BoxJob(uint job_index) {
 		}
 		const uint geometries = min(LoadGuestU32(blas + kHeaderOffsets[2][2]), 1u << 16);
 		for (uint g = lid; g < geometries; g += gl_WorkGroupSize.x) {
-			const uint64_t host = HostAddress(ArgumentSlot(blas, g), 16u);
+			const uint64_t host = WriteAddress(ArgumentSlot(blas, g), 16u);
 			if (host != 0) {
 				const uint signs     = CoherentU32(host + 12).v;
 				CoherentU32x4(host).v = uvec4(0x7f800000u) | (uvec4(signs, signs >> 1, signs >> 2, signs >> 3) << 31);
@@ -319,7 +331,7 @@ void BoxJob(uint job_index) {
 		const uint end   = s_level_begin[level + 1];
 		for (uint i = begin + lid; i < end; i += gl_WorkGroupSize.x) {
 			const uint     node     = U32Ref(queue + uint64_t(i) * 4).v;
-			const uint64_t host     = HostAddress(blas + (uint64_t(node >> 3) << 6), 112u);
+			const uint64_t host     = WriteAddress(blas + (uint64_t(node >> 3) << 6), 112u);
 			if (host == 0) {
 				continue;
 			}
@@ -379,7 +391,7 @@ void BoxJob(uint job_index) {
 		LoadBoxes(HostAddress(blas + (uint64_t(0x25u >> 3) << 6), 112u), lo, hi);
 		const vec3     box_lo = min(min(lo[0], lo[1]), min(lo[2], lo[3]));
 		const vec3     box_hi = max(max(hi[0], hi[1]), max(hi[2], hi[3]));
-		const uint64_t header = HostAddress(blas + 152, 24u);
+		const uint64_t header = WriteAddress(blas + 152, 24u);
 		if (header != 0) {
 			CoherentU32(header).v      = floatBitsToUint(box_lo.x);
 			CoherentU32(header + 4).v  = floatBitsToUint(box_lo.y);

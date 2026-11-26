@@ -554,6 +554,15 @@ private:
 	                                                      bool indirect_draw);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
 	                                          const DrawCallInfo& draw, DrawRenderState& state);
+	bool DrawIndexOnce(CommandBuffer& buffer, const DrawIndexArgs& args);
+	bool DrawAutoOnce(CommandBuffer& buffer, const DrawAutoArgs& args);
+	void DispatchDirectOnce(CommandBuffer& buffer, uint32_t thread_group_x,
+                                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+                                    bool async_compute);
+	void DispatchIndirectThreadsOnce(CommandBuffer& buffer, uint64_t args_addr,
+                                             uint32_t mode, bool async_compute);
+	void DispatchIndirectOnce(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
+                                      bool async_compute);
 	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
 	                                       const DrawIndexBufferSource& index_source);

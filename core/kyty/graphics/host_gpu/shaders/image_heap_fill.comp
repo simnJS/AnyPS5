@@ -156,7 +156,7 @@ void main() {
 				miss = true;
 			}
 		}
-		if (miss) {
+		if (miss && pc.ring_capacity != 0u) {
 			Ring       ring = Ring(pc.ring);
 			const uint at   = atomicAdd(ring.count, 1u);
 			if (at < pc.ring_capacity) {

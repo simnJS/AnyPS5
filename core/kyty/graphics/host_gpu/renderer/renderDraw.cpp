@@ -1772,8 +1772,8 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
                                             const DrawCallInfo& draw,
                                             DrawRenderState&    state) {
+	m_context.GetImageHeap().BeginDraw();
 	if (!shaders_resolved) {
-		m_context.GetImageHeap().BeginDraw();
 		const auto begin = Common::SteadyNs();
 		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 		Bump(g_execute_resolve.here_ns[0], Common::SteadyNs() - begin);
@@ -2300,6 +2300,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (state.ps_active) {
 		PrepareDrawRayTracing(m_context, buffer, bindings.pixel);
 	}
+	if (m_context.GetImageHeap().CheckTableWrites()) return;
 	auto vk_buffer = buffer.Handle();
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -2483,15 +2484,23 @@ struct TableNormalDraw {
 }
 
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
+	m_context.GetCommandScheduler().PopPendingOperations();
+	Common::LockGuard lock(m_context.GetMutex());
+	bool result;
+	do {
+		result = DrawIndexOnce(buffer, args);
+	} while (m_context.GetImageHeap().TakeReplay());
+	return result;
+}
+
+bool RenderExecutor::DrawIndexOnce(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	const TableNormalDraw table_normal {*this, args.indirect, true, TableCount::TableSampleStart()};
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
-	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
@@ -2583,15 +2592,23 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 }
 
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
+	m_context.GetCommandScheduler().PopPendingOperations();
+	Common::LockGuard lock(m_context.GetMutex());
+	bool result;
+	do {
+		result = DrawAutoOnce(buffer, args);
+	} while (m_context.GetImageHeap().TakeReplay());
+	return result;
+}
+
+bool RenderExecutor::DrawAutoOnce(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	const TableNormalDraw table_normal {*this, args.indirect, false, TableCount::TableSampleStart()};
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
-	Common::LockGuard lock(m_context.GetMutex());
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}

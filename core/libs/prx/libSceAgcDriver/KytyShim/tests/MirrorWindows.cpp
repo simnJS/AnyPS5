@@ -201,7 +201,7 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	auto& scheduler = renderer.GetCommandScheduler();
 	auto& buffers   = renderer.GetBufferCache();
 	auto& graphics  = renderer.GetGraphics();
-	constexpr uint32_t first = 0x10000, second = 0x20000;
+	constexpr uint32_t first = 0x10000, second = 0x20000, third = 0x30000;
 	std::array<uint32_t, 16> words {};
 	words[0] = first;
 	words[1] = static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u;
@@ -209,8 +209,9 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	std::copy_n(words.begin(), 8, words.begin() + 8);
 	words[8] = second;
 	renderer.MapMemory(address, sizeof(words));
-	if (!Libs::LibKernel::Memory::TryWriteBacking(address, words.data(), sizeof(words))) {
-		return "could not seed the descriptor table in guest backing";
+	const std::array<uint32_t, 16> empty_table {};
+	if (!Libs::LibKernel::Memory::TryWriteBacking(address, empty_table.data(), sizeof(words))) {
+		return "could not clear the descriptor table in guest backing";
 	}
 	buffers.InvalidateMemory(address, sizeof(words));
 
@@ -223,18 +224,50 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout_info, nullptr, &layout), "consumer layout");
 	const IR::ImageResource root {.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D};
 	const IR::ImageHeapRequest request {.base = address, .size = sizeof(words), .step = 32, .count = 2, .root = &root};
-	const auto consume = [&](bool write_during_preparation) {
+	heap.BeginDraw();
+	IR::ImageHeapView empty_view;
+	auto outside = request;
+	outside.base = buffers.GetGuestMirror()->Base() + buffers.GetGuestMirror()->Size() - 4u;
+	if (heap.Acquire(outside, empty_view)) return "a table crossing the mirror limit was accepted";
+	auto cpu_request = request;
+	cpu_request.step = sizeof(words);
+	if (!heap.Acquire(cpu_request, empty_view) || !empty_view.kinds.empty()) return "unexpected initial CPU kind";
+	if (!Libs::LibKernel::Memory::TryWriteBacking(address, words.data(), sizeof(words))) return "CPU table write failed";
+	buffers.InvalidateMemory(address, sizeof(words));
+	heap.BeginDraw();
+	if (!heap.Acquire(cpu_request, empty_view) || empty_view.kinds.size() != 1) return "CPU writes did not rearm an empty view";
+	heap.Rebind(renderer.GetRenderExecutor());
+	if (heap.CheckTableWrites()) return "CPU discovery required a second draw";
+	heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+	reader.Record(scheduler, empty_view.slots, sizeof(uint32_t));
+	Finish(scheduler);
+	if (reader.Words(sizeof(uint32_t)).front() == 0u) return "the first CPU descriptor used slot zero";
+	if (!Libs::LibKernel::Memory::TryWriteBacking(address, empty_table.data(), sizeof(words))) return "CPU table reset failed";
+	buffers.InvalidateMemory(address, sizeof(words));
+	heap.BeginDraw();
+	if (!heap.Acquire(request, empty_view) || !empty_view.kinds.empty()) return "unexpected kind for an empty table";
+	const auto [target, destination] = buffers.ObtainRange(address, sizeof(words), true);
+	const auto [upload, uploaded] = buffers.UploadHeapData(sizeof(words), [&](uint8_t* mapped, uint64_t) {
+		std::memcpy(mapped, words.data(), sizeof(words));
+	});
+	target->CopyFrom(scheduler.Current(), *upload, uploaded, destination, sizeof(words));
+	const auto consume = [&](uint32_t late_value) {
 		heap.BeginDraw();
 		IR::ImageHeapView view;
 		if (!heap.Acquire(request, view) || view.kinds.size() != 1) return std::vector<uint32_t> {};
 		heap.Rebind(renderer.GetRenderExecutor());
-		if (write_during_preparation) {
+		if (late_value != 0u) {
 			auto& stream = buffers.GetUtilityBuffer(MemoryUsage::Stream);
 			if (stream.Map(stream.Size(), 16).first == nullptr) return std::vector<uint32_t> {};
 			stream.Commit();
 			const auto [buffer, offset] = buffers.ObtainRange(address, sizeof(uint32_t), true);
-			buffer->Fill(offset, sizeof(uint32_t), second);
+			buffer->Fill(offset, sizeof(uint32_t), late_value);
+			if (!heap.CheckTableWrites() || !heap.TakeReplay()) return std::vector<uint32_t> {};
+			heap.BeginDraw();
+			if (!heap.Acquire(request, view)) return std::vector<uint32_t> {};
+			heap.Rebind(renderer.GetRenderExecutor());
 		}
+		if (heap.CheckTableWrites()) return std::vector<uint32_t> {};
 		const auto tick = scheduler.CurrentTick();
 		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
 		if (scheduler.CurrentTick() != tick) return std::vector<uint32_t> {};
@@ -242,13 +275,38 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 		Finish(scheduler);
 		return reader.Words(sizeof(words));
 	};
-	const auto initial = consume(false);
-	const auto late    = consume(true);
-	(void)consume(false);
+	const auto initial = consume(0);
+	const auto late = consume(second);
+	const auto novel = consume(third);
+	if (novel.empty() || initial.empty() || novel[0] == 0u || novel[0] == initial[0] ||
+	    novel[0] == initial[8] || novel[8] != initial[8]) return "a new descriptor missed its only draw";
 	const auto [mirror, offset] = buffers.ObtainRange(address, sizeof(words), false, false, ObtainFrom::Mirror);
 	renderer.PrepareBda(true, false);
 	mirror->Fill(offset, sizeof(uint32_t), first);
-	const auto indirect = consume(false);
+	const auto indirect = consume(0);
+	const auto packed = address >= Libs::LibKernel::Memory::kExtendedMemoryBase
+	                        ? address - Libs::LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE : address;
+	const auto page = packed / BufferCache::CACHING_PAGESIZE;
+	const auto bitmap_word = BufferCache::WRITE_BITMAP_OFFSET + page / 32u * 4u;
+	renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
+	buffers.GetFaultBuffer()->Fill(bitmap_word, 4, 1u << ((page + 1u) % 32u));
+	const auto groups = heap.FillGroups();
+	const auto inspected = buffers.HeapBitmapBytes();
+	const auto disjoint = consume(0);
+	if (disjoint != indirect || heap.FillGroups() != groups || buffers.HeapBitmapBytes() - inspected != 4u) {
+		return "a disjoint shader write did more than inspect the watched bitmap word";
+	}
+	renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
+	mirror->Fill(offset, sizeof(uint32_t), third);
+	buffers.GetFaultBuffer()->Fill(bitmap_word, 4, 1u << (page % 32u));
+	const auto bitmap_hit = consume(0);
+	if (bitmap_hit.empty() || bitmap_hit[0] != novel[0]) return "the written page did not reach its first consumer";
+	renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
+	heap.BeginDraw();
+	buffers.CollectHeapWritePages();
+	bool dirty = false;
+	buffers.TakeHeapTableWrites([&](uint64_t, uint64_t) { dirty = true; });
+	if (dirty) return "a consumed page bit invalidated the table again";
 	const auto bytes = buffers.GetUtilityBuffer(MemoryUsage::Stream).Size() + sizeof(uint32_t);
 	const auto tick  = scheduler.CurrentTick();
 	const auto [large, start] = buffers.UploadHeapData(bytes, [&](uint8_t* mapped, uint64_t) {
