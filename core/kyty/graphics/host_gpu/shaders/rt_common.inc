@@ -56,20 +56,22 @@ uint64_t GuestAddress(uint64_t offset, uint bytes) {
 }
 
 uint64_t HostAddress(uint64_t va, uint bytes) {
+	if (va < guest_base) return 0;
 	const uint64_t offset = va - guest_base;
-	if (offset >= mirror_size || bytes > mirror_size - offset) return 0;
-	const uint64_t packed = va < lower_size ? va : va - extended_base + lower_size;
-	if (va >= lower_size && va < extended_base) return 0;
-	const uint block = uint(packed >> 16);
+	uint block = uint(va >> 16);
+	if (va >= lower_size) {
+		if (va < extended_base || offset >= mirror_size || bytes > mirror_size - offset) return 0;
+		block -= uint((extended_base - lower_size) >> 16);
+	}
 	const uint entry = words[block >> 4];
 	const bool start = Resident(block, entry);
 	const uint64_t first = (uint64_t(entry >> 16) << 24) | (offset & 0xfffffful);
-	if (bytes <= 0x10000u - (uint(packed) & 0xffffu)) {
+	if (bytes <= 0x10000u - (uint(va) & 0xffffu)) {
 		return start ? mirror_base + first : GuestAddress(offset, bytes);
 	}
 	if (va < lower_size && bytes > lower_size - va) return 0;
 	const uint64_t last_byte = offset + bytes - 1u;
-	const uint last_block = uint((packed + bytes - 1u) >> 16);
+	const uint last_block = block + uint(((va & 0xfffful) + bytes - 1u) >> 16);
 	const uint last_entry = (block >> 4) == (last_block >> 4) ? entry : words[last_block >> 4];
 	const bool end = Resident(last_block, last_entry);
 	const uint64_t last = (uint64_t(last_entry >> 16) << 24) | (last_byte & 0xfffffful);
