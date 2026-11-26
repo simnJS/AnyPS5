@@ -2280,7 +2280,8 @@ uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t
 		                          bit);
 	};
 	const auto ready = AndCondition(state, inside, holds(word(BufferCache::RESIDENCY_OFFSET)));
-	EmitIfCondition(state, ready, [&] { mark(word(BufferCache::USE_BITMAP_OFFSET)); });
+	const auto use = word(BufferCache::USE_BITMAP_OFFSET);
+	EmitIfCondition(state, AndCondition(state, ready, Unary(state, spv::OpLogicalNot, boolean, holds(use))), [&] { mark(use); });
 	const auto missed = AndCondition(state, inside, Unary(state, spv::OpLogicalNot, boolean, ready));
 	const auto guest_page = EmitValueOrDefaultIfCondition(state, missed, u64, ConstantU64(state, 0), [&] {
 		mark(word(BufferCache::FAULT_BITMAP_OFFSET));

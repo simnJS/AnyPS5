@@ -29,7 +29,9 @@ bool Resident(uint block) {
 	const uint bit = 1u << (block & 31u);
 	const uint word = block >> 5;
 	if ((words[word] & bit) != 0) {
-		atomicOr(words[use_word - 64u + word], bit);
+		if ((words[use_word - 64u + word] & bit) == 0) {
+			atomicOr(words[use_word - 64u + word], bit);
+		}
 		return true;
 	}
 	atomicOr(words[fault_word - 64u + word], bit);
