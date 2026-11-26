@@ -209,7 +209,9 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	std::copy_n(words.begin(), 8, words.begin() + 8);
 	words[8] = second;
 	renderer.MapMemory(address, sizeof(words));
-	std::memcpy(reinterpret_cast<void*>(address), words.data(), sizeof(words));
+	if (!Libs::LibKernel::Memory::TryWriteBacking(address, words.data(), sizeof(words))) {
+		return "could not seed the descriptor table in guest backing";
+	}
 	buffers.InvalidateMemory(address, sizeof(words));
 
 	vk::DescriptorSetLayout empty;
