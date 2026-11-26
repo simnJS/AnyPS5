@@ -2270,9 +2270,10 @@ void CommandProcessor::EmitHleRefitArgs() {
 		for (size_t i = 0; i < refit.size(); i++) {
 			if (refit[i] != 0 && sizes[i] > RayTracing::HleRefitBlasHeaderBytes) {
 				(void)cache.ObtainRange(refit[i], sizes[i], true);
+				cache.NoteHeapShaderWrites(refit[i], sizes[i]);
 			}
 		}
-		context.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
+		context.PrepareBda(true, false, BdaWriteTracking::ExplicitRanges);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		context.GetRayTracing()->RecordHleRefit(command.Handle(), refit, {}, 2, true);
@@ -2337,8 +2338,9 @@ void CommandProcessor::EmitHleRefit() {
 				(void)cache.PrepareDeviceAddressRead(blas, header_bytes);
 				(void)cache.ObtainRange(blas + header_bytes, size - header_bytes, true);
 			}
+			if (blas != 0 && size > header_bytes) cache.NoteHeapShaderWrites(blas, size);
 		}
-		context.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
+		context.PrepareBda(true, false, BdaWriteTracking::ExplicitRanges);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		context.GetRayTracing()->RecordHleRefit(command.Handle(), refit, geometries, header_layout);

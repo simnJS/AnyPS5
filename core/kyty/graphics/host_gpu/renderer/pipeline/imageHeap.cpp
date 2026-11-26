@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <tuple>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -43,6 +44,12 @@ constexpr size_t   MaxRangesPerView     = 32;
 constexpr uint32_t DirectoryGap         = 16;
 constexpr size_t   MaxGpuRuns           = 64;
 constexpr uint64_t StampBytes           = uint64_t {IR::ImageHeapCapacity} * sizeof(uint32_t);
+constexpr uint32_t MaxAttempts          = 4;
+constexpr uint64_t ChunkBytes           = 4096;
+constexpr size_t   MaxFoundRanges       = 64;
+constexpr uint32_t ReportFrames         = 300;
+constexpr size_t   MaxRemembered        = 64;
+constexpr uint32_t RememberFrames       = 256;
 static_assert(Slots::ArmShift == IR::ImageHeapKindShift);
 static_assert(IR::ImageHeapCapacity - 1u <= Slots::IndexMask);
 
@@ -81,6 +88,21 @@ IR::ImageResource ResolutionProfile(const IR::ImageResource& root) {
 	resolved.unfiltered_access_only     = false;
 	resolved.sample_access_only         = false;
 	return resolved;
+}
+
+template <typename Range>
+void MergeRanges(std::vector<Range>& ranges, std::vector<Range>& merged, uint64_t count) {
+	std::ranges::sort(ranges, {}, &Range::begin);
+	merged.clear();
+	for (const auto& range: ranges) {
+		const auto end = static_cast<uint32_t>(std::min<uint64_t>(range.end, count));
+		if (range.begin >= end) continue;
+		if (!merged.empty() && range.begin <= merged.back().end) {
+			merged.back().end = std::max(merged.back().end, end);
+		} else {
+			merged.push_back({range.begin, end});
+		}
+	}
 }
 
 std::unique_ptr<Buffer> HostBuffer(RenderContext& context, uint64_t size) {
@@ -179,11 +201,13 @@ ImageHeap::~ImageHeap() {
 
 void ImageHeap::BeginDraw() {
 	++m_draw;
+	if (!std::exchange(m_replaying, false)) m_attempt = 0;
 	m_have_fallback = false;
 	if (!std::exchange(m_keep_snapshots, false) && std::exchange(m_have_snapshots, false)) {
 		for (const auto& memory: m_memories) {
-			if (!memory->snapshot) continue;
-			m_context.GetCommandScheduler().DeferOperation([snapshot = std::move(memory->snapshot)] {});
+			if (!memory->snapshot && !memory->previous) continue;
+			m_context.GetCommandScheduler().DeferOperation(
+			    [snapshot = std::move(memory->snapshot), previous = std::move(memory->previous)] {});
 			memory->fresh = true;
 		}
 	}
@@ -196,7 +220,8 @@ void ImageHeap::BeginDraw() {
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
 	const auto size = request.size & ~uint64_t {3};
-	const auto* mirror = m_context.GetBufferCache().GetGuestMirror();
+	auto& cache = m_context.GetBufferCache();
+	const auto* mirror = cache.GetGuestMirror();
 	if (!GuestRange {request.base, request.size}.Valid() || mirror == nullptr ||
 	    !mirror->Holds(request.base, request.size) || size / 4u > UINT32_MAX - 8u ||
 	    request.first >= size || request.step / 4u > UINT32_MAX || request.root == nullptr ||
@@ -243,15 +268,24 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		view            = views.insert(views.end(), std::move(created));
 	}
 	auto& selected = **view;
-	m_context.GetBufferCache().CollectHeapWritePages();
 	SyncMemory(selected.memory);
 	if (m_admission_draw != m_draw) {
 		AdvanceSweep();
 		m_admission_draw = m_draw;
 		TakeGpuWrites();
 	}
+	if (cache.HeapBitmapReady(selected.memory.base, selected.memory.size)) {
+		m_bitmap_writes.Clear();
+		cache.CollectHeapWritePages(m_bitmap_writes);
+		m_bitmap_writes.ForEach([&](uint64_t begin, uint64_t end) { ApplyGpuWrite(begin, end, nullptr); });
+	}
 	UpdateProbes(selected.memory);
+	if (selected.overflowed && selected.capacity && selected.overflow_epoch != m_capacity_epoch) {
+		selected.discover     = true;
+		selected.discover_all = true;
+	}
 	if (std::exchange(selected.discover, false)) Discover(selected);
+	if (!selected.gpu_found.empty()) DiscoverOnGpu(selected.memory);
 	if (selected.overflowed) {
 		SaveFallback(selected.memory);
 		return false;
@@ -285,7 +319,11 @@ uint32_t ImageHeap::Profile(const IR::ImageResource& root, bool table) {
 ImageHeap::Shape& ImageHeap::FindShape(uint64_t step, uint64_t first, uint32_t profile) {
 	auto& shape = m_shapes[{.step = step, .first = first, .profile = profile}];
 	if (shape == nullptr) {
-		shape = std::make_unique<Shape>(Shape {.step = step, .first = first, .profile = profile});
+		shape = std::make_unique<Shape>(Shape {.step    = step,
+		                                       .first   = first,
+		                                       .profile = profile,
+		                                       .id      = static_cast<uint32_t>(m_shape_ids.size())});
+		m_shape_ids.push_back(shape.get());
 	}
 	return *shape;
 }
@@ -297,104 +335,234 @@ ImageHeap::Shape& ImageHeap::ListShape(uint32_t profile) {
 }
 
 void ImageHeap::Discover(View& view) {
-	auto& memory = view.memory;
-	const auto& shape = view.shape;
+	auto&       memory    = view.memory;
+	const auto& shape     = view.shape;
+	auto&       cache     = m_context.GetBufferCache();
+	const auto  key_bytes = uint64_t {m_profiles[shape.profile].r128 ? 16u : 32u};
+	const bool  whole     = std::exchange(view.discover_all, false);
+	if (whole) {
+		view.found.assign(1u, {0u, static_cast<uint32_t>(view.count)});
+		view.gpu_found.clear();
+		view.overflowed = false;
+	}
+	MergeRanges(view.found, m_ranges, view.count);
+	view.found.clear();
+	const auto chunk = std::max<uint64_t>(1u, ChunkBytes > key_bytes ? (ChunkBytes - key_bytes) / shape.step + 1u : 1u);
+	++m_stats.cpu_discoveries;
+	for (const auto& range: m_ranges) {
+		for (uint32_t first = range.begin; first < range.end && !view.overflowed;) {
+			const auto last  = static_cast<uint32_t>(std::min<uint64_t>(range.end, first + chunk));
+			const auto begin = shape.first + uint64_t {first} * shape.step;
+			const auto end   = std::min(memory.size, shape.first + uint64_t {last - 1u} * shape.step + key_bytes);
+			if (begin >= end) break;
+			m_scratch.resize((end - begin) / 4u);
+			if (memory.snapshot || !memory.cpu_bytes.Contains(memory.base + begin, end - begin) ||
+			    cache.HasGpuDirtyBytes(memory.base + begin, end - begin) ||
+			    !LibKernel::Memory::TryReadBufferBacking(memory.base + begin, m_scratch.data(), end - begin)) {
+				view.gpu_found.push_back({first, last});
+				first = last;
+				continue;
+			}
+			const std::span<const uint32_t> words {m_scratch.data(), m_scratch.size()};
+			for (auto probe = first; probe < last; ++probe) {
+				const auto refusal = Admit(view, Slots::ReadKey(words, (uint64_t {probe - first} * shape.step) / 4u,
+				                                                static_cast<uint32_t>(key_bytes / 4u)));
+				if (refusal != Refusal::None) {
+					Refuse(view, refusal);
+					break;
+				}
+			}
+			m_stats.cpu_probes += last - first;
+			first = last;
+		}
+	}
+	if (view.overflowed) view.gpu_found.clear();
+}
+
+void ImageHeap::DiscoverOnGpu(Memory& memory) {
+	m_batch.clear();
+	for (const auto& candidate: memory.views) {
+		auto& view = *candidate;
+		if (std::exchange(view.discover, false)) Discover(view);
+		if (!view.gpu_found.empty()) m_batch.push_back(&view);
+	}
+	if (m_batch.empty()) return;
 	auto& scheduler = m_context.GetCommandScheduler();
-	auto& command = scheduler.Current();
+	auto& cache     = m_context.GetBufferCache();
+	auto& command   = scheduler.Current();
 	command.EndRendering();
 	PrepareGpu(command);
 	FlushDirectory(command);
 	if (!m_discovery_ring) m_discovery_ring = HostBuffer(m_context, Slots::RingBytes);
 	m_discovery_ring->Fill(0u, Slots::RingHeaderBytes, 0u);
-	if (view.clear) {
-		view.buffer->Fill(0u, view.buffer->Size(), 0u);
-		view.clear = false;
-	}
 	m_jobs.clear();
 	m_groups.clear();
-	view.arms = static_cast<uint32_t>(shape.kind_keys.size());
-	if (m_table_profiles[shape.profile] && !shape.kinds.empty() &&
-	    !IR::ImageTableHeapExemplar(m_profiles[shape.profile], shape.kinds.front())) view.arms = 0;
-	AppendJobs(view);
+	std::vector<std::pair<uint32_t, Range>>     discovered;
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	for (uint32_t index = 0; index < m_batch.size(); ++index) {
+		auto&       view  = *m_batch[index];
+		const auto& shape = view.shape;
+		if (view.clear) {
+			view.buffer->Fill(0u, view.buffer->Size(), 0u);
+			view.clear = false;
+		}
+		view.arms = static_cast<uint32_t>(shape.kind_keys.size());
+		if (m_table_profiles[shape.profile] && !shape.kinds.empty() &&
+		    !IR::ImageTableHeapExemplar(m_profiles[shape.profile], shape.kinds.front())) view.arms = 0;
+		MergeRanges(view.gpu_found, m_ranges, view.count);
+		view.gpu_found.clear();
+		const auto key_bytes = uint64_t {m_profiles[shape.profile].r128 ? 16u : 32u};
+		AppendJobs(view, index, &m_ranges);
+		for (const auto& range: m_ranges) {
+			discovered.emplace_back(index, range);
+			spans.emplace_back(shape.first + uint64_t {range.begin} * shape.step,
+			                   std::min(memory.size, shape.first + uint64_t {range.end - 1u} * shape.step + key_bytes));
+			m_stats.gpu_probes += range.end - range.begin;
+		}
+	}
 	Dispatch(command, m_discovery_ring.get());
+	std::ranges::sort(spans);
+	std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> copies;
+	uint64_t total = 0;
+	for (const auto& [begin, end]: spans) {
+		if (begin >= end) continue;
+		if (!copies.empty() && begin <= std::get<1>(copies.back())) {
+			std::get<1>(copies.back()) = std::max(std::get<1>(copies.back()), end);
+		} else {
+			copies.emplace_back(begin, end, 0u);
+		}
+	}
+	for (auto& [begin, end, at]: copies) {
+		at = total;
+		total += end - begin;
+	}
+	std::unique_ptr<Buffer> download;
+	if (total != 0 && !memory.snapshot) {
+		download = HostBuffer(m_context, total);
+		for (const auto& [begin, end, at]: copies) {
+			const auto [source, offset] = cache.ObtainRange(memory.base + begin, end - begin, false, false, ObtainFrom::Mirror);
+			download->CopyFrom(command, *source, offset, at, end - begin);
+		}
+	}
 	scheduler.Wait(scheduler.CurrentTick());
+	++m_stats.discovery;
+	++m_stats.gpu_discoveries;
 	m_discovery_ring->Invalidate(0, Slots::RingBytes);
+	if (download) download->Invalidate(0, total);
+	if (memory.snapshot) memory.snapshot->Invalidate(0, memory.size);
+	const auto read = [&](uint64_t offset, uint64_t length, void* out) {
+		if (memory.snapshot) {
+			if (offset >= memory.size) return false;
+			std::memcpy(out, memory.snapshot->Mapped().data() + offset, std::min(length, memory.size - offset));
+			return true;
+		}
+		const auto copy = std::ranges::find_if(copies, [&](const auto& candidate) {
+			return std::get<0>(candidate) <= offset && offset < std::get<1>(candidate);
+		});
+		if (!download || copy == copies.end()) return false;
+		std::memcpy(out, download->Mapped().data() + std::get<2>(*copy) + (offset - std::get<0>(*copy)),
+		            std::min(length, std::get<1>(*copy) - offset));
+		return true;
+	};
 	const auto* ring = m_discovery_ring->Mapped().data();
 	uint32_t count;
 	std::memcpy(&count, ring, sizeof(count));
-	view.overflowed = false;
-	if (count <= Slots::RingCapacity) {
-		if (view.full) {
-			view.written = static_cast<uint32_t>(view.count);
-			view.filled = m_frame;
+	const auto admit = [&](View& view, const Slots::KeyWordArray& words, uint32_t probe) {
+		if (view.overflowed) return;
+		if (const auto refusal = Admit(view, words); refusal != Refusal::None) {
+			Refuse(view, refusal);
+			return;
 		}
-		view.full = false;
-		view.pending.clear();
-		for (uint32_t i = 0; i < count && !view.overflowed; ++i) {
+		if (!view.full) view.pending.push_back({probe, probe + 1u});
+	};
+	if (count <= Slots::RingCapacity) {
+		for (uint32_t i = 0; i < count; ++i) {
 			Slots::Miss miss;
 			std::memcpy(&miss, ring + Slots::RingHeaderBytes + i * sizeof(miss), sizeof(miss));
-			Admit(view, miss.words);
-			const auto probe = static_cast<uint32_t>((uint64_t {miss.slot} * 4u - shape.first) / shape.step);
-			view.pending.push_back({probe, probe + 1u});
+			if (miss.view >= m_batch.size()) continue;
+			auto& view = *m_batch[miss.view];
+			admit(view, miss.words, static_cast<uint32_t>((uint64_t {miss.slot} * 4u - view.shape.first) / view.shape.step));
 		}
-		return;
-	}
-	const auto key_words = m_profiles[shape.profile].r128 ? 4u : 8u;
-	uint32_t first = 0;
-	uint32_t last = static_cast<uint32_t>(view.count);
-	if (!view.full) {
-		first = std::ranges::min(view.pending, {}, &Range::begin).begin;
-		last = std::ranges::max(view.pending, {}, &Range::end).end;
-	}
-	if (first >= last) return;
-	const auto begin = shape.first + uint64_t {first} * shape.step;
-	const auto end = std::min(memory.size, shape.first + uint64_t {last - 1u} * shape.step + key_words * 4u);
-	const auto bytes = end - begin;
-	auto& cache = m_context.GetBufferCache();
-	StreamBuffer::Download download {};
-	const uint8_t* mapped;
-	if (memory.snapshot) {
-		scheduler.Wait(memory.snapshot_tick);
-		memory.snapshot->Invalidate(begin, bytes);
-		mapped = memory.snapshot->Mapped().data() + begin;
 	} else {
-		download = cache.GetUtilityBuffer(MemoryUsage::Download).MapDownload(bytes, 4);
-		const auto [source, offset] = cache.ObtainRange(memory.base + begin, bytes, false, false, ObtainFrom::Mirror);
-		download.buffer->CopyFrom(scheduler.Current(), *source, offset, download.offset, bytes);
-		scheduler.Wait(scheduler.CurrentTick());
-		download.buffer->Invalidate(download.offset, bytes);
-		mapped = download.mapped;
+		for (const auto& [index, range]: discovered) {
+			auto&      view      = *m_batch[index];
+			const auto key_bytes = uint64_t {m_profiles[view.shape.profile].r128 ? 16u : 32u};
+			for (auto probe = range.begin; probe < range.end && !view.overflowed; ++probe) {
+				Slots::KeyWordArray words {};
+				if (read(view.shape.first + uint64_t {probe} * view.shape.step, key_bytes, words.data())) {
+					admit(view, words, probe);
+				}
+			}
+		}
 	}
-	const std::span words {reinterpret_cast<const uint32_t*>(mapped), size_t(bytes / 4u)};
-	for (uint32_t probe = first; probe < last && !view.overflowed; ++probe) {
-		Admit(view, Slots::ReadKey(words, (uint64_t {probe - first} * shape.step) / 4u, key_words));
+	if (download && !memory.snapshot) {
+		for (const auto& [begin, end, at]: copies) {
+			LearnProvenance(memory, begin, download->Mapped().subspan(at, end - begin));
+		}
 	}
 }
 
-void ImageHeap::Admit(View& view, const Slots::KeyWordArray& words) {
-	const auto& shape = view.shape;
+ImageHeap::Refusal ImageHeap::Admit(View& view, const Slots::KeyWordArray& words) {
+	return AdmitKey(view.shape, words);
+}
+
+ImageHeap::Refusal ImageHeap::AdmitKey(Shape& shape, const Slots::KeyWordArray& words) {
 	const auto& profile = m_profiles[shape.profile];
 	const bool table = m_table_profiles[shape.profile];
 	const Key key {.value = {.dwords = words, .dword_count = 8u}, .profile = shape.profile};
 	const auto* known = m_directory.Find(key.value.dwords, shape.profile);
-	if (known != nullptr && (known->flags & Slots::NegativeFlag) != 0u) return;
+	if (known != nullptr && (known->flags & Slots::NegativeFlag) != 0u) return Refusal::None;
 	auto value = key.value;
 	const auto kind = known != nullptr ? known->value >> Slots::KindShift
 	                  : table ? IR::ImageTableHeapKind(profile, value) : IR::ImageHeapKind(profile, value);
+	if (known != nullptr && kind != 0u) {
+		const auto armed = std::ranges::find(shape.kind_keys, kind);
+		if (armed != shape.kind_keys.end() &&
+		    (!table || IR::ImageTableHeapExemplar(profile, shape.kinds[static_cast<size_t>(armed - shape.kind_keys.begin())]) ||
+		     !IR::ImageTableHeapExemplar(profile, value))) {
+			return Refusal::None;
+		}
+	}
 	if (kind == 0u) {
 		if (known == nullptr) (void)m_directory.Insert(key.value.dwords, shape.profile, 0u, Slots::NegativeFlag);
-		return;
+		return Refusal::None;
 	}
 	const auto index = Entry(key, kind, true);
-	uint32_t arm = 0;
 	if (index != 0u && m_elements[index].table && !m_elements[index].freed) {
 		m_elements[index].born = m_frame;
 		Hash(index);
 	}
-	if (index == 0u || !m_elements[index].hashed || !Arm(view.shape, kind, key.value, Slots::MaxArms, arm)) {
-		view.overflowed = true;
-		view.discover = true;
-		view.full = true;
+	if (index == 0u || !m_elements[index].hashed) return Refusal::Capacity;
+	uint32_t arm = 0;
+	return Arm(shape, kind, key.value, Slots::MaxArms, arm) ? Refusal::None : Refusal::Arms;
+}
+
+void ImageHeap::Refuse(View& view, Refusal refusal) {
+	if (!view.overflowed) ++m_stats.overflows;
+	view.overflowed     = true;
+	view.full           = true;
+	view.capacity       = refusal == Refusal::Capacity;
+	view.overflow_epoch = m_capacity_epoch;
+	view.found.clear();
+	view.gpu_found.clear();
+}
+
+void ImageHeap::AdmitLate(const Slots::Miss& miss) {
+	if (miss.shape >= m_shape_ids.size()) return;
+	auto& shape = *m_shape_ids[miss.shape];
+	if (shape.profile != miss.profile) return;
+	const auto refusal = AdmitKey(shape, miss.words);
+	for (const auto& memory: m_memories) {
+		if (miss.guest < memory->base || miss.guest - memory->base >= memory->size) continue;
+		const auto offset = miss.guest - memory->base;
+		for (const auto& view: memory->views) {
+			if (&view->shape != &shape) continue;
+			if (refusal != Refusal::None) {
+				Refuse(*view, refusal);
+			} else {
+				AddBytes(*view, offset, offset + 4u, false);
+			}
+		}
 	}
 }
 
@@ -478,6 +646,7 @@ void ImageHeap::Forget(uint32_t index) {
 void ImageHeap::Free(uint32_t index) {
 	auto& element = m_elements[index];
 	element.freed = true;
+	m_capacity_changed = true;
 	auto& textures = m_context.GetTextureCache();
 	if (auto* image = textures.m_slot_images.try_get(element.image);
 	    image != nullptr && image->serial == element.serial) {
@@ -491,8 +660,9 @@ void ImageHeap::Invalidate(uint32_t profile) {
 	for (const auto& memory: m_memories) {
 		for (const auto& view: memory->views) {
 			if (view->shape.profile == profile) {
-				view->full = true;
-				view->discover = true;
+				view->full         = true;
+				view->discover     = true;
+				view->discover_all = true;
 			}
 		}
 	}
@@ -733,8 +903,23 @@ uint32_t ImageHeap::Allocate(bool may_fail) {
 }
 
 void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
+	const bool moved = memory.base != base;
 	{
 		std::scoped_lock lock {m_mutex};
+		if (moved) {
+			if (memory.size != 0 && !memory.cpu_bytes.Empty()) {
+				if (m_remembered.size() == MaxRemembered) m_remembered.erase(m_remembered.begin());
+				m_remembered.push_back({.base      = memory.base,
+				                        .size      = memory.size,
+				                        .frame     = m_frame,
+				                        .cpu_bytes = std::move(memory.cpu_bytes)});
+			}
+			memory.cpu_bytes.Clear();
+			if (const auto known = std::ranges::find(m_remembered, base, &Remembered::base); known != m_remembered.end()) {
+				memory.cpu_bytes = std::move(known->cpu_bytes);
+				m_remembered.erase(known);
+			}
+		}
 		memory.base = base;
 		memory.size = size;
 	}
@@ -743,13 +928,17 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 	memory.written.clear();
 	memory.gpu_written.clear();
 	auto& scheduler = m_context.GetCommandScheduler();
-	if (memory.snapshot) scheduler.DeferOperation([snapshot = std::move(memory.snapshot)] {});
+	if (memory.snapshot || memory.previous) {
+		scheduler.DeferOperation([snapshot = std::move(memory.snapshot), previous = std::move(memory.previous)] {});
+	}
 	memory.fallback_draw = 0;
 	memory.fallback_valid = false;
 	for (auto& view: memory.views) {
 		view->count = std::min(view->limit, Probes(size, view->shape.first, view->shape.step));
 		view->full  = true;
 		view->pending.clear();
+		view->found.clear();
+		view->gpu_found.clear();
 		if ((size / 4u + 1u) * sizeof(uint32_t) > view->buffer->Size()) {
 			if (scheduler.Active()) {
 				scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
@@ -779,20 +968,37 @@ void ImageHeap::Service(Ring& ring) {
 	uint32_t    count = 0;
 	std::memcpy(&count, bytes, sizeof(count));
 	m_check_stats.misses += count;
-	if (count > Slots::RingCapacity) ++m_check_stats.overflows;
+	m_stats.late += count;
+	if (count > Slots::RingCapacity) {
+		++m_check_stats.overflows;
+		for (const auto& memory: m_memories) {
+			for (const auto& view: memory->views) view->full = true;
+		}
+	}
+	for (uint32_t i = 0; i < std::min(count, Slots::RingCapacity); ++i) {
+		Slots::Miss miss;
+		std::memcpy(&miss, bytes + Slots::RingHeaderBytes + i * sizeof(miss), sizeof(miss));
+		AdmitLate(miss);
+	}
 }
 
-void ImageHeap::AddBytes(View& view, uint64_t begin, uint64_t end) {
+void ImageHeap::AddBytes(View& view, uint64_t begin, uint64_t end, bool discover) {
 	const auto&    shape = view.shape;
 	const uint64_t bytes = m_profiles[shape.profile].r128 ? 16u : 32u;
 	const uint64_t first = begin < shape.first + bytes ? 0u : (begin - shape.first - bytes) / shape.step + 1u;
 	const uint64_t last  = end <= shape.first ? 0u
 	                                          : std::min<uint64_t>((end - shape.first - 1u) / shape.step + 1u,
 	                                                               view.count);
-	if (first < last) {
-		view.discover = true;
-		if (!view.full) view.pending.push_back({static_cast<uint32_t>(first), static_cast<uint32_t>(last)});
+	if (first >= last) return;
+	const Range range {static_cast<uint32_t>(first), static_cast<uint32_t>(last)};
+	if (!view.full) view.pending.push_back(range);
+	if (!discover) return;
+	view.discover = true;
+	if (view.overflowed || view.found.size() >= MaxFoundRanges) {
+		view.discover_all = true;
+		view.found.clear();
 	}
+	if (!view.discover_all) view.found.push_back(range);
 }
 
 void ImageHeap::SyncMemory(Memory& memory) {
@@ -800,6 +1006,7 @@ void ImageHeap::SyncMemory(Memory& memory) {
 	memory.prepared = m_draw;
 	auto& cache = m_context.GetBufferCache();
 	m_context.CollectHotPageWrites(memory.base, memory.size);
+	const bool unowned = !cache.IsRegionRegistered(memory.base, memory.size);
 	cache.ConsumeCpuWrites(CpuWriteConsumer::ImageHeapTables, memory.base, memory.size,
 	                       [&](uint64_t run, uint64_t bytes) {
 		                       memory.written.emplace_back(run, run + bytes);
@@ -813,6 +1020,12 @@ void ImageHeap::SyncMemory(Memory& memory) {
 		                       }
 	                       });
 	cache.EnsureRangeContents(memory.base, memory.size);
+	if (unowned && !cache.HasGpuDirtyBytes(memory.base, memory.size)) memory.cpu_bytes.Add(memory.base, memory.size);
+	for (const auto& [begin, end]: memory.written) {
+		const auto first = std::max(begin, memory.base);
+		const auto last  = std::min(end, memory.base + memory.size);
+		if (first < last && !cache.HasGpuDirtyBytes(first, last - first)) memory.cpu_bytes.Add(first, last - first);
+	}
 }
 
 void ImageHeap::UpdateProbes(Memory& memory) {
@@ -828,47 +1041,53 @@ void ImageHeap::UpdateProbes(Memory& memory) {
 	memory.gpu_written.clear();
 	if (whole || !m_runs.empty()) memory.fallback_valid = false;
 	for (const auto& view: memory.views) {
-		if (whole) view->discover = true;
+		if (whole) {
+			view->discover     = true;
+			view->discover_all = true;
+			view->found.clear();
+		}
 		if (whole || m_frame - view->filled >= RefillFrames) view->full = true;
 		if (!whole) {
 			for (const auto& [begin, end]: m_runs) {
 				const auto first = std::max(begin, memory.base);
 				const auto last  = std::min(end, memory.base + memory.size);
-				if (first < last) AddBytes(*view, first - memory.base, last - memory.base);
+				if (first < last) AddBytes(*view, first - memory.base, last - memory.base, true);
 			}
 		}
 	}
 }
 
-void ImageHeap::AppendJobs(View& view) {
+void ImageHeap::AppendJobs(View& view, uint32_t id, const std::vector<Range>* ranges) {
 	const auto& memory = view.memory;
 	const auto* mirror = m_context.GetBufferCache().GetGuestMirror();
 	Slots::Job job {.table       = memory.snapshot ? memory.snapshot->BufferDeviceAddress()
 	                                              : mirror->DeviceAddress() + (memory.base - mirror->Base()),
 	                .slots       = view.buffer->BufferDeviceAddress(),
+	                .guest       = memory.base,
 	                .table_words = static_cast<uint32_t>(memory.size / 4u),
 	                .first_word  = static_cast<uint32_t>(view.shape.first / 4u),
 	                .step_words  = static_cast<uint32_t>(view.shape.step / 4u),
 	                .count       = static_cast<uint32_t>(view.count),
 	                .profile     = view.shape.profile,
 	                .key_words   = m_profiles[view.shape.profile].r128 ? 4u : 8u,
-	                .arm_count   = std::min(view.arms, Slots::MaxArms)};
+	                .view        = id,
+	                .arm_count   = std::min(view.arms, Slots::MaxArms),
+	                .shape       = view.shape.id};
 	std::copy_n(view.shape.kind_keys.begin(), job.arm_count, job.kinds.begin());
+	if (ranges != nullptr) {
+		for (const auto& range: *ranges) {
+			job.begin = range.begin;
+			job.end   = std::min(range.end, job.count);
+			Slots::AddJob(m_jobs, m_groups, job);
+		}
+		return;
+	}
 	if (view.full) {
 		job.begin     = 0u;
 		job.end       = std::max(job.count, view.written);
 		Slots::AddJob(m_jobs, m_groups, job);
 	} else {
-		auto& ranges = view.pending;
-		std::ranges::sort(ranges, {}, &Range::begin);
-		m_ranges.clear();
-		for (const auto& range: ranges) {
-			if (!m_ranges.empty() && range.begin <= m_ranges.back().end) {
-				m_ranges.back().end = std::max(m_ranges.back().end, range.end);
-			} else {
-				m_ranges.push_back(range);
-			}
-		}
+		MergeRanges(view.pending, m_ranges, UINT32_MAX);
 		if (m_ranges.size() > MaxRangesPerView) {
 			m_ranges.front().end = m_ranges.back().end;
 			m_ranges.resize(1u);
@@ -891,7 +1110,7 @@ void ImageHeap::RecordFills(CommandBuffer& buffer) {
 		auto& memory = view->memory;
 		UpdateProbes(memory);
 		if (!view->full && view->pending.empty()) continue;
-		AppendJobs(*view);
+		AppendJobs(*view, 0u, nullptr);
 		if (view->clear) {
 			m_cleared.push_back(view);
 			view->clear = false;
@@ -1005,24 +1224,24 @@ void ImageHeap::Dispatch(CommandBuffer& buffer, Buffer* feedback) {
 		    std::memcpy(mapped, m_jobs.data(), job_bytes);
 		    std::memcpy(mapped + job_bytes, m_groups.data(), group_bytes);
 	    });
-	if (feedback == nullptr && m_check) feedback = CurrentRing().buffer.get();
+	if (feedback == nullptr) feedback = CurrentRing().buffer.get();
 	Slots::Push push {.jobs    = source->BufferDeviceAddress() + offset,
 	                  .groups  = source->BufferDeviceAddress() + offset + job_bytes,
 	                  .buckets = m_buckets->BufferDeviceAddress(),
-	                  .ring    = feedback ? feedback->BufferDeviceAddress() : 0u,
+	                  .ring    = feedback->BufferDeviceAddress(),
 	                  .used    = m_used->BufferDeviceAddress(),
 	                  .frame   = m_frame,
-	                  .ring_capacity = feedback ? Slots::RingCapacity : 0u};
+	                  .ring_capacity = Slots::RingCapacity};
 	const auto native = buffer.Handle();
 	GlobalBarrier(native, vk::PipelineStageFlagBits::eAllCommands, AnyAccess,
 	              vk::PipelineStageFlagBits::eComputeShader,
 	              vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
 	native.bindPipeline(vk::PipelineBindPoint::eCompute, m_fill_pipeline);
 	const auto total = static_cast<uint32_t>(m_groups.size());
-	for (uint32_t offset = 0; offset < total; offset += Slots::MaxGroups) {
-		push.group_offset = offset;
+	for (uint32_t first = 0; first < total; first += Slots::MaxGroups) {
+		push.group_offset = first;
 		native.pushConstants(m_fill_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-		native.dispatch(std::min(Slots::MaxGroups, total - offset), 1, 1);
+		native.dispatch(std::min(Slots::MaxGroups, total - first), 1, 1);
 	}
 	GlobalBarrier(native, vk::PipelineStageFlagBits::eComputeShader, vk::AccessFlagBits::eShaderWrite,
 	              vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
@@ -1088,6 +1307,7 @@ bool ImageHeap::StepSweep() {
 			for (uint32_t profile = 0; profile < invalidate.size(); ++profile) {
 				if (invalidate[profile]) Invalidate(profile);
 			}
+			m_capacity_changed |= !m_candidates.empty();
 			if (m_candidates.empty()) {
 				m_sweep       = Sweep::Idle;
 				m_sweep_frame = m_frame + SweepFrames;
@@ -1137,8 +1357,10 @@ void ImageHeap::PurgeDirectory() {
 			(void)m_directory.Erase(words, profile);
 		}
 	}
+	m_capacity_changed |= !m_dead.empty();
 	m_dead.clear();
 	if (m_directory.Negative() <= Slots::BucketCount / 8u) return;
+	m_capacity_changed = true;
 	m_directory.Rebuild([](const Slots::Bucket& bucket) { return (bucket.flags & Slots::NegativeFlag) == 0u; },
 	                    [&](const Slots::Bucket& bucket) {
 		                    const auto index   = bucket.value & Slots::IndexMask;
@@ -1155,7 +1377,10 @@ void ImageHeap::RecordChecks(CommandBuffer& buffer) {
 	for (auto* view: m_active) {
 		if (view->overflowed || view->checked == m_frame || m_checks.size() >= MaxChecks) continue;
 		const auto& memory = view->memory;
-		if (cache.HasGpuDirtyBytes(memory.base, memory.size)) continue;
+		if (memory.snapshot || !memory.cpu_bytes.Contains(memory.base, memory.size) ||
+		    cache.HasGpuDirtyBytes(memory.base, memory.size)) {
+			continue;
+		}
 		m_scratch.resize(memory.size / 4u);
 		if (m_scratch.empty() ||
 		    !LibKernel::Memory::TryReadBufferBacking(memory.base, m_scratch.data(), memory.size)) {
@@ -1379,13 +1604,16 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 	std::erase_if(m_changes, other);
 	std::scoped_lock lock {m_mutex};
+	const bool forgot = std::erase_if(m_remembered, [&](const Remembered& known) {
+		return address < known.base + known.size && known.base < address + size;
+	}) != 0u;
 	if (std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
 		    if (address >= memory->base + memory->size || memory->base >= address + size) {
 			    return false;
 		    }
 		    Drop(*memory);
 		    return true;
-	    }) != 0u) {
+	    }) != 0u || forgot) {
 		WatchTables();
 	}
 	if (ForEachChanged([&](uint32_t index) { Mark(index, State::Buried); })) Repoint();
@@ -1393,31 +1621,65 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 
 void ImageHeap::RunGarbageCollector() {
 	++m_frame;
+	if (std::exchange(m_capacity_changed, false)) ++m_capacity_epoch;
 	if (m_context.GetCommandScheduler().Active()) {
 		AdvanceSweep();
 		Retire();
 	}
-	std::scoped_lock lock {m_mutex};
-	if (std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
-		    memory->idle = memory->draw > m_suspend_draw ? 0u : memory->idle + 1u;
-		    if (memory->idle < (memory->size < MinTableBytes ? 1u : LargeTableIdleFrames)) {
-			    return false;
-		    }
-		    Drop(*memory);
-		    return true;
-	    }) != 0u) {
-		WatchTables();
+	{
+		std::scoped_lock lock {m_mutex};
+		bool watch = std::erase_if(m_remembered, [&](const Remembered& known) {
+			return known.frame + RememberFrames < m_frame;
+		}) != 0u;
+		watch |= std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
+			         memory->idle = memory->draw > m_suspend_draw ? 0u : memory->idle + 1u;
+			         if (memory->idle < (memory->size < MinTableBytes ? 1u : LargeTableIdleFrames)) {
+				         return false;
+			         }
+			         if (!memory->cpu_bytes.Empty()) {
+				         std::erase_if(m_remembered, [&](const Remembered& known) { return known.base == memory->base; });
+				         if (m_remembered.size() == MaxRemembered) m_remembered.erase(m_remembered.begin());
+				         m_remembered.push_back({.base      = memory->base,
+				                                 .size      = memory->size,
+				                                 .frame     = m_frame,
+				                                 .cpu_bytes = std::move(memory->cpu_bytes)});
+			         }
+			         Drop(*memory);
+			         return true;
+		         }) != 0u;
+		if (watch) WatchTables();
+		m_suspend_draw = m_draw;
 	}
-	m_suspend_draw = m_draw;
+	Report();
+}
+
+void ImageHeap::Report() {
+	if (m_frame < m_stats.reported + ReportFrames) return;
+	m_stats.reported = m_frame;
+	const auto bitmap = m_context.GetBufferCache().HeapBitmapWaits();
+	if (m_stats.cpu_discoveries + m_stats.gpu_discoveries + m_stats.fallback + m_stats.fallback_reads +
+	        m_stats.snapshot + m_stats.late + bitmap + m_check_stats.groups == 0u) {
+		return;
+	}
+	std::fprintf(stderr,
+	             "[kyty-image-heap] waits: %" PRIu64 " discovery, %" PRIu64 " bitmap, %" PRIu64 " fallback, %" PRIu64
+	             " snapshot; %" PRIu64 " cpu discoveries (%" PRIu64 " probes), %" PRIu64 " gpu discoveries (%" PRIu64
+	             " probes), %" PRIu64 " cpu fallback reads, %" PRIu64 " late misses, %" PRIu64 " replays, %" PRIu64
+	             " overflowed views, %" PRIu64 " heap groups\n",
+	             m_stats.discovery, bitmap, m_stats.fallback, m_stats.snapshot, m_stats.cpu_discoveries,
+	             m_stats.cpu_probes, m_stats.gpu_discoveries, m_stats.gpu_probes, m_stats.fallback_reads, m_stats.late,
+	             m_stats.replays, m_stats.overflows, m_check_stats.groups);
 }
 
 void ImageHeap::WatchTables() {
 	m_watched.clear();
 	for (const auto& memory: m_memories) m_watched.emplace_back(memory->base, memory->size);
+	for (const auto& known: m_remembered) m_watched.emplace_back(known.base, known.size);
 	m_context.GetBufferCache().WatchHeapTables(m_watched);
 }
 
 void ImageHeap::RetryProfile(uint32_t profile) {
+	if (m_attempt + 1u >= MaxAttempts) return;
 	m_retry |= std::ranges::any_of(m_active, [&](const View* view) { return view->shape.profile == profile; });
 }
 
@@ -1428,19 +1690,46 @@ void ImageHeap::SaveFallback(Memory& memory) {
 	auto& cache = m_context.GetBufferCache();
 	auto& scheduler = m_context.GetCommandScheduler();
 	memory.fallback.resize(memory.size / 4u);
+	memory.fallback_valid = true;
+	if (!memory.snapshot && memory.cpu_bytes.Contains(memory.base, memory.size) &&
+	    !cache.HasGpuDirtyBytes(memory.base, memory.size) &&
+	    LibKernel::Memory::TryReadBufferBacking(memory.base, memory.fallback.data(), memory.size)) {
+		++m_stats.fallback_reads;
+		return;
+	}
 	if (memory.snapshot) {
-		scheduler.Wait(memory.snapshot_tick);
+		if (!scheduler.IsFree(memory.snapshot_tick)) {
+			scheduler.Wait(memory.snapshot_tick);
+			++m_stats.snapshot;
+		}
 		memory.snapshot->Invalidate(0, memory.size);
 		std::memcpy(memory.fallback.data(), memory.snapshot->Mapped().data(), memory.size);
-	} else {
-		const auto [source, offset] = cache.ObtainRange(memory.base, memory.size, false, false, ObtainFrom::Mirror);
-		auto download = cache.GetUtilityBuffer(MemoryUsage::Download).MapDownload(memory.size, 4);
-		download.buffer->CopyFrom(scheduler.Current(), *source, offset, download.offset, memory.size);
-		scheduler.Wait(scheduler.CurrentTick());
-		download.buffer->Invalidate(download.offset, memory.size);
-		std::memcpy(memory.fallback.data(), download.mapped, memory.size);
+		return;
 	}
-	memory.fallback_valid = true;
+	const auto [source, offset] = cache.ObtainRange(memory.base, memory.size, false, false, ObtainFrom::Mirror);
+	auto download = HostBuffer(m_context, memory.size);
+	download->CopyFrom(scheduler.Current(), *source, offset, 0, memory.size);
+	scheduler.Wait(scheduler.CurrentTick());
+	++m_stats.fallback;
+	download->Invalidate(0, memory.size);
+	std::memcpy(memory.fallback.data(), download->Mapped().data(), memory.size);
+	LearnProvenance(memory, 0u, download->Mapped().first(memory.size));
+}
+
+void ImageHeap::LearnProvenance(Memory& memory, uint64_t begin, std::span<const uint8_t> bytes) {
+	auto& cache = m_context.GetBufferCache();
+	std::vector<uint8_t> guest;
+	for (uint64_t at = 0; at < bytes.size(); at += ChunkBytes) {
+		const auto length  = std::min<uint64_t>(ChunkBytes, bytes.size() - at);
+		const auto address = memory.base + begin + at;
+		guest.resize(length);
+		if (cache.HasGpuDirtyBytes(address, length) ||
+		    !LibKernel::Memory::TryReadBufferBacking(address, guest.data(), length) ||
+		    std::memcmp(guest.data(), bytes.data() + at, length) != 0) {
+			continue;
+		}
+		memory.cpu_bytes.Add(address, length);
+	}
 }
 
 bool ImageHeap::ReadFallback(uint64_t address, std::span<uint32_t> words) const {
@@ -1457,59 +1746,70 @@ bool ImageHeap::ReadFallback(uint64_t address, std::span<uint32_t> words) const 
 
 bool ImageHeap::CheckTableWrites() {
 	if (m_active.empty() && !m_have_fallback) return false;
-	m_retry |= TakeGpuWrites(true);
+	const bool changed = TakeGpuWrites(true);
+	m_retry |= changed;
+	if (m_attempt + 1u >= MaxAttempts) m_retry = false;
+	m_stats.replays += m_retry ? 1u : 0u;
 	m_keep_snapshots = m_retry;
-	m_have_snapshots |= m_retry;
+	m_have_snapshots |= changed;
 	return m_retry;
 }
 
+void ImageHeap::ApplyGpuWrite(uint64_t begin, uint64_t end, std::vector<Memory*>* changed) {
+	for (const auto& memory: m_memories) {
+		const auto first = std::max(begin, memory->base);
+		const auto last  = std::min(end, memory->base + memory->size);
+		if (first >= last) continue;
+		memory->synced = 0;
+		memory->cpu_bytes.Subtract(first, last - first);
+		if (changed != nullptr && std::ranges::find(*changed, memory.get()) == changed->end() &&
+		    (memory->fallback_draw == m_draw ||
+		     std::ranges::any_of(m_active, [&](const View* view) { return &view->memory == memory.get(); }))) {
+			changed->push_back(memory.get());
+		}
+		if (memory->gpu_written.size() >= MaxGpuRuns) {
+			memory->gpu_all = true;
+			memory->gpu_written.clear();
+			continue;
+		}
+		memory->gpu_written.emplace_back(first, last);
+	}
+	for (auto& known: m_remembered) {
+		const auto first = std::max(begin, known.base);
+		const auto last  = std::min(end, known.base + known.size);
+		if (first < last) known.cpu_bytes.Subtract(first, last - first);
+	}
+}
+
 bool ImageHeap::TakeGpuWrites(bool snapshot) {
-	std::vector<Memory*> changed;
 	auto& cache = m_context.GetBufferCache();
 	auto& scheduler = m_context.GetCommandScheduler();
-	cache.TakeHeapTableWrites([&](uint64_t begin, uint64_t end) {
-		for (const auto& memory: m_memories) {
-			const auto first = std::max(begin, memory->base);
-			const auto last  = std::min(end, memory->base + memory->size);
-			if (first >= last) continue;
-			memory->synced = 0;
-			const bool selected = memory->fallback_draw == m_draw ||
-			    std::ranges::any_of(m_active, [&](const View* view) { return &view->memory == memory.get(); });
-			if (snapshot && selected && std::ranges::find(changed, memory.get()) == changed.end()) {
-				changed.push_back(memory.get());
-			}
-			if (memory->gpu_written.size() >= MaxGpuRuns) {
-				memory->gpu_all = true;
-				memory->gpu_written.clear();
-				continue;
-			}
-			memory->gpu_written.emplace_back(first, last);
-		}
-	});
+	m_changed.clear();
+	cache.TakeHeapTableWrites([&](uint64_t begin, uint64_t end) { ApplyGpuWrite(begin, end, snapshot ? &m_changed : nullptr); });
 	bool retry = false;
-	for (auto* memory: changed) {
+	for (auto* memory: m_changed) {
+		if (memory->previous && memory->snapshot && scheduler.IsFree(memory->snapshot_tick)) {
+			memory->previous->Invalidate(0, memory->size);
+			memory->snapshot->Invalidate(0, memory->size);
+			if (std::memcmp(memory->previous->Mapped().data(), memory->snapshot->Mapped().data(), memory->size) == 0) continue;
+		}
 		const auto [source, offset] = cache.ObtainRange(memory->base, memory->size, false, false, ObtainFrom::Mirror);
 		auto latest = HostBuffer(m_context, memory->size);
 		latest->CopyFrom(scheduler.Current(), *source, offset, 0, memory->size);
-		const auto tick = scheduler.CurrentTick();
-		if (memory->snapshot) {
-			scheduler.Wait(tick);
-			latest->Invalidate(0, memory->size);
-			memory->snapshot->Invalidate(0, memory->size);
-			if (std::memcmp(latest->Mapped().data(), memory->snapshot->Mapped().data(), memory->size) == 0) continue;
-		}
-		memory->snapshot = std::move(latest);
-		memory->snapshot_tick = tick;
-		memory->fresh = true;
-		retry = true;
+		if (memory->previous) scheduler.DeferOperation([previous = std::move(memory->previous)] {});
+		memory->previous      = std::move(memory->snapshot);
+		memory->snapshot      = std::move(latest);
+		memory->snapshot_tick = scheduler.CurrentTick();
+		memory->fresh         = true;
+		retry                 = true;
 	}
 	return retry;
 }
 
 void ImageHeap::Drop(Memory& memory) {
 	auto& scheduler = m_context.GetCommandScheduler();
-	if (memory.snapshot && scheduler.Active()) {
-		scheduler.DeferOperation([snapshot = std::move(memory.snapshot)] {});
+	if ((memory.snapshot || memory.previous) && scheduler.Active()) {
+		scheduler.DeferOperation([snapshot = std::move(memory.snapshot), previous = std::move(memory.previous)] {});
 	}
 	for (auto& view: memory.views) {
 		std::erase(m_active, view.get());

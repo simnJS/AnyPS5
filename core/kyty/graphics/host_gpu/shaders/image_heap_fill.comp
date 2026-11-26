@@ -17,6 +17,7 @@ const uint GroupProbes  = 64u;
 struct Job {
 	uint64_t table;
 	uint64_t slots;
+	uint64_t guest;
 	uint     table_words;
 	uint     first_word;
 	uint     step_words;
@@ -28,7 +29,7 @@ struct Job {
 	uint     key_words;
 	uint     view;
 	uint     arm_count;
-	uint     pad;
+	uint     shape;
 	uint     kinds[MaxArms];
 };
 
@@ -41,11 +42,13 @@ struct Bucket {
 };
 
 struct Miss {
-	uint words[KeyWords];
-	uint profile;
-	uint view;
-	uint slot;
-	uint pad;
+	uint     words[KeyWords];
+	uint     profile;
+	uint     view;
+	uint     slot;
+	uint     shape;
+	uint64_t guest;
+	uint64_t pad;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Jobs {
@@ -166,7 +169,9 @@ void main() {
 				ring.v[at].profile = profile;
 				ring.v[at].view    = jobs.v[index].view;
 				ring.v[at].slot    = slot;
-				ring.v[at].pad     = 0u;
+				ring.v[at].shape   = jobs.v[index].shape;
+				ring.v[at].guest   = jobs.v[index].guest + uint64_t(slot) * 4ul;
+				ring.v[at].pad     = 0ul;
 			}
 		}
 	}

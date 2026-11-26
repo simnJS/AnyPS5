@@ -196,6 +196,7 @@ const char* CheckFill(GraphicContext& graphics, uint64_t address) {
 		const auto& table = tables[view];
 		Slots::Job  job {.table       = mirror->DeviceAddress() + address + table.offset - mirror->Base(),
 		                 .slots       = 0,
+		                 .guest       = address + table.offset,
 		                 .table_words = static_cast<uint32_t>(table.bytes / 4u),
 		                 .first_word  = first / 4u,
 		                 .step_words  = step / 4u,
@@ -203,7 +204,8 @@ const char* CheckFill(GraphicContext& graphics, uint64_t address) {
 		                 .profile     = profile,
 		                 .key_words   = key_words,
 		                 .view        = 100u + view,
-		                 .arm_count   = 2u};
+		                 .arm_count   = 2u,
+		                 .shape       = 7u + view};
 		job.kinds[0] = 1u;
 		job.kinds[1] = 2u;
 		return job;
@@ -349,10 +351,15 @@ const char* CheckFill(GraphicContext& graphics, uint64_t address) {
 				std::memcpy(&miss, reinterpret_cast<const uint8_t*>(header.data()) + Slots::RingHeaderBytes + at * sizeof(miss),
 				            sizeof(miss));
 				found.emplace_back(miss.words, miss.profile, miss.view, miss.slot);
+				const auto view = miss.view - 100u;
+				if (view >= tables.size() || miss.shape != 7u + view ||
+				    miss.guest != address + tables[view].offset + uint64_t {miss.slot} * 4u) {
+					failure = "a miss does not name the shape and guest address of its key";
+				}
 			}
 			std::ranges::sort(found);
 			std::ranges::sort(expected_misses);
-			if (found != expected_misses) failure = "the miss ring holds other misses than the CPU reference";
+			if (failure == nullptr && found != expected_misses) failure = "the miss ring holds other misses than the CPU reference";
 		}
 	}
 	if (failure == nullptr && Words(*used, 65536u) != expected_used) {

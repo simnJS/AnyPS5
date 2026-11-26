@@ -3049,7 +3049,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (dma_stage_count != 0) {
 		const bool reach_synchronized =
 		    m_context.SynchronizeDmaFootprint(std::span {dma_stages.data(), dma_stage_count});
-		m_context.PrepareBda(dma_write, !reach_synchronized, BdaWriteTracking::PageBitmap);
+		m_context.PrepareBda(dma_write, !reach_synchronized, m_context.ReachWriteTracking(reach_synchronized, dma_write));
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);

@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEHEAP_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeapSlots.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -34,7 +35,12 @@ public:
 	uint64_t FillGroups() const { return m_check_stats.groups; }
 	bool ReadFallback(uint64_t address, std::span<uint32_t> words) const override;
 	bool ReplayPending() const { return m_retry; }
-	bool TakeReplay() { return std::exchange(m_retry, false); }
+	bool TakeReplay() {
+		const bool replay = std::exchange(m_retry, false);
+		m_replaying        = replay;
+		m_attempt += replay ? 1u : 0u;
+		return replay;
+	}
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
 	bool AcquireList(const ShaderRecompiler::IR::ImageHeapList& list,
@@ -82,6 +88,7 @@ private:
 	};
 
 	enum class State : uint8_t { Live, Stale, Buried };
+	enum class Refusal : uint8_t { None, Capacity, Arms };
 	enum class Sweep : uint8_t { Idle, Snapshot, Removed, Confirm };
 
 	struct List;
@@ -110,6 +117,7 @@ private:
 		uint64_t                     step    = 0;
 		uint64_t                     first   = 0;
 		uint32_t                     profile = 0;
+		uint32_t                     id      = 0;
 		std::vector<uint32_t>        kind_keys;
 		std::vector<DescriptorValue> kinds;
 	};
@@ -130,12 +138,17 @@ private:
 		uint32_t                written = 0;
 		uint32_t                filled  = 0;
 		uint32_t                checked = 0;
+		uint32_t                overflow_epoch = 0;
 		std::unique_ptr<Buffer> buffer;
 		std::vector<Range>      pending;
-		bool                    full       = true;
-		bool                    clear      = true;
-		bool                    discover   = true;
-		bool                    overflowed = false;
+		std::vector<Range>      found;
+		std::vector<Range>      gpu_found;
+		bool                    full         = true;
+		bool                    clear        = true;
+		bool                    discover     = true;
+		bool                    discover_all = true;
+		bool                    overflowed   = false;
+		bool                    capacity     = false;
 	};
 
 	struct Memory {
@@ -148,13 +161,22 @@ private:
 		bool                                       gpu_all = false;
 		bool                                       fresh   = true;
 		std::unique_ptr<Buffer>                    snapshot;
+		std::unique_ptr<Buffer>                    previous;
 		uint64_t                                   snapshot_tick = 0;
+		RangeSet                                   cpu_bytes;
 		uint64_t                                   fallback_draw = 0;
 		bool                                       fallback_valid = false;
 		std::vector<uint32_t>                      fallback;
 		std::vector<std::pair<uint64_t, uint64_t>> written;
 		std::vector<std::pair<uint64_t, uint64_t>> gpu_written;
 		std::vector<std::unique_ptr<View>>         views;
+	};
+
+	struct Remembered {
+		uint64_t base  = 0;
+		uint64_t size  = 0;
+		uint32_t frame = 0;
+		RangeSet cpu_bytes;
 	};
 
 	struct List {
@@ -180,6 +202,21 @@ private:
 		std::vector<uint32_t>   expected;
 	};
 
+	struct WaitStats {
+		uint64_t discovery       = 0;
+		uint64_t fallback        = 0;
+		uint64_t snapshot        = 0;
+		uint64_t cpu_discoveries = 0;
+		uint64_t cpu_probes      = 0;
+		uint64_t gpu_discoveries = 0;
+		uint64_t gpu_probes      = 0;
+		uint64_t late            = 0;
+		uint64_t replays         = 0;
+		uint64_t overflows       = 0;
+		uint64_t fallback_reads  = 0;
+		uint32_t reported        = 0;
+	};
+
 	struct CheckStats {
 		uint64_t views      = 0;
 		uint64_t slots      = 0;
@@ -196,8 +233,15 @@ private:
 	Shape&   FindShape(uint64_t step, uint64_t first, uint32_t profile);
 	Shape&   ListShape(uint32_t profile);
 	void     Discover(View& view);
-	void     Admit(View& view, const ImageHeapSlots::KeyWordArray& words);
-	void     AppendJobs(View& view);
+	void     DiscoverOnGpu(Memory& memory);
+	Refusal  Admit(View& view, const ImageHeapSlots::KeyWordArray& words);
+	Refusal  AdmitKey(Shape& shape, const ImageHeapSlots::KeyWordArray& words);
+	void     Refuse(View& view, Refusal refusal);
+	void     AdmitLate(const ImageHeapSlots::Miss& miss);
+	void     ApplyGpuWrite(uint64_t begin, uint64_t end, std::vector<Memory*>* changed);
+	void     LearnProvenance(Memory& memory, uint64_t begin, std::span<const uint8_t> bytes);
+	void     Report();
+	void     AppendJobs(View& view, uint32_t id, const std::vector<Range>* ranges);
 	void     AdvanceSweep();
 	void     RetryProfile(uint32_t profile);
 	void     SaveFallback(Memory& memory);
@@ -233,7 +277,7 @@ private:
 	void     Service(Ring& ring);
 	void     SyncMemory(Memory& memory);
 	void     UpdateProbes(Memory& memory);
-	void     AddBytes(View& view, uint64_t begin, uint64_t end);
+	void     AddBytes(View& view, uint64_t begin, uint64_t end, bool discover);
 	void     RecordFills(CommandBuffer& buffer);
 	void     PrepareGpu(CommandBuffer& buffer);
 	void     FlushDirectory(CommandBuffer& buffer);
@@ -248,7 +292,9 @@ private:
 	RenderContext&                                                      m_context;
 	std::mutex                                                          m_mutex;
 	std::vector<std::unique_ptr<Memory>>                                m_memories;
+	std::vector<Remembered>                                             m_remembered;
 	std::unordered_map<ShapeKey, std::unique_ptr<Shape>, ShapeKeyHash> m_shapes;
+	std::vector<Shape*>                                                 m_shape_ids;
 	std::unordered_map<uint32_t, std::unique_ptr<Shape>>               m_list_shapes;
 	std::unordered_map<ListKey, List, ListKeyHash>                      m_lists;
 	std::vector<View*>                                                  m_active;
@@ -257,6 +303,9 @@ private:
 	uint64_t                                                            m_admission_draw = 0;
 	uint64_t                                                            m_suspend_draw = 0;
 	uint32_t                                                            m_frame        = 1;
+	uint32_t                                                            m_attempt      = 0;
+	uint32_t                                                            m_capacity_epoch = 0;
+	bool                                                                m_capacity_changed = false;
 	std::vector<ShaderRecompiler::IR::ImageResource>                    m_profiles;
 	std::vector<bool>                                                   m_table_profiles;
 	std::vector<uint32_t>                                               m_key_profiles;
@@ -286,6 +335,9 @@ private:
 	std::vector<uint32_t>                                               m_groups;
 	std::vector<View*>                                                  m_cleared;
 	std::vector<Range>                                                  m_ranges;
+	std::vector<View*>                                                  m_batch;
+	std::vector<Memory*>                                                m_changed;
+	RangeSet                                                            m_bitmap_writes;
 	std::unique_ptr<Buffer>                                             m_discovery_ring;
 	std::deque<Ring>                                                    m_rings;
 	std::vector<std::unique_ptr<Buffer>>                                m_free_rings;
@@ -303,11 +355,13 @@ private:
 	std::vector<uint32_t>                                               m_stamps;
 	bool                                                                m_check = false;
 	bool                                                                m_retry = false;
+	bool                                                                m_replaying = false;
 	bool                                                                m_keep_snapshots = false;
 	bool                                                                m_have_snapshots = false;
 	bool                                                                m_have_fallback = false;
 	std::deque<Check>                                                   m_checks;
 	CheckStats                                                          m_check_stats;
+	WaitStats                                                           m_stats;
 	vk::DescriptorSetLayout                                             m_layout = nullptr;
 	vk::DescriptorPool                                                  m_pool   = nullptr;
 	vk::DescriptorSet                                                   m_set    = nullptr;

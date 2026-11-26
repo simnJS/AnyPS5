@@ -1308,22 +1308,30 @@ void BufferCache::CacheFaultedMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::BeginHeapDraw() {
-	m_heap_bitmap_ready |= std::exchange(m_heap_shader_bitmap, false);
+	if (!m_heap_bitmap_pending.Empty()) {
+		m_heap_bitmap_pending.ForEach([&](uint64_t begin, uint64_t end) { m_heap_bitmap_ready.Add(begin, end - begin); });
+		m_heap_bitmap_pending.Clear();
+	}
 	if (m_heap_shader_writes.Empty()) return;
 	m_heap_shader_writes.ForEach([&](uint64_t begin, uint64_t end) { m_heap_table_writes.Add(begin, end - begin); });
 	m_heap_shader_writes.Clear();
 }
 
-void BufferCache::CollectHeapWritePages() {
-	if (!std::exchange(m_heap_bitmap_ready, false) || m_heap_tables.Empty()) return;
+void BufferCache::CollectHeapWritePages(RangeSet& written) {
+	if (m_heap_bitmap_ready.Empty()) return;
+	if (m_heap_tables.Empty()) {
+		m_heap_bitmap_ready.Clear();
+		return;
+	}
 	RangeSet words;
-	m_heap_tables.ForEach([&](uint64_t begin, uint64_t end) {
+	m_heap_bitmap_ready.ForEach([&](uint64_t begin, uint64_t end) {
 		const auto packed = begin >= LibKernel::Memory::kExtendedMemoryBase
 		                        ? begin - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE : begin;
 		const auto first = packed / (32 * CACHING_PAGESIZE);
 		const auto last = (packed + (end - begin) - 1u) / (32 * CACHING_PAGESIZE);
 		words.Add(first * 4u, (last - first + 1u) * 4u);
 	});
+	m_heap_bitmap_ready.Clear();
 	uint64_t bytes = 0;
 	std::vector<vk::BufferCopy> copies;
 	words.ForEach([&](uint64_t begin, uint64_t end) {
@@ -1345,6 +1353,7 @@ void BufferCache::CollectHeapWritePages() {
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
 	                       {}, 1, &after, 0, nullptr, 0, nullptr);
 	m_scheduler.Wait(m_scheduler.CurrentTick());
+	++m_heap_bitmap_waits;
 	download.buffer->Invalidate(download.offset, bytes);
 	std::vector<uint64_t> consumed;
 	for (const auto& copy: copies) {
@@ -1359,7 +1368,7 @@ void BufferCache::CollectHeapWritePages() {
 				consumed.push_back(address);
 				m_heap_tables.ForEachInRange(address, CACHING_PAGESIZE, [&](uint64_t begin, uint64_t end) {
 					hit = true;
-					m_heap_table_writes.Add(begin, end - begin);
+					written.Add(begin, end - begin);
 				});
 				bits &= bits - 1u;
 			}

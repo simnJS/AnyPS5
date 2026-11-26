@@ -235,7 +235,9 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	if (!Libs::LibKernel::Memory::TryWriteBacking(address, words.data(), sizeof(words))) return "CPU table write failed";
 	buffers.InvalidateMemory(address, sizeof(words));
 	heap.BeginDraw();
+	const auto cpu_tick = scheduler.CurrentTick();
 	if (!heap.Acquire(cpu_request, empty_view) || empty_view.kinds.size() != 1) return "CPU writes did not rearm an empty view";
+	if (scheduler.CurrentTick() != cpu_tick) return "a CPU-written table waited for the GPU queue";
 	heap.Rebind(renderer.GetRenderExecutor());
 	if (heap.CheckTableWrites()) return "CPU discovery required a second draw";
 	heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
@@ -273,10 +275,14 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 				};
 				write_again();
 				if (!heap.CheckTableWrites() || !heap.TakeReplay()) return std::vector<uint32_t> {};
-				heap.BeginDraw();
-				if (!heap.Acquire(request, view)) return std::vector<uint32_t> {};
-				heap.Rebind(renderer.GetRenderExecutor());
-				write_again();
+				for (int attempt = 2;; ++attempt) {
+					heap.BeginDraw();
+					if (!heap.Acquire(request, view)) return std::vector<uint32_t> {};
+					heap.Rebind(renderer.GetRenderExecutor());
+					write_again();
+					if (!heap.CheckTableWrites()) break;
+					if (attempt == 4 || !heap.TakeReplay()) return std::vector<uint32_t> {};
+				}
 			}
 		}
 		if (heap.CheckTableWrites()) return std::vector<uint32_t> {};
@@ -322,10 +328,72 @@ const char* CheckHeapConsumer(RenderContext& renderer, uint64_t address, Address
 	if (bitmap_hit.empty() || bitmap_hit[0] != novel[0]) return "the written page did not reach its first consumer";
 	renderer.PrepareBda(true, false, BdaWriteTracking::PageBitmap);
 	heap.BeginDraw();
-	buffers.CollectHeapWritePages();
-	bool dirty = false;
+	RangeSet collected;
+	buffers.CollectHeapWritePages(collected);
+	bool dirty = !collected.Empty();
 	buffers.TakeHeapTableWrites([&](uint64_t, uint64_t) { dirty = true; });
 	if (dirty) return "a consumed page bit invalidated the table again";
+	buffers.NoteHeapShaderWrites(address + 4u * BufferCache::CACHING_PAGESIZE, BufferCache::CACHING_PAGESIZE);
+	heap.BeginDraw();
+	if (buffers.HeapBitmapReady(address, sizeof(words))) return "a writer whose reach misses the table flagged it";
+	const auto reach_bytes = buffers.HeapBitmapBytes();
+	const auto reach = consume(0);
+	if (reach != bitmap_hit || buffers.HeapBitmapBytes() != reach_bytes) {
+		return "a writer whose reach misses the table made its consumer read the bitmap";
+	}
+	if (renderer.ReachWriteTracking(false, true) != BdaWriteTracking::PageBitmap) {
+		return "an unknown reach did not fall back to the page bitmap";
+	}
+	buffers.NoteHeapShaderWrites();
+	heap.BeginDraw();
+	const auto collect_tick = scheduler.CurrentTick();
+	buffers.ProcessWriteBuffer([](std::span<const uint64_t>) {});
+	if (scheduler.CurrentTick() != collect_tick) return "the frame collection of the write bitmap waited for the GPU queue";
+	bool converted = false;
+	buffers.TakeHeapTableWrites([&](uint64_t begin, uint64_t end) { converted |= begin <= address && address + sizeof(words) <= end; });
+	if (!converted || buffers.HeapBitmapReady(address, sizeof(words))) {
+		return "the frame collection dropped a pending bitmap check of a table";
+	}
+	{
+		heap.BeginDraw();
+		const auto [noted, noted_at] = buffers.ObtainRange(address, sizeof(uint32_t), true);
+		noted->Fill(noted_at, sizeof(uint32_t), first);
+		IR::ImageHeapView view;
+		if (!heap.Acquire(request, view)) return "could not prepare an unannounced mirror write";
+		heap.Rebind(renderer.GetRenderExecutor());
+		constexpr uint32_t fourth = 0x40000;
+		const auto [unannounced, at] = buffers.ObtainRange(address, sizeof(words), false, false, ObtainFrom::Mirror);
+		unannounced->Fill(at, sizeof(uint32_t), fourth);
+		if (heap.CheckTableWrites()) return "an unannounced mirror write replayed the draw";
+		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+		Finish(scheduler);
+		const auto served = consume(0);
+		if (served.empty() || served[0] == 0u || served[0] == initial[0] || served[0] == initial[8] ||
+		    served[0] == novel[0] || served[8] != initial[8]) {
+			return "a key missed by the in-stream fill was not served at its next draw";
+		}
+	}
+	{
+		const auto other = address + 0x1000u;
+		renderer.MapMemory(other, sizeof(words));
+		if (!Libs::LibKernel::Memory::TryWriteBacking(other, words.data(), sizeof(words))) return "second CPU table write failed";
+		buffers.InvalidateMemory(other, sizeof(words));
+		auto other_request = request;
+		other_request.base = other;
+		IR::ImageHeapView view;
+		heap.BeginDraw();
+		const auto first_tick = scheduler.CurrentTick();
+		if (!heap.Acquire(other_request, view) || view.kinds.size() != 1 || scheduler.CurrentTick() != first_tick) {
+			return "a new CPU table was not discovered without waiting";
+		}
+		heap.RunGarbageCollector();
+		heap.RunGarbageCollector();
+		heap.BeginDraw();
+		const auto again_tick = scheduler.CurrentTick();
+		if (!heap.Acquire(other_request, view) || scheduler.CurrentTick() != again_tick) {
+			return "a CPU table taken up again after the collector waited for the GPU queue";
+		}
+	}
 	const auto bytes = buffers.GetUtilityBuffer(MemoryUsage::Stream).Size() + sizeof(uint32_t);
 	const auto tick  = scheduler.CurrentTick();
 	const auto [large, start] = buffers.UploadHeapData(bytes, [&](uint8_t* mapped, uint64_t) {

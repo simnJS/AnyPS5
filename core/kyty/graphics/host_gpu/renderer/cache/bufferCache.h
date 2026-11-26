@@ -198,7 +198,8 @@ public:
 	void               ProcessUseBuffer();
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
 		BeginHeapDraw();
-		CollectHeapWritePages();
+		m_heap_bitmap_ready.ForEach([&](uint64_t begin, uint64_t end) { m_heap_table_writes.Add(begin, end - begin); });
+		m_heap_bitmap_ready.Clear();
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
 	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
@@ -215,8 +216,8 @@ public:
 	void WatchHeapTables(std::span<const std::pair<uint64_t, uint64_t>> tables) {
 		m_heap_tables.Clear();
 		if (tables.empty()) {
-			m_heap_shader_bitmap = false;
-			m_heap_bitmap_ready = false;
+			m_heap_bitmap_pending.Clear();
+			m_heap_bitmap_ready.Clear();
 			m_heap_shader_writes.Clear();
 		}
 		for (const auto& [base, size]: tables) {
@@ -231,10 +232,23 @@ public:
 			});
 		}
 	}
-	void NoteHeapShaderWrites() noexcept { m_heap_shader_bitmap = !m_heap_tables.Empty(); }
+	void NoteHeapShaderWrites() {
+		m_heap_tables.ForEach([&](uint64_t begin, uint64_t end) { m_heap_bitmap_pending.Add(begin, end - begin); });
+	}
+	void NoteHeapShaderWrites(uint64_t vaddr, uint64_t size) {
+		if (!m_heap_tables.Empty() && size != 0) {
+			m_heap_tables.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
+				m_heap_bitmap_pending.Add(begin, end - begin);
+			});
+		}
+	}
+	[[nodiscard]] bool HeapBitmapReady(uint64_t vaddr, uint64_t size) const {
+		return !m_heap_bitmap_ready.Empty() && m_heap_bitmap_ready.Intersects(vaddr, size);
+	}
 	void BeginHeapDraw();
-	void CollectHeapWritePages();
+	void CollectHeapWritePages(RangeSet& written);
 	uint64_t HeapBitmapBytes() const noexcept { return m_heap_bitmap_bytes; }
+	uint64_t HeapBitmapWaits() const noexcept { return m_heap_bitmap_waits; }
 	template <typename Func>
 	void TakeHeapTableWrites(Func&& func) {
 		if (std::exchange(m_heap_writes_unbounded, false)) {
@@ -462,9 +476,10 @@ private:
 	RangeSet                                          m_heap_tables;
 	RangeSet                                          m_heap_table_writes;
 	RangeSet                                          m_heap_shader_writes;
-	bool                                              m_heap_shader_bitmap = false;
-	bool                                              m_heap_bitmap_ready = false;
+	RangeSet                                          m_heap_bitmap_pending;
+	RangeSet                                          m_heap_bitmap_ready;
 	uint64_t                                          m_heap_bitmap_bytes = 0;
+	uint64_t                                          m_heap_bitmap_waits = 0;
 	bool                                              m_heap_writes_unbounded = false;
 	static constexpr size_t                           StaleRingSize = 32;
 	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};

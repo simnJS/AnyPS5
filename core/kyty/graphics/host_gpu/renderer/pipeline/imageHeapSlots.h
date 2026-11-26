@@ -40,6 +40,7 @@ static_assert(sizeof(Bucket) == 48u);
 struct Job {
 	uint64_t                      table       = 0;
 	uint64_t                      slots       = 0;
+	uint64_t                      guest       = 0;
 	uint32_t                      table_words = 0;
 	uint32_t                      first_word  = 0;
 	uint32_t                      step_words  = 0;
@@ -51,19 +52,21 @@ struct Job {
 	uint32_t                      key_words   = 0;
 	uint32_t                      view        = 0;
 	uint32_t                      arm_count   = 0;
-	uint32_t                      pad         = 0;
+	uint32_t                      shape       = 0;
 	std::array<uint32_t, MaxArms> kinds {};
 };
-static_assert(sizeof(Job) == 96u);
+static_assert(sizeof(Job) == 104u);
 
 struct Miss {
 	KeyWordArray words {};
 	uint32_t     profile = 0;
 	uint32_t     view    = 0;
 	uint32_t     slot    = 0;
-	uint32_t     pad     = 0;
+	uint32_t     shape   = 0;
+	uint64_t     guest   = 0;
+	uint64_t     pad     = 0;
 };
-static_assert(sizeof(Miss) == 48u);
+static_assert(sizeof(Miss) == 64u);
 
 inline constexpr uint64_t RingHeaderBytes = 16u;
 inline constexpr uint64_t RingBytes       = RingHeaderBytes + uint64_t {RingCapacity} * sizeof(Miss);

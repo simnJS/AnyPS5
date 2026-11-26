@@ -587,7 +587,9 @@ void RenderExecutor::DispatchDirectOnce(CommandBuffer& buffer, uint32_t thread_g
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
 			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized, BdaWriteTracking::PageBitmap);
+			const bool address_writes = MayWriteThroughDeviceAddresses(program);
+			m_context.PrepareBda(address_writes, !reach_synchronized,
+			                     m_context.ReachWriteTracking(reach_synchronized, address_writes));
 			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}
@@ -966,7 +968,9 @@ void RenderExecutor::DispatchIndirectThreadsOnce(CommandBuffer& buffer, uint64_t
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
 		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized, BdaWriteTracking::PageBitmap);
+		const bool address_writes = MayWriteThroughDeviceAddresses(program);
+		m_context.PrepareBda(address_writes, !reach_synchronized,
+		                     m_context.ReachWriteTracking(reach_synchronized, address_writes));
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			m_context.GetBufferCache().RequestFlushForReadbacks();
 		}
@@ -1109,7 +1113,9 @@ void RenderExecutor::DispatchIndirectOnce(CommandBuffer& buffer, uint64_t args_a
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
 			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized, BdaWriteTracking::PageBitmap);
+			const bool address_writes = MayWriteThroughDeviceAddresses(program);
+			m_context.PrepareBda(address_writes, !reach_synchronized,
+			                     m_context.ReachWriteTracking(reach_synchronized, address_writes));
 			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}
