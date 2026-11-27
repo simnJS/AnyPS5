@@ -1069,13 +1069,14 @@ target_link_libraries(kyty_shim_cross_queue_order_tests PRIVATE libzstd_static)
 set_target_properties(kyty_shim_cross_queue_order_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_host_test_executable(kyty_shim_cross_queue_order_tests)
 add_dependencies(kyty_shim_cross_queue_order_tests agc_frame_replay)
-foreach(scenario compute_waits_graphics_data graphics_waits_compute_data dma_wait generated_command_buffer)
+foreach(scenario compute_waits_graphics_data graphics_waits_compute_data dma_wait generated_command_buffer
+        compute_waits_graphics_clock recycled_label)
     add_test(NAME kyty_shim_cross_queue_${scenario}
             COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> ${scenario})
     set_tests_properties(kyty_shim_cross_queue_${scenario} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
             LABELS "cross_queue_order" PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_${scenario}: ok")
 endforeach()
-foreach(scenario compute_waits_graphics_clock graphics_waits_compute_clock recycled_label early_label)
+foreach(scenario graphics_waits_compute_clock early_label)
     add_test(NAME kyty_shim_cross_queue_${scenario}
             COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> ${scenario})
     set_tests_properties(kyty_shim_cross_queue_${scenario} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
@@ -1085,8 +1086,8 @@ endforeach()
 add_test(NAME kyty_shim_cross_queue_recycled_label_own_tick
         COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> recycled_label)
 set_tests_properties(kyty_shim_cross_queue_recycled_label_own_tick PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
-        LABELS "cross_queue_order;expected_failure" ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0"
-        PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_recycled_label: order broken: ")
+        LABELS "cross_queue_order" ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0"
+        PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_recycled_label: ok")
 if(WIN32)
     set_property(TEST kyty_shim_buffer_null_range kyty_shim_uniform_scalar_replay kyty_shim_empty_buffer_replay
             kyty_shim_empty_buffer_replay_off kyty_shim_bda_load_forms
