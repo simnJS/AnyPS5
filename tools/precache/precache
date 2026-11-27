@@ -226,7 +226,7 @@ def excluded_device(policy_path, cache):
                     if match and match[1] in denied:
                         return key
     header = bytes.fromhex(policy['shader_header'])
-    if len(header) != 26:
+    if len(header) not in (26, 34, 37):
         raise ValueError('invalid shader store header in driver exclusion policy')
     decompress = zstd_decoder()
     for store in cache.glob('*.shaders'):
