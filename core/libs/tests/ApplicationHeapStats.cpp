@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 namespace {
+// storage buffer used by the heap stats test
 
 alignas(64) std::array<std::byte, 256> storage{};
 unsigned statsCalls = 0;
