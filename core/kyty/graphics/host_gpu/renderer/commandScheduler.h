@@ -78,7 +78,7 @@ public:
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
-	using SubmitHook = void (*)(void* userdata, CommandBuffer& command);
+	using SubmitHook = void (*)(void* userdata, CommandBuffer& command, SubmitInfo& submit);
 	void SetSubmitHook(SubmitHook hook, void* userdata) noexcept {
 		m_submit_hook      = hook;
 		m_submit_hook_data = userdata;
@@ -184,7 +184,6 @@ private:
 	std::atomic<bool>           m_flips_pending {false};
 	bool                        m_flip_running KYTY_GUARDED_BY(m_flip_mutex) = false;
 	uint64_t                    m_last_flip_tick = 0;
-	bool                        m_flips_in_place = false;
 	std::once_flag              m_flip_thread_once;
 	std::jthread                m_flip_thread;
 #endif

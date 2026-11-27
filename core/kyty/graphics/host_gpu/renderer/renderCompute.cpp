@@ -86,7 +86,7 @@ static bool PrepareSelfSizedBuffers(RenderContext& context, const ShaderStageRun
 	if (stage.module->info.info.self_sized_buffers.empty() || !context.CacheSelfSizedBuffers(stage)) {
 		return false;
 	}
-	context.GetIndirectWriteTables().NotePendingWrites();
+	context.GetIndirectWriteTables().TrackWriteBitmap();
 	return true;
 }
 
@@ -374,7 +374,7 @@ static void CacheDmaBases(RenderContext& context, const ShaderStageRuntime& stag
 		const auto base = low | uint64_t {high} << 32u;
 		for (uint64_t index = 0; index <= 2; ++index) {
 			const auto page = base + index * BufferCache::CACHING_PAGESIZE;
-			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+			if (context.IsMapped(page, 1)) context.GetBufferCache().RequestDeviceRange(page, 1);
 		}
 	};
 	const auto& info = stage.module->info.info;
@@ -634,8 +634,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		if (program.info.uses_dma) {
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
-			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+			m_context.PrepareShaderBda(std::span {&dma_stage, 1}, MayWriteThroughDeviceAddresses(program));
 		}
 		PrepareRayQuery(m_context, input_info.stage, bindings);
 		if (program.info.uses_image_heap) {
@@ -1028,8 +1027,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+		m_context.PrepareShaderBda(std::span {&dma_stage, 1}, MayWriteThroughDeviceAddresses(program));
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
 	if (program.info.uses_image_heap) {
@@ -1040,7 +1038,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	constexpr uint64_t ArgsSize = 3 * sizeof(uint32_t);
 	const auto shared_groups = BindIndirectSharedMemory(m_context, input_info, bindings);
 	const auto [args_buffer, args_offset] =
-	    m_context.GetBufferCache().ObtainBuffer(args_addr, ArgsSize, false);
+	    m_context.GetBufferCache().ObtainRange(args_addr, ArgsSize, false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	m_context.GetOcclusionQueries().WriteForReaders();
@@ -1156,8 +1154,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		if (program.info.uses_dma) {
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
-			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+			m_context.PrepareShaderBda(std::span {&dma_stage, 1}, MayWriteThroughDeviceAddresses(program));
 		}
 		PrepareRayQuery(m_context, input_info.stage, bindings);
 		uint32_t shared_groups = 0;
@@ -1173,7 +1170,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			m_context.GetImageHeap().Rebind(*this);
 		}
 		RebindImages(bindings);
-		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainRange(
 		    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 		EXIT_IF((args_offset & 3u) != 0);
 		RebindBuffers(bindings);

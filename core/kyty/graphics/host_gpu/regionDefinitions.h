@@ -4,6 +4,7 @@
 #include "common/bitArray.h"
 #include "common/common.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/guestMappingSpace.h"
 
 #include <compare>
 
@@ -21,11 +22,7 @@ struct GuestRange {
 
 	[[nodiscard]] constexpr bool Empty() const noexcept { return address == 0 && size == 0; }
 	[[nodiscard]] constexpr bool Valid() const noexcept {
-		if (address == 0 || size == 0) return false;
-		if (address < LOWER_ADDRESS_SIZE) return size <= LOWER_ADDRESS_SIZE - address;
-		constexpr auto base = LibKernel::Memory::kExtendedMemoryBase;
-		constexpr auto length = LibKernel::Memory::kExtendedMemorySize;
-		return address >= base && address - base < length && size <= length - (address - base);
+		return ClassifyGuestMapping(address, size) == GuestMappingSpace::Gpu;
 	}
 	[[nodiscard]] constexpr bool     ValidOrEmpty() const noexcept { return Empty() || Valid(); }
 	[[nodiscard]] constexpr uint64_t End() const noexcept { return address + size; }
@@ -33,8 +30,8 @@ struct GuestRange {
 };
 
 enum class DirtySource { Cpu, Gpu };
-enum class CpuWriteConsumer : uint32_t { IndirectWriteTables, BufferTables };
-constexpr size_t CPU_WRITE_CONSUMERS = 2;
+enum class CpuWriteConsumer : uint32_t { IndirectWriteTables, BufferTables, ImageHeapTables };
+constexpr size_t CPU_WRITE_CONSUMERS = 3;
 using RegionBits = Common::BitArray<TRACKER_REGION_PAGES>;
 static_assert(sizeof(RegionBits) == TRACKER_REGION_PAGES / 8);
 

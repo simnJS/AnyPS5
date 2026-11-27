@@ -114,7 +114,7 @@ constexpr uint64_t ReadbackSize    = ReadbackUsed + uint64_t {SlotCapacity} * 4;
 
 constexpr uint32_t HeaderInState = 0xffffffffu;
 
-constexpr uint32_t WalkBindings = 2;
+constexpr uint32_t WalkBindings = 1;
 
 struct TlasPush {
 	uint64_t user_ptr_va;
@@ -1664,8 +1664,8 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 		for (const auto* buffer: {m_table.get(), m_slots.get(), m_context_table.get()}) {
 			command.fillBuffer(buffer->Handle(), 0, buffer->Size(), 0);
 		}
-		UpdateBuffer(command, *m_upload, m_buffer_cache.GetBdaPageTableBuffer()->Handle(),
-		             BufferCache::NATIVE_RT_CONTEXT_PAGE * sizeof(uint64_t), &m_context_address,
+		UpdateBuffer(command, *m_upload, m_buffer_cache.GetFaultBuffer()->Handle(),
+		             BufferCache::RT_CONTEXT_OFFSET, &m_context_address,
 		             sizeof(m_context_address));
 	}
 	const auto forget = [&](uint32_t table_index) {
@@ -1727,11 +1727,9 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	}
 
 	m_buffer_cache.PrepareFaultBuffer();
-	auto*       page_table   = m_buffer_cache.GetBdaPageTableBuffer();
 	const auto* fault_buffer = m_buffer_cache.GetFaultBuffer();
 	const std::array<vk::DescriptorBufferInfo, WalkBindings> infos {{
-	    {page_table->Handle(), 0, page_table->Size()},
-	    {fault_buffer->Handle(), 0, BufferCache::WRITE_BITMAP_OFFSET},
+	    {fault_buffer->Handle(), 0, fault_buffer->Size()},
 	}};
 	std::array<vk::WriteDescriptorSet, WalkBindings> writes {};
 	for (uint32_t i = 0; i < WalkBindings; i++) {
@@ -2051,13 +2049,13 @@ void RayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t input_va
 	              vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
 	              vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
-	auto* page_table = m_buffer_cache.GetBdaPageTableBuffer();
-	const vk::DescriptorBufferInfo page_info {page_table->Handle(), 0, page_table->Size()};
+	auto* fault_buffer = m_buffer_cache.GetFaultBuffer();
+	const vk::DescriptorBufferInfo fault_info {fault_buffer->Handle(), 0, fault_buffer->Size()};
 	vk::WriteDescriptorSet write {};
 	write.dstBinding      = 0;
 	write.descriptorCount = 1;
 	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
-	write.pBufferInfo     = &page_info;
+	write.pBufferInfo     = &fault_info;
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_hle_tlas_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_hle_tlas_layout, 0, 1, &write);
 	const HleTlasPush push {input_va,
@@ -2280,13 +2278,13 @@ void RayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const 
 			done += chunk;
 		}
 	};
-	auto* page_table = m_buffer_cache.GetBdaPageTableBuffer();
-	const vk::DescriptorBufferInfo page_info {page_table->Handle(), 0, page_table->Size()};
+	auto* fault_buffer = m_buffer_cache.GetFaultBuffer();
+	const vk::DescriptorBufferInfo fault_info {fault_buffer->Handle(), 0, fault_buffer->Size()};
 	vk::WriteDescriptorSet write {};
 	write.dstBinding      = 0;
 	write.descriptorCount = 1;
 	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
-	write.pBufferInfo     = &page_info;
+	write.pBufferInfo     = &fault_info;
 	const auto jobs = m_hle_jobs->BufferDeviceAddress();
 	const auto pass = [&](std::span<const HleRefitGeometry> batch_geometries, std::span<const uint64_t> batch_blases) {
 		const uint64_t geometry_bytes = uint64_t {HleRefitGeometryStride} * batch_geometries.size();

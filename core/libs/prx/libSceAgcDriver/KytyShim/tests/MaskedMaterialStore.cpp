@@ -212,7 +212,7 @@ void SyntheticPlan() {
 
 int Gpu() {
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* reason = gpu.Initialize()) {
+	if (const auto* reason = gpu.Initialize(false, true)) {
 		std::fprintf(stderr, "masked material STORE GPU unavailable: %s\n", reason);
 		return std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr ? 1 : 77;
 	}

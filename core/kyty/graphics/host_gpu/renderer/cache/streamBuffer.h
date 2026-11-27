@@ -38,15 +38,21 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+class GuestMirror;
+
+struct MirrorWindow {
+	vk::Buffer        buffer  = nullptr;
+	vk::DeviceAddress address = 0;
+	uint64_t          base    = 0;
+	const GuestMirror* mirror = nullptr;
+};
+
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
-	       vk::Buffer imported, vk::DeviceAddress device_address);
-	struct SparseResident {};
-	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseResident sparse, vk::BufferUsageFlags flags,
-	       uint64_t size);
+	       MirrorWindow mirror);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -58,41 +64,33 @@ public:
 	[[nodiscard]] bool               IsDeviceLocal() const noexcept { return m_device_local; }
 #endif
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
-	[[nodiscard]] bool               InPlace() const noexcept { return m_in_place; }
-	[[nodiscard]] bool               IsSparseResident() const noexcept { return m_sparse_block != 0; }
+	[[nodiscard]] bool               IsWindow() const noexcept { return m_window; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
+	[[nodiscard]] uint64_t           HandleOffset() const noexcept { return m_handle_offset; }
+	[[nodiscard]] uint64_t           GuestAddress(uint64_t offset) const noexcept;
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
 		EXIT_IF(m_device_address == 0);
 		return m_device_address;
 	}
-	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
-		return address - m_cpu_address;
+	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept;
+	[[nodiscard]] bool HoldsOffsets(uint64_t offset, uint64_t size) const noexcept {
+		return offset >= m_handle_offset && size <= Size() && offset - m_handle_offset <= Size() - size;
 	}
-	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept {
-		return address >= m_cpu_address && size <= Size() &&
-		       address - m_cpu_address <= Size() - size;
+	[[nodiscard]] uint64_t Capacity(uint64_t offset) const noexcept {
+		return HoldsOffsets(offset, 0) ? Size() - (offset - m_handle_offset) : 0;
 	}
-	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
-	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
+	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
 	              uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
-	void Commit(uint64_t offset, uint64_t size);
-
-	bool   is_deleted   = false;
-	int    stream_score = 0;
-	size_t lru_id       = 0;
-	bool device_address_pinned = false;
-	bool in_place_refused      = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
 private:
-	void Create(vk::BufferUsageFlags flags);
 	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
@@ -101,21 +99,19 @@ private:
 	CommandScheduler*             m_scheduler   = nullptr;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
+	uint64_t                      m_handle_offset = 0;
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
 	VmaAllocator                  m_allocator  = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
-	bool                          m_in_place = false;
+	const GuestMirror*            m_mirror = nullptr;
+	bool                          m_window   = false;
 #if defined(ANYPS5_KYTY)
 	bool                          m_device_local = false;
 #endif
 	std::span<uint8_t>            m_mapped;
-	uint64_t                      m_sparse_block = 0;
-	uint32_t                      m_sparse_types = 0;
-	uint64_t                      m_sparse_size  = 0;
-	std::vector<VmaAllocation>    m_sparse_blocks;
 };
 
 class StreamBuffer final: public Buffer {

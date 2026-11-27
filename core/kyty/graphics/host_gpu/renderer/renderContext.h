@@ -103,14 +103,17 @@ public:
 	void NoteFlip() noexcept { m_flip_number.fetch_add(1, std::memory_order_relaxed); }
 #endif
 	[[nodiscard]] bool UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const;
-	void               MapMemory(uint64_t vaddr, uint64_t size);
+	bool               AdmitMemory(uint64_t address, uint64_t size);
+	void               CancelMemoryAdmission(uint64_t address, uint64_t size);
+	bool               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	void               CacheIndexedBufferReads(const ShaderStageRuntime& runtime);
 	bool               CacheSelfSizedBuffers(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
-	void               PrepareBda(bool may_write, bool full_sync = true);
+	void               PrepareBda(bool may_write, bool full_sync = true, BdaWriteTracking tracking = BdaWriteTracking::Unknown);
 	void               PrepareHackMarks();
+	void PrepareShaderBda(std::span<const ShaderStageRuntime* const> stages, bool may_write);
 	void               RunGarbageCollector();
 	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);
 	void ForgetHleTlas(uint64_t header);
@@ -121,9 +124,10 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	bool ReserveMirrorRange(uint64_t address, uint64_t size);
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
 	void CacheTlasMemory(const ShaderStageRuntime& runtime, const RayTracing::TlasSource& source, bool note_instances);
-	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages);
+	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages, bool bind_spans = false);
 	[[nodiscard]] bool AddRecordReach(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool AddRayTracingReach(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool RayQueryTableVsharp(const ShaderStageRuntime& runtime, uint32_t table,
@@ -186,6 +190,7 @@ private:
 		BufferCache::SetRegions regions;
 		std::array<uint64_t, 3> compared_in {};
 		std::array<uint64_t, 3> synced_in {};
+		std::array<uint64_t, 3> bound_in {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 		uint32_t                replaced = 0;
 		std::vector<std::pair<uint64_t, uint64_t>> written;
 	};

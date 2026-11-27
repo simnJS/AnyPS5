@@ -1,7 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-#define RT_RECORD_PAGES
 #include "rt_common.inc"
 
 layout(local_size_x = 256) in;
@@ -180,7 +179,7 @@ void main() {
 		s_exact               = 1u;
 		s_psr_format          = 0u;
 		state.header_va       = header;
-		const bool cached = s_valid != 0 && HostAddress(header) != 0;
+		const bool cached = s_valid != 0 && HostAddress(header, 4u) != 0;
 		if (cached && psr) {
 			const uint     format  = PsrFormat(header, false);
 			const uint64_t records = header + LoadGuestU64(header + (format == 10u ? 0x30u : 0x28u));
@@ -241,7 +240,7 @@ void main() {
 		for (uint i = head + lid; i < tail; i += gl_WorkGroupSize.x) {
 			const uint node = U32Ref(pc.queue + uint64_t(i) * 4).v;
 			const uint64_t address = NodeAddress(header, node);
-			const uint64_t host    = HostAddress(address);
+			const uint64_t host    = HostAddress(address, 16u);
 			if (host == 0) {
 				atomicOr(state.overflow, kUnmapped);
 				continue;
@@ -296,7 +295,7 @@ void main() {
 			U32Ref(pc.instance_nodes + uint64_t(i) * 4).v = node;
 		}
 		const uint64_t      record = InstanceRecord(header, instance_base, node, pc.instance_layout);
-		if (HostAddress(record) == 0) {
+		if (HostAddress(record, 4u) == 0) {
 			atomicOr(state.overflow, kUnmapped);
 			if (psr) {
 				s_exact = 0u;

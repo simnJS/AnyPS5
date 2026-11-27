@@ -155,6 +155,8 @@ relinker source/input.elf app.elf
 ./app.elf
 ```
 
+**GPU requirement: sparse binding.** AnyKyty keeps the guest memory the GPU reads and writes in one sparse buffer that mirrors it, address for address, and binds video memory to it in 64 KiB blocks as the game uses them. The GPU must offer Vulkan's `sparseBinding` and `sparseResidencyBuffer` features and a queue that binds sparse memory, and must accept a sparse buffer of at least 64 GiB (768 GiB on current NVIDIA drivers, found by a probe at startup). NVIDIA's driver, AMD's Windows driver and RADV do. A GPU without them is refused like any other missing feature (`Could not find suitable device: … sparseBinding is not supported`); a GPU whose probe binds no size stops at startup with a line that starts with `[kyty-mirror] no mirror:` and gives the reason. There is no fallback without the mirror.
+
 No environment variable is needed to start it. The relinker built with AnyKyty gives the functions that page tracking needs a frame on its own for a Windows output (`--no-frame-red-zone` turns that off), and a title that asks for an add-on is told it is installed (see [Add-ons](USAGE.md#add-ons)). On Windows, convert with `relinker --windows source/input.elf app.exe`, and add `--to-intel` on an Intel CPU.
 
 The full procedure, with module folders and Windows output, is in [usage](USAGE.md) and [game testing](../dev/GAME_TESTING.md). Games that pace on vblank run at 60 FPS; to lift that cap see `ANYPS5_VBLANK_HZ` in the [settings](#settings).

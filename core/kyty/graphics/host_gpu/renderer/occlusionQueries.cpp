@@ -570,6 +570,14 @@ void OcclusionQueries::WriteForReaders() {
 				write.known = value & OcclusionCounters::ValueMask;
 				write.dump  = UINT32_MAX;
 			}
+			auto& cache = m_context.GetBufferCache();
+			const auto* mirror = cache.GetGuestMirror();
+			if (mirror && mirror->Holds(target.address, target.size) &&
+			    target.device_address == mirror->DeviceAddress() + mirror->Offset(target.address)) {
+				for (auto db = db_first; db < db_end; ++db) {
+					cache.NoteHeapTransfer(read.address + db * OcclusionCounters::DbStride, sizeof(uint64_t));
+				}
+			}
 			writes.push_back(write);
 		}
 	}

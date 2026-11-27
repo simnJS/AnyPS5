@@ -21,6 +21,7 @@ public:
 
 	bool Prepare(uint64_t address, uint64_t size);
 	void NotePendingWrites() noexcept;
+	void TrackWriteBitmap() noexcept;
 	[[nodiscard]] bool TakePendingWrites() noexcept {
 		const bool pending = m_pending_writes;
 		m_pending_writes   = false;

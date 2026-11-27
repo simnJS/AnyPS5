@@ -71,7 +71,6 @@ struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
 		uint64_t size    = 0;
-		BufferId id;
 	};
 	struct TableImageSource {
 		TableViewMemo*                              view;

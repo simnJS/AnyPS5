@@ -1497,7 +1497,7 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		std::tie(range.buffer, range.offset) = cache.ObtainBuffer(range.base_address, size, false);
+		std::tie(range.buffer, range.offset) = cache.ObtainRange(range.base_address, size, false);
 	}
 
 	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
@@ -1507,7 +1507,7 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 		const auto  size   = sizes[i];
 		if (size == 0) {
 			if (null_buffer == nullptr) {
-				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
+				null_buffer = cache.GetNullBuffer().Handle();
 			}
 			prepared.buffers[i] = null_buffer;
 			prepared.offsets[i] = 0;
@@ -1793,8 +1793,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
                                             const DrawCallInfo& draw,
                                             DrawRenderState&    state, bool prefer_generic) {
 	m_prepared_graphics_pipeline = nullptr;
+	m_context.GetImageHeap().BeginDraw();
 	if (!shaders_resolved) {
-		m_context.GetImageHeap().BeginDraw();
 		const auto begin = Common::SteadyNs();
 		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state, prefer_generic);
 		Bump(g_execute_resolve.here_ns[0], Common::SteadyNs() - begin);
@@ -1894,7 +1894,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		prepared.buffer = stream.Handle();
 	} else {
 		auto [buffer_ptr, offset] =
-		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
+		    buffer.GetContext().GetBufferCache().ObtainRange(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
 	}
@@ -2243,7 +2243,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		const auto size = static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size;
 		index_begin     = index_source.address & ~uint64_t {3};
 		index_end       = (index_source.address + size + 3u) & ~uint64_t {3};
-		(void)m_context.GetBufferCache().FindBuffer(index_begin, index_end - index_begin);
 	}
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -2300,7 +2299,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		index_binding = PrepareIndexBuffer(buffer, index_source);
 	} else if (draw.indexed) {
 		const auto [indices, offset] =
-		    m_context.GetBufferCache().ObtainBuffer(index_begin, index_end - index_begin, false);
+		    m_context.GetBufferCache().ObtainRange(index_begin, index_end - index_begin, false);
 		mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
@@ -2309,10 +2308,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
 		                  (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 		                                : sizeof(vk::DrawIndirectCommand));
-		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
+		args_buffer = m_context.GetBufferCache().ObtainRange(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 		if (emit.indirect.count_address != 0) {
-			count_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.count_address,
+			count_buffer = m_context.GetBufferCache().ObtainRange(emit.indirect.count_address,
 			                                                       sizeof(uint32_t), false);
 			EXIT_IF(count_buffer.first == nullptr || (count_buffer.second & 3u) != 0);
 		}

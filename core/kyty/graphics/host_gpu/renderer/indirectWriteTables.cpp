@@ -88,7 +88,7 @@ void IndirectWriteTables::Cover(Table& table, std::vector<GuestRange>& targets) 
 	});
 	auto& buffer_cache = m_context.GetBufferCache();
 	for (const auto& group: CoalesceTargets(std::move(targets))) {
-		(void)buffer_cache.FindBuffer(group.address, group.size);
+		buffer_cache.RequestDeviceRange(group.address, group.size);
 	}
 	targets.clear();
 }
@@ -160,6 +160,11 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 }
 
 void IndirectWriteTables::NotePendingWrites() noexcept {
+	m_context.GetBufferCache().NoteHeapShaderWrites();
+	TrackWriteBitmap();
+}
+
+void IndirectWriteTables::TrackWriteBitmap() noexcept {
 	if (!std::exchange(m_pending_writes, true)) {
 		m_context.GetBufferCache().BeginIndirectWrites();
 	}

@@ -26,8 +26,6 @@ struct VramBudgetTestAccess {
 	static uint64_t TextureTrigger(const TextureCache& cache) { return cache.m_trigger_gc_memory; }
 	static uint64_t TexturePressure(const TextureCache& cache) { return cache.m_pressure_gc_memory; }
 	static uint64_t TextureCritical(const TextureCache& cache) { return cache.m_critical_gc_memory; }
-	static uint64_t BufferTrigger(const BufferCache& cache) { return cache.m_trigger_gc_memory; }
-	static uint64_t BufferCritical(const BufferCache& cache) { return cache.m_critical_gc_memory; }
 
 	static std::vector<vk::DescriptorPool> PendingDescriptorPools(const DescriptorHeap& heap) {
 		std::vector<vk::DescriptorPool> pools;
@@ -115,8 +113,6 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	const auto tex_trigger_large  = VramBudgetTestAccess::TextureTrigger(textures);
 	const auto tex_pressure_large = VramBudgetTestAccess::TexturePressure(textures);
 	const auto tex_critical_large = VramBudgetTestAccess::TextureCritical(textures);
-	const auto buf_trigger_large  = VramBudgetTestAccess::BufferTrigger(buffers);
-	const auto buf_critical_large = VramBudgetTestAccess::BufferCritical(buffers);
 
 	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 0);
 	textures.RunGarbageCollector();
@@ -125,8 +121,6 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	const auto tex_trigger_small  = VramBudgetTestAccess::TextureTrigger(textures);
 	const auto tex_pressure_small = VramBudgetTestAccess::TexturePressure(textures);
 	const auto tex_critical_small = VramBudgetTestAccess::TextureCritical(textures);
-	const auto buf_trigger_small  = VramBudgetTestAccess::BufferTrigger(buffers);
-	const auto buf_critical_small = VramBudgetTestAccess::BufferCritical(buffers);
 
 	if (tex_trigger_small >= tex_trigger_large || tex_pressure_small >= tex_pressure_large ||
 	    tex_critical_small >= tex_critical_large) {
@@ -134,9 +128,6 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	}
 	if (tex_trigger_small != 0) {
 		return "texture cache trigger threshold was non-zero at <= 8 GiB budget";
-	}
-	if (buf_trigger_small >= buf_trigger_large || buf_critical_small >= buf_critical_large) {
-		return "buffer cache GC did not refresh thresholds when reported budget decreased";
 	}
 
 	vk::ImageCreateInfo recycle_info {};
@@ -218,7 +209,7 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* unavailable = gpu.Initialize()) {
+	if (const auto* unavailable = gpu.Initialize(false, true)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n",
 		             name, required ? "FAILED" : "skipped", unavailable);

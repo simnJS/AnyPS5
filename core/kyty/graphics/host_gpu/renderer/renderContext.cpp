@@ -12,7 +12,6 @@
 #include "graphics/shader/shaderBindings.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
-#include "loader/demonsSoulsPageFree.h"
 
 #include <atomic>
 #include <span>
@@ -21,7 +20,6 @@
 #include <array>
 #include <bit>
 #include <map>
-#include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
@@ -42,7 +40,7 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache, this),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_image_heap(*this, m_page_manager), m_pipeline_cache(graphics, &m_image_heap, shader_store) {
+      m_image_heap(*this), m_pipeline_cache(graphics, &m_image_heap, shader_store) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_ray_tracing = std::make_unique<RayTracing>(*this);
 #if defined(ANYPS5_KYTY)
@@ -114,11 +112,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write) {
 		const auto owner   = m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
 		const bool texture = m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		const bool heap    = m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 		m_strict_watch.InvalidateMemory(fault_vaddr, fault_size);
 		if (!GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
 			m_page_manager.NoteWriteFault(fault_vaddr);
-			BufferCache::CountWriteFault(owner, texture || heap);
+			BufferCache::CountWriteFault(owner, texture);
 		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, true);
@@ -133,7 +130,6 @@ void RenderContext::CollectHotPageWrites(uint64_t vaddr, uint64_t size) {
 		    auto& self = *static_cast<RenderContext*>(context);
 		    self.m_buffer_cache.InvalidateMemory(begin, end - begin, true);
 		    self.m_texture_cache.InvalidateMemory(begin, end - begin);
-		    self.m_image_heap.InvalidateMemory(begin, end - begin);
 		    self.m_strict_watch.InvalidateMemory(begin, end - begin);
 	    },
 	    this, vaddr, size);
@@ -181,7 +177,6 @@ void RenderContext::WriteFromCompletion(void* destination, const void* data,
 			if (m_page_manager.IsWatched(page)) {
 				m_buffer_cache.InvalidateUnlessGpuModified(vaddr, size);
 				m_texture_cache.InvalidateMemory(vaddr, size);
-				m_image_heap.InvalidateMemory(vaddr, size);
 				break;
 			}
 		}
@@ -215,7 +210,6 @@ void RenderContext::WriteQwordsFromCompletion(void* destination, const uint64_t*
 			if (m_page_manager.IsWatched(address & ~(TRACKER_PAGE_SIZE - 1))) {
 				m_buffer_cache.InvalidateUnlessGpuModified(address, sizeof(uint64_t));
 				m_texture_cache.InvalidateMemory(address, sizeof(uint64_t));
-				m_image_heap.InvalidateMemory(address, sizeof(uint64_t));
 			}
 		}
 		return;
@@ -261,7 +255,6 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
-	m_image_heap.InvalidateMemory(vaddr, size);
 	m_strict_watch.InvalidateMemory(vaddr, size);
 	return true;
 }
@@ -273,7 +266,6 @@ bool RenderContext::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
-	m_image_heap.InvalidateMemory(vaddr, size);
 	m_strict_watch.InvalidateMemory(vaddr, size);
 	return true;
 }
@@ -286,34 +278,7 @@ void RenderContext::MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) c
 void RenderContext::FreedByGame(uint64_t vaddr, uint64_t size) {
 	if (m_gpu == nullptr || m_gpu->IsStopping() || !GuestRange {vaddr, size}.Valid()) return;
 	m_gpu->SendCommand([this, vaddr, size] {
-		if (!IsMapped(vaddr, size)) return;
-		const auto start = std::chrono::steady_clock::now();
-		static BufferCache::FreeBlockSplits splits;
-		static uint64_t                     blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0;
-		static auto                         next = start + std::chrono::seconds(30);
-		const auto                          lists = splits.lists;
-		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, &Loader::DemonsSoulsPageFree::FreeBlocksIn, &splits);
-		const auto took  = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-		ns += took;
-		max_ns = std::max(max_ns, took);
-		if (freed != 0) {
-			blocks++;
-			bytes += size;
-			let_go += freed;
-		}
-		if ((freed == 0 && splits.lists == lists) || start < next) return;
-		std::printf("Engine frees: %llu freed blocks (%.0f MiB) had buffers over them: %.0f MiB of buffers let go (%.0f MiB cut off "
-		            "buffers over other free blocks too, the allocator's lists read %llu times), %.1f ms on the GPU thread (at most "
-		            "%.2f ms a block)\n",
-		            static_cast<unsigned long long>(blocks), static_cast<double>(bytes) / 1048576.0,
-		            static_cast<double>(let_go) / 1048576.0, static_cast<double>(splits.cut) / 1048576.0,
-		            static_cast<unsigned long long>(splits.lists), static_cast<double>(ns) / 1e6,
-		            static_cast<double>(max_ns) / 1e6);
-		std::fflush(stdout);
-		blocks = bytes = let_go = ns = max_ns = 0;
-		splits = {};
-		next   = start + std::chrono::seconds(30);
+		if (IsMapped(vaddr, size)) (void)m_buffer_cache.DropFreedRange(vaddr, size);
 	});
 }
 
@@ -346,14 +311,53 @@ bool RenderContext::UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
-void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+bool RenderContext::AdmitMemory(uint64_t address, uint64_t size) {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return ReserveMirrorRange(address, size);
+}
+
+void RenderContext::CancelMemoryAdmission(uint64_t address, uint64_t size) {
+	auto& mirror = *m_buffer_cache.GetGuestMirror();
+	if (!mirror.Holds(address, size)) return;
+	const auto cancel = [this, &mirror, address, size] {
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		const auto first = address - ((address - mirror.Base()) & (GuestMirror::WindowSize - 1));
+		for (auto window = first; window < address + size; window += GuestMirror::WindowSize) {
+			const auto bytes = std::min(GuestMirror::WindowSize, mirror.GuestSpan() - (window - mirror.Base()));
+			if (!m_mapped_ranges.Intersects(window, bytes) && !mirror.AnyRequested(window, bytes)) mirror.FreeWindow(window);
+		}
+	};
+	if (m_gpu == nullptr || m_gpu->IsStopping()) cancel();
+	else m_gpu->SendUrgentCommandSync(cancel);
+}
+
+bool RenderContext::ReserveMirrorRange(uint64_t address, uint64_t size) {
+	auto& mirror = *m_buffer_cache.GetGuestMirror();
+	if (!GuestRange{address, size}.Valid() || !mirror.Holds(address, size)) return false;
+	const auto end = address + size;
+	const bool previous = address > mirror.Base() && m_mapped_ranges.Contains(address - 1, 1);
+	const bool next = end < mirror.Base() + mirror.GuestSpan() && m_mapped_ranges.Contains(end, 1);
+	return mirror.MapWindows(address - previous, size + previous + next);
+}
+
+bool RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
+		if (!ReserveMirrorRange(vaddr, size)) return false;
 		m_mapped_ranges.Add(vaddr, size);
 		m_mapped_ranges_version++;
 		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
 		m_bda_mapped_since_sync.emplace_back(vaddr, size);
 	}
+	if (m_buffer_cache.GuestMemoryImported(vaddr, size)) {
+		const auto forget = [this, vaddr, size] { m_buffer_cache.ForgetGuestMemory(vaddr, size); };
+		if (m_gpu == nullptr || m_gpu->IsStopping()) {
+			forget();
+		} else {
+			m_gpu->SendUrgentCommandSync(forget);
+		}
+	}
+	m_buffer_cache.ImportGuestMemory(vaddr, size);
 	if (m_texture_cache.HasPartialCandidates()) {
 		const auto map = [this, vaddr, size] { m_texture_cache.MapMemory(vaddr, size); };
 		if (m_gpu == nullptr || m_gpu->IsStopping()) {
@@ -362,6 +366,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 			m_gpu->SendUrgentCommandSync(map);
 		}
 	}
+	return true;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -384,13 +389,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
-		const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
 		m_buffer_cache.ForgetCommandBuffers(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
-		if (registered) {
-			m_buffer_cache.DeleteUnmappedBuffers(vaddr, size);
-			m_buffer_cache.SplitUnmappedBuffers(vaddr, size);
-		}
+		m_buffer_cache.ForgetGuestMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		m_strict_watch.UnmapMemory(vaddr, size);
@@ -399,15 +400,34 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_guest_bvh_memory.erase(m_guest_bvh_memory.lower_bound(vaddr), m_guest_bvh_memory.lower_bound(vaddr + size));
 			std::erase_if(m_hle_tlases, [&](const HleTlas& tlas) { return tlas.header >= vaddr && tlas.header - vaddr < size; });
 		}
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
-		m_mapped_ranges_version++;
-		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
-		if (m_unmap_log.size() >= 4096) {
-			m_unmap_log_floor = m_unmap_log.front().version;
-			m_unmap_log.pop_front();
+		auto& mirror = *m_buffer_cache.GetGuestMirror();
+		std::vector<uint64_t> empty;
+		{
+			std::lock_guard lock(m_mapped_ranges_mutex);
+			m_mapped_ranges.Subtract(vaddr, size);
+			m_mapped_ranges_version++;
+			m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
+			if (m_unmap_log.size() >= 4096) {
+				m_unmap_log_floor = m_unmap_log.front().version;
+				m_unmap_log.pop_front();
+			}
+			m_unmap_log.push_back({m_mapped_ranges_version, vaddr, size});
+			if (mirror.Holds(vaddr, size)) {
+				const auto first = vaddr - ((vaddr - mirror.Base()) & (GuestMirror::WindowSize - 1));
+				for (auto window = first; window < vaddr + size; window += GuestMirror::WindowSize) {
+					if (mirror.Offset(window) != UINT64_MAX && !m_mapped_ranges.Intersects(window, GuestMirror::WindowSize)) {
+						empty.push_back(window);
+					}
+				}
+			}
 		}
-		m_unmap_log.push_back({m_mapped_ranges_version, vaddr, size});
+		if (!empty.empty()) {
+			m_buffer_cache.ReleaseWindowBlocks(empty);
+			std::lock_guard lock(m_mapped_ranges_mutex);
+			for (const auto window: empty) {
+				if (!m_mapped_ranges.Intersects(window, GuestMirror::WindowSize)) mirror.FreeWindow(window);
+			}
+		}
 	};
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
 		unmap();
@@ -429,7 +449,7 @@ void RenderContext::CacheIndexedBufferReads(const ShaderStageRuntime& runtime) {
 		                        LibKernel::Memory::IsFullyMapped(base, size));
 	};
 	const auto pending = [&](uint64_t address, uint64_t size) {
-		return m_buffer_cache.DeferredLabelPending(address, size) || m_texture_cache.IsRegionGpuModified(address, size, true);
+		return m_texture_cache.IsRegionGpuModified(address, size, true);
 	};
 	const auto read = [&](const ShaderBufferResource& source, uint64_t offset, std::span<uint32_t> words) {
 		std::ranges::fill(words, 0u);
@@ -493,7 +513,8 @@ void RenderContext::CacheIndexedBufferReads(const ShaderStageRuntime& runtime) {
 	if (pending_page) return;
 	std::vector<std::pair<uint64_t, uint64_t>> spans;
 	children.ForEach([&](uint64_t first, uint64_t last) {
-		if (m_buffer_cache.FindBuffer(first, last - first)) spans.emplace_back(first, last);
+		m_buffer_cache.RequestDeviceRange(first, last - first);
+		spans.emplace_back(first, last);
 	});
 	if (!spans.empty()) m_buffer_cache.SynchronizeBuffersInSpans(spans);
 }
@@ -509,7 +530,7 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 		}
 		m_mapped_ranges.ForEachInRange(base, window, [&](uint64_t start, uint64_t end) {
 			if (!contiguous || start == base) {
-				(void)m_buffer_cache.FindBuffer(start, end - start);
+				m_buffer_cache.RequestDeviceRange(start, end - start);
 			}
 		});
 	};
@@ -560,17 +581,21 @@ bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
 		uint32_t low  = 0;
 		uint32_t high = 0;
 		if (!value(buffer.base_low_register, low) || !value(buffer.base_high_register, high)) {
+			if (buffer.written) m_buffer_cache.NoteHeapShaderWrites();
+			written |= buffer.written;
 			continue;
 		}
 		written |= buffer.written;
 		const auto base = low | (uint64_t {high & 0xffffu} << 32u);
+		if (buffer.written) {
+			const auto first = Common::AlignDown(base, 4u);
+			m_buffer_cache.NoteHeapShaderWrites(first, base - first + uint64_t {UINT32_MAX} + 16u);
+		}
 		if (base == 0) {
 			continue;
 		}
 		m_mapped_ranges.ForEachInRange(base, CachedBytes, [this](uint64_t start, uint64_t end) {
-			if (const auto id = m_buffer_cache.FindBuffer(start, end - start)) {
-				m_buffer_cache.GetBuffer(id).device_address_pinned = true;
-			}
+			m_buffer_cache.RequestDeviceRange(start, end - start);
 		});
 	}
 	return written;
@@ -631,9 +656,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime, const Ray
 	}
 	for (const auto& [first, last]: ranges) {
 		m_mapped_ranges.ForEachInRange(first, last - first, [this](uint64_t start, uint64_t stop) {
-			if (const auto id = m_buffer_cache.FindBuffer(start, stop - start)) {
-				m_buffer_cache.GetBuffer(id).device_address_pinned = true;
-			}
+			m_buffer_cache.RequestDeviceRange(start, stop - start);
 		});
 	}
 	if (note_instances && program.info.ray_query && m_ray_tracing->Enabled()) {
@@ -642,6 +665,14 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime, const Ray
 }
 
 bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages) {
+	if (stages.size() == 1 && stages.front()->module->info.stage == ShaderType::Compute) {
+		const auto& info = stages.front()->module->info.info;
+		if (info.dma_bounded && !info.dma_windows.empty() && info.dma_tables.empty() &&
+		    info.dma_record_tables.empty() && info.self_sized_buffers.empty() &&
+		    !info.ray_query && !info.bvh && SynchronizeDmaReach(stages, true)) {
+			return true;
+		}
+	}
 	constexpr int JoinedRuns = 6;
 	for (const auto* stage: stages) {
 		const auto& program = stage->module->info;
@@ -663,7 +694,7 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 	return true;
 }
 
-bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages) {
+bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages, bool bind_spans) {
 	constexpr uint64_t MaxBufferBytes = uint64_t {256} * 1024 * 1024;
 	constexpr uint64_t WaveRecords = 64;
 	m_dma_spans.clear();
@@ -706,7 +737,8 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 			if (!base_of(window.base_register, base)) {
 				return false;
 			}
-			const auto before = static_cast<uint64_t>(-window.first) + 4u;
+			const auto before = static_cast<uint64_t>(-window.first) + (bind_spans ? 8u : 4u);
+			if (bind_spans && (base < before || base > UINT64_MAX - window.last)) return false;
 			const auto start  = base > before ? base - before : 0;
 			add(start, std::min(base, UINT64_MAX - window.last) + window.last - start);
 		}
@@ -791,6 +823,29 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 				}
 				add(descriptor.Base48(), descriptor.GetSize());
 			}
+		}
+	}
+	for (const auto& [begin, end]: m_dma_spans) {
+		if (bind_spans) {
+			m_buffer_cache.RequestDeviceRange(begin, end - begin);
+		} else {
+			m_buffer_cache.RequestUnimportedRange(begin, end - begin);
+		}
+	}
+	const std::array bound_layout {m_mapped_ranges_version, m_buffer_cache.RegistrationEpoch(), m_buffer_cache.ImportGeneration()};
+	for (auto* table: m_dma_sets) {
+		if (table->bound_in == bound_layout) {
+			continue;
+		}
+		const auto requested = m_buffer_cache.RegisterEpoch();
+		table->ranges.ForEach([this](uint64_t first, uint64_t last) {
+			m_mapped_ranges.ForEachInRange(first, last - first, [this](uint64_t start, uint64_t end) {
+				m_buffer_cache.RequestUnimportedRange(start, end - start);
+			});
+		});
+		table->bound_in = bound_layout;
+		if (m_buffer_cache.RegisterEpoch() != requested) {
+			table->synced_in = {};
 		}
 	}
 	const auto reach_layout = ReachLayout();
@@ -1115,6 +1170,7 @@ bool RenderContext::AddBufferTable(const ShaderBufferResource& table) {
 			}
 		}
 		entries.synced_in = {};
+		entries.bound_in  = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 	}
 	m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) { m_dma_spans.emplace_back(start, end); });
 	if (std::ranges::find(m_dma_sets, &entries) == m_dma_sets.end()) {
@@ -1198,17 +1254,55 @@ bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 	return true;
 }
 
-void RenderContext::PrepareBda(bool may_write, bool full_sync) {
+void RenderContext::PrepareShaderBda(std::span<const ShaderStageRuntime* const> stages, bool may_write) {
+	const bool synchronized = SynchronizeDmaFootprint(stages);
+	const auto track_writes = [&](const ShaderStageRuntime* stage) {
+		const auto& program = stage->module->info;
+		if (std::ranges::any_of(program.info.buffers, [](const auto& buffer) { return buffer.indirect_write_table; })) {
+			return false;
+		}
+		if (!program.has_address_writes) return true;
+		if (program.info.dma_windows.empty()) {
+			return false;
+		}
+		const auto& user = stage->resources->user_data;
+		for (const auto& window: program.info.dma_windows) {
+			const auto index = uint64_t {window.base_register} - program.user_data_base;
+			if (window.base_register < program.user_data_base || index + 1u >= user.size()) {
+				return false;
+			}
+			const auto base = user[index] | (uint64_t {user[index + 1u]} << 32u);
+			const auto before = static_cast<uint64_t>(-window.first) + 8u;
+			if (base < before || base > UINT64_MAX - window.last) {
+				return false;
+			}
+			m_buffer_cache.NoteHeapShaderWrites(base - before, before + window.last);
+			const auto buffer_base = base & UINT64_C(0x0000ffffffffffff);
+			if (base != buffer_base) {
+				const auto first = buffer_base > before ? buffer_base - before : 0;
+				m_buffer_cache.NoteHeapShaderWrites(first, buffer_base + window.last - first);
+			}
+		}
+		return true;
+	};
+	const bool bounded = !may_write || std::ranges::all_of(stages, track_writes);
+	PrepareBda(may_write, !synchronized, bounded ? BdaWriteTracking::ExplicitRanges : BdaWriteTracking::PageBitmap);
+}
+
+void RenderContext::PrepareBda(bool may_write, bool full_sync, BdaWriteTracking tracking) {
 	[[maybe_unused]] static const bool logged = [] {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
-	m_buffer_cache.PrepareFaultBuffer();
+	m_buffer_cache.PrepareFaultBuffer(may_write);
 	if (may_write) {
-		m_buffer_cache.NoteDeviceAddressUse();
-		m_indirect_write_tables.NotePendingWrites();
+		m_buffer_cache.NoteDeviceAddressUse(tracking);
+		m_indirect_write_tables.TrackWriteBitmap();
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	if (full_sync) {
+		m_buffer_cache.RequestUnimportedRanges(m_mapped_ranges, m_mapped_ranges_version);
+	}
 	const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(),
 	                                      m_buffer_cache.RegisterEpoch(), m_mapped_ranges_version};
 	const bool same_layout = epochs[1] == m_bda_sync_epochs[1] && epochs[2] == m_bda_sync_epochs[2];

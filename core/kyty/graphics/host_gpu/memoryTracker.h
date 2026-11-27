@@ -147,24 +147,6 @@ public:
 		return true;
 	}
 
-	uint64_t SetInPlace(uint64_t vaddr, uint64_t size) {
-		uint64_t pages = 0;
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			Common::ScopedLock lock(manager->lock);
-			pages += manager->SetInPlace(offset, bytes);
-		});
-		return pages;
-	}
-
-	uint64_t ClearInPlace(uint64_t vaddr, uint64_t size) {
-		uint64_t pages = 0;
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			Common::ScopedLock lock(manager->lock);
-			pages += manager->ClearInPlace(offset, bytes);
-		});
-		return pages;
-	}
-
 	[[nodiscard]] bool EverGpuWritten(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
 			return false;

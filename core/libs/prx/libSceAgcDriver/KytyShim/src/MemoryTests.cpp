@@ -239,6 +239,27 @@ void TestSoleBacking() {
     std::printf("sole backing: one mapping keeps its stamp, a second mapping of a page reads as aliased, an unmapped alias or a remap changes the stamp, a file mapped twice reads as private\n");
 }
 
+void TestAdmissionReplay() {
+    void* block = nullptr;
+    Require(sceKernelMapFlexibleMemory(&block, Page * 3, CpuReadWrite, 0) == 0);
+    const auto first = Address(block);
+    Require(sceKernelMunmap(first + Page, Page) == 0);
+    static uint64_t rejected;
+    rejected = first + 2 * Page;
+    static HookLog replay;
+    const auto admit = [](uint64_t address, uint64_t size) {
+        if (address == rejected) return false;
+        replay.mapped.emplace_back(address, size);
+        return true;
+    };
+    const auto cancel = [](uint64_t address, uint64_t size) { replay.unmapped.emplace_back(address, size); };
+    const auto notifications = g_hooks.mapped.size();
+    Require(!Memory::Shim::SetGpuRangeHooks(&OnMap, &OnUnmap, admit, cancel));
+    Require(Covers(replay.mapped, first, Page) && replay.unmapped == replay.mapped);
+    Require(g_hooks.mapped.size() == notifications);
+    Require(sceKernelMunmap(first, Page) == 0 && sceKernelMunmap(rejected, Page) == 0);
+}
+
 void TestGpuHooks() {
     void* before = nullptr;
     Require(sceKernelMapFlexibleMemory(&before, Page * 2, CpuReadWrite, 0) == 0);
@@ -1302,6 +1323,7 @@ int main() {
     TestFlexible();
     TestDirect();
     TestSoleBacking();
+    TestAdmissionReplay();
     TestGpuHooks();
     TestReleaseWhileMapped();
     TestHostProtectionTable();

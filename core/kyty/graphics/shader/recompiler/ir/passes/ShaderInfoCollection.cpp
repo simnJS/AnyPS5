@@ -269,6 +269,7 @@ void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
 }
 
 struct InputUsage {
+	bool address_writes = false;
 	std::array<uint8_t, 32> components {};
 	std::array<bool, 32> per_vertex {};
 	std::array<bool, NumScalarRegs> user_data {};
@@ -355,6 +356,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		}
 		if (buffer_access != BufferAccess::None) {
 			if (kind == ResourceKind::IndirectBuffer) {
+				inputs.address_writes |= buffer_access != BufferAccess::Read;
 				info.uses_dma = true;
 				info.subgroup_local_invocation_id |= op != ValueOpcode::ReadConstBuffer;
 			}
@@ -753,6 +755,9 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
 		}
+	}
+	if (program.stage != ShaderType::Compute && program.has_address_writes) {
+		program.has_address_writes = inputs.address_writes;
 	}
 	if (program.stage == ShaderType::Compute) CollectProvenBufferWrites(program, *input_info.compute);
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
