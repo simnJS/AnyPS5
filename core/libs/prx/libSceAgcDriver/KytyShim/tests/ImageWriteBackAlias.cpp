@@ -599,7 +599,7 @@ const char* CheckLayeredColorClear(GraphicContext& graphics, uint64_t address) {
 	desc.info.data.address = address;
 	desc.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
 	desc.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
-	desc.info.extent = {Width, Width, 1};
+	desc.info.extent = vk::Extent3D {Width, Width, 1};
 	desc.info.resources.layers = Layers;
 	desc.info.UpdateSize();
 	desc.info.metadata.kind = ImageMetadataKind::Dcc;
@@ -655,7 +655,8 @@ const char* CheckRepeatedDetile(GraphicContext& graphics, uint64_t address) {
 	info.data.address = address;
 	info.pixel_format = vk::Format::eR32Uint;
 	info.guest_format = Prospero::BufferFormat::k32UInt;
-	info.extent = {128, 128, 1};
+	info.extent = vk::Extent3D {128, 128, 1};
+	info.resources.levels = 4;
 	info.tile_mode = Prospero::TileMode::kStandard4KB;
 	info.UpdateSize();
 	const auto bytes = info.data.size;
@@ -684,19 +685,28 @@ const char* CheckRepeatedDetile(GraphicContext& graphics, uint64_t address) {
 		return std::memcmp(output.Mapped().data(), output.Mapped().data() + info.LinearSize(), info.LinearSize()) == 0;
 	};
 	const char* failure = nullptr;
-	for (uint32_t step = 0; step < 4 && failure == nullptr; ++step) {
+	for (uint32_t step = 0; step < 5 && failure == nullptr; ++step) {
+		if (step != 0 && !textures.CopyToImage(address, source, bytes)) {
+			failure = "could not restore the tiled copy after readback";
+			break;
+		}
 		if (step == 1) {
 			buffers.InvalidateMemory(source, bytes);
 			data[17] ^= 0xffffffffu;
 			Libs::LibKernel::Memory::WriteBacking(source, data.data(), bytes);
 		} else if (step == 2) {
 			(void)textures.InvalidateMemory(address, bytes);
+			Libs::LibKernel::Memory::WriteBacking(address, data.data(), bytes);
 			textures.UpdateImage(target);
 			textures.MarkGpuWritten(target);
 		} else if (step == 3) {
 			const auto [buffer, offset] = buffers.ObtainBuffer(source, bytes, true, false);
 			buffer->Fill(offset, bytes, FillValue);
+		} else if (step == 4 && !textures.ClearImageFromBuffer(scheduler.Current(), address, bytes, 0)) {
+			failure = "the destination image clear was rejected";
+			break;
 		}
+		textures.MarkGpuWritten(reference);
 		const auto before = image.write_count;
 		if (!textures.CopyToImage(address, source, bytes) || image.write_count == before ||
 		    !textures.CopyToImage(info.data.address, source, bytes)) {
@@ -707,6 +717,10 @@ const char* CheckRepeatedDetile(GraphicContext& graphics, uint64_t address) {
 		if (!textures.CopyToImage(address, source, bytes) || (step == 0 && image.write_count != copied)) {
 			failure = "the unchanged tracked copy ran the detiler again";
 			break;
+		}
+		if (step == 0) {
+			buffers.CopyBuffer(address, source, bytes, false, false);
+			if (image.write_count != copied) failure = "the repeated DMA copy ran the detiler again";
 		}
 		if (!compare()) failure = "the resident tiled copy differs from the reference detile";
 	}

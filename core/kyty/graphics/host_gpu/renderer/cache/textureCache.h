@@ -216,9 +216,9 @@ private:
 	};
 	struct ColorClearMemo {
 		ColorClearKey key {};
-		uint64_t clear_epoch = 0, cpu_epoch = 0, mapping = 0, writes = 0;
+		uint64_t clear_epoch = 0, cpu_epoch = 0, gpu_epoch = 0, mapping = 0, writes = 0;
 		uint32_t version = 0;
-		bool settled = false;
+		bool settled = false, sole_image = false;
 		std::vector<uint8_t> codes;
 	};
 	using ColorClearMemos = std::array<ColorClearMemo, 256>;

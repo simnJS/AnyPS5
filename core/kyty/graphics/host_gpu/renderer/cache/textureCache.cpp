@@ -1823,6 +1823,11 @@ static bool HasSoleBacking(GuestRange range) {
 	       LibKernel::Memory::BackingShare::Sole;
 }
 
+static bool FullyWatched(const Image& image) {
+	return image.registered && image.track_addr == image.info.data.address &&
+	       image.track_addr_end == image.info.data.End() && image.untracked_holes.empty();
+}
+
 static uint64_t TrackedCpuEpoch(BufferCache& buffers, PageManager& pages, GuestRange range) {
 	const auto epoch = buffers.CpuModificationEpoch(range.address, range.size);
 	if (epoch == 0 || pages.HasHotPages() || buffers.IsRegionCpuDirty(range.address, range.size)) return 0;
@@ -1892,12 +1897,20 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto mapping = LibKernel::Memory::BackingEpoch();
 	const bool gpu_owned = m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size);
 	const auto cpu_epoch = gpu_owned ? 0 : TrackedCpuEpoch(m_buffer_cache, m_page_manager, viewed);
+	std::vector<uint8_t> codes;
 	if (cpu_epoch != 0) {
 		Common::ScopedLock lock {m_lock};
+		const auto& image = m_slot_images[id];
 		if (memo.clear_epoch == clear_epoch && memo.cpu_epoch == cpu_epoch && memo.mapping == mapping &&
-		    LibKernel::Memory::BackingEpoch() == mapping && memo.key == key && (memo.settled || (memo.version == ImageVersion(id) &&
-		                                         memo.writes == m_slot_images[id].write_count))) {
-			return;
+		    memo.key == key && (memo.gpu_epoch == m_buffer_cache.GpuWriteGeneration() ||
+		                        m_buffer_cache.NeverGpuWritten(viewed.address, viewed.size)) &&
+		    LibKernel::Memory::BackingEpoch() == mapping) {
+			if (memo.settled) return;
+			if (memo.sole_image && FullyWatched(image) && !image.IsCpuDirty() && !image.IsBufferModified() &&
+			    memo.version == ImageVersion(id) && memo.writes == image.write_count &&
+			    (memo.gpu_epoch == m_buffer_cache.GpuWriteGeneration() ||
+			     m_buffer_cache.NeverGpuWritten(image_data.address, image_data.size))) return;
+			codes = memo.codes;
 		}
 	}
 	const bool expand = desc.type != BindingType::VideoOut && !desc.candidate;
@@ -2006,16 +2019,24 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		return;
 	}
-	std::vector<uint8_t> codes(count);
-	for (uint32_t slice = 0; slice < count; ++slice) {
-		vk::ClearValue clear {};
-		codes[slice] = read_code(slice, clear);
+	if (codes.empty()) {
+		codes.resize(count);
+		for (uint32_t slice = 0; slice < count; ++slice) {
+			vk::ClearValue clear {};
+			codes[slice] = read_code(slice, clear);
+		}
 	}
 	const bool settled = std::ranges::all_of(codes, [](uint8_t code) { return code == 0xff; });
 	{
 		Common::ScopedLock lock {m_lock};
 		auto& image = m_slot_images[id];
-		const bool applied = !expand && independent && !m_page_manager.HasHotPages() && memo.mapping == mapping &&
+		const bool same_image = memo.mapping == mapping && memo.key.serial == serial;
+		const bool sole_image = !settled && !expand && independent &&
+		                        ((same_image && memo.sole_image) || HasSoleBacking(image_data));
+		const bool applied = sole_image && memo.sole_image && FullyWatched(image) && !m_page_manager.HasHotPages() &&
+		                     !image.IsCpuDirty() && !image.IsBufferModified() &&
+		                     (memo.gpu_epoch == m_buffer_cache.GpuWriteGeneration() ||
+		                      m_buffer_cache.NeverGpuWritten(image_data.address, image_data.size)) && memo.mapping == mapping &&
 		                     memo.key == key && memo.version == ImageVersion(id) &&
 		                     memo.writes == image.write_count && memo.codes == codes;
 		if (!settled && !applied) {
@@ -2041,6 +2062,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		memo.key = key;
 		memo.cpu_epoch = tracked && (settled || !expand) ? cpu_epoch : 0;
 		memo.settled = settled;
+		memo.sole_image = sole_image;
+		memo.gpu_epoch = m_buffer_cache.GpuWriteGeneration();
 		memo.clear_epoch = clear_epoch;
 		memo.mapping = mapping;
 		memo.version = ImageVersion(id);
@@ -3693,7 +3716,8 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 	DetileCopy copy_state {image.serial, address, source, size, cpu_epoch, mapping, m_image_set_epoch,
 	                       m_buffer_cache.RegistrationEpoch(), image.write_count, ImageVersion(targets.front())};
 	const auto [buffer, source_offset] = m_buffer_cache.ObtainBuffer(source, size, false);
-	const bool reusable = cpu_epoch != 0 && !buffer->InPlace() && m_buffer_cache.GetBufferIfLive(registered) == buffer;
+	const bool reusable = cpu_epoch != 0 && FullyWatched(image) && !buffer->InPlace() &&
+	                      m_buffer_cache.GetBufferIfLive(registered) == buffer;
 	const bool clean_copy = reusable && memo == copy_state &&
 	                        m_buffer_cache.NeverGpuWritten(source, size) && m_buffer_cache.NeverGpuWritten(address, size) &&
 	                        !m_scheduler.HasPendingGuestOperations(source, size) &&
