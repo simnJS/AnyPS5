@@ -972,7 +972,7 @@ target_link_libraries(kyty_shim_cross_queue_order_tests PRIVATE libzstd_static)
 set_target_properties(kyty_shim_cross_queue_order_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_host_test_executable(kyty_shim_cross_queue_order_tests)
 add_dependencies(kyty_shim_cross_queue_order_tests agc_frame_replay)
-foreach(scenario compute_waits_graphics_data graphics_waits_compute_data dma_wait)
+foreach(scenario compute_waits_graphics_data graphics_waits_compute_data dma_wait generated_command_buffer)
     add_test(NAME kyty_shim_cross_queue_${scenario}
             COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> ${scenario})
     set_tests_properties(kyty_shim_cross_queue_${scenario} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
@@ -996,7 +996,7 @@ if(WIN32)
             kyty_shim_generic_compute_replay kyty_shim_generic_compute_replay_wide
             kyty_shim_bda_submission_sync kyty_shim_indexed_buffer_reads
             kyty_shim_cross_queue_compute_waits_graphics_data kyty_shim_cross_queue_graphics_waits_compute_data
-            kyty_shim_cross_queue_dma_wait kyty_shim_cross_queue_compute_waits_graphics_clock
+            kyty_shim_cross_queue_dma_wait kyty_shim_cross_queue_generated_command_buffer kyty_shim_cross_queue_compute_waits_graphics_clock
             kyty_shim_cross_queue_graphics_waits_compute_clock kyty_shim_cross_queue_recycled_label
             kyty_shim_cross_queue_early_label kyty_shim_cross_queue_recycled_label_own_tick
             APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
