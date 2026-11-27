@@ -25,6 +25,14 @@ public:
 	[[nodiscard]] vk::DescriptorSet CommitPersistent(vk::DescriptorSetLayout layout);
 	void ReleasePersistent(vk::DescriptorSet set);
 	void TrimCompletedPools();
+	void RetirePersistent(vk::DescriptorSet set, uint64_t tick);
+
+	[[nodiscard]] size_t ActivePersistentPoolCount() const noexcept {
+		return m_persistent_pools.size();
+	}
+	[[nodiscard]] size_t RetiredPersistentPoolCount() const noexcept {
+		return m_retired_persistent_pools.size();
+	}
 
 	static void RegisterLayout(vk::DescriptorSetLayout                         layout,
 	                           std::span<const vk::DescriptorSetLayoutBinding> bindings);
@@ -53,13 +61,21 @@ private:
 	void UsePool(Pool pool);
 	void RetireCurrentPool();
 
+	struct PersistentPool {
+		vk::DescriptorPool      pool   = nullptr;
+		vk::DescriptorSet       set    = nullptr;
+		vk::DescriptorSetLayout layout = nullptr;
+		uint64_t                tick   = 0;
+	};
+
 	GraphicContext&  m_graphics;
 	MasterSemaphore& m_master_semaphore;
 	Pool             m_current_pool;
 	std::vector<vk::DescriptorPoolSize>                m_free;
 	uint32_t                                           m_free_sets = 0;
 	std::deque<std::pair<Pool, uint64_t>>              m_pending_pools;
-	std::unordered_map<vk::DescriptorSet, vk::DescriptorPool> m_persistent_pools;
+	std::unordered_map<vk::DescriptorSet, PersistentPool> m_persistent_pools;
+	std::deque<PersistentPool>                          m_retired_persistent_pools;
 	std::unordered_map<vk::DescriptorSetLayout, Batch> m_sets;
 	std::unordered_map<vk::DescriptorSetLayout, std::vector<vk::DescriptorPoolSize>> m_layout_sizes;
 };
