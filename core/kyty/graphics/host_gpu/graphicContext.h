@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <span>
@@ -63,6 +64,8 @@ struct GraphicContext {
 #if defined(ANYPS5_KYTY)
 	bool                               pipeline_library_enabled               = false;
 	bool                               pipeline_cache_persistent              = true;
+	bool                               compute_pipeline_binaries              = false;
+	std::filesystem::path              compute_pipeline_binary_directory;
 #endif
 	bool                                      mesh_shader_enabled                   = false;
 	bool                                      shader_float16_enabled                = false;

@@ -177,8 +177,8 @@ bool AsyncPipelinesEnabled() {
 	return g_config->async_pipelines_enabled;
 }
 
-bool AsyncPipelinesSkipMore() {
-	return g_config->async_pipelines_skip_more;
+bool AsyncPipelinesProbe() {
+	return g_config->async_pipelines_probe;
 }
 
 bool RayTracingStatsEnabled() {

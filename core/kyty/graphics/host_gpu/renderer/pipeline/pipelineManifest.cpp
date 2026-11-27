@@ -594,13 +594,13 @@ PipelineCache::ProgramKey PipelineCache::ManifestProgramKey(const ManifestModule
 	return key;
 }
 
-namespace {
-
-std::string ManifestStem(const std::string& title) {
+std::string PipelineCacheTitleStem(const std::string& title) {
 	std::string version;
 	Loader::SystemContentParamSfoGetString("APP_VER", &version);
 	return SafeFileName(version.empty() ? title : title + "_" + version);
 }
+
+namespace {
 
 std::filesystem::path ManifestAssetFolder() {
 	if (const char* base = SDL_GetBasePath(); base != nullptr) {
@@ -619,7 +619,7 @@ bool PipelineCache::HasStartupPipelineData() {
 	if (!Config::PipelineManifestEnabled()) return false;
 	const auto title = PipelineCacheTitleId();
 	if (title.empty()) return false;
-	const auto stem = ManifestStem(title);
+	const auto stem = PipelineCacheTitleStem(title);
 	const auto assets = ManifestAssetFolder();
 	std::vector<std::filesystem::path> folders;
 	if (!assets.empty()) folders.push_back(assets);
@@ -633,7 +633,7 @@ void PipelineCache::OpenManifest() {
 	const auto title  = PipelineCacheTitleId();
 	if ((!warm && !record) || title.empty()) return;
 
-	const auto stem = ManifestStem(title);
+	const auto stem = PipelineCacheTitleStem(title);
 	const auto name = stem + ".kpm";
 	OpenUseOrder(PipelineCacheDirectory() / (stem + ".use"));
 	const auto assets = ManifestAssetFolder();
@@ -809,6 +809,15 @@ void PipelineCache::OpenManifest() {
 	} else {
 		AddManifestRecords(all);
 	}
+	const auto restored_rank = [&](const AsyncPipelineJob& job) {
+		if (job.compute) return UseRank(job.module->info.shader_hash);
+		uint32_t rank = 0;
+		for (const auto* stage: job.stages) {
+			if (stage != nullptr) rank = std::max(rank, UseRank(stage->info.shader_hash));
+		}
+		return rank;
+	};
+	std::ranges::stable_sort(m_restore_jobs, std::ranges::less {}, restored_rank);
 #if defined(ANYPS5_KYTY)
 	ManifestState::PrioritizeRestoredCompute(m_restore_jobs);
 	state.restored_graphics = std::ranges::count(m_restore_jobs, false, &AsyncPipelineJob::compute);
@@ -3337,6 +3346,7 @@ void PipelineCache::CreateManifestGraphicsPipeline(const GraphicsPipelineKey& ke
 		}
 		m_async_pending_graphics.erase(key);
 	}
+	m_async_finished.notify_all();
 #if defined(ANYPS5_KYTY)
 	if (created && m_libraries != nullptr) m_libraries->NotePreparedPipeline(key, stages);
 #endif
@@ -3375,7 +3385,7 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bo
 	const bool ran   = RunDroppable(state.dropped, from_assets, module.info.shader_hash, 0, what, [&] {
 		cache_hit = FindComputePipeline(m_graphics, pipeline, module, m_driver_cache);
 		if (!cache_hit && state.WaitForMemory(stop)) {
-			CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+			CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache, ComputePipelineCacheMode::KnownMiss);
 		}
 	});
 	const bool created = ran && pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
@@ -3391,6 +3401,7 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bo
 		}
 		m_async_pending_compute.erase(module.id);
 	}
+	m_async_finished.notify_all();
 	std::scoped_lock lock(state.mutex);
 	state.compute += created && !cache_hit ? 1u : 0u;
 	state.compute_cached += cache_hit ? 1u : 0u;

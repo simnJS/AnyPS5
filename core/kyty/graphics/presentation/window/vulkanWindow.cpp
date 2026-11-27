@@ -37,6 +37,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -573,6 +574,23 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	LOGF("Vulkan fragment shader pixel interlock: %s\n",
 	     graphics.fragment_shader_pixel_interlock_enabled ? "true" : "false");
+	graphics.compute_pipeline_binaries = false;
+	if (KYTY_BUILD == KYTY_BUILD_RELEASE && graphics.pipeline_cache_persistent && Config::ShaderCacheEnabled() &&
+	    !Config::GraphicsDebugDumpEnabled() && !Config::PipelineManifestRecord() &&
+	    HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME)) {
+		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceMaintenance5FeaturesKHR,
+		                   vk::PhysicalDevicePipelineBinaryFeaturesKHR>
+		    binary_features;
+		physical_device.getFeatures2(&binary_features.get<vk::PhysicalDeviceFeatures2>());
+		graphics.compute_pipeline_binaries =
+		    binary_features.get<vk::PhysicalDeviceMaintenance5FeaturesKHR>().maintenance5 == VK_TRUE &&
+		    binary_features.get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries == VK_TRUE;
+		if (graphics.compute_pipeline_binaries) {
+			add(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+			add(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+		}
+	}
 #endif
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 
@@ -898,9 +916,36 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		presentation.pNext = const_cast<void*>(device_info.pNext);
 		device_info.pNext = &presentation;
 	}
+#if defined(ANYPS5_KYTY)
+	vk::PhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary {.pipelineBinaries = VK_TRUE};
+	vk::PhysicalDeviceMaintenance5FeaturesKHR   binary_flags {.pNext = &pipeline_binary, .maintenance5 = VK_TRUE};
+	const void*                                 unbinary_features = create.get<vk::DeviceCreateInfo>().pNext;
+	if (graphics.compute_pipeline_binaries) {
+		auto& device_info     = create.get<vk::DeviceCreateInfo>();
+		pipeline_binary.pNext = const_cast<void*>(device_info.pNext);
+		device_info.pNext     = &binary_flags;
+	}
+#endif
 	vk::Device device = nullptr;
-	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
-	                     "vkCreateDevice");
+	auto       created = physical_device.createDevice(&create.get(), nullptr, &device);
+#if defined(ANYPS5_KYTY)
+	if (created != vk::Result::eSuccess && graphics.compute_pipeline_binaries) {
+		std::erase_if(device_extensions, [](const char* name) {
+			return std::string_view(name) == VK_KHR_MAINTENANCE_5_EXTENSION_NAME ||
+			       std::string_view(name) == VK_KHR_PIPELINE_BINARY_EXTENSION_NAME;
+		});
+		auto& device_info                   = create.get<vk::DeviceCreateInfo>();
+		device_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
+		device_info.ppEnabledExtensionNames = device_extensions.data();
+		device_info.pNext                   = unbinary_features;
+		graphics.compute_pipeline_binaries  = false;
+		LOGF("Vulkan compute pipeline binaries unavailable: vkCreateDevice returned %s\n",
+		     vk::to_string(created).c_str());
+		created = physical_device.createDevice(&create.get(), nullptr, &device);
+	}
+	LOGF("Vulkan compute pipeline binaries: %s\n", graphics.compute_pipeline_binaries ? "true" : "false");
+#endif
+	RequireVulkanSuccess(created, "vkCreateDevice");
 	if (mesh_lds_padding) {
 		graphics.fn_get_shader_info =
 		    reinterpret_cast<PFN_vkGetShaderInfoAMD>(device.getProcAddr("vkGetShaderInfoAMD"));

@@ -31,8 +31,19 @@
 #include <cinttypes>
 #if defined(ANYPS5_KYTY)
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <xxhash.h>
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #endif
 #include <fmt/format.h>
 #include <span>
@@ -93,13 +104,17 @@ private:
 };
 
 #if defined(ANYPS5_KYTY)
-vk::Result CreateAuditedPipeline(const GraphicContext& graphics, const char* kind, uint64_t variant,
-                                 vk::PipelineCreateFlags flags, vk::Pipeline& out, auto&& create) {
+bool PipelineCompileAuditEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PIPELINE_COMPILE_AUDIT");
 		return value != nullptr && std::string_view(value) == "1";
 	}();
-	if (!enabled) {
+	return enabled;
+}
+
+vk::Result CreateAuditedPipeline(const GraphicContext& graphics, const char* kind, uint64_t variant,
+                                 vk::PipelineCreateFlags flags, vk::Pipeline& out, auto&& create) {
+	if (!PipelineCompileAuditEnabled()) {
 		return create(flags);
 	}
 
@@ -131,9 +146,330 @@ vk::Result CreateAuditedPipeline(const GraphicContext& graphics, const char* kin
 	}
 	return create(flags);
 }
+
+constexpr uint32_t                MaxComputeBinaryCount = 16;
+constexpr uint32_t                MaxComputeBinaryBytes = 32u << 20;
+constexpr uint32_t                MinComputeBinaryWords = 50'000;
+constexpr std::array<char, 8>     ComputeBinaryMagic {'K', 'Y', 'T', 'Y', 'C', 'B', '1', '\0'};
+std::atomic<uint64_t>             g_compute_binary_files {0};
+
+struct ComputeBinaryKey {
+	uint32_t                                                  size = 0;
+	std::array<uint8_t, VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR> bytes {};
+
+	[[nodiscard]] bool     Valid() const { return size != 0 && size <= bytes.size(); }
+	[[nodiscard]] uint64_t Hash() const { return XXH3_64bits(bytes.data(), size); }
+	bool                   operator==(const ComputeBinaryKey&) const = default;
+};
+
+ComputeBinaryKey ComputeBinaryDeviceKey(const GraphicContext& graphics) {
+	const auto&    properties = graphics.physical_device_properties;
+	const uint32_t ids[] {properties.vendorID, properties.deviceID, properties.driverVersion,
+	                      static_cast<uint32_t>(graphics.driver_id)};
+	ComputeBinaryKey key;
+	static_assert(sizeof(ids) + VK_UUID_SIZE == VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+	key.size = VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
+	std::memcpy(key.bytes.data(), ids, sizeof(ids));
+	std::memcpy(key.bytes.data() + sizeof(ids), properties.pipelineCacheUUID.data(), VK_UUID_SIZE);
+	return key;
+}
+
+ComputeBinaryKey ComputeBinaryKeyOf(const vk::PipelineBinaryKeyKHR& key) {
+	ComputeBinaryKey out;
+	if (key.keySize == 0 || key.keySize > out.bytes.size()) {
+		return out;
+	}
+	out.size = key.keySize;
+	std::memcpy(out.bytes.data(), key.key.data(), key.keySize);
+	return out;
+}
+
+struct ComputeBinaryHeader {
+	std::array<char, 8> magic = ComputeBinaryMagic;
+	ComputeBinaryKey    device;
+	ComputeBinaryKey    pipeline;
+	uint32_t            count = 0;
+};
+static_assert(sizeof(ComputeBinaryHeader) == 84);
+static_assert(std::is_trivially_copyable_v<ComputeBinaryHeader>);
+
+struct ComputeBinaryRecord {
+	ComputeBinaryKey key;
+	uint32_t         size     = 0;
+	uint64_t         checksum = 0;
+};
+static_assert(sizeof(ComputeBinaryRecord) == 48);
+static_assert(std::is_trivially_copyable_v<ComputeBinaryRecord>);
+
+constexpr size_t MaxComputeBinaryFile =
+    sizeof(ComputeBinaryHeader) + MaxComputeBinaryCount * sizeof(ComputeBinaryRecord) + MaxComputeBinaryBytes;
+
+struct ComputeBinaryHandles {
+	vk::Device                         device;
+	std::vector<vk::PipelineBinaryKHR> handles;
+
+	ComputeBinaryHandles(vk::Device owner, uint32_t count): device(owner), handles(count) {}
+	~ComputeBinaryHandles() {
+		for (const auto handle: handles) {
+			if (handle) {
+				device.destroyPipelineBinaryKHR(handle, nullptr);
+			}
+		}
+	}
+	ComputeBinaryHandles(const ComputeBinaryHandles&)            = delete;
+	ComputeBinaryHandles& operator=(const ComputeBinaryHandles&) = delete;
+};
+
+std::optional<vk::Result> RestoreComputeBinary(vk::Device device, const std::filesystem::path& path,
+                                               const ComputeBinaryHeader& expected,
+                                               vk::ComputePipelineCreateInfo info, vk::Pipeline& pipeline) {
+	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	if (!file) {
+		return std::nullopt;
+	}
+	const auto end = file.tellg();
+	if (end < static_cast<std::streamoff>(sizeof(ComputeBinaryHeader)) ||
+	    end > static_cast<std::streamoff>(MaxComputeBinaryFile)) {
+		return std::nullopt;
+	}
+	std::vector<uint8_t> bytes(static_cast<size_t>(end));
+	file.seekg(0);
+	if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+		return std::nullopt;
+	}
+	ComputeBinaryHeader header;
+	std::memcpy(&header, bytes.data(), sizeof(header));
+	if (header.magic != ComputeBinaryMagic || !header.device.Valid() || !header.pipeline.Valid() ||
+	    header.device != expected.device || header.pipeline != expected.pipeline || header.count == 0 ||
+	    header.count > MaxComputeBinaryCount) {
+		return std::nullopt;
+	}
+	size_t offset = sizeof(header);
+	if (bytes.size() - offset < header.count * sizeof(ComputeBinaryRecord)) {
+		return std::nullopt;
+	}
+	std::vector<ComputeBinaryRecord> records(header.count);
+	std::memcpy(records.data(), bytes.data() + offset, header.count * sizeof(ComputeBinaryRecord));
+	offset += header.count * sizeof(ComputeBinaryRecord);
+	std::vector<vk::PipelineBinaryKeyKHR>  keys(header.count);
+	std::vector<vk::PipelineBinaryDataKHR> data(header.count);
+	uint64_t                               total = 0;
+	for (uint32_t i = 0; i < header.count; i++) {
+		const auto& record = records[i];
+		total += record.size;
+		if (!record.key.Valid() || record.size == 0 || total > MaxComputeBinaryBytes ||
+		    bytes.size() - offset < record.size ||
+		    XXH3_64bits(bytes.data() + offset, record.size) != record.checksum) {
+			return std::nullopt;
+		}
+		keys[i].keySize = record.key.size;
+		std::memcpy(keys[i].key.data(), record.key.bytes.data(), record.key.size);
+		data[i].dataSize = record.size;
+		data[i].pData    = bytes.data() + offset;
+		offset += record.size;
+	}
+	if (offset != bytes.size()) {
+		return std::nullopt;
+	}
+	const vk::PipelineBinaryKeysAndDataKHR keys_and_data {.binaryCount         = header.count,
+	                                                      .pPipelineBinaryKeys = keys.data(),
+	                                                      .pPipelineBinaryData = data.data()};
+	const vk::PipelineBinaryCreateInfoKHR  create {.pKeysAndDataInfo = &keys_and_data};
+	ComputeBinaryHandles                   handles(device, header.count);
+	vk::PipelineBinaryHandlesInfoKHR       created {.pipelineBinaryCount = header.count,
+	                                                .pPipelineBinaries   = handles.handles.data()};
+	auto result = device.createPipelineBinariesKHR(&create, nullptr, &created);
+	if (result == vk::Result::eErrorDeviceLost) {
+		return result;
+	}
+	if (result != vk::Result::eSuccess) {
+		return std::nullopt;
+	}
+	vk::PipelineBinaryInfoKHR binaries {.pNext             = info.pNext,
+	                                    .binaryCount       = header.count,
+	                                    .pPipelineBinaries = handles.handles.data()};
+	info.pNext = &binaries;
+	result     = device.createComputePipelines(nullptr, 1, &info, nullptr, &pipeline);
+	if (result == vk::Result::eSuccess && pipeline) {
+		return result;
+	}
+	if (pipeline) {
+		device.destroyPipeline(pipeline, nullptr);
+		pipeline = nullptr;
+	}
+	if (result == vk::Result::eErrorDeviceLost) {
+		return result;
+	}
+	return std::nullopt;
+}
+
+uint64_t ProcessId() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return static_cast<uint64_t>(_getpid());
+#else
+	return static_cast<uint64_t>(getpid());
+#endif
+}
+
+bool WriteComputeBinaryFile(const std::filesystem::path& path, const ComputeBinaryHeader& header,
+                            std::span<const ComputeBinaryRecord> records,
+                            std::span<const std::vector<uint8_t>> blobs) {
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	auto temporary = path;
+	temporary += fmt::format(".{}.{}.{}.tmp", ProcessId(), SteadyNs(),
+	                         g_compute_binary_files.fetch_add(1, std::memory_order_relaxed));
+	bool written = false;
+	{
+		std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+		if (file) {
+			file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+			file.write(reinterpret_cast<const char*>(records.data()),
+			           static_cast<std::streamsize>(records.size_bytes()));
+			for (const auto& blob: blobs) {
+				file.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
+			}
+			file.close();
+			written = static_cast<bool>(file);
+		}
+	}
+	if (written) {
+		std::filesystem::rename(temporary, path, error);
+		written = !error;
+	}
+	if (!written) {
+		std::filesystem::remove(temporary, error);
+	}
+	return written;
+}
+
+bool SaveComputeBinary(vk::Device device, const std::filesystem::path& path, ComputeBinaryHeader header,
+                       vk::Pipeline pipeline) {
+	const vk::PipelineBinaryCreateInfoKHR create {.pipeline = pipeline};
+	vk::PipelineBinaryHandlesInfoKHR      counted {};
+	if (device.createPipelineBinariesKHR(&create, nullptr, &counted) != vk::Result::eSuccess ||
+	    counted.pipelineBinaryCount == 0 || counted.pipelineBinaryCount > MaxComputeBinaryCount) {
+		return false;
+	}
+	ComputeBinaryHandles             handles(device, counted.pipelineBinaryCount);
+	vk::PipelineBinaryHandlesInfoKHR created {.pipelineBinaryCount = counted.pipelineBinaryCount,
+	                                          .pPipelineBinaries   = handles.handles.data()};
+	if (device.createPipelineBinariesKHR(&create, nullptr, &created) != vk::Result::eSuccess ||
+	    created.pipelineBinaryCount != counted.pipelineBinaryCount) {
+		return false;
+	}
+	std::vector<ComputeBinaryRecord>  records(created.pipelineBinaryCount);
+	std::vector<std::vector<uint8_t>> blobs(created.pipelineBinaryCount);
+	uint64_t                          total = 0;
+	for (uint32_t i = 0; i < created.pipelineBinaryCount; i++) {
+		const vk::PipelineBinaryDataInfoKHR info {.pipelineBinary = handles.handles[i]};
+		vk::PipelineBinaryKeyKHR            key {};
+		size_t                              size = 0;
+		if (device.getPipelineBinaryDataKHR(&info, &key, &size, nullptr) != vk::Result::eSuccess || size == 0 ||
+		    size > MaxComputeBinaryBytes - total) {
+			return false;
+		}
+		blobs[i].resize(size);
+		if (device.getPipelineBinaryDataKHR(&info, &key, &size, blobs[i].data()) != vk::Result::eSuccess ||
+		    size != blobs[i].size()) {
+			return false;
+		}
+		records[i].key      = ComputeBinaryKeyOf(key);
+		records[i].size     = static_cast<uint32_t>(size);
+		records[i].checksum = XXH3_64bits(blobs[i].data(), size);
+		if (!records[i].key.Valid()) {
+			return false;
+		}
+		total += size;
+	}
+	header.count = created.pipelineBinaryCount;
+	return WriteComputeBinaryFile(path, header, records, blobs);
+}
+
+std::optional<vk::Result> CreateComputePipelineWithBinary(const GraphicContext& graphics,
+                                                          vk::ComputePipelineCreateInfo info,
+                                                          vk::PipelineCache driver_cache,
+                                                          ComputePipelineCacheMode cache_mode,
+                                                          vk::Pipeline& pipeline, const char*& mode) {
+	const auto device = graphics.device;
+	info.flags &= ~vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
+	vk::PipelineBinaryKeyKHR  exact {};
+	vk::PipelineCreateInfoKHR keyed {.pNext = &info};
+	if (device.getPipelineKeyKHR(&keyed, &exact) != vk::Result::eSuccess) {
+		return std::nullopt;
+	}
+	const ComputeBinaryHeader header {.device = ComputeBinaryDeviceKey(graphics), .pipeline = ComputeBinaryKeyOf(exact)};
+	if (!header.device.Valid() || !header.pipeline.Valid()) {
+		return std::nullopt;
+	}
+	const auto path = graphics.compute_pipeline_binary_directory /
+	                  fmt::format("{:016x}-{:016x}.bin", header.device.Hash(), header.pipeline.Hash());
+	if (cache_mode != ComputePipelineCacheMode::KnownMiss) {
+		if (const auto restored = RestoreComputeBinary(device, path, header, info, pipeline)) {
+			mode = "binary";
+			return restored;
+		}
+	}
+	if (cache_mode == ComputePipelineCacheMode::Lookup) {
+		return std::nullopt;
+	}
+	if (driver_cache && !graphics.pipeline_cache_lookup_enabled) {
+		return std::nullopt;
+	}
+	if (cache_mode == ComputePipelineCacheMode::Full && driver_cache) {
+		auto probe = info;
+		probe.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+		const auto found = device.createComputePipelines(driver_cache, 1, &probe, nullptr, &pipeline);
+		if (found == vk::Result::eSuccess && pipeline) {
+			mode = "lookup";
+			return found;
+		}
+		if (pipeline) {
+			device.destroyPipeline(pipeline, nullptr);
+			pipeline = nullptr;
+		}
+		if (found == vk::Result::eErrorDeviceLost) {
+			return found;
+		}
+	}
+	const vk::PipelineCreateFlags2CreateInfoKHR flags {
+	    .pNext = info.pNext,
+	    .flags = vk::PipelineCreateFlags2KHR(static_cast<VkPipelineCreateFlags2KHR>(
+	                 static_cast<VkPipelineCreateFlags>(info.flags))) |
+	             vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR};
+	auto capture  = info;
+	capture.pNext = &flags;
+	const auto result = device.createComputePipelines(nullptr, 1, &capture, nullptr, &pipeline);
+	if (result != vk::Result::eSuccess || !pipeline) {
+		if (pipeline) {
+			device.destroyPipeline(pipeline, nullptr);
+			pipeline = nullptr;
+		}
+		if (result == vk::Result::eErrorDeviceLost) {
+			return result;
+		}
+		return std::nullopt;
+	}
+	SaveComputeBinary(device, path, header, pipeline);
+	const vk::ReleaseCapturedPipelineDataInfoKHR release {.pipeline = pipeline};
+	static_cast<void>(device.releaseCapturedPipelineDataKHR(&release, nullptr));
+	mode = "binary-capture";
+	return result;
+}
 #endif
 
 }
+
+#if defined(ANYPS5_KYTY)
+bool CanUseComputeBinaries(const GraphicContext& graphics, const ShaderModule& module) {
+	const auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	return graphics.compute_pipeline_binaries && !graphics.compute_pipeline_binary_directory.empty() &&
+	       module.spirv_words >= MinComputeBinaryWords && !PipelineCompileAuditEnabled() &&
+	       dispatcher.vkGetPipelineKeyKHR != nullptr && dispatcher.vkCreatePipelineBinariesKHR != nullptr &&
+	       dispatcher.vkDestroyPipelineBinaryKHR != nullptr && dispatcher.vkGetPipelineBinaryDataKHR != nullptr &&
+	       dispatcher.vkReleaseCapturedPipelineDataKHR != nullptr;
+}
+#endif
 
 DriverCreations GetDriverCreations(double slow_seconds) {
 	DriverCreations result;
@@ -1040,7 +1376,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  const ShaderModule& module, vk::PipelineCache driver_cache,
-                                 bool lookup, std::chrono::nanoseconds* driver_time) {
+                                 ComputePipelineCacheMode cache_mode, std::chrono::nanoseconds* driver_time) {
+	const bool lookup = cache_mode == ComputePipelineCacheMode::Lookup;
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -1085,16 +1422,30 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 	Clock::time_point finished {};
 	Clock::duration elapsed {};
 	vk::Result result;
+#if defined(ANYPS5_KYTY)
+	const char* mode = lookup ? "lookup" : "create";
+#endif
 	{
 		const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
 		                                    {module.info.shader_hash, 0, 0, 0});
 		const auto started = timing ? Clock::now() : Clock::time_point {};
 #if defined(ANYPS5_KYTY)
-		const auto create = [&](vk::PipelineCreateFlags flags) {
-			info.flags = flags;
-			return graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
-		};
-		result = CreateAuditedPipeline(graphics, "compute", module.id, info.flags, pipeline.pipeline, create);
+		const bool driver_lookup = lookup && graphics.pipeline_cache_lookup_enabled && driver_cache;
+		std::optional<vk::Result> binary;
+		if (CanUseComputeBinaries(graphics, module)) {
+			binary = CreateComputePipelineWithBinary(graphics, info, driver_cache, cache_mode, pipeline.pipeline, mode);
+		}
+		if (binary) {
+			result = *binary;
+		} else if (lookup && !driver_lookup) {
+			result = vk::Result::ePipelineCompileRequired;
+		} else {
+			const auto create = [&](vk::PipelineCreateFlags flags) {
+				info.flags = flags;
+				return graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+			};
+			result = CreateAuditedPipeline(graphics, "compute", module.id, info.flags, pipeline.pipeline, create);
+		}
 #else
 		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 #endif
@@ -1111,7 +1462,7 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "[kyty-gpl] compute-driver {:.6f} s 0x{:016x} module={} spirv_words={} mode={} result={} @{}\n",
 		    std::chrono::duration<double>(elapsed).count(), module.info.shader_hash, module.id,
-		    module.spirv_words, lookup ? "lookup" : "create", vk::to_string(result),
+		    module.spirv_words, mode, vk::to_string(result),
 		    finished.time_since_epoch().count()));
 	}
 #endif
@@ -1119,8 +1470,9 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache) {
-	const auto result = CreateComputePipeline(graphics, pipeline, module, driver_cache, false);
+                            const ShaderModule& module, vk::PipelineCache driver_cache,
+                            ComputePipelineCacheMode cache_mode) {
+	const auto result = CreateComputePipeline(graphics, pipeline, module, driver_cache, cache_mode);
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkCreateComputePipelines failed: %s, cs 0x%016" PRIx64 "\n", vk::to_string(result).c_str(),
 		     module.info.shader_hash);
@@ -1129,10 +1481,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                          const ShaderModule& module, vk::PipelineCache cache) {
-	if (!graphics.pipeline_cache_lookup_enabled || cache == nullptr) {
+	const bool driver_lookup = graphics.pipeline_cache_lookup_enabled && cache != nullptr;
+#if defined(ANYPS5_KYTY)
+	if (!driver_lookup && !CanUseComputeBinaries(graphics, module)) {
 		return false;
 	}
-	if (CreateComputePipeline(graphics, pipeline, module, cache, true) == vk::Result::eSuccess &&
+#else
+	if (!driver_lookup) {
+		return false;
+	}
+#endif
+	if (CreateComputePipeline(graphics, pipeline, module, cache, ComputePipelineCacheMode::Lookup) ==
+	        vk::Result::eSuccess &&
 	    pipeline.pipeline != nullptr) {
 		return true;
 	}

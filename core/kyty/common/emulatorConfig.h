@@ -73,7 +73,7 @@ struct ConfigOptions {
 	uint32_t               wave_split_check_period     = 0;
 	bool                   native_rt                   = false;
 	bool                   async_pipelines_enabled     = true;
-	bool                   async_pipelines_skip_more   = false;
+	bool                   async_pipelines_probe       = false;
 	bool                   rt_stats_enabled            = false;
 	bool                   rt_emulation                = true;
 	uint32_t               rt_oracle                   = 0;
@@ -130,7 +130,7 @@ bool RelaxedShaderFloatEnabled();
 uint32_t WaveSplitCheckPeriod();
 bool NativeRtEnabled();
 bool AsyncPipelinesEnabled();
-bool AsyncPipelinesSkipMore();
+bool AsyncPipelinesProbe();
 bool RayTracingStatsEnabled();
 bool RayTracingEmulation();
 uint32_t RayTracingOracle();

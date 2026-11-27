@@ -40,8 +40,18 @@ struct ReplayResources {
     }
 };
 
+size_t CountBinaryFiles(const std::filesystem::path& directory) {
+    std::error_code error;
+    size_t count = 0;
+    for (std::filesystem::directory_iterator entry(directory, error), end; !error && entry != end;
+         entry.increment(error)) {
+        count += entry->path().extension() == ".bin" ? 1u : 0u;
+    }
+    return count;
+}
+
 int ReplayComputePipeline(const std::filesystem::path& store, uint64_t moduleId,
-                          const std::filesystem::path& output) {
+                          const std::filesystem::path& output, const std::filesystem::path& binaryCache) {
     std::error_code fileError;
     if (!std::filesystem::is_regular_file(store, fileError)) {
         std::fputs("Expected a regular Kyty shader store file\n", stderr);
@@ -87,8 +97,13 @@ int ReplayComputePipeline(const std::filesystem::path& store, uint64_t moduleId,
     }
     if (module.info.info.uses_image_heap) graphics.image_heap_layout = ImageHeap::CreateLayout(graphics.device);
     module.module = CompileSPV(spirv, graphics.device);
+    const bool binaries = !binaryCache.empty() && graphics.compute_pipeline_binaries;
+    if (binaries) graphics.compute_pipeline_binary_directory = binaryCache;
+    const auto filesBefore = binaries ? CountBinaryFiles(binaryCache) : 0u;
     std::chrono::nanoseconds elapsed {};
-    const auto result = CreateComputePipeline(graphics, resources.pipeline, module, resources.cache, false, &elapsed);
+    const auto result = CreateComputePipeline(graphics, resources.pipeline, module, resources.cache,
+                                              ComputePipelineCacheMode::Full, &elapsed);
+    const auto filesAfter = binaries ? CountBinaryFiles(binaryCache) : 0u;
     const auto gpu = GetVulkanDeviceIdentity(graphics);
     const char* diskCache = std::getenv("__GL_SHADER_DISK_CACHE");
     const auto policy = diskCache == nullptr ? std::string_view {} : std::string_view(diskCache);
@@ -106,9 +121,11 @@ int ReplayComputePipeline(const std::filesystem::path& store, uint64_t moduleId,
         "{\"schema\":1,\"module_id\":\"%" PRIu64 "\",\"spirv_words\":%u,"
         "\"vendor_id\":%u,\"device_id\":%u,\"driver_version\":%u,"
         "\"driver_create_ns\":%" PRId64 ",\"vk_result\":%d,"
-        "\"vulkan_cache\":\"empty\",\"nvidia_disk_cache_env\":\"%s\"}\n",
+        "\"vulkan_cache\":\"empty\",\"nvidia_disk_cache_env\":\"%s\","
+        "\"pipeline_binaries\":%s,\"binary_files_before\":%zu,\"binary_files_after\":%zu}\n",
         module.id, module.spirv_words, gpu.vendor_id, gpu.device_id, gpu.driver_version,
-        static_cast<int64_t>(elapsed.count()), static_cast<int>(result), setting);
+        static_cast<int64_t>(elapsed.count()), static_cast<int>(result), setting,
+        binaries ? "true" : "false", filesBefore, filesAfter);
     if (std::fclose(report) != 0 || written < 0) {
         std::fputs("Could not write the replay report\n", stderr);
         return 2;
@@ -121,10 +138,11 @@ int ReplayComputePipeline(const std::filesystem::path& store, uint64_t moduleId,
 
 extern "C" int AgcDriverKytyReplayComputePipeline_nid_postfix(
     const std::filesystem::path::value_type* store, uint64_t moduleId,
-    const std::filesystem::path::value_type* output) {
+    const std::filesystem::path::value_type* output, const std::filesystem::path::value_type* binaryCache) {
     if (store == nullptr || *store == 0 || moduleId == 0 || output == nullptr || *output == 0) return 64;
     try {
-        return ReplayComputePipeline(store, moduleId, output);
+        return ReplayComputePipeline(store, moduleId, output,
+                                     binaryCache == nullptr ? std::filesystem::path {} : std::filesystem::path(binaryCache));
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 3;
