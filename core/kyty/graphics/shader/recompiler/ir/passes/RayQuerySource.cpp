@@ -291,6 +291,154 @@ Value Incoming(const Inst& phi, const Block* from) {
 }
 
 using FForm = std::array<uint32_t, 7>;
+class EdgeReach {
+public:
+	explicit EdgeReach(const Program& program): m_program(program) {
+		for (const auto* block: program.blocks) {
+			if (block->ImmPredecessors().empty()) m_roots.push_back(block);
+		}
+	}
+
+	[[nodiscard]] bool Dead(const Block* block, const Block* from, const Block* target) const {
+		const auto key = std::tuple {block, from, target};
+		if (const auto at = m_dead.find(key); at != m_dead.end()) return at->second;
+		const bool dead = Decided(block, from, target);
+		m_dead.emplace(key, dead);
+		return dead;
+	}
+
+private:
+	using Known = std::vector<std::pair<Value, bool>>;
+
+	static bool Reaches(const Block* from, const Block* to, const Block* avoid) {
+		if (from == avoid) return false;
+		std::unordered_set<const Block*> seen {from};
+		std::vector<const Block*>        work {from};
+		while (!work.empty()) {
+			const auto* block = work.back();
+			work.pop_back();
+			if (block == to) return true;
+			for (const auto* next: block->ImmSuccessors()) {
+				if (next != avoid && seen.insert(next).second) work.push_back(next);
+			}
+		}
+		return false;
+	}
+
+	[[nodiscard]] bool Dominates(const Block* dominator, const Block* block) const {
+		if (dominator == block) return true;
+		if (m_roots.empty()) return false;
+		return std::ranges::none_of(m_roots, [&](const Block* root) { return Reaches(root, block, dominator); });
+	}
+
+	static void Learn(Known& known, Value value, bool truth, const Block* taken, const Block* branch, uint32_t depth = 0) {
+		value = value.Resolve();
+		if (value.IsImmediate() || depth > 8) return;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->Parent() == nullptr || Reaches(taken, inst->Parent(), branch)) return;
+		known.emplace_back(value, truth);
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ConditionRef:
+				if (inst->Flags<CFG::BranchCondition>() == CFG::BranchCondition::ScalarInstruction) {
+					Learn(known, inst->Arg(0), truth, taken, branch, depth + 1);
+				}
+				break;
+			case ValueOpcode::LogicalNot: Learn(known, inst->Arg(0), !truth, taken, branch, depth + 1); break;
+			case ValueOpcode::LogicalAnd:
+				if (truth) {
+					Learn(known, inst->Arg(0), true, taken, branch, depth + 1);
+					Learn(known, inst->Arg(1), true, taken, branch, depth + 1);
+				}
+				break;
+			case ValueOpcode::LogicalOr:
+				if (!truth) {
+					Learn(known, inst->Arg(0), false, taken, branch, depth + 1);
+					Learn(known, inst->Arg(1), false, taken, branch, depth + 1);
+				}
+				break;
+			default: break;
+		}
+	}
+
+	const Known& KnownAt(const Block* from) const {
+		const auto at = m_known.find(from);
+		if (at != m_known.end()) return at->second;
+		Known known;
+		for (const auto* block: m_program.blocks) {
+			const auto& term = block->terminator;
+			if (block->condition.IsEmpty() || term.true_block == nullptr || term.false_block == nullptr ||
+			    term.true_block == term.false_block || !Dominates(block, from)) {
+				continue;
+			}
+			const bool taken = Reaches(term.true_block, from, block);
+			if (taken != Reaches(term.false_block, from, block)) {
+				Learn(known, block->condition, taken, taken ? term.true_block : term.false_block, block);
+			}
+		}
+		return m_known.emplace(from, std::move(known)).first->second;
+	}
+
+	static std::optional<bool> Evaluate(Value value, const Block* block, const Block* from, const Known& known, uint32_t depth) {
+		value = value.Resolve();
+		if (value.IsEmpty() || depth > 16) return std::nullopt;
+		if (value.IsImmediate()) return value.GetType() == Type::U1 ? std::optional(value.U1()) : std::nullopt;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return std::nullopt;
+		if (inst->GetOpcode() == ValueOpcode::Phi && block != nullptr && inst->Parent() == block) {
+			for (size_t index = 0; index < inst->NumArgs(); ++index) {
+				if (inst->PhiBlock(index) == from) return Evaluate(inst->Arg(index), nullptr, from, known, depth + 1);
+			}
+			return std::nullopt;
+		}
+		for (const auto& [fact, truth]: known) {
+			if (fact == value) return truth;
+		}
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ConditionRef:
+				if (inst->Flags<CFG::BranchCondition>() == CFG::BranchCondition::ScalarInstruction) {
+					return Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				}
+				return std::nullopt;
+			case ValueOpcode::LogicalNot: {
+				const auto inner = Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				return inner ? std::optional(!*inner) : std::nullopt;
+			}
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr: {
+				const bool any = inst->GetOpcode() == ValueOpcode::LogicalOr;
+				const auto a = Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				const auto b = Evaluate(inst->Arg(1), block, from, known, depth + 1);
+				if (a == any || b == any) return any;
+				if (a && b) return !any;
+				return std::nullopt;
+			}
+			case ValueOpcode::SelectU1: {
+				const auto pick = Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				return pick ? Evaluate(inst->Arg(*pick ? 1 : 2), block, from, known, depth + 1) : std::nullopt;
+			}
+			default: return std::nullopt;
+		}
+	}
+
+	[[nodiscard]] bool Decided(const Block* block, const Block* from, const Block* target) const {
+		const auto& term = block->terminator;
+		if (block == target || block->condition.IsEmpty() || term.true_block == nullptr || term.false_block == nullptr ||
+		    term.true_block == term.false_block) {
+			return false;
+		}
+		if (Reaches(block, from, nullptr)) return false;
+		const bool onward = Reaches(term.true_block, target, nullptr);
+		if (onward == Reaches(term.false_block, target, nullptr)) return false;
+		const auto taken = Evaluate(block->condition, block, from, KnownAt(from), 0);
+		return taken.has_value() && *taken != onward;
+	}
+
+	const Program&                                                           m_program;
+	std::vector<const Block*>                                                m_roots;
+	mutable std::map<std::tuple<const Block*, const Block*, const Block*>, bool> m_dead;
+	mutable std::unordered_map<const Block*, Known>                          m_known;
+};
+
 using World = std::array<std::vector<Value>, 6>;
 
 struct Blas {
@@ -305,6 +453,12 @@ public:
 	Evaluator(const Program& program, const Order& order, Store& store, Value active)
 	    : m_program(program), m_order(order), m_store(store) {
 		if (!active.IsEmpty()) AddFact(active);
+	}
+
+	Evaluator& Toward(const EdgeReach& reach, const Block* target) {
+		m_reach  = &reach;
+		m_target = target;
+		return *this;
 	}
 
 	std::optional<bool> Decide(Value condition, uint32_t depth = 0) const {
@@ -436,6 +590,7 @@ public:
 			if (!m_busy.insert(l).second) return {Opaque(*l, 64)};
 			Choices result;
 			for (size_t index = 0; index < l->NumArgs(); ++index) {
+				if (Unreached(*l, index)) continue;
 				const auto from = l->PhiBlock(index);
 				Append(result, Pair(l->Arg(index), Incoming(*h, from), depth + 1));
 			}
@@ -849,6 +1004,10 @@ private:
 		std::vector<const Inst*> products;
 	};
 
+	[[nodiscard]] bool Unreached(const Inst& phi, size_t index) const {
+		return m_reach != nullptr && m_target != nullptr && m_reach->Dead(phi.Parent(), phi.PhiBlock(index), m_target);
+	}
+
 	Evaluator& Given(Value fact) {
 		fact = fact.Resolve();
 		const auto* inst = fact.TryInstruction();
@@ -857,6 +1016,8 @@ private:
 		if (!child) {
 			child          = std::make_unique<Evaluator>(m_program, m_order, m_store, Value {});
 			child->m_facts = m_facts;
+			child->m_reach  = m_reach;
+			child->m_target = m_target;
 			child->AddFact(fact);
 		}
 		return *child;
@@ -882,6 +1043,8 @@ private:
 		if (!child) {
 			child          = std::make_unique<Evaluator>(m_program, m_order, m_store, Value {});
 			child->m_facts = m_facts;
+			child->m_reach  = m_reach;
+			child->m_target = m_target;
 			for (const auto fact: extra) child->AddFact(fact);
 		}
 		return child.get();
@@ -1190,7 +1353,9 @@ private:
 			case ValueOpcode::Phi: {
 				if (m_order.Carried(inst)) return {Opaque(inst, 32)};
 				Choices result;
-				for (size_t index = 0; index < inst.NumArgs(); ++index) Append(result, Word(inst.Arg(index)));
+				for (size_t index = 0; index < inst.NumArgs(); ++index) {
+					if (!Unreached(inst, index)) Append(result, Word(inst.Arg(index)));
+				}
 				return result;
 			}
 			case ValueOpcode::IAdd32: return Combine(inst.Arg(0), inst.Arg(1), [&](uint32_t x, uint32_t y) { return m_store.Add(x, y); });
@@ -1278,7 +1443,9 @@ private:
 			case ValueOpcode::Phi: {
 				if (m_order.Carried(inst)) return {Opaque(inst, 64)};
 				Choices result;
-				for (size_t index = 0; index < inst.NumArgs(); ++index) Append(result, Wide(inst.Arg(index)));
+				for (size_t index = 0; index < inst.NumArgs(); ++index) {
+					if (!Unreached(inst, index)) Append(result, Wide(inst.Arg(index)));
+				}
 				return result;
 			}
 			case ValueOpcode::BitwiseAnd64:
@@ -1297,6 +1464,8 @@ private:
 	std::unordered_map<const Inst*, std::vector<FForm>> m_floats;
 	std::unordered_map<const Inst*, std::unique_ptr<Evaluator>> m_given;
 	std::map<std::pair<const Block*, const Block*>, std::unique_ptr<Evaluator>> m_edges;
+	const EdgeReach*                                m_reach  = nullptr;
+	const Block*                                    m_target = nullptr;
 };
 
 struct Source {
@@ -2038,6 +2207,7 @@ OracleWalks Refuse(const char* reason, uint32_t detail = 0) {
 OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> intersections) {
 	if (intersections.empty()) return Refuse("no intersection");
 	const Order       order(program);
+	const EdgeReach   edges(program);
 	Store             store;
 	std::vector<Site> sites;
 	for (auto* bvh: intersections) {
@@ -2051,6 +2221,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	std::vector<std::tuple<Source, uint32_t, uint32_t>> named_sources;
 	for (auto& site: sites) {
 		Evaluator   ev(program, order, store, site.bvh->Arg(2));
+		ev.Toward(edges, site.bvh->Parent());
 		const auto* low   = ProducerOf(site.descriptor->Arg(0), ValueOpcode::CompositeExtractU64);
 		const auto* field = low != nullptr ? ProducerOf(low->Arg(0), ValueOpcode::BitwiseAnd64) : nullptr;
 		const auto* shift = field != nullptr ? ProducerOf(field->Arg(0), ValueOpcode::ShiftRightLogical64) : nullptr;
@@ -2096,6 +2267,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	for (auto& site: sites) {
 		if (site.top) continue;
 		Evaluator ev(program, order, store, site.bvh->Arg(2));
+		ev.Toward(edges, site.bvh->Parent());
 		for (const auto base: site.bases) {
 			const auto blas = BlasOf(store, base);
 			if (!blas) continue;
@@ -2220,6 +2392,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	}
 	{
 		Evaluator ev(program, order, store, top->bvh->Arg(2));
+		ev.Toward(edges, top->bvh->Parent());
 		for (uint32_t k = 0; k < 6; ++k) {
 			const auto current = ev.Strip(top->address->Arg(top->words + 1 + k));
 			world[k].push_back(current);
@@ -2269,6 +2442,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		if (site.blases.empty()) continue;
 		lower.push_back(&site);
 		Evaluator ev(program, order, store, site.bvh->Arg(2));
+		ev.Toward(edges, site.bvh->Parent());
 		std::array<std::vector<FForm>, 6> rays;
 		for (uint32_t k = 0; k < 6; ++k) {
 			const auto arg   = site.address->Arg(site.words + 1 + k);
@@ -2338,6 +2512,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	std::vector<uint32_t>                      inline_roots;
 	for (const auto* site: lower) {
 		Evaluator ev(program, order, store, site->bvh->Arg(2));
+		ev.Toward(edges, site->bvh->Parent());
 		for (const auto& [value, distance]: NodeSources(ev, site->nodes)) {
 			if (value.IsImmediate()) continue;
 			for (const auto word: ev.Word(value)) {
@@ -2368,6 +2543,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	std::vector<uint32_t> tops;
 	{
 		Evaluator ev(program, order, store, top->bvh->Arg(2));
+		ev.Toward(edges, top->bvh->Parent());
 		for (const auto& [value, distance]: NodeSources(ev, top->nodes)) {
 			const auto constant = ImmediateU32(value);
 			if (!constant || *constant == 0xffffffffu || (*constant & 7u) < 4u || (*constant & 7u) > 5u) continue;

@@ -47,7 +47,7 @@ square bracket followed by an opening bracket or parenthesis. Name identifiers i
 backticks without template arguments, arrows, or chained indexes, and write
 comparisons in words.
 Choose exactly one action
-and submit it by calling the maintenance tool exactly once. 'reply' posts body.
+and return it as the JSON object. 'reply' posts body.
 'approve' applies to a pull request whose complete diff you checked and found
 correct, complete, and consistent with the project guidance; body is a short
 public note. 'reject' applies to a pull request with a blocking
@@ -138,16 +138,10 @@ def ask_model(context, key, model, final):
         "max_tokens": 12000 if final else 8000,
         "system": INSTRUCTIONS + (FINAL_REVIEWER if final else FIRST_REVIEWER),
         "messages": [{"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
-        "tools": [{
-            "name": "maintenance",
-            "description": "Publish the triage decision for this thread.",
-            "input_schema": schema,
-            "strict": True,
-        }],
-        "tool_choice": {"type": "auto"},
+        "output_config": {"format": {"type": "json_schema", "schema": schema}},
     }
     if final:
-        payload["output_config"] = {"effort": "high"}
+        payload["output_config"]["effort"] = "high"
     request = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps(payload).encode(),
@@ -160,10 +154,14 @@ def ask_model(context, key, model, final):
     with urllib.request.urlopen(request, timeout=360 if final else 150) as response:
         result = json.load(response)
     for part in result.get("content", []):
-        if part.get("type") == "tool_use" and part.get("name") == "maintenance":
-            decision = part.get("input", {})
-            if decision.get("action") in actions and isinstance(decision.get("body"), str):
-                return {"action": decision["action"], "body": decision["body"]}
+        if part.get("type") != "text":
+            continue
+        try:
+            decision = json.loads(part.get("text", ""))
+        except ValueError:
+            continue
+        if isinstance(decision, dict) and decision.get("action") in actions and isinstance(decision.get("body"), str):
+            return {"action": decision["action"], "body": decision["body"]}
     blocks = [str(part.get("type")) for part in result.get("content", [])]
     print(f"{model} returned no valid decision (stop_reason={result.get('stop_reason')}, blocks={blocks}).")
     return None

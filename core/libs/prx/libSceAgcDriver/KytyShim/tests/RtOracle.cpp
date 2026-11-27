@@ -582,6 +582,106 @@ void ComputedHeader(ChasedSource source) {
     Expect(!unreadable, "a program whose pointer chain is unreadable yields no header");
 }
 
+enum class WalkGuard { Blocked, Reachable, MixedVote, VoteAtJoin };
+
+IR::OracleWalks GuardedWalks(WalkGuard guard) {
+    using Op = IR::ValueOpcode;
+    IR::Block   pre, join, second_pre, exit;
+    SourceWalk  walk;
+    walk.program.blocks = {&walk.entry, &pre, &walk.header, &walk.body, &walk.latch, &walk.merge, &join, &second_pre,
+                           &walk.second_header, &walk.second_body, &walk.second_latch, &walk.second_merge, &exit};
+    Number(walk);
+    const auto u32    = [](uint32_t value) { return IR::Value(value); };
+    const auto word   = static_cast<uint64_t>(IR::Type::U32);
+    const auto ray    = UserRay(walk);
+    const auto first  = UserHeader(walk, 0x40);
+    const auto second = UserHeader(walk, 0x20);
+    const auto flag   = walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {14})});
+    const auto ref = [&](CFG::BranchCondition kind, IR::Value predicate) {
+        return walk.Add(Op::ConditionRef, {predicate}, static_cast<uint64_t>(kind));
+    };
+    IR::Value skip, later;
+    switch (guard) {
+        case WalkGuard::Blocked:
+        case WalkGuard::Reachable:
+            later = walk.Add(Op::INotEqual32, {flag, u32(0)});
+            skip  = ref(CFG::BranchCondition::ScalarInstruction, later);
+            break;
+        case WalkGuard::MixedVote: {
+            const auto lane_zero = walk.Add(Op::IEqual32, {walk.Add(Op::LaneId, {}), u32(0)});
+            skip  = walk.Add(Op::LogicalNot, {ref(CFG::BranchCondition::VccNonZero, lane_zero)});
+            later = walk.Add(Op::LogicalNot, {lane_zero});
+            break;
+        }
+        case WalkGuard::VoteAtJoin:
+            skip = walk.Add(Op::IEqual32, {walk.Add(Op::LaneId, {}), u32(0)});
+            break;
+    }
+    walk.entry.condition              = skip;
+    walk.entry.terminator.kind        = CFG::TerminatorKind::ConditionalBranch;
+    walk.entry.terminator.true_block  = &join;
+    walk.entry.terminator.false_block = &pre;
+    walk.entry.terminator.merge_block = &join;
+    walk.entry.AddBranch(&join);
+    walk.entry.AddBranch(&pre);
+    BuildWalk(walk, {pre, walk.header, walk.body, walk.latch, walk.merge}, first, ray, HighWord::Exact);
+
+    walk.block        = &walk.merge;
+    const auto table  = walk.Add(Op::GetAddressResource, {second[0], second[1]});
+    const auto low    = walk.Add(Op::IAdd32, {second[0], walk.LoadAddress(table, 0x30)});
+    const auto carry  = walk.Add(Op::SelectU32, {walk.Add(Op::ULessThan32, {low, second[0]}), u32(1), u32(0)});
+    const auto high   = walk.Add(Op::IAdd32, {walk.Add(Op::IAdd32, {second[1], walk.LoadAddress(table, 0x34)}), carry});
+    const auto buffer = walk.Add(Op::GetBufferResource, {low, walk.Add(Op::BitwiseOr32, {high, u32(0x00800000u)}), u32(0xffffffffu), u32(0x00027000u)});
+    const auto index  = walk.Add(Op::ShiftRightLogical32, {flag, u32(3)});
+    const auto record = [&](uint32_t dword) {
+        return walk.Load(Op::LoadBufferU32, {buffer, index, u32(0), u32(0), IR::Value(true)}, dword * 4u, true);
+    };
+    const std::array<IR::Value, 2> raw {record(12), record(13)};
+    Link(walk.merge, join);
+
+    walk.block       = &join;
+    auto& header_low  = join.AppendNewInst(Op::Phi, {}, word);
+    auto& header_high = join.AppendNewInst(Op::Phi, {}, word);
+    auto& gate        = join.AppendNewInst(Op::Phi, {}, static_cast<uint64_t>(IR::Type::U1));
+    header_low.AddPhiOperand(&walk.entry, second[0]);
+    header_low.AddPhiOperand(&walk.merge, raw[0]);
+    header_high.AddPhiOperand(&walk.entry, second[1]);
+    header_high.AddPhiOperand(&walk.merge, raw[1]);
+    gate.AddPhiOperand(&walk.entry, IR::Value(false));
+    gate.AddPhiOperand(&walk.merge, IR::Value(true));
+    const auto open = guard == WalkGuard::Reachable ? IR::Value(&gate) : walk.Add(Op::LogicalNot, {IR::Value(&gate)});
+    join.condition              = guard == WalkGuard::VoteAtJoin ? ref(CFG::BranchCondition::VccNonZero, open)
+                                                                : walk.Add(Op::LogicalOr, {later, open});
+    join.terminator.kind        = CFG::TerminatorKind::ConditionalBranch;
+    join.terminator.true_block  = &second_pre;
+    join.terminator.false_block = &exit;
+    join.terminator.merge_block = &exit;
+    join.AddBranch(&second_pre);
+    join.AddBranch(&exit);
+    BuildWalk(walk, {second_pre, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge},
+              {IR::Value(&header_low), IR::Value(&header_high)}, ray, HighWord::Masked);
+    Link(walk.second_merge, exit);
+    return IR::DeriveOracleWalks(walk.program, walk.sites);
+}
+
+void UnreachableEdgeWalks() {
+    const auto bound = [](const IR::OracleWalks& derived, size_t loop) -> std::optional<uint32_t> {
+        if (derived.loop_headers.size() <= loop || derived.loop_headers[loop].size() != 1) return std::nullopt;
+        return derived.headers[derived.loop_headers[loop].front()].header_offset;
+    };
+    const auto blocked = GuardedWalks(WalkGuard::Blocked);
+    if (blocked.refusal != nullptr) std::fprintf(stderr, "unreachable edge walks refused: %s\n", blocked.refusal);
+    Expect(blocked.refusal == nullptr && bound(blocked, 0) == 0x40u && bound(blocked, 1) == 0x20u,
+           "a header value whose edge cannot reach the walk does not reject its TLAS");
+    const auto rejects_second = [&](WalkGuard guard) {
+        const auto derived = GuardedWalks(guard);
+        return derived.refusal == nullptr && derived.loop_headers.size() == 2 && bound(derived, 0) == 0x40u && derived.loop_headers[1].empty();
+    };
+    Expect(rejects_second(WalkGuard::Reachable), "a full-width record read that can reach the walk still rejects the TLAS");
+    Expect(rejects_second(WalkGuard::MixedVote), "a positive wave vote leaves other lanes free to carry a full-width record to the walk");
+    Expect(rejects_second(WalkGuard::VoteAtJoin), "a wave vote at the join includes lanes from both phi inputs");
+}
+
 void HeaderPrograms() {
     using Op = IR::HeaderOp;
     const auto op = [](Op value) { return static_cast<uint32_t>(value); };
@@ -774,6 +874,7 @@ int main() {
     ComputedHeader(ChasedSource::Address);
     ComputedHeader(ChasedSource::Scalar);
     ComputedHeader(ChasedSource::ScalarBuffer);
+    UnreachableEdgeWalks();
     HeaderPrograms();
     CodeWaveSize();
     DescriptorHighWord();
