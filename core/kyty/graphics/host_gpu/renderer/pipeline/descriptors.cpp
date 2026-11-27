@@ -8,6 +8,7 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeSwitches.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -42,6 +43,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -1362,13 +1364,15 @@ void RenderExecutor::LogTableSummary(size_t binding_slots) {
 	    "a size mismatch); table cache of {} entries, one generation per entry: {} lookups, {} hits, {} new keys, "
 	    "{} keys made again after an eviction, {} evictions, {} cleared past {} elements, {} cleared for the element "
 	    "budget, {} generation bumps; {} entries in use, {} keys seen, {} elements; "
-	    "{} shader bindings retained with {} slots, {} bindings retired\n",
+	    "{} shader bindings retained with {} slots, {} bindings retired; {} reused tables rebound over {} elements, "
+	    "{} elements checked, {} full scans; shadow: {} journal passes compared, {} mismatched elements\n",
 	    seconds, taken.prepared, taken.bindings, taken.reused, taken.prepared - taken.reused, taken.unfinished,
 	    taken.renewed, taken.layout, taken.left_renewed + taken.left_size, taken.left_renewed, taken.left_size,
 	    m_table_resolutions.Capacity(), cache.lookups, cache.hits, cache.created, cache.recreated, cache.evicted,
 	    cache.overflowed, MaxTableElements, cache.trimmed, cache.generations, m_table_resolutions.Size(),
 	    m_table_resolutions.KnownKeys(), m_table_element_count, m_table_states.size(), binding_slots,
-	    taken.retired_bindings));
+	    taken.retired_bindings, taken.rebinds, taken.elements, taken.candidates, taken.full_scans,
+	    taken.shadow_passes, taken.shadow_mismatches));
 }
 
 RenderExecutor::TableResolution&
@@ -1593,9 +1597,9 @@ static bool ReadsStencilPlane(const Image& image, const TextureCache::ImageDesc&
 }
 
 static bool ImageReadReady(const Image& image, const TextureBinding& texture) {
-	const auto layout = image.info.data.Empty() && !image.is_depth_copy ? vk::ImageLayout::eGeneral
-	                    : image.info.IsDepth()  ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-	                                            : vk::ImageLayout::eShaderReadOnlyOptimal;
+	const auto layout = image.info.IsDepth() && (!image.info.data.Empty() || image.is_depth_copy)
+	                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+	                        : vk::ImageLayout::eGeneral;
 	if (texture.layout != layout) {
 		return false;
 	}
@@ -1767,6 +1771,17 @@ void RenderExecutor::UnpinTableBindings(TableBindingState& state) {
 		}
 	}
 	state.valid = false;
+	state.watch.Invalidate();
+}
+
+void RenderExecutor::TrackTableElement(TableBindingState& state, uint32_t element) {
+	using Checked       = TableBindingState::Checked;
+	const auto& checked = state.checked[element];
+	state.watch.Track(element, checked.image != Checked::None, checked.image < Checked::NullImage, checked.image,
+	                  checked.element, [&](uint32_t other, uint32_t slot) {
+		                  return other < state.checked.size() && state.checked[other].image != Checked::None &&
+		                         state.checked[other].element == slot;
+	                  });
 }
 
 void RenderExecutor::IndexTableSlots(TableBindingState& state) {
@@ -1897,6 +1912,7 @@ void RenderExecutor::DropUnusedTableElements(TableBindingState& state, PreparedB
 	state.infos.resize(kept);
 	state.marks.resize(kept);
 	state.checked.resize(kept);
+	state.watch.Invalidate();
 	for (auto& slot: state.slots) {
 		slot = remap[slot];
 	}
@@ -1954,7 +1970,8 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 	state.marks.assign(state.elements.size(), 0);
 	state.checked.assign(state.elements.size(), {});
 	state.mark_stamp = 0;
-	state.valid      = true;
+	state.watch.Invalidate();
+	state.valid = true;
 }
 
 bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -2091,20 +2108,70 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 	const auto element_count = static_cast<uint32_t>(state.elements.size());
 	EXIT_IF(state.checked.size() != element_count);
 	m_table_checks.clear();
-	m_table_element_flags.assign((size_t {element_count} + 7) & ~size_t {7}, 0);
-	GetExecHelpers().ParallelFor(element_count, 2048, [&](uint32_t begin, uint32_t end) {
-		for (uint32_t index = begin; index < end; index++) {
-			m_table_element_flags[index] =
-			    state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index]) ? 1 : 0;
-		}
-	});
-	for (uint32_t first = 0; first < element_count; first += 8) {
-		uint64_t word = 0;
-		std::memcpy(&word, m_table_element_flags.data() + first, sizeof(word));
-		for (; word != 0; word &= word - 1) {
-			m_table_checks.push_back(first + static_cast<uint32_t>(std::countr_zero(word)) / 8u);
+	auto& watch = state.watch;
+	watch.Begin(element_count);
+	const auto image_seq   = Image::change_journal.Head();
+	const auto element_seq = m_table_element_journal->Head();
+	uint64_t   considered  = 0;
+	m_bound_image_indices.clear();
+	for (const auto id: m_bound_images) {
+		if (id) {
+			m_bound_image_indices.push_back(id.index);
 		}
 	}
+	const bool journal = Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::TableJournal);
+	const bool full = !journal || !watch.Collect(Image::change_journal, image_seq, *m_table_element_journal, element_seq,
+	                                 m_bound_image_indices, [&](uint32_t index) {
+		                                 if (!watch.Consider(index)) {
+			                                 return;
+		                                 }
+		                                 considered++;
+		                                 if (state.marks[index] != state.mark_stamp &&
+		                                     !still_unchanged(state.checked[index])) {
+			                                 m_table_checks.push_back(index);
+		                                 }
+	                                 });
+	if (!full) {
+		std::ranges::sort(m_table_checks);
+		static const bool shadow = [] {
+			const char* value = std::getenv("KYTY_TABLE_JOURNAL_SHADOW");
+			return value != nullptr && std::string_view {value} == "1";
+		}();
+		static uint64_t shadow_turn = 0;
+		if (shadow && (++shadow_turn & 15u) == 0) {
+			std::vector<uint32_t> reference;
+			for (uint32_t index = 0; index < element_count; index++) {
+				if (state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index])) {
+					reference.push_back(index);
+				}
+			}
+			std::vector<uint32_t> missed;
+			std::ranges::set_difference(reference, m_table_checks, std::back_inserter(missed));
+			m_table_stats.shadow_passes++;
+			m_table_stats.shadow_mismatches += missed.size() + (m_table_checks.size() + missed.size() - reference.size());
+		}
+	} else {
+		m_table_checks.clear();
+		considered = element_count;
+		m_table_element_flags.assign((size_t {element_count} + 7) & ~size_t {7}, 0);
+		GetExecHelpers().ParallelFor(element_count, 2048, [&](uint32_t begin, uint32_t end) {
+			for (uint32_t index = begin; index < end; index++) {
+				m_table_element_flags[index] =
+				    state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index]) ? 1 : 0;
+			}
+		});
+		for (uint32_t first = 0; first < element_count; first += 8) {
+			uint64_t word = 0;
+			std::memcpy(&word, m_table_element_flags.data() + first, sizeof(word));
+			for (; word != 0; word &= word - 1) {
+				m_table_checks.push_back(first + static_cast<uint32_t>(std::countr_zero(word)) / 8u);
+			}
+		}
+	}
+	m_table_stats.rebinds++;
+	m_table_stats.elements += element_count;
+	m_table_stats.candidates += considered;
+	m_table_stats.full_scans += full ? 1 : 0;
 	const auto check_count = static_cast<uint32_t>(m_table_checks.size());
 	m_table_flags.assign(check_count, 0);
 	GetExecHelpers().ParallelFor(check_count, 256, [&](uint32_t begin, uint32_t end) {
@@ -2195,6 +2262,21 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 			break;
 		}
 	}
+	EXIT_IF(state.elements.size() != element_count);
+	watch.BeginTracking(full);
+	if (full) {
+		for (uint32_t index = 0; index < element_count; index++) {
+			TrackTableElement(state, index);
+		}
+	} else {
+		for (const auto index: m_table_checks) {
+			TrackTableElement(state, index);
+		}
+		for (const auto index: prepared.table_visits) {
+			TrackTableElement(state, index);
+		}
+	}
+	watch.Finish(image_seq, element_seq);
 }
 
 void RenderExecutor::FlushDeferredDispatchBarrier() {
@@ -2254,7 +2336,7 @@ void RenderExecutor::ResetBindings() {
 	for (auto& elements: m_retired_table_elements) {
 		for (auto& [dwords, element]: elements) {
 			if (element.version_slot < m_table_element_versions.size()) {
-				m_table_element_versions[element.version_slot]++;
+				BumpTableElementVersion(element.version_slot);
 				m_free_table_element_versions.push_back(element.version_slot);
 			}
 		}
@@ -3108,11 +3190,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 	const auto tick = m_context.GetTextureCache().m_gc_tick;
 	EXIT_IF(prepared.table_sources.size() != prepared.table_images.size());
-	const auto element_changed = [&](uint32_t slot) {
-		if (slot < m_table_element_versions.size()) {
-			m_table_element_versions[slot]++;
-		}
-	};
+	const auto element_changed = [&](uint32_t slot) { BumpTableElementVersion(slot); };
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
 		const auto& source = prepared.table_sources[k];
 		auto& texture = *prepared.table_images[k];
@@ -3471,7 +3549,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				prepare_image(image, vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
 				              range);
-			} else {
+			} else if (!Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::TableJournal) ||
+			           !image.Settled(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead)) {
 				prepare_image(image, image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range);
 			}
 			binding.layout = image.backing.state.layout;

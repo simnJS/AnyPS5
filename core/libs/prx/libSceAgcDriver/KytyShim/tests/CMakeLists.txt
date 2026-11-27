@@ -241,6 +241,16 @@ if(NOT WIN32)
 endif()
 
 if(NOT ANYPS5_KYTY_DLL)
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/TableWatch.cpp)
+    add_test_executable(kyty_shim_table_watch_tests ${CMAKE_CURRENT_SOURCE_DIR}/TableWatchMain.cpp)
+    configure_host_test_executable(kyty_shim_table_watch_tests)
+    target_link_libraries(kyty_shim_table_watch_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_table_watch COMMAND kyty_shim_table_watch_tests)
+    set_tests_properties(kyty_shim_table_watch PROPERTIES TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "kyty_shim_table_watch: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+
+if(NOT ANYPS5_KYTY_DLL)
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/TableResolutionCache.cpp)
     add_test_executable(kyty_shim_table_resolution_cache_tests ${CMAKE_CURRENT_SOURCE_DIR}/TableResolutionCacheMain.cpp)
     configure_host_test_executable(kyty_shim_table_resolution_cache_tests)

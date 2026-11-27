@@ -6,6 +6,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/image/imageChangeJournal.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <algorithm>
@@ -207,8 +208,11 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
-		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
+		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eGeneral;
+	}
+	[[nodiscard]] bool Settled(vk::ImageLayout layout, vk::AccessFlags2 access) const noexcept {
+		return backing.subresource_states.empty() && backing.state.layout == layout &&
+		       backing.state.access_mask == access;
 	}
 	struct HeapChange {
 		GuestRange data;
@@ -218,10 +222,12 @@ public:
 	void StateChanged() const noexcept {
 		state_epoch.fetch_add(1u, std::memory_order_relaxed);
 		if (version != nullptr) {
+			change_journal.Push(version_index);
 			version->fetch_add(1u, std::memory_order_release);
 		}
 	}
 	static inline std::atomic<uint64_t> state_epoch {0};
+	static inline ImageChangeJournal    change_journal;
 	[[nodiscard]] static uint64_t       StateEpoch() noexcept { return state_epoch.load(std::memory_order_relaxed); }
 	void HeapChanged() const {
 		StateChanged();
@@ -270,7 +276,8 @@ public:
 #if defined(ANYPS5_KYTY)
 	std::array<uint64_t, 4> target_frames {};
 #endif
-	std::atomic<uint32_t>* version = nullptr;
+	std::atomic<uint32_t>* version       = nullptr;
+	uint32_t               version_index = 0;
 
 private:
 	friend struct ImageTestAccess;
