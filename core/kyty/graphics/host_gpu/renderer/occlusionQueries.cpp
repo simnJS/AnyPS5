@@ -107,7 +107,7 @@ OcclusionQueries::OcclusionQueries(RenderContext& context)
 
 OcclusionQueries::~OcclusionQueries() {
 	if (m_counter_pipeline) {
-		m_device.destroyPipeline(m_counter_pipeline);
+		MemoryTelemetry::Destroy(m_device, m_counter_pipeline);
 	}
 	if (m_counter_layout) {
 		m_device.destroyPipelineLayout(m_counter_layout);
@@ -476,7 +476,7 @@ void OcclusionQueries::CreateCounterPipeline() {
 	pipeline_info.stage  = stage;
 	pipeline_info.layout = m_counter_layout;
 	const auto result =
-	    m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &m_counter_pipeline);
+	    MemoryTelemetry::Create(m_device, nullptr, pipeline_info, m_counter_pipeline);
 	m_device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create occlusion counter pipeline");
 	SetVulkanObjectNameF(m_device, m_counter_pipeline, "Kyty.OcclusionCounters");

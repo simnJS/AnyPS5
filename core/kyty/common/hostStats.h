@@ -58,6 +58,14 @@ struct HostStats {
 	std::optional<uint64_t> gpu_recoveries;
 };
 
+struct ProcessMemory {
+	std::optional<uint64_t> rss;
+	std::optional<uint64_t> private_bytes;
+	std::optional<uint64_t> malloc_bytes;
+};
+
+[[nodiscard]] ProcessMemory ReadProcessMemory();
+
 struct SystemMemory {
 	uint64_t total;
 	uint64_t available;

@@ -156,7 +156,7 @@ ImageHeap::ImageHeap(RenderContext& context): m_context(context), m_check(SlotCh
 	pool_info.maxSets       = 1;
 	pool_info.poolSizeCount = 1;
 	pool_info.pPoolSizes    = &pool_size;
-	EXIT_IF(graphics.device.createDescriptorPool(&pool_info, nullptr, &m_pool) !=
+	EXIT_IF(MemoryTelemetry::Create(graphics.device, pool_info, m_pool) !=
 	        vk::Result::eSuccess);
 	vk::DescriptorSetAllocateInfo allocate {};
 	allocate.descriptorPool     = m_pool;
@@ -195,9 +195,9 @@ vk::DescriptorSetLayout ImageHeap::CreateLayout(vk::Device device) {
 ImageHeap::~ImageHeap() {
 	auto& graphics             = m_context.GetGraphics();
 	graphics.image_heap_layout = nullptr;
-	if (m_fill_pipeline) graphics.device.destroyPipeline(m_fill_pipeline, nullptr);
+	if (m_fill_pipeline) MemoryTelemetry::Destroy(graphics.device, m_fill_pipeline);
 	if (m_fill_layout) graphics.device.destroyPipelineLayout(m_fill_layout, nullptr);
-	graphics.device.destroyDescriptorPool(m_pool, nullptr);
+	MemoryTelemetry::Destroy(graphics.device, m_pool);
 	graphics.device.destroyDescriptorSetLayout(m_layout, nullptr);
 }
 
@@ -1229,7 +1229,7 @@ void ImageHeap::PrepareGpu() {
 	pipeline_info.stage  = stage;
 	pipeline_info.layout = m_fill_layout;
 	const auto result =
-	    graphics.device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &m_fill_pipeline);
+	    MemoryTelemetry::Create(graphics.device, nullptr, pipeline_info, m_fill_pipeline);
 	graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create image heap fill pipeline");
 	SetVulkanObjectNameF(graphics.device, m_fill_pipeline, "Kyty.ImageHeapFill");

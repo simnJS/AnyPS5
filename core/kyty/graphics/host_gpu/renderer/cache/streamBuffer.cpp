@@ -61,7 +61,7 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 }
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, MemoryTelemetry::Kind category)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -123,6 +123,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		     static_cast<unsigned>(static_cast<VkBufferUsageFlags>(flags)));
 	}
 
+	using MemoryTelemetry::Kind;
+	if (category == Kind::Buffer) {
+		switch (usage) {
+			case MemoryUsage::Upload: category = Kind::Upload; break;
+			case MemoryUsage::Download: category = Kind::Download; break;
+			case MemoryUsage::Stream: category = Kind::Stream; break;
+			case MemoryUsage::DeviceLocal: break;
+		}
+	}
+	m_charge.Add(category, graphics.IsLocalMemoryType(allocation_result.memoryType), allocation_result.size);
 	m_buffer = native_buffer;
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
@@ -172,6 +182,7 @@ Buffer::~Buffer() {
 		return;
 	}
 	vmaDestroyBuffer(m_allocator, m_buffer, m_allocation);
+	m_charge.Release();
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {
@@ -259,9 +270,9 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
+                           uint64_t size, MemoryTelemetry::Kind category)
     : Buffer(graphics, scheduler, usage, 0,
-             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size, category),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

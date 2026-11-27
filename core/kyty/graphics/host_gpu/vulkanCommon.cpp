@@ -8,6 +8,41 @@
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 namespace Libs::Graphics {
+
+namespace MemoryTelemetry {
+
+vk::Result Create(vk::Device device, const vk::DescriptorPoolCreateInfo& info, vk::DescriptorPool& handle) {
+	const auto result = device.createDescriptorPool(&info, nullptr, &handle);
+	if (result == vk::Result::eSuccess) live_objects<vk::DescriptorPool>.fetch_add(1, std::memory_order_relaxed);
+	return result;
+}
+
+vk::Result Create(vk::Device device, const vk::CommandPoolCreateInfo& info, vk::CommandPool& handle) {
+	const auto result = device.createCommandPool(&info, nullptr, &handle);
+	if (result == vk::Result::eSuccess) live_objects<vk::CommandPool>.fetch_add(1, std::memory_order_relaxed);
+	return result;
+}
+
+vk::Result Create(vk::Device device, const vk::PipelineCacheCreateInfo& info, vk::PipelineCache& handle) {
+	const auto result = device.createPipelineCache(&info, nullptr, &handle);
+	if (result == vk::Result::eSuccess) live_objects<vk::PipelineCache>.fetch_add(1, std::memory_order_relaxed);
+	return result;
+}
+
+vk::Result Create(vk::Device device, vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info, vk::Pipeline& handle) {
+	const auto result = device.createGraphicsPipelines(cache, 1, &info, nullptr, &handle);
+	if (result == vk::Result::eSuccess) live_objects<vk::Pipeline>.fetch_add(1, std::memory_order_relaxed);
+	return result;
+}
+
+vk::Result Create(vk::Device device, vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& info, vk::Pipeline& handle) {
+	const auto result = device.createComputePipelines(cache, 1, &info, nullptr, &handle);
+	if (result == vk::Result::eSuccess) live_objects<vk::Pipeline>.fetch_add(1, std::memory_order_relaxed);
+	return result;
+}
+
+}
+
 namespace {
 
 struct FormatMapping {
@@ -141,7 +176,7 @@ vk::Pipeline CreateComputePipeline(vk::Device device, std::span<const uint32_t> 
 	create.stage.pName    = "main";
 	create.layout         = layout;
 	vk::Pipeline pipeline = nullptr;
-	const auto   result   = device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
+	const auto   result   = MemoryTelemetry::Create(device, nullptr, create, pipeline);
 	device.destroyShaderModule(shader, nullptr);
 	RequireVulkanSuccess(result, operation);
 	return pipeline;

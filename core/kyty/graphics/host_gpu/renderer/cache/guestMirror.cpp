@@ -92,11 +92,15 @@ Outcome ProbeOnce(const GraphicContext& graphics, uint64_t size, std::string& de
 	vk::DeviceMemory memory = nullptr;
 	vk::Fence    fence   = nullptr;
 	Outcome      outcome = Outcome::Failed;
+	MemoryTelemetry::Allocation charge;
 	const auto   cleanup = [&](bool device_usable) {
 		if (!device_usable) return;
 		if (fence) device.destroyFence(fence, nullptr, d);
 		if (buffer) device.destroyBuffer(buffer, nullptr, d);
-		if (memory) device.freeMemory(memory, nullptr, d);
+		if (memory) {
+			device.freeMemory(memory, nullptr, d);
+			charge.Release();
+		}
 		device.destroy(nullptr, d);
 	};
 	const vk::BufferCreateInfo buffer_info {.flags = BufferFlags, .size = size, .usage = BufferUsage};
@@ -116,8 +120,10 @@ Outcome ProbeOnce(const GraphicContext& graphics, uint64_t size, std::string& de
 	const vk::MemoryAllocateInfo      allocate {
 	         .pNext = &allocate_flags, .allocationSize = requirements.alignment, .memoryTypeIndex = type};
 	const vk::FenceCreateInfo    fence_info {};
-	if (type == UINT32_MAX || device.allocateMemory(&allocate, nullptr, &memory, d) != vk::Result::eSuccess ||
-	    device.createFence(&fence_info, nullptr, &fence, d) != vk::Result::eSuccess) {
+	if (type != UINT32_MAX && device.allocateMemory(&allocate, nullptr, &memory, d) == vk::Result::eSuccess) {
+		charge.Add(MemoryTelemetry::Kind::Other, graphics.IsLocalMemoryType(type), allocate.allocationSize);
+	}
+	if (!charge.bytes || device.createFence(&fence_info, nullptr, &fence, d) != vk::Result::eSuccess) {
 		detail = "no memory for one page";
 		cleanup(true);
 		return Outcome::Failed;
@@ -320,13 +326,17 @@ void GuestMirror::DestroyBuffer() {
 	const auto device = m_graphics.device;
 	if (m_buffer) device.destroyBuffer(m_buffer);
 	for (auto& chunk: m_chunks) {
-		if (chunk.allocation) vmaFreeMemory(chunk.allocator, chunk.allocation);
+		if (chunk.allocation) {
+			vmaFreeMemory(chunk.allocator, chunk.allocation);
+			chunk.charge.Release();
+		}
 	}
 	if (m_fence) device.destroyFence(m_fence);
 	if (m_semaphore) device.destroySemaphore(m_semaphore);
 	m_buffer    = nullptr;
 	m_fence     = nullptr;
 	m_semaphore = nullptr;
+	MemoryTelemetry::resident.fetch_sub(m_bound_blocks.exchange(0, std::memory_order_relaxed) << m_block_bits, std::memory_order_relaxed);
 	m_chunks.clear();
 }
 
@@ -694,6 +704,7 @@ GuestMirror::Grant GuestMirror::Allocate(uint64_t wanted) {
 		     vk::to_string(static_cast<vk::Result>(result)).c_str());
 	}
 	EXIT_IF(info.offset != 0);
+	chunk.charge.Add(MemoryTelemetry::Kind::Mirror, m_graphics.IsLocalMemoryType(info.memoryType), info.size);
 	chunk.memory = info.deviceMemory;
 	if (!m_free_chunks.empty()) {
 		m_current_chunk = m_free_chunks.back();
@@ -751,6 +762,7 @@ void GuestMirror::Bind(const Command& command) {
 		}
 	}
 	m_blocks.fetch_add(blocks, std::memory_order_relaxed);
+	MemoryTelemetry::resident.fetch_add(blocks << m_block_bits, std::memory_order_relaxed);
 	m_bound_blocks.fetch_add(blocks, std::memory_order_relaxed);
 }
 
@@ -788,6 +800,7 @@ void GuestMirror::Unbind(const Command& command) {
 		auto& chunk = m_chunks[index];
 		if (chunk.memory && chunk.used == 0) {
 			vmaFreeMemory(chunk.allocator, chunk.allocation);
+			chunk.charge.Release();
 			chunk          = {};
 			emptied[index] = true;
 			m_free_chunks.push_back(index);
@@ -797,6 +810,7 @@ void GuestMirror::Unbind(const Command& command) {
 	}
 	std::erase_if(m_free_slots, [&](const Slot& slot) { return emptied[slot.chunk]; });
 	m_unbound_blocks.fetch_add(blocks, std::memory_order_relaxed);
+	MemoryTelemetry::resident.fetch_sub(blocks << m_block_bits, std::memory_order_relaxed);
 	m_bound_blocks.fetch_sub(std::min(blocks, m_bound_blocks.load(std::memory_order_relaxed)), std::memory_order_relaxed);
 }
 

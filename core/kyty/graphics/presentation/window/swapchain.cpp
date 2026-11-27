@@ -176,6 +176,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		EXIT("failed to allocate prepared presentation image, extent=%ux%u format=%d\n",
 		     extent.width, extent.height, static_cast<int>(format));
 	}
+	dst.charge.Reclassify(MemoryTelemetry::Kind::Color);
 }
 
 void Presenter::Frame::Transit(CommandRecorder command, vk::ImageLayout layout,
@@ -604,15 +605,15 @@ void Swapchain::Destroy(bool wait_queue) {
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
-	graphics.device.destroyPipeline(m_overlay_pipeline, nullptr);
+	MemoryTelemetry::Destroy(graphics.device, m_overlay_pipeline);
 	graphics.device.destroyPipelineLayout(m_overlay_layout, nullptr);
 	graphics.device.destroyDescriptorSetLayout(m_overlay_descriptors, nullptr);
 	graphics.device.destroySampler(m_overlay_sampler, nullptr);
-	graphics.device.destroyPipeline(m_easu_pipeline, nullptr);
+	MemoryTelemetry::Destroy(graphics.device, m_easu_pipeline);
 	graphics.device.destroyPipelineLayout(m_easu_layout, nullptr);
-	graphics.device.destroyPipeline(m_rcas_pipeline, nullptr);
+	MemoryTelemetry::Destroy(graphics.device, m_rcas_pipeline);
 	graphics.device.destroyPipelineLayout(m_rcas_layout, nullptr);
-	graphics.device.destroyPipeline(m_cmaa2_pipeline, nullptr);
+	MemoryTelemetry::Destroy(graphics.device, m_cmaa2_pipeline);
 	graphics.device.destroyPipelineLayout(m_cmaa2_layout, nullptr);
 	graphics.device.destroyDescriptorSetLayout(m_fsr_descriptors, nullptr);
 	graphics.device.destroySampler(m_fsr_sampler, nullptr);
@@ -903,7 +904,7 @@ void Swapchain::EnsureFsrPipelines() {
 	create.pStages        = easu_stages.data();
 	create.layout         = m_easu_layout;
 	RequireVulkanSuccess(
-	    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_easu_pipeline),
+	    MemoryTelemetry::Create(device, nullptr, create, m_easu_pipeline),
 	    "create FSR EASU pipeline");
 
 	std::array<vk::PipelineShaderStageCreateInfo, 2> rcas_stages {};
@@ -917,7 +918,7 @@ void Swapchain::EnsureFsrPipelines() {
 	create.pStages        = rcas_stages.data();
 	create.layout         = m_rcas_layout;
 	RequireVulkanSuccess(
-	    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_rcas_pipeline),
+	    MemoryTelemetry::Create(device, nullptr, create, m_rcas_pipeline),
 	    "create FSR RCAS pipeline");
 
 	std::array<vk::PipelineShaderStageCreateInfo, 2> cmaa2_stages {};
@@ -931,7 +932,7 @@ void Swapchain::EnsureFsrPipelines() {
 	create.pStages         = cmaa2_stages.data();
 	create.layout          = m_cmaa2_layout;
 	RequireVulkanSuccess(
-	    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_cmaa2_pipeline),
+	    MemoryTelemetry::Create(device, nullptr, create, m_cmaa2_pipeline),
 	    "create CMAA2 pipeline");
 
 	device.destroyShaderModule(cmaa2_fragment, nullptr);
@@ -989,6 +990,7 @@ void Swapchain::DrawFsr(vk::CommandBuffer command, Presenter::Frame* source,
 		if (!graphics.CreateImage(create, slot.image)) {
 			EXIT("failed to allocate FSR upscale intermediate image\n");
 		}
+		slot.image.charge.Reclassify(MemoryTelemetry::Kind::Color);
 		vk::ImageViewCreateInfo view_info {};
 		view_info.image            = slot.image.image;
 		view_info.viewType         = vk::ImageViewType::e2D;
@@ -1349,7 +1351,7 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 		create.pDynamicState       = &dynamic;
 		create.layout              = m_overlay_layout;
 		RequireVulkanSuccess(
-		    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_overlay_pipeline),
+		    MemoryTelemetry::Create(device, nullptr, create, m_overlay_pipeline),
 		    "create video-out overlay pipeline");
 		device.destroyShaderModule(fragment, nullptr);
 		device.destroyShaderModule(vertex, nullptr);

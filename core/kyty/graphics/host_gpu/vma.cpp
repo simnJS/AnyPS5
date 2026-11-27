@@ -40,7 +40,7 @@ struct RecycledImage {
 	vk::ImageCreateInfo create;
 	VkImage             image      = VK_NULL_HANDLE;
 	VmaAllocation       allocation = nullptr;
-	uint64_t            size       = 0;
+	MemoryTelemetry::Allocation charge;
 };
 
 constexpr size_t   RecycledImagesMax     = 32;
@@ -79,13 +79,13 @@ public:
 	ImageGraveyard(const ImageGraveyard&)            = delete;
 	ImageGraveyard& operator=(const ImageGraveyard&) = delete;
 
-	void Push(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+	void Push(VmaAllocator allocator, VkImage image, VmaAllocation allocation, MemoryTelemetry::Allocation charge) {
 		{
 			std::lock_guard lock(m_mutex);
 			if (!m_thread.joinable()) {
 				m_thread = std::thread([this] { Run(); });
 			}
-			m_items.push_back({allocator, image, allocation});
+			m_items.push_back({allocator, image, allocation, charge});
 		}
 		m_wake.notify_one();
 	}
@@ -100,6 +100,7 @@ private:
 		VmaAllocator  allocator;
 		VkImage       image;
 		VmaAllocation allocation;
+		MemoryTelemetry::Allocation charge;
 	};
 
 	void Run() {
@@ -113,8 +114,9 @@ private:
 			batch.swap(m_items);
 			m_busy = true;
 			lock.unlock();
-			for (const auto& item: batch) {
+			for (auto& item: batch) {
 				vmaDestroyImage(item.allocator, item.image, item.allocation);
+				item.charge.Release();
 			}
 			batch.clear();
 			lock.lock();
@@ -140,8 +142,9 @@ ImageGraveyard& Graveyard() {
 void DestroyRecycledImages(VmaAllocator allocator) {
 	Graveyard().Flush();
 	std::lock_guard lock(g_recycled_mutex);
-	for (const auto& entry: g_recycled) {
+	for (auto& entry: g_recycled) {
 		vmaDestroyImage(allocator, entry.image, entry.allocation);
+		entry.charge.Release();
 	}
 	g_recycled.clear();
 	g_recycled_bytes = 0;
@@ -393,6 +396,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
+	const auto category = (image_info.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment)
+	                          ? MemoryTelemetry::Kind::Depth
+	                          : bindless ? MemoryTelemetry::Kind::HeapTexture : MemoryTelemetry::Kind::Texture;
 	if (Recyclable(image_info)) {
 		std::lock_guard lock(g_recycled_mutex);
 		const auto      found =
@@ -402,11 +408,14 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		if (found != g_recycled.end()) {
 			native_image     = found->image;
 			image.allocation = found->allocation;
-			g_recycled_bytes -= found->size;
+			image.charge = found->charge;
+			image.charge.Reclassify(category);
+			g_recycled_bytes -= found->charge.bytes;
 			g_recycled.erase(found);
 		}
 	}
 	if (native_image == VK_NULL_HANDLE) {
+		VmaAllocationInfo info {};
 		const auto* create = static_cast<const vk::ImageCreateInfo::NativeType*>(image_info);
 		auto result = vk::Result::eErrorOutOfDeviceMemory;
 		if (const uint32_t types = bindless ? BindlessImageSpillTypes(*this) : 0; types != 0) {
@@ -415,23 +424,23 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			spill_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 			spill_info.memoryTypeBits = types;
 			result = static_cast<vk::Result>(vmaCreateImage(
-			    spill_allocator, create, &spill_info, &native_image, &image.allocation, nullptr));
+			    spill_allocator, create, &spill_info, &native_image, &image.allocation, &info));
 			image.spilled = result == vk::Result::eSuccess;
 		}
 		if (result != vk::Result::eSuccess) {
 			result = static_cast<vk::Result>(vmaCreateImage(
-			    allocator, create, &alloc_info, &native_image, &image.allocation, nullptr));
+			    allocator, create, &alloc_info, &native_image, &image.allocation, &info));
 		}
 		if (result != vk::Result::eSuccess) {
 			DestroyRecycledImages(allocator);
 			result = static_cast<vk::Result>(vmaCreateImage(
-			    allocator, create, &alloc_info, &native_image, &image.allocation, nullptr));
+			    allocator, create, &alloc_info, &native_image, &image.allocation, &info));
 		}
 		if (result != vk::Result::eSuccess && spill_allocator != nullptr) {
 			VmaAllocationCreateInfo spill_info {};
 			spill_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 			result           = static_cast<vk::Result>(vmaCreateImage(
-			    spill_allocator, create, &spill_info, &native_image, &image.allocation, nullptr));
+			    spill_allocator, create, &spill_info, &native_image, &image.allocation, &info));
 			if (result == vk::Result::eSuccess) {
 				image.spilled = true;
 				static std::atomic<uint32_t> reported {0};
@@ -446,7 +455,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			spill_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 			result           = static_cast<vk::Result>(vmaCreateImage(
                 spill_allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &spill_info,
-                &native_image, &image.allocation, nullptr));
+                &native_image, &image.allocation, &info));
 			if (result == vk::Result::eSuccess) {
 				image.spilled = true;
 				static std::atomic<uint32_t> reported {0};
@@ -461,6 +470,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			LogMemoryBudget();
 			return false;
 		}
+		image.charge.Add(category, IsLocalMemoryType(info.memoryType), info.size);
 	}
 	image.image = native_image;
 
@@ -496,20 +506,19 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	if (image.recyclable) {
-		VmaAllocationInfo allocation_info {};
-		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
 		std::lock_guard lock(g_recycled_mutex);
-		g_recycled.push_back({create, image.image, image.allocation, allocation_info.size});
-		g_recycled_bytes += allocation_info.size;
+		g_recycled.push_back({create, image.image, image.allocation, image.charge});
+		g_recycled_bytes += image.charge.bytes;
 		while (g_recycled.size() > RecycledImagesMax || g_recycled_bytes > RecycledImageBytesMax) {
 			const auto& oldest = g_recycled.front();
-			Graveyard().Push(allocator, oldest.image, oldest.allocation);
-			g_recycled_bytes -= oldest.size;
+			Graveyard().Push(allocator, oldest.image, oldest.allocation, oldest.charge);
+			g_recycled_bytes -= oldest.charge.bytes;
 			g_recycled.erase(g_recycled.begin());
 		}
 	} else {
-		Graveyard().Push(image.spilled ? spill_allocator : allocator, image.image, image.allocation);
+		Graveyard().Push(image.spilled ? spill_allocator : allocator, image.image, image.allocation, image.charge);
 	}
+	image.charge = {};
 	image.image      = nullptr;
 	image.allocation = nullptr;
 	image.spilled    = false;

@@ -13,6 +13,7 @@
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <atomic>
 #include <cstdint>
 #include <fmt/format.h>
 #include <span>
@@ -26,6 +27,24 @@ namespace Libs::Graphics {
 
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
+namespace MemoryTelemetry {
+
+template <class Handle> inline constinit std::atomic<uint64_t> live_objects {};
+
+template <class Handle>
+void Destroy(vk::Device device, Handle handle) {
+	device.destroy(handle, nullptr);
+	if (handle) live_objects<Handle>.fetch_sub(1, std::memory_order_relaxed);
+}
+
+[[nodiscard]] vk::Result Create(vk::Device device, const vk::DescriptorPoolCreateInfo& info, vk::DescriptorPool& handle);
+[[nodiscard]] vk::Result Create(vk::Device device, const vk::CommandPoolCreateInfo& info, vk::CommandPool& handle);
+[[nodiscard]] vk::Result Create(vk::Device device, const vk::PipelineCacheCreateInfo& info, vk::PipelineCache& handle);
+[[nodiscard]] vk::Result Create(vk::Device device, vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info, vk::Pipeline& handle);
+[[nodiscard]] vk::Result Create(vk::Device device, vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& info, vk::Pipeline& handle);
+
+}
+
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 vk::Pipeline     CreateComputePipeline(vk::Device device, std::span<const uint32_t> code,
                                        vk::PipelineLayout layout, const char* operation);

@@ -160,7 +160,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 	std::vector<vk::PipelineCache> caches(threads);
 	for (auto& cache: caches) {
 		const vk::PipelineCacheCreateInfo create {};
-		if (shared || m_graphics.device.createPipelineCache(&create, nullptr, &cache) != vk::Result::eSuccess) {
+		if (shared || MemoryTelemetry::Create(m_graphics.device, create, cache) != vk::Result::eSuccess) {
 			cache = m_driver_cache;
 		}
 	}
@@ -193,7 +193,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 		Log::WriteToConsoleAndLog("Shader cache: the per-thread pipeline caches could not be merged\n");
 	}
 	for (const auto cache: merged) {
-		m_graphics.device.destroyPipelineCache(cache, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, cache);
 	}
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: {} pipelines created on {} threads, {}, stamp {:016x}\n", jobs.size(), threads,
@@ -265,7 +265,7 @@ void PipelineCache::WarmUpNativePipelines() {
 		CreateGraphicsPipelineLayout(m_graphics, pipeline, key, stages);
 		const auto result = CreateGraphicsPipelineWhole(m_graphics, pipeline, key, stages, m_driver_cache, {}, pipeline.pipeline);
 		if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr || pipeline.pipeline_layout == nullptr) {
-			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			MemoryTelemetry::Destroy(m_graphics.device, pipeline.pipeline);
 			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 			continue;

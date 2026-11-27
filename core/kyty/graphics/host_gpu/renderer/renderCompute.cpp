@@ -833,7 +833,7 @@ struct IndirectThreadClamps {
 
 	IndirectThreadClamps(GraphicContext& graphics, CommandScheduler& scheduler)
 	    : stride(std::max<uint64_t>(sizeof(uint32_t), graphics.GetPhysicalDeviceProperties().limits.nonCoherentAtomSize)),
-	      buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags, Slots * stride) {}
+	      buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags, Slots * stride, MemoryTelemetry::Kind::Indirect) {}
 
 	uint32_t Acquire() {
 		Common::LockGuard lock(mutex);
@@ -903,12 +903,12 @@ struct IndirectThreadPass {
 		pipeline_info.stage  = stage;
 		pipeline_info.layout = pipeline_layout;
 		const auto result =
-		    graphics.device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline);
+		    MemoryTelemetry::Create(graphics.device, nullptr, pipeline_info, pipeline);
 		graphics.device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create indirect-thread pipeline");
 	}
 	~IndirectThreadPass() {
-		graphics.device.destroyPipeline(pipeline, nullptr);
+		MemoryTelemetry::Destroy(graphics.device, pipeline);
 		graphics.device.destroyPipelineLayout(pipeline_layout, nullptr);
 		graphics.device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
 	}

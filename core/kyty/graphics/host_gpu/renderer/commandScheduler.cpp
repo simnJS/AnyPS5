@@ -31,12 +31,12 @@ CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemap
 	create.queueFamilyIndex = graphics.queue_family;
 	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
 	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-	const auto result       = graphics.device.createCommandPool(&create, nullptr, &m_pool);
+	const auto result       = MemoryTelemetry::Create(graphics.device, create, m_pool);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_pool == nullptr);
 }
 
 CommandScheduler::CommandPool::~CommandPool() {
-	m_graphics.device.destroyCommandPool(m_pool, nullptr);
+	MemoryTelemetry::Destroy(m_graphics.device, m_pool);
 }
 
 size_t CommandScheduler::CommandPool::Grow() {

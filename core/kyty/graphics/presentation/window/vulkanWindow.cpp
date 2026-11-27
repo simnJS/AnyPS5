@@ -417,6 +417,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	out_queue_family = best_queue_family;
 }
 
+static VKAPI_ATTR void VKAPI_CALL ReportMemory(const vk::DeviceMemoryReportCallbackDataEXT* event, void* data) {
+	static_cast<DriverMemoryReport*>(data)->Observe(static_cast<const VkDeviceMemoryReportCallbackDataEXT&>(*event));
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
                                      std::vector<const char*> device_extensions,
                                      const std::vector<const char*>& instance_extensions) {
@@ -457,6 +461,20 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
 	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
+	vk::PhysicalDeviceDeviceMemoryReportFeaturesEXT report_feature {};
+	if (HasExtension(available_extensions, VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFeatures2 query {.pNext = &report_feature};
+		physical_device.getFeatures2(&query);
+		if (report_feature.deviceMemoryReport) {
+			add(VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME);
+			uint32_t local_heaps = 0;
+			const auto& memory = graphics.physical_device_memory_properties;
+			for (uint32_t i = 0; i < memory.memoryHeapCount; ++i) {
+				if (memory.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) local_heaps |= 1u << i;
+			}
+			graphics.driver_memory_report = std::make_unique<DriverMemoryReport>(local_heaps);
+		}
+	}
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	if (add(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
 		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceExternalMemoryHostPropertiesEXT> host_properties;
@@ -898,6 +916,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		presentation.pNext = const_cast<void*>(device_info.pNext);
 		device_info.pNext = &presentation;
 	}
+	vk::DeviceDeviceMemoryReportCreateInfoEXT report {};
+	if (report_feature.deviceMemoryReport) {
+		auto& device_info = create.get<vk::DeviceCreateInfo>();
+		report.pfnUserCallback = &ReportMemory;
+		report.pUserData = graphics.driver_memory_report.get();
+		report.pNext = device_info.pNext;
+		report_feature.pNext = &report;
+		device_info.pNext = &report_feature;
+	}
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
 	                     "vkCreateDevice");
@@ -1247,6 +1274,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create Vulkan memory allocator");
 	}
 
+	graphic_ctx.StartMemoryMinutes();
 	ShaderRecompiler::IR::SetComputeIndirectFloors(256, 8);
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
@@ -1390,6 +1418,7 @@ void WindowContext::RecreateSurface() {
 }
 
 WindowContext::~WindowContext() {
+	graphic_ctx.StopMemoryMinutes();
 	Vr::OpenXrShutdown();
 	ShutdownSystemOverlayInput();
 	presenter.reset();

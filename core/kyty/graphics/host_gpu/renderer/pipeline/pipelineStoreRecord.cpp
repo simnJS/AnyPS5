@@ -117,6 +117,7 @@ bool LinkedComputeStore::Read(std::istream& input, std::span<const uint8_t> head
 	if (header.empty() || !read(magic.data(), magic.size()) || std::string_view(magic.data(), magic.size()) != "KYTYLCS1" ||
 	    !read(profile.data(), profile.size()) || !std::ranges::equal(profile, header) || !read(&count, sizeof(count))) return false;
 	decltype(m_entries) entries;
+	uint64_t retained = 0;
 	std::unordered_set<uint64_t> ids;
 	std::vector<uint8_t> compressed, raw;
 	size_t budget = 256u << 20;
@@ -153,10 +154,13 @@ bool LinkedComputeStore::Read(std::istream& input, std::span<const uint8_t> head
 		    !ids.insert(module.id).second) return false;
 		budget -= std::max<size_t>(frame.raw_size, initial_budget - reader.allocation_budget);
 		module.spirv_words = static_cast<uint32_t>(entry.spirv.size());
+		retained += sizeof(Entry) + sizeof(uint32_t) * (entry.spirv.capacity() + entry.caller.capacity() +
+		                                               module.function_code.capacity() + key.static_state.capacity());
 		entries.emplace(key.hash, std::move(entry));
 	}
 	if (input.peek() != std::char_traits<char>::eof() || input.bad()) return false;
 	m_entries.swap(entries);
+	m_bytes.Set(retained);
 	return true;
 }
 

@@ -277,14 +277,15 @@ void StopGpu() {
     const bool exclusive = gate.try_lock_for(StopGateTimeout);
     s.stopped.store(true, std::memory_order_release);
     std::lock_guard start(s.startMutex);
-    if (s.renderer.load(std::memory_order_acquire) == nullptr) return;
+    auto* renderer = s.renderer.load(std::memory_order_acquire);
+    if (renderer == nullptr) return;
+    renderer->GetGraphics().StopMemoryMinutes();
     if (!exclusive) {
         std::fprintf(stderr, "[kyty] GPU shutdown: a submission was still inside the GPU 2 s into the shutdown; leaving the Kyty GPU running until the process exits\n");
         std::fflush(stderr);
         return;
     }
     std::exception_ptr failure;
-    auto* renderer = s.renderer.load(std::memory_order_acquire);
     auto thread = Libc::StartHostThread([&failure, renderer] {
         try {
             renderer->ShutdownGpu();

@@ -179,11 +179,11 @@ PipelineLibraries::PipelineLibraries(GraphicContext& graphics, vk::PipelineCache
 PipelineLibraries::~PipelineLibraries() {
 	Stop();
 	for (const auto& optimized: m_optimized) {
-		m_graphics.device.destroyPipeline(optimized.pipeline, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, optimized.pipeline);
 	}
 	for (auto& part: m_parts) {
 		for (const auto& library: part | std::views::values) {
-			m_graphics.device.destroyPipeline(library->handle, nullptr);
+			MemoryTelemetry::Destroy(m_graphics.device, library->handle);
 		}
 	}
 	for (const auto& layout: m_layouts | std::views::values) {
@@ -399,7 +399,7 @@ bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPi
 	m_link_ns.fetch_add(Elapsed(started), std::memory_order_relaxed);
 	if (m_graphics.fn_get_shader_info && mesh && stages[3] != nullptr && pipeline.pipeline &&
 	    QueryMeshLdsWgpPadDwords(m_graphics, pipeline.pipeline, *stages[0]) != 0) {
-		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, pipeline.pipeline);
 		pipeline.pipeline = nullptr;
 	}
 	if (!pipeline.pipeline) {

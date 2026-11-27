@@ -126,7 +126,7 @@ vk::Result CreateAuditedPipeline(const GraphicContext& graphics, const char* kin
 		return probe;
 	}
 	if (out) {
-		graphics.device.destroyPipeline(out, nullptr);
+		MemoryTelemetry::Destroy(graphics.device, out);
 		out = nullptr;
 	}
 	return create(flags);
@@ -374,7 +374,7 @@ static vk::Result PadMeshPipeline(const GraphicContext& graphics, const ShaderMo
 	for (unsigned attempt = 0;; ++attempt) {
 		const auto pad = QueryMeshLdsWgpPadDwords(graphics, pipeline, module, total_pad, total_pad == 0);
 		if (pad == 0) return vk::Result::eSuccess;
-		graphics.device.destroyPipeline(pipeline, nullptr);
+		MemoryTelemetry::Destroy(graphics.device, pipeline);
 		pipeline = nullptr;
 		if (!pad || attempt == 2) return vk::Result::eErrorInitializationFailed;
 		total_pad += *pad;
@@ -384,7 +384,7 @@ static vk::Result PadMeshPipeline(const GraphicContext& graphics, const ShaderMo
 		const vk::SpecializationInfo spec {.mapEntryCount = 1, .pMapEntries = &entry,
 		                                   .dataSize = sizeof(length), .pData = &length};
 		mesh_stage.pSpecializationInfo = &spec;
-		const auto result = graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr, &pipeline);
+		const auto result = MemoryTelemetry::Create(graphics.device, cache, info, pipeline);
 		mesh_stage.pSpecializationInfo = nullptr;
 		if (result != vk::Result::eSuccess) return result;
 	}
@@ -607,7 +607,7 @@ public:
 		    {Hash(0), Hash(1), Hash(2), Hash(3)});
 		const auto create = [&](vk::PipelineCreateFlags create_flags) {
 			pipeline_info.flags = create_flags;
-			const auto result = m_graphics.device.createGraphicsPipelines(cache, 1, &pipeline_info, nullptr, &out);
+			const auto result = MemoryTelemetry::Create(m_graphics.device, cache, pipeline_info, out);
 			if (result == vk::Result::eSuccess && m_graphics.fn_get_shader_info && mesh && m_stages[3]) {
 				return PadMeshPipeline(m_graphics, *m_stages[0], shader_stages[0], cache, pipeline_info, out);
 			}
@@ -674,7 +674,7 @@ public:
 			    {Hash(0), Hash(1), Hash(2), Hash(3)});
 			const auto build = [&](vk::PipelineCreateFlags flags) {
 				create.flags = flags;
-				return m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &handle);
+				return MemoryTelemetry::Create(m_graphics.device, nullptr, create, handle);
 			};
 			result = CreateAuditedPipeline(m_graphics, "graphics_library", PipelineCache::GraphicsPipelineKeyHash {}(m_key),
 			                               create.flags, handle, build);
@@ -787,7 +787,7 @@ vk::Pipeline LinkGraphicsPipeline(GraphicContext& graphics, vk::PipelineLayout l
 	vk::Pipeline handle = nullptr;
 	const auto link = [&](vk::PipelineCreateFlags flags) {
 		create.flags = flags;
-		return graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &handle);
+		return MemoryTelemetry::Create(graphics.device, nullptr, create, handle);
 	};
 	const auto result = CreateAuditedPipeline(graphics, "graphics_link", PipelineCache::GraphicsPipelineKeyHash {}(key),
 	                                         {}, handle, link);
@@ -1019,8 +1019,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		const ScopedDriverCreation creation(
 		    {name(0, mesh ? "ms" : "vs"), name(1, "hs"), name(2, "ds"), name(3, "ps")},
 		    {hash(0), hash(1), hash(2), hash(3)});
-		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-		                                                 &pipeline.pipeline);
+		result = MemoryTelemetry::Create(graphics.device, driver_cache, pipeline_info, pipeline.pipeline);
 	}
 	if (result == vk::Result::eSuccess && graphics.fn_get_shader_info && mesh && pixel) {
 		result = PadMeshPipeline(graphics, vertex, shader_stages[0], driver_cache, pipeline_info, pipeline.pipeline);
@@ -1092,11 +1091,11 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 #if defined(ANYPS5_KYTY)
 		const auto create = [&](vk::PipelineCreateFlags flags) {
 			info.flags = flags;
-			return graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+			return MemoryTelemetry::Create(graphics.device, driver_cache, info, pipeline.pipeline);
 		};
 		result = CreateAuditedPipeline(graphics, "compute", module.id, info.flags, pipeline.pipeline, create);
 #else
-		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+		result = MemoryTelemetry::Create(graphics.device, driver_cache, info, pipeline.pipeline);
 #endif
 		if (timing) {
 			finished = Clock::now();
@@ -1136,7 +1135,7 @@ bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipe
 	    pipeline.pipeline != nullptr) {
 		return true;
 	}
-	graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	MemoryTelemetry::Destroy(graphics.device, pipeline.pipeline);
 	graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 	graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 	pipeline = {};

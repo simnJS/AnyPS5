@@ -1,5 +1,6 @@
 #pragma once
 
+#include "graphics/host_gpu/memoryTelemetry.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStoreFormat.h"
 
@@ -22,6 +23,7 @@ public:
 	                  const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t cursor) const;
 
 private:
+	MemoryTelemetry::PipelineBytes m_bytes;
 	std::unordered_multimap<uint64_t, Entry> m_entries;
 };
 

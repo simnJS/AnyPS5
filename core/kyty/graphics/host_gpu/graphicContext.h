@@ -6,7 +6,11 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include "graphics/host_gpu/driverMemoryReport.h"
+#include "graphics/host_gpu/memoryTelemetry.h"
+
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -33,6 +37,7 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	VmaAllocator                       spill_allocator                       = nullptr;
+	std::unique_ptr<DriverMemoryReport> driver_memory_report;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               external_memory_host_enabled          = false;
 	uint64_t                           host_pointer_alignment                = 0;
@@ -89,6 +94,12 @@ struct GraphicContext {
 	uint64_t                           mirror_base            = 0;
 	uint64_t                           mirror_size            = 0;
 
+	[[nodiscard]] bool IsLocalMemoryType(uint32_t type) const {
+		const auto& memory = physical_device_memory_properties;
+		const auto heap = memory.memoryTypes[type].heapIndex;
+		return bool(memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+	}
+
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
 	}
@@ -141,6 +152,9 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
+	void               LogMemoryMinute(const char* reason, uint64_t seconds) const;
+	void               StartMemoryMinutes();
+	void               StopMemoryMinutes();
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept {
 		return memory_budget_ext_enabled || m_memory_override_enabled;
 	}
@@ -199,6 +213,7 @@ struct VulkanImage {
 	vk::Image                     image       = nullptr;
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
+	MemoryTelemetry::Allocation   charge;
 	VmaAllocation                allocation = nullptr;
 	bool recyclable = false;
 	bool spilled    = false;

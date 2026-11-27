@@ -106,6 +106,24 @@ const char* CheckDescriptorPoolRetirement(GraphicContext& graphics) {
 	return nullptr;
 }
 
+const char* CheckBufferCharges(GraphicContext& graphics, CommandScheduler& scheduler) {
+	using namespace MemoryTelemetry;
+	for (const auto& [usage, category]: {std::pair {MemoryUsage::DeviceLocal, Kind::Buffer},
+	                                    std::pair {MemoryUsage::Download, Kind::Download},
+	                                    std::pair {MemoryUsage::Upload, Kind::Upload},
+	                                    std::pair {MemoryUsage::Stream, Kind::Stream}}) {
+		const auto& heaps = totals[static_cast<size_t>(category)];
+		const auto bytes = [&] { return heaps[0].bytes.load() + heaps[1].bytes.load(); };
+		const auto before = bytes();
+		{
+			Buffer buffer(graphics, scheduler, usage, 0, vk::BufferUsageFlagBits::eTransferSrc, 4096);
+			if (bytes() < before + 4096) return "buffer allocation not charged to its usage";
+		}
+		if (bytes() != before) return "destroyed buffer retained a charge";
+	}
+	return nullptr;
+}
+
 const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, BufferCache& buffers) {
 	if (const auto* failure = CheckDescriptorPoolRetirement(graphics)) {
 		return failure;
@@ -142,10 +160,26 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	recycle_info.sharingMode   = vk::SharingMode::eExclusive;
 	recycle_info.initialLayout = vk::ImageLayout::eUndefined;
 
+	graphics.TrimRecycledImages();
+	const auto& charges = MemoryTelemetry::totals[static_cast<size_t>(MemoryTelemetry::Kind::Texture)];
+	const auto texture_bytes = [&] { return charges[0].bytes.load() + charges[1].bytes.load(); };
+	const auto baseline = texture_bytes();
 	VulkanImage recycled_image {};
 	if (!graphics.CreateImage(recycle_info, recycled_image)) {
 		return "could not create recyclable image for recycle pool check";
 	}
+	const auto bytes = recycled_image.charge.bytes;
+	if (bytes == 0 || texture_bytes() != baseline + bytes) return "image allocation was not counted";
+	graphics.DeleteImage(recycled_image);
+	if (texture_bytes() != baseline + bytes) return "recycling released a live image charge";
+	if (!graphics.CreateImage(recycle_info, recycled_image) || texture_bytes() != baseline + bytes) {
+		return "reusing a recycled image changed its charge";
+	}
+	graphics.LogMemoryMinute("sample", 0);
+	graphics.DeleteImage(recycled_image);
+	graphics.TrimRecycledImages();
+	if (texture_bytes() != baseline) return "trim left a dead image charge";
+	if (!graphics.CreateImage(recycle_info, recycled_image)) return "could not recreate image for GC";
 	graphics.DeleteImage(recycled_image);
 	if (graphics.RecycledImageCount() == 0) {
 		return "deleted recyclable image did not enter the recycle pool";
@@ -191,6 +225,7 @@ const char* CheckVramCase(GraphicContext& graphics, uint64_t address) {
 	producer.Reset();
 	auto& scheduler = renderer.GetCommandScheduler();
 	auto& textures  = renderer.GetTextureCache();
+	if (const auto* failure = CheckBufferCharges(graphics, scheduler)) return failure;
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 
 	const auto* failure = address == 0 ? CheckVramBudget(graphics, textures, renderer.GetBufferCache())
@@ -209,7 +244,7 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* unavailable = gpu.Initialize(false, true)) {
+	if (const auto* unavailable = gpu.Initialize(false, true, true)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n",
 		             name, required ? "FAILED" : "skipped", unavailable);
