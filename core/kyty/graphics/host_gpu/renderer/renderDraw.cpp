@@ -2445,6 +2445,15 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	const auto thin_refuse = [](bool condition, Thin::Refusal refusal) {
+		return condition ? Thin::Bit(refusal) : Thin::RefusalMask {0};
+	};
+	ClassifyThinDraw(stages, pipeline,
+	                 thin_refuse(vertex_bindings.count != 0, Thin::Refusal::VertexBuffers) |
+	                     thin_refuse(draw.indexed && index_source.host_data == nullptr, Thin::Refusal::IndexBuffer) |
+	                     thin_refuse(index_source.host_data != nullptr, Thin::Refusal::CpuConsumed) |
+	                     thin_refuse(mesh_active, Thin::Refusal::MeshDraw) |
+	                     thin_refuse(!m_render_targets_reused, Thin::Refusal::Targets));
 
 	if (shader_write_stages) {
 		buffer.DeferShaderWriteBarrier(shader_write_stages);
@@ -2518,9 +2527,12 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
+	const ThinOperation thin_operation(
+	    *this, args.indirect.address != 0 ? Thin::OperationKind::IndirectDraw : Thin::OperationKind::Draw);
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer)) {
+		NoteThinRefused(Thin::Refusal::CpuConsumed, false);
 		InvalidateRenderTargetMemo();
 		ResetBindings();
 		return true;
@@ -2618,9 +2630,12 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}
+	const ThinOperation thin_operation(
+	    *this, args.indirect.address != 0 ? Thin::OperationKind::IndirectDraw : Thin::OperationKind::Draw);
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer)) {
+		NoteThinRefused(Thin::Refusal::CpuConsumed, false);
 		InvalidateRenderTargetMemo();
 		ResetBindings();
 		return true;
@@ -2678,6 +2693,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
+		NoteThinRefused(Thin::Refusal::CpuConsumed, false);
 		ResetBindings();
 		return true;
 	}
