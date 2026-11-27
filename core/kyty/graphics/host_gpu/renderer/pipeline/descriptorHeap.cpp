@@ -146,7 +146,9 @@ void DescriptorHeap::RetirePersistent(vk::DescriptorSet set, uint64_t tick) {
 
 vk::DescriptorSet DescriptorHeap::CommitPersistent(vk::DescriptorSetLayout layout) {
 	if (!m_retired_persistent_pools.empty()) {
-		if (!m_master_semaphore.IsFree(m_retired_persistent_pools.front().tick)) {
+		if (!std::ranges::all_of(m_retired_persistent_pools, [&](const auto& entry) {
+			    return m_master_semaphore.IsFree(entry.tick);
+		    })) {
 			m_master_semaphore.Refresh();
 		}
 		for (auto it = m_retired_persistent_pools.begin();
@@ -194,10 +196,17 @@ void DescriptorHeap::ReleasePersistent(vk::DescriptorSet set) {
 }
 
 void DescriptorHeap::TrimCompletedPools() {
-	if (m_pending_pools.size() < 2) {
+	if (m_pending_pools.size() < 2 && m_retired_persistent_pools.empty()) {
 		return;
 	}
 	m_master_semaphore.Refresh();
+	std::erase_if(m_retired_persistent_pools, [&](const auto& entry) {
+		if (!m_master_semaphore.IsFree(entry.tick)) {
+			return false;
+		}
+		m_graphics.device.destroyDescriptorPool(entry.pool, nullptr);
+		return true;
+	});
 	while (m_pending_pools.size() > 1 && m_master_semaphore.IsFree(m_pending_pools[1].second)) {
 		m_graphics.device.destroyDescriptorPool(m_pending_pools.front().first.pool, nullptr);
 		m_pending_pools.pop_front();

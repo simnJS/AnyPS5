@@ -2,9 +2,9 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 
-#include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -16,13 +16,25 @@ int Check(bool condition, const char* what) {
 	return 1;
 }
 
+void CompleteTick(vk::Queue queue, vk::Semaphore semaphore, uint64_t tick) {
+	const vk::SemaphoreSubmitInfo signal {
+	    .semaphore = semaphore, .value = tick, .stageMask = vk::PipelineStageFlagBits2::eAllCommands};
+	const vk::SubmitInfo2 submit {.signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &signal};
+	if (queue.submit2(1, &submit, nullptr) != vk::Result::eSuccess ||
+	    queue.waitIdle() != vk::Result::eSuccess) {
+		std::fprintf(stderr, "kyty_shim_persistent_descriptor_reclaim: FAILED queue completion\n");
+		std::exit(1);
+	}
+}
+
 }
 
 int main() {
 	KytyShimTests::TestVulkanDevice vulkan;
 	if (const char* skip = vulkan.Initialize(); skip != nullptr) {
-		std::printf("kyty_shim_persistent_descriptor_reclaim: skipped (%s)\n", skip);
-		return 77;
+		const char* required = std::getenv("ANYPS5_REQUIRE_VULKAN");
+		std::fprintf(stderr, "kyty_shim_persistent_descriptor_reclaim: %s\n", skip);
+		return required != nullptr && required[0] != '\0' && required[0] != '0' ? 1 : 77;
 	}
 
 	const std::array bindings_a {
@@ -80,30 +92,34 @@ int main() {
 		failures += Check(heap.ActivePersistentPoolCount() == 1, "active count while in-flight");
 		failures += Check(heap.RetiredPersistentPoolCount() == 1, "in-flight pool retained");
 
-		if (vulkan.graphics.device.signalSemaphore(
-		        vk::SemaphoreSignalInfo {.semaphore = semaphore.Handle(), .value = in_flight_tick}) !=
-		    vk::Result::eSuccess) {
-			failures += Check(false, "signalSemaphore in_flight_tick");
-		}
+		CompleteTick(vulkan.graphics.queue, semaphore.Handle(), in_flight_tick);
 
 		const auto set_a3 = heap.CommitPersistent(layout_a);
 		failures += Check(set_a3 == set_a1, "completed retired set with same layout reused");
 		failures += Check(heap.ActivePersistentPoolCount() == 2, "active count after reuse");
 		failures += Check(heap.RetiredPersistentPoolCount() == 0, "retired count after reuse");
 
-		const uint64_t tick_2 = std::max(semaphore.NextTick(), in_flight_tick + 1);
-		heap.RetirePersistent(set_a2, tick_2);
-		if (vulkan.graphics.device.signalSemaphore(
-		        vk::SemaphoreSignalInfo {.semaphore = semaphore.Handle(), .value = tick_2}) !=
-		    vk::Result::eSuccess) {
-			failures += Check(false, "signalSemaphore tick_2");
-		}
-
 		const auto set_b1 = heap.CommitPersistent(layout_b);
-		failures += Check(static_cast<bool>(set_b1), "CommitPersistent layout_b");
-		failures += Check(heap.ActivePersistentPoolCount() == 2, "active count after layout_b");
-		failures += Check(heap.RetiredPersistentPoolCount() == 0,
-		                  "completed mismatched retired pool destroyed");
+		const auto tick_2 = semaphore.NextTick();
+		heap.RetirePersistent(set_b1, in_flight_tick);
+		heap.RetirePersistent(set_a2, tick_2);
+		CompleteTick(vulkan.graphics.queue, semaphore.Handle(), tick_2);
+		const auto set_a4 = heap.CommitPersistent(layout_a);
+		failures += Check(set_a4 == set_a2, "reuse behind a completed mismatched pool");
+		failures += Check(heap.ActivePersistentPoolCount() == 2, "active count after mixed layouts");
+		failures += Check(heap.RetiredPersistentPoolCount() == 0, "completed mismatch destroyed");
+
+		const auto tick_3 = semaphore.NextTick();
+		heap.RetirePersistent(set_a3, tick_3);
+		heap.RetirePersistent(set_a4, tick_2);
+		heap.TrimCompletedPools();
+		failures += Check(heap.RetiredPersistentPoolCount() == 1, "trim removes the completed pool");
+		const auto set_a5 = heap.CommitPersistent(layout_a);
+		failures += Check(set_a5 != set_a3 && heap.RetiredPersistentPoolCount() == 1,
+		                  "pending set stays retired after trim");
+		CompleteTick(vulkan.graphics.queue, semaphore.Handle(), tick_3);
+		heap.TrimCompletedPools();
+		failures += Check(heap.RetiredPersistentPoolCount() == 0, "trim after the last allocation");
 	}
 
 	vulkan.graphics.device.destroyDescriptorSetLayout(layout_a, nullptr);
