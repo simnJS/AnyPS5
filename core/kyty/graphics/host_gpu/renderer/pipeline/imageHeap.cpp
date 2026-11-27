@@ -1159,7 +1159,7 @@ void ImageHeap::AppendJobs(View& view) {
 	if (view.full) {
 		job.begin = 0u;
 		job.end   = std::max(job.count, view.written);
-		Slots::AddJob(m_jobs, m_groups, job);
+		Slots::PushJob(m_jobs, m_groups, job);
 		return;
 	}
 	MergeRanges(view.pending, m_ranges, UINT32_MAX);
@@ -1170,7 +1170,7 @@ void ImageHeap::AppendJobs(View& view) {
 	for (const auto& range: m_ranges) {
 		job.begin = range.begin;
 		job.end   = std::min(range.end, job.count);
-		Slots::AddJob(m_jobs, m_groups, job);
+		Slots::PushJob(m_jobs, m_groups, job);
 	}
 }
 

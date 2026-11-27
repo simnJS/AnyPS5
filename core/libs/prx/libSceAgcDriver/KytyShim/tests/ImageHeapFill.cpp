@@ -242,7 +242,7 @@ const char* CheckFill(GraphicContext& graphics, uint64_t address) {
 	std::vector<Slots::Job> recorded;
 	for (auto& job: jobs) {
 		job.slots = outputs[job.view - 100u].buffer->BufferDeviceAddress();
-		Slots::AddJob(recorded, groups, job);
+		Slots::PushJob(recorded, groups, job);
 	}
 
 	const auto bucket_bytes = uint64_t {Slots::BucketCount} * sizeof(Slots::Bucket);
