@@ -13,6 +13,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
 #include "kernel/memory.h"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 
@@ -1054,6 +1055,101 @@ const char* CheckRemap(GraphicContext& graphics, uint64_t address) {
 	return failure;
 }
 
+uint64_t ShmemBytes() {
+	std::FILE* status = std::fopen("/proc/self/status", "r");
+	if (status == nullptr) return UINT64_MAX;
+	char     line[256];
+	uint64_t bytes = UINT64_MAX;
+	while (std::fgets(line, sizeof(line), status) != nullptr) {
+		unsigned long long kib = 0;
+		if (std::sscanf(line, "RssShmem: %llu kB", &kib) == 1) {
+			bytes = uint64_t {kib} << 10u;
+			break;
+		}
+	}
+	std::fclose(status);
+	return bytes;
+}
+
+const char* CheckSparseImport(GraphicContext& graphics) {
+#ifdef _WIN32
+	static_cast<void>(graphics);
+	return nullptr;
+#else
+	constexpr uint64_t Page      = GuestHostView::PageSize;
+	constexpr uint64_t Bytes     = uint64_t {4} << 30u;
+	constexpr uint64_t Sparse    = 0xa000000000;
+	constexpr uint64_t Slack     = uint64_t {64} << 20u;
+	constexpr uint64_t Later     = uint64_t {2} << 30u;
+	constexpr uint64_t Untouched = uint64_t {3} << 30u;
+	constexpr uint64_t Synced    = (uint64_t {7} << 30u) / 2u;
+	constexpr std::array<uint64_t, 3> Written {0, (uint64_t {1} << 30u) + Page, Bytes - Page};
+	RenderContext    renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+	auto&       buffers = renderer.GetBufferCache();
+	auto*       mirror  = buffers.GetGuestMirror();
+	const auto* view    = buffers.GetGuestHostView();
+	if (view == nullptr || !view->Enabled()) {
+		g_unchecked = "the device does not import host memory";
+		return nullptr;
+	}
+	if (!mirror->Holds(Sparse, Bytes)) return "the sparse fixture lies outside the guest mirror";
+	const auto before = ShmemBytes();
+	void*      mapped = reinterpret_cast<void*>(Sparse);
+	if (DoMapAnon_nid_no_patch(&mapped, Bytes, CpuReadWrite, 0x10, Page, false) != 0 || reinterpret_cast<uint64_t>(mapped) != Sparse) {
+		return "could not map a sparse guest range";
+	}
+	AddressReader reader(graphics, scheduler, 16);
+	const auto    reads = [&](uint64_t guest_address) {
+		const auto page = view->Lookup(guest_address & ~(Page - 1));
+		if (page == 0) return false;
+		reader.Record(scheduler, page + (guest_address & (Page - 1)), 8);
+		Finish(scheduler);
+		const auto words = reader.Words(8);
+		return std::memcmp(words.data(), reinterpret_cast<const void*>(guest_address), 8) == 0;
+	};
+	const auto verify = [&]() -> const char* {
+		for (const auto at: Written) {
+			*reinterpret_cast<volatile uint64_t*>(Sparse + at) = (uint64_t {Pattern(at)} << 32u) | Pattern(at + 1);
+		}
+		if (!renderer.MapMemory(Sparse, Bytes)) return "the sparse fixture was not admitted";
+		renderer.PrepareBda(false, false);
+		const auto imported = ShmemBytes();
+		if (before == UINT64_MAX || imported == UINT64_MAX) return "RssShmem cannot be read";
+		if (view->Lookup(Sparse) == 0) {
+			g_unchecked = "the driver did not import the sparse fixture";
+			return nullptr;
+		}
+		if (imported > before + Slack) return "importing a sparse guest range made its holes resident";
+		for (const auto at: Written) {
+			if (!reads(Sparse + at)) return "a written page of a sparse range is not imported or does not read its guest memory";
+		}
+		if (view->Lookup(Sparse + Later) != 0 || view->Lookup(Sparse + Untouched) != 0) return "a hole of a sparse range is imported";
+		if (view->Totals().pending < Bytes - Written.size() * (GuestHostView::JoinBytes + Page)) return "the holes of a sparse range are not kept";
+		*reinterpret_cast<volatile uint64_t*>(Sparse + Later) = 0x5eed5eed00c0ffeeull;
+		buffers.RequestUnimportedRange(Sparse + Later, sizeof(uint64_t));
+		if (!reads(Sparse + Later)) return "a hole written after the import was not imported when the GPU asked for it";
+		if (mirror->Requested(Sparse + Later, 8)) return "a hole reached by a known range was bound in the mirror instead of imported";
+		*reinterpret_cast<volatile uint64_t*>(Sparse + Synced) = 0x0123456789abcdefull;
+		renderer.PrepareBda(false, true);
+		if (!reads(Sparse + Synced)) return "a dispatch with no known reach did not import a hole written since the import";
+		if (mirror->Requested(Sparse + Untouched, 8)) return "a dispatch with no known reach bound a hole of a sparse range in the mirror";
+		if (view->Lookup(Sparse + Untouched) != 0) return "a dispatch with no known reach imported a hole";
+		const auto synced = ShmemBytes();
+		if (synced == UINT64_MAX || synced > before + Slack) return "a dispatch with no known reach made the holes of a sparse range resident";
+		return nullptr;
+	};
+	const auto* failure = verify();
+	renderer.UnmapMemory(Sparse, Bytes);
+	if (failure == nullptr && (view->Totals().holes != 0 || view->Totals().pending != 0)) failure = "an unmap of a sparse range kept its holes";
+	if (DoMunmap_nid_no_patch(mapped, Bytes) != 0 && failure == nullptr) failure = "could not unmap a sparse guest range";
+	return failure;
+#endif
+}
+
 }
 
 extern "C" int RunKytyMirrorWindowsTest() {
@@ -1084,6 +1180,7 @@ extern "C" int RunKytyMirrorWindowsTest() {
 	if (failure == nullptr && g_skipped.empty()) failure = CheckCut(graphics, address);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckTableReach(graphics, address, false);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckTableReach(graphics, address, true);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckSparseImport(graphics);
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", Name);
 		return 1;

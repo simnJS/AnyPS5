@@ -87,6 +87,8 @@ GuestHostView::Stats GuestHostView::Totals() const {
 	stats.imports = m_imports.size();
 	std::lock_guard lock(m_mutex);
 	stats.refused = m_refused;
+	stats.holes   = m_holes.size();
+	for (const auto& [guest, hole]: m_holes) stats.pending += hole.end - guest;
 	return stats;
 }
 
@@ -97,7 +99,44 @@ bool GuestHostView::Overlaps(uint64_t vaddr, uint64_t size) const {
 	auto            at     = m_imports.upper_bound(vaddr);
 	if (at != m_imports.begin() && within(std::prev(at)->second)) return true;
 	if (at != m_imports.end() && within(at->second)) return true;
+	auto hole = m_holes.upper_bound(vaddr);
+	if (hole != m_holes.begin() && std::prev(hole)->second.end > vaddr) return true;
+	if (hole != m_holes.end() && hole->first < vaddr + size) return true;
 	return std::ranges::any_of(m_arrivals, within);
+}
+
+void GuestHostView::HolesIn(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& holes) const {
+	holes.clear();
+	if (size == 0 || UINT64_MAX - vaddr < size) return;
+	const auto      end  = vaddr + size;
+	std::lock_guard lock(m_mutex);
+	auto            at   = m_holes.upper_bound(vaddr);
+	if (at != m_holes.begin() && std::prev(at)->second.end > vaddr) --at;
+	for (; at != m_holes.end() && at->first < end; ++at) {
+		holes.emplace_back(std::max(vaddr, at->first), std::min(end, at->second.end));
+	}
+}
+
+void GuestHostView::KeepHolesLocked(const std::vector<HoleRun>& holes, uint64_t blocks, uint64_t epoch) {
+	for (const auto& hole: holes) {
+		if (hole.guest < hole.end) m_holes[hole.guest] = Hole {.end = hole.end, .host = hole.host, .blocks = blocks, .epoch = epoch};
+	}
+}
+
+void GuestHostView::DropHolesLocked(uint64_t begin, uint64_t end) {
+	auto at = m_holes.upper_bound(begin);
+	if (at != m_holes.begin() && std::prev(at)->second.end > begin) --at;
+	std::vector<std::pair<uint64_t, Hole>> kept;
+	while (at != m_holes.end() && at->first < end) {
+		const auto guest = at->first;
+		const auto hole  = at->second;
+		if (guest < begin) kept.emplace_back(guest, Hole {.end = begin, .host = hole.host, .blocks = hole.blocks, .epoch = hole.epoch});
+		if (hole.end > end) {
+			kept.emplace_back(end, Hole {.end = hole.end, .host = hole.host + (end - guest), .blocks = hole.blocks, .epoch = hole.epoch});
+		}
+		at = m_holes.erase(at);
+	}
+	for (const auto& [guest, hole]: kept) m_holes.emplace(guest, hole);
 }
 
 void GuestHostView::Refuse(uint64_t guest, uint64_t bytes, const char* why) {
@@ -192,17 +231,34 @@ void GuestHostView::ImportRun(uint8_t* host, uint64_t guest, uint64_t bytes, std
 	}
 }
 
+void GuestHostView::ImportPopulated(uint8_t* host, uint64_t guest, uint64_t bytes, std::vector<Imported>& made,
+                                    std::vector<HoleRun>& holes) {
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	if (!LibKernel::Memory::TryGetPopulatedRuns(host, bytes, JoinBytes, runs)) {
+		ImportRun(host, guest, bytes, made);
+		return;
+	}
+	uint64_t done = 0;
+	for (const auto& [offset, run]: runs) {
+		if (done < offset) holes.push_back({.guest = guest + done, .end = guest + offset, .host = host + done});
+		ImportRun(host + offset, guest + offset, run, made);
+		done = offset + run;
+	}
+	if (done < bytes) holes.push_back({.guest = guest + done, .end = guest + bytes, .host = host + done});
+}
+
 void GuestHostView::Import(uint64_t vaddr, uint64_t size) {
 	if (!Enabled() || size == 0 || vaddr >= m_base + m_size || UINT64_MAX - vaddr < size || vaddr + size <= m_base) return;
 	const auto begin = Common::AlignUp(std::max(vaddr, m_base), PageSize);
 	const auto end   = Common::AlignDown(std::min(vaddr + size, m_base + m_size), PageSize);
 	if (begin >= end) return;
 	std::vector<Imported>                            made;
+	std::vector<HoleRun>                             holes;
 	std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
 	if (LibKernel::Memory::TryGetBackingPieces(begin, end - begin, pieces)) {
 		auto guest = begin;
 		for (const auto& [host, bytes]: pieces) {
-			ImportRun(const_cast<uint8_t*>(host), guest, bytes, made);
+			ImportPopulated(const_cast<uint8_t*>(host), guest, bytes, made, holes);
 			guest += bytes;
 		}
 	} else {
@@ -215,17 +271,89 @@ void GuestHostView::Import(uint64_t vaddr, uint64_t size) {
 				run_bytes += PageSize;
 				continue;
 			}
-			if (run != nullptr) ImportRun(run, run_guest, run_bytes, made);
+			if (run != nullptr) ImportPopulated(run, run_guest, run_bytes, made, holes);
 			run       = host;
 			run_guest = page;
 			run_bytes = PageSize;
 		}
-		if (run != nullptr) ImportRun(run, run_guest, run_bytes, made);
+		if (run != nullptr) ImportPopulated(run, run_guest, run_bytes, made, holes);
 	}
-	if (made.empty()) return;
+	if (made.empty() && holes.empty()) return;
 	std::lock_guard lock(m_mutex);
+	KeepHolesLocked(holes, UINT64_MAX, UINT64_MAX);
+	if (made.empty()) return;
 	m_arrivals.insert(m_arrivals.end(), made.begin(), made.end());
 	m_arrived.store(true, std::memory_order_release);
+}
+
+void GuestHostView::Refresh(uint64_t vaddr, uint64_t size) {
+	if (!Enabled() || size == 0 || UINT64_MAX - vaddr < size) return;
+	const auto                             blocks = LibKernel::Memory::BackingFileBlocks();
+	const auto                             epoch  = LibKernel::Memory::BackingEpoch();
+	const auto                             end    = vaddr + size;
+	std::vector<std::pair<uint64_t, Hole>> stale;
+	{
+		std::lock_guard lock(m_mutex);
+		auto            at = m_holes.upper_bound(vaddr);
+		if (at != m_holes.begin() && std::prev(at)->second.end > vaddr) --at;
+		for (; at != m_holes.end() && at->first < end; ++at) {
+			if (blocks != 0 && at->second.blocks == blocks && at->second.epoch == epoch) continue;
+			stale.emplace_back(*at);
+		}
+	}
+	if (stale.empty()) return;
+	std::vector<Imported> made;
+	std::vector<HoleRun>  holes;
+	for (const auto& [guest, hole]: stale) ImportPopulated(hole.host, guest, hole.end - guest, made, holes);
+	{
+		std::lock_guard lock(m_mutex);
+		for (const auto& [guest, hole]: stale) {
+			const auto found = m_holes.find(guest);
+			if (found != m_holes.end() && found->second.end == hole.end && found->second.host == hole.host) m_holes.erase(found);
+		}
+		KeepHolesLocked(holes, blocks, epoch);
+		if (!made.empty()) {
+			m_arrivals.insert(m_arrivals.end(), made.begin(), made.end());
+			m_arrived.store(true, std::memory_order_release);
+		}
+	}
+	Publish();
+}
+
+void GuestHostView::Claim(uint64_t vaddr, uint64_t size) {
+	if (!Enabled() || size == 0 || UINT64_MAX - vaddr < size) return;
+	const auto                             first = Common::AlignDown(vaddr, JoinBytes);
+	const auto                             last  = Common::AlignUp(vaddr + size, JoinBytes);
+	std::vector<std::pair<uint64_t, Hole>> claimed;
+	{
+		std::lock_guard lock(m_mutex);
+		auto            at = m_holes.upper_bound(first);
+		if (at != m_holes.begin() && std::prev(at)->second.end > first) --at;
+		for (; at != m_holes.end() && at->first < last; ++at) claimed.emplace_back(*at);
+	}
+	if (claimed.empty()) return;
+	std::vector<Imported> made;
+	std::vector<HoleRun>  holes;
+	for (const auto& [guest, hole]: claimed) {
+		const auto begin = std::max(guest, first);
+		const auto end   = std::min(hole.end, last);
+		if (guest < begin) holes.push_back({.guest = guest, .end = begin, .host = hole.host});
+		ImportRun(hole.host + (begin - guest), begin, end - begin, made);
+		if (end < hole.end) holes.push_back({.guest = end, .end = hole.end, .host = hole.host + (end - guest)});
+	}
+	{
+		std::lock_guard lock(m_mutex);
+		for (const auto& [guest, hole]: claimed) {
+			const auto found = m_holes.find(guest);
+			if (found != m_holes.end() && found->second.end == hole.end && found->second.host == hole.host) m_holes.erase(found);
+		}
+		KeepHolesLocked(holes, UINT64_MAX, UINT64_MAX);
+		if (!made.empty()) {
+			m_arrivals.insert(m_arrivals.end(), made.begin(), made.end());
+			m_arrived.store(true, std::memory_order_release);
+		}
+	}
+	Publish();
 }
 
 Buffer& GuestHostView::Chunk(uint64_t index) {
@@ -308,6 +436,10 @@ void GuestHostView::Forget(uint64_t vaddr, uint64_t size) {
 	const auto            begin = Common::AlignDown(std::max(vaddr, m_base), PageSize);
 	const auto            end   = Common::AlignUp(std::min(vaddr + size, m_base + m_size), PageSize);
 	std::vector<Imported> doomed;
+	{
+		std::lock_guard lock(m_mutex);
+		DropHolesLocked(begin, end);
+	}
 	{
 		auto at = m_imports.upper_bound(begin);
 		if (at != m_imports.begin() && std::prev(at)->second.guest + std::prev(at)->second.bytes > begin) --at;

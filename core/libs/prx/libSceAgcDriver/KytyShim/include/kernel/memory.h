@@ -140,6 +140,8 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 [[nodiscard]] bool GuestViewRange(const uint8_t** base, uint64_t* guest_bytes, uint64_t* view_bytes);
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
 bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
+bool TryGetPopulatedRuns(const uint8_t* host, uint64_t size, uint64_t join, std::vector<std::pair<uint64_t, uint64_t>>& runs);
+[[nodiscard]] uint64_t BackingFileBlocks();
 bool DiscardBacking(uint64_t address, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] bool     GuestRangeWatched(uint64_t vaddr, uint64_t size);

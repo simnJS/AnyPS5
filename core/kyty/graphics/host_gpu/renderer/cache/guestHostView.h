@@ -29,6 +29,7 @@ public:
 	static constexpr uint32_t ChunkBits       = 30;
 	static constexpr uint64_t EntriesPerChunk = uint64_t {1} << (ChunkBits - PageBits);
 	static constexpr uint64_t PieceBytes      = uint64_t {64} << 20u;
+	static constexpr uint64_t JoinBytes       = uint64_t {1} << 20u;
 
 	struct Stats {
 		uint64_t imports  = 0;
@@ -36,6 +37,8 @@ public:
 		uint64_t refused  = 0;
 		uint64_t waits    = 0;
 		uint64_t ordered  = 0;
+		uint64_t pending  = 0;
+		uint64_t holes    = 0;
 	};
 
 	GuestHostView(GraphicContext& graphics, CommandScheduler& scheduler, StreamBuffer& staging, uint64_t base, uint64_t size);
@@ -49,6 +52,8 @@ public:
 	[[nodiscard]] bool     Overlaps(uint64_t vaddr, uint64_t size) const;
 
 	void Import(uint64_t vaddr, uint64_t size);
+	void Refresh(uint64_t vaddr, uint64_t size);
+	void Claim(uint64_t vaddr, uint64_t size);
 	void Publish();
 	void Forget(uint64_t vaddr, uint64_t size);
 	void NoteReach() noexcept { m_reached = true; }
@@ -77,7 +82,36 @@ public:
 		if (done < vaddr + size) func(done, vaddr + size);
 	}
 
+	template <typename Func>
+	void ForEachUnheldGap(uint64_t vaddr, uint64_t size, Func&& func) const {
+		std::vector<std::pair<uint64_t, uint64_t>> holes;
+		HolesIn(vaddr, size, holes);
+		size_t next = 0;
+		ForEachGap(vaddr, size, [&](uint64_t from, uint64_t to) {
+			auto at = from;
+			while (next < holes.size() && holes[next].second <= at) next++;
+			for (auto index = next; index < holes.size() && holes[index].first < to; index++) {
+				if (at < holes[index].first) func(at, holes[index].first);
+				at = std::max(at, holes[index].second);
+			}
+			if (at < to) func(at, to);
+		});
+	}
+
 private:
+	struct Hole {
+		uint64_t end    = 0;
+		uint8_t* host   = nullptr;
+		uint64_t blocks = UINT64_MAX;
+		uint64_t epoch  = UINT64_MAX;
+	};
+
+	struct HoleRun {
+		uint64_t guest = 0;
+		uint64_t end   = 0;
+		uint8_t* host  = nullptr;
+	};
+
 	struct Imported {
 		MemoryTelemetry::Allocation charge;
 		vk::Buffer       buffer  = nullptr;
@@ -89,6 +123,11 @@ private:
 	};
 
 	void               ImportRun(uint8_t* host, uint64_t guest, uint64_t bytes, std::vector<Imported>& made);
+	void               ImportPopulated(uint8_t* host, uint64_t guest, uint64_t bytes, std::vector<Imported>& made,
+	                                   std::vector<HoleRun>& holes);
+	void               KeepHolesLocked(const std::vector<HoleRun>& holes, uint64_t blocks, uint64_t epoch);
+	void               DropHolesLocked(uint64_t begin, uint64_t end);
+	void               HolesIn(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& holes) const;
 	[[nodiscard]] bool ImportPiece(uint8_t* host, uint64_t guest, uint64_t bytes, Imported& import);
 	void               Destroy(Imported& import);
 	void               WriteEntries(const Imported& import, bool present);
@@ -113,6 +152,7 @@ private:
 
 	mutable std::mutex    m_mutex;
 	std::vector<Imported> m_arrivals;
+	std::map<uint64_t, Hole> m_holes;
 	std::atomic<bool>     m_arrived {false};
 	uint64_t              m_refused       = 0;
 	bool                  m_refusal_logged = false;

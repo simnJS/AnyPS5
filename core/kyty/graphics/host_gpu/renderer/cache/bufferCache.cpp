@@ -1430,16 +1430,18 @@ void BufferCache::RequestUnimportedRange(uint64_t vaddr, uint64_t size) {
 	const auto begin = std::max(vaddr, m_guest_mirror->Base());
 	const auto end   = std::min(vaddr + size, m_guest_mirror->Base() + m_guest_mirror->GuestSpan());
 	if (begin >= end) return;
+	m_host_view->Claim(begin, end - begin);
 	m_host_view->Publish();
 	m_host_view->ForEachGap(begin, end - begin, [this](uint64_t from, uint64_t to) { RequestDeviceRange(from, to - from); });
 }
 
 void BufferCache::RequestUnimportedRanges(const RangeSet& mapped, uint64_t mapping_epoch) {
+	m_host_view->Refresh(m_guest_mirror->Base(), m_guest_mirror->GuestSpan());
 	const std::array layout {mapping_epoch, RegistrationEpoch(), m_host_view->Generation()};
 	if (layout == m_unimported_layout) return;
 	uint64_t bytes = 0;
 	mapped.ForEachInRange(m_guest_mirror->Base(), m_guest_mirror->GuestSpan(), [&](uint64_t begin, uint64_t end) {
-		m_host_view->ForEachGap(begin, end - begin, [&](uint64_t from, uint64_t to) {
+		m_host_view->ForEachUnheldGap(begin, end - begin, [&](uint64_t from, uint64_t to) {
 			RequestDeviceRange(from, to - from);
 			bytes += to - from;
 		});

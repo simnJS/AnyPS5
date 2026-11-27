@@ -33,6 +33,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -1036,6 +1037,64 @@ bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::p
 	    [&](uint64_t offset, uint64_t, uint64_t bytes) { pieces.emplace_back(base + offset, bytes); },
 	    [&](uint64_t, uint64_t bytes) { pieces.emplace_back(nullptr, bytes); });
 	return true;
+}
+
+bool TryGetPopulatedRuns(const uint8_t* host, uint64_t size, uint64_t join, std::vector<std::pair<uint64_t, uint64_t>>& runs) {
+	runs.clear();
+#ifdef _WIN32
+	static_cast<void>(host);
+	static_cast<void>(size);
+	static_cast<void>(join);
+	return false;
+#else
+	const auto& state = State();
+	if (!Shim::ViewEnabled() || state.guest_file < 0 || state.direct_file < 0 || host == nullptr || size == 0 || host < state.base) return false;
+	const auto offset = static_cast<uint64_t>(host - state.base);
+	if (offset > state.view_bytes || size > state.view_bytes - offset) return false;
+	const auto end = offset + size;
+	for (auto cursor = offset; cursor < end;) {
+		const bool guest = cursor < state.guest_bytes;
+		const auto file = guest ? state.guest_file : state.direct_file;
+		const auto file_start = guest ? 0 : state.guest_bytes;
+		const auto file_stop = guest ? std::min(end, state.guest_bytes) : end;
+		const auto data = ::lseek(file, static_cast<off_t>(cursor - file_start), SEEK_DATA);
+		if (data < 0) {
+			if (errno != ENXIO) return false;
+			cursor = file_stop;
+			continue;
+		}
+		const auto first = file_start + static_cast<uint64_t>(data);
+		if (first >= file_stop) {
+			cursor = file_stop;
+			continue;
+		}
+		const auto hole = ::lseek(file, static_cast<off_t>(first - file_start), SEEK_HOLE);
+		if (hole < 0) return false;
+		const auto last = std::min(file_stop, std::max(first + 1u, file_start + static_cast<uint64_t>(hole)));
+		const auto begin = std::max(offset, first & ~PageMask);
+		const auto stop = std::min(end, (last + PageMask) & ~PageMask);
+		if (!runs.empty() && offset + runs.back().first + runs.back().second + join >= begin) {
+			runs.back().second = std::max(runs.back().second, stop - offset - runs.back().first);
+		} else {
+			runs.emplace_back(begin - offset, stop - begin);
+		}
+		cursor = std::max(last, stop);
+	}
+	return true;
+#endif
+}
+
+uint64_t BackingFileBlocks() {
+#ifdef _WIN32
+	return 0;
+#else
+	const auto& state = State();
+	if (!Shim::ViewEnabled() || state.guest_file < 0 || state.direct_file < 0) return 0;
+	struct stat guest {};
+	struct stat direct {};
+	if (::fstat(state.guest_file, &guest) != 0 || ::fstat(state.direct_file, &direct) != 0) return 0;
+	return static_cast<uint64_t>(guest.st_blocks) + static_cast<uint64_t>(direct.st_blocks);
+#endif
 }
 
 bool IsBackingReadable(uint64_t vaddr, uint64_t size) {
