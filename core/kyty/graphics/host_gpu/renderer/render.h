@@ -203,13 +203,20 @@ public:
 	                             bool async_compute);
 	class ThinOperation {
 	public:
-		ThinOperation(RenderExecutor& executor, bool indirect);
+		ThinOperation(RenderExecutor& executor, Thin::OperationKind kind);
 		~ThinOperation();
 		KYTY_CLASS_NO_COPY(ThinOperation);
 
 	private:
-		RenderExecutor& m_executor;
-		uint64_t        m_begin = 0;
+		friend class RenderExecutor;
+		RenderExecutor&     m_executor;
+		ThinOperation*      m_outer = nullptr;
+		Thin::DispatchKey   m_key;
+		Thin::RefusalMask   m_refusals = Thin::Bit(Thin::Refusal::Unresolved);
+		Thin::OperationKind m_kind;
+		bool                m_learning = false;
+		bool                m_served   = false;
+		uint64_t            m_begin    = 0;
 	};
 	RayTracingCheck& RtCheck();
 	WaveSplitCheck&  SplitCheck();
@@ -717,6 +724,8 @@ private:
 	                       const PreparedBindings& bindings, const HW::ComputeShaderInfo& cs_regs, uint32_t mode,
 	                       bool writes, bool indirect_writes);
 	void NoteThinRefused(Thin::Refusal refusal, bool remember);
+	void ClassifyThinDraw(std::span<PreparedBindings* const> stages, const PipelineCache::Pipeline& pipeline,
+	                      Thin::RefusalMask draw_refusals);
 	std::unique_ptr<NativeXprCache, void (*)(NativeXprCache*)> m_native_xpr {nullptr, nullptr};
 	struct TableXpr;
 	struct TablePair;

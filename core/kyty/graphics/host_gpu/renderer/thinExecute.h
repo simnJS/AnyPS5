@@ -24,6 +24,8 @@ enum class Refusal : uint8_t {
 	CpuSrt,
 	MemorySync,
 	GpuFlatLoads,
+	VertexBuffers,
+	IndexBuffer,
 	CpuImages,
 	ImageTables,
 	ImageHeap,
@@ -38,6 +40,8 @@ enum class Refusal : uint8_t {
 	Checks,
 	PushLayout,
 	Instrumentation,
+	Targets,
+	MeshDraw,
 	Count,
 };
 
@@ -58,7 +62,9 @@ enum class Owner : uint8_t { A, B, C, D, E, Count };
 		case Refusal::CpuBuffers:
 		case Refusal::CpuSrt:
 		case Refusal::MemorySync:
-		case Refusal::GpuFlatLoads: return Owner::A;
+		case Refusal::GpuFlatLoads:
+		case Refusal::VertexBuffers:
+		case Refusal::IndexBuffer: return Owner::A;
 		case Refusal::CpuImages:
 		case Refusal::ImageTables:
 		case Refusal::ImageHeap:
@@ -78,7 +84,7 @@ enum class Owner : uint8_t { A, B, C, D, E, Count };
 
 [[nodiscard]] std::string_view RefusalName(Refusal refusal);
 
-enum class DispatchKind : uint8_t { Direct, Indirect, Count };
+enum class OperationKind : uint8_t { Direct, Indirect, Draw, IndirectDraw, Count };
 
 struct DispatchKey {
 	uint64_t                data_addr      = 0;
@@ -93,7 +99,7 @@ struct DispatchKey {
 };
 
 [[nodiscard]] DispatchKey MakeDispatchKey(const HW::CsStageRegisters& regs, uint64_t map_generation, uint32_t mode,
-                                          bool async_compute, DispatchKind kind);
+                                          bool async_compute, OperationKind kind);
 
 struct DispatchKeyHash {
 	size_t operator()(const DispatchKey& key) const noexcept;
@@ -189,11 +195,11 @@ struct Counters {
 		uint64_t                           full_ns    = 0;
 		uint64_t                           full_timed = 0;
 	};
-	std::array<Kind, static_cast<size_t>(DispatchKind::Count)> kinds {};
+	std::array<Kind, static_cast<size_t>(OperationKind::Count)> kinds {};
 
-	void NoteServed(DispatchKind kind);
-	void NoteRefused(DispatchKind kind, RefusalMask refusals);
-	void NoteTime(DispatchKind kind, bool thin, uint64_t ns);
+	void NoteServed(OperationKind kind);
+	void NoteRefused(OperationKind kind, RefusalMask refusals);
+	void NoteTime(OperationKind kind, bool thin, uint64_t ns);
 	[[nodiscard]] std::string Summary(double seconds, uint64_t frames) const;
 };
 

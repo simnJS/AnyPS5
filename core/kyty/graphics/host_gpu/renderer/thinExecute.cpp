@@ -42,16 +42,17 @@ constexpr uint64_t Mix(uint64_t hash, uint64_t value) {
 }
 
 constexpr std::array<std::string_view, RefusalCount> RefusalNames {
-    "unresolved",     "specialized",   "pipeline wait", "CPU buffers",   "CPU SRT",      "memory sync",
-    "GPU flat loads", "CPU images",    "image tables",  "image heap",    "CPU samplers", "indirect args",
-    "shared memory",  "GDS",           "ray tracing",   "write targets", "CPU consumed", "ordered append",
-    "checks",         "push layout",   "instrumentation",
+    "unresolved",     "specialized",   "pipeline wait",  "CPU buffers",   "CPU SRT",       "memory sync",
+    "GPU flat loads", "vertex buffers", "index buffer",  "CPU images",    "image tables",  "image heap",
+    "CPU samplers",   "indirect args", "shared memory",  "GDS",           "ray tracing",   "write targets",
+    "CPU consumed",   "ordered append", "checks",        "push layout",   "instrumentation", "targets",
+    "mesh draw",
 };
 
 constexpr std::array<std::string_view, static_cast<size_t>(Owner::Count)> OwnerNames {"A", "B", "C", "D", "E"};
 
-constexpr std::array<std::string_view, static_cast<size_t>(DispatchKind::Count)> KindNames {"direct dispatches",
-                                                                                         "indirect dispatches"};
+constexpr std::array<std::string_view, static_cast<size_t>(OperationKind::Count)> KindNames {
+    "direct dispatches", "indirect dispatches", "draws", "indirect draws"};
 
 }
 
@@ -61,7 +62,7 @@ std::string_view RefusalName(Refusal refusal) {
 }
 
 DispatchKey MakeDispatchKey(const HW::CsStageRegisters& regs, uint64_t map_generation, uint32_t mode,
-                            bool async_compute, DispatchKind kind) {
+                            bool async_compute, OperationKind kind) {
 	DispatchKey key;
 	key.data_addr      = regs.data_addr;
 	key.map_generation = map_generation;
@@ -223,7 +224,7 @@ void DispatchTable::Learn(const DispatchKey& key, const DispatchEntry& entry) {
 	m_entries.insert_or_assign(key, entry);
 }
 
-void Counters::NoteServed(DispatchKind kind) {
+void Counters::NoteServed(OperationKind kind) {
 	auto& counts = kinds[static_cast<size_t>(kind)];
 	counts.operations++;
 	counts.served++;
@@ -231,7 +232,7 @@ void Counters::NoteServed(DispatchKind kind) {
 	counts.without_cd++;
 }
 
-void Counters::NoteRefused(DispatchKind kind, RefusalMask refusals) {
+void Counters::NoteRefused(OperationKind kind, RefusalMask refusals) {
 	auto& counts = kinds[static_cast<size_t>(kind)];
 	counts.operations++;
 	bool first = true;
@@ -248,7 +249,7 @@ void Counters::NoteRefused(DispatchKind kind, RefusalMask refusals) {
 	if ((owners & (c | d)) == 0) counts.without_cd++;
 }
 
-void Counters::NoteTime(DispatchKind kind, bool thin, uint64_t ns) {
+void Counters::NoteTime(OperationKind kind, bool thin, uint64_t ns) {
 	auto& counts = kinds[static_cast<size_t>(kind)];
 	(thin ? counts.thin_ns : counts.full_ns) += ns;
 	(thin ? counts.thin_timed : counts.full_timed)++;

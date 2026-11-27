@@ -22,12 +22,7 @@ namespace Libs::Graphics {
 struct RenderExecutor::ThinDispatches {
 	Thin::DispatchTable table;
 	Thin::Counters      counters;
-	Thin::DispatchKind  kind = Thin::DispatchKind::Direct;
-	Thin::DispatchKey   key;
-	Thin::RefusalMask   refusals  = Thin::Bit(Thin::Refusal::Unresolved);
-	bool                active    = false;
-	bool                learning  = false;
-	bool                served    = false;
+	ThinOperation*      current   = nullptr;
 	uint32_t            ticks     = 0;
 	uint64_t            log_ns    = 0;
 	uint64_t            log_frame = 0;
@@ -43,31 +38,25 @@ RenderExecutor::ThinDispatches& RenderExecutor::OwnThin() {
 	return *m_thin;
 }
 
-RenderExecutor::ThinOperation::ThinOperation(RenderExecutor& executor, bool indirect): m_executor(executor) {
-	auto& thin    = executor.OwnThin();
-	thin.kind     = indirect ? Thin::DispatchKind::Indirect : Thin::DispatchKind::Direct;
-	thin.active   = true;
-	thin.learning = false;
-	thin.served   = false;
-	thin.refusals = Thin::Bit(Thin::Refusal::Unresolved);
+RenderExecutor::ThinOperation::ThinOperation(RenderExecutor& executor, Thin::OperationKind kind)
+    : m_executor(executor), m_kind(kind) {
+	auto& thin   = executor.OwnThin();
+	m_outer      = std::exchange(thin.current, this);
 	if (++thin.ticks % Thin::TimingPeriod == 0) {
 		m_begin = Common::SteadyNs();
 	}
 }
 
 RenderExecutor::ThinOperation::~ThinOperation() {
-	auto& thin = *m_executor.m_thin;
-	if (!thin.active) {
-		return;
-	}
-	thin.active = false;
-	if (thin.served) {
-		thin.counters.NoteServed(thin.kind);
+	auto& thin   = *m_executor.m_thin;
+	thin.current = m_outer;
+	if (m_served) {
+		thin.counters.NoteServed(m_kind);
 	} else {
-		thin.counters.NoteRefused(thin.kind, thin.refusals);
+		thin.counters.NoteRefused(m_kind, m_refusals);
 	}
 	if (m_begin != 0) {
-		thin.counters.NoteTime(thin.kind, thin.served, Common::SteadyNs() - m_begin);
+		thin.counters.NoteTime(m_kind, m_served, Common::SteadyNs() - m_begin);
 	}
 	if (thin.ticks % ThinSummaryPeriod != 0) {
 		return;
@@ -93,14 +82,18 @@ RenderExecutor::ThinOperation::~ThinOperation() {
 bool RenderExecutor::TryThinDispatch(CommandBuffer& buffer, const HW::ComputeShaderInfo& cs_regs,
                                      const uint32_t (&groups)[3], uint32_t mode, bool async_compute) {
 	auto& thin = OwnThin();
-	thin.key   = Thin::MakeDispatchKey(cs_regs.cs_regs, ShaderMapGeneration(), mode, async_compute, thin.kind);
-	const auto* entry = thin.table.Find(thin.key, m_context.FrameNumber());
-	if (entry == nullptr) {
-		thin.learning = true;
+	auto* op   = thin.current;
+	if (op == nullptr) {
 		return false;
 	}
-	if (entry->refusals != 0 || thin.kind != Thin::DispatchKind::Direct) {
-		thin.refusals = entry->refusals != 0 ? entry->refusals : Thin::Bit(Thin::Refusal::IndirectArgs);
+	op->m_key         = Thin::MakeDispatchKey(cs_regs.cs_regs, ShaderMapGeneration(), mode, async_compute, op->m_kind);
+	const auto* entry = thin.table.Find(op->m_key, m_context.FrameNumber());
+	if (entry == nullptr) {
+		op->m_learning = true;
+		return false;
+	}
+	if (entry->refusals != 0 || op->m_kind != Thin::OperationKind::Direct) {
+		op->m_refusals = entry->refusals != 0 ? entry->refusals : Thin::Bit(Thin::Refusal::IndirectArgs);
 		return false;
 	}
 	const auto& plan = entry->plan;
@@ -108,7 +101,8 @@ bool RenderExecutor::TryThinDispatch(CommandBuffer& buffer, const HW::ComputeSha
 	uint32_t       group_counts[3] {groups[0], groups[1], groups[2]};
 	const uint32_t no_threads[3] {};
 	if (plan.thread_dimensions) {
-		const uint32_t sizes[] {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y, cs_regs.cs_regs.num_thread_z};
+		const uint32_t sizes[] {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+		                        cs_regs.cs_regs.num_thread_z};
 		for (uint32_t axis = 0; axis < 3u; ++axis) {
 			const auto size    = std::max(sizes[axis], 1u);
 			group_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
@@ -139,59 +133,90 @@ bool RenderExecutor::TryThinDispatch(CommandBuffer& buffer, const HW::ComputeSha
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_deferred_barrier       = true;
 	m_deferred_barrier_queue = m_guest_queue;
-	thin.served              = true;
+	op->m_served             = true;
 	return true;
+}
+
+static bool ThinPushLayout(const ShaderRecompiler::IR::CompiledShaderInfo& program, std::span<const uint32_t> user_data,
+                           const uint32_t (&dispatch_threads)[3], std::span<const uint32_t> shader_data,
+                           Thin::PushPlan& plan) {
+	if (!Thin::MakePushPlan(program, static_cast<uint32_t>(user_data.size()), plan)) {
+		return false;
+	}
+	ShaderRecompiler::IR::PushData packed;
+	Thin::PackPushData(plan, user_data, dispatch_threads, packed);
+	return Thin::SamePushData(plan, shader_data, packed);
 }
 
 void RenderExecutor::LearnThinDispatch(const ShaderComputeInputInfo& input_info, const PipelineCache::Pipeline& pipeline,
                                        const PreparedBindings& bindings, const HW::ComputeShaderInfo& cs_regs,
                                        uint32_t mode, bool writes, bool indirect_writes) {
-	auto& thin = OwnThin();
-	if (!thin.active || !thin.learning) {
+	auto* op = OwnThin().current;
+	if (op == nullptr || !op->m_learning) {
 		return;
 	}
-	thin.learning      = false;
-	const auto& module = *input_info.stage.module;
-	const auto& program = module.info;
+	op->m_learning      = false;
+	const auto& program = input_info.stage.module->info;
 	constexpr uint32_t OrderedAppend = 1u << 3u;
-	auto facts = Thin::DescribeProgram(program, *input_info.stage.resources);
+	auto facts                 = Thin::DescribeProgram(program, *input_info.stage.resources);
 	facts.pipeline_ready       = pipeline.pipeline != nullptr && !pipeline.uses_image_heap;
+	facts.image_heap           = facts.image_heap || pipeline.uses_image_heap;
 	facts.lds_storage          = input_info.lds_storage || bindings.shared_memory.buffer != nullptr;
 	facts.write_targets        = facts.write_targets || indirect_writes;
 	facts.ordered_append       = (mode & OrderedAppend) != 0 && program.info.uses_gds;
-	facts.indirect_args_on_cpu = thin.kind == Thin::DispatchKind::Indirect;
+	facts.indirect_args_on_cpu = op->m_kind != Thin::OperationKind::Direct;
 	facts.checked              = Config::WaveSplitCheckPeriod() != 0 && WaveSplitCheck::Candidate(input_info);
 	Thin::DispatchEntry entry;
 	auto&               plan = entry.plan;
 	const auto user_sgprs = std::min<uint32_t>(cs_regs.cs_regs.user_sgpr, HW::UserSgprInfo::SGPRS_MAX);
-	if (Thin::MakePushPlan(program, user_sgprs, plan.push)) {
-		ShaderRecompiler::IR::PushData packed;
-		Thin::PackPushData(plan.push, std::span<const uint32_t> {cs_regs.cs_user_sgpr.value, user_sgprs},
-		                   input_info.dispatch_threads_num, packed);
-		facts.push_layout = Thin::SamePushData(plan.push, bindings.shader_data, packed);
-	}
-	entry.refusals = Thin::Classify(facts);
-	entry.learned  = m_context.FrameNumber();
+	facts.push_layout     = ThinPushLayout(program, std::span<const uint32_t> {cs_regs.cs_user_sgpr.value, user_sgprs},
+	                                       input_info.dispatch_threads_num, bindings.shader_data, plan.push);
+	entry.refusals         = Thin::Classify(facts);
+	entry.learned          = m_context.FrameNumber();
 	plan.pipeline          = pipeline.pipeline;
 	plan.layout            = pipeline.pipeline_layout;
 	plan.push_stages       = pipeline.push_stages;
 	plan.thread_dimensions = input_info.dispatch_thread_dimensions;
 	plan.writes            = writes;
 	plan.shader_hash       = program.shader_hash;
-	thin.table.Learn(thin.key, entry);
-	thin.refusals = entry.refusals;
+	OwnThin().table.Learn(op->m_key, entry);
+	op->m_refusals = entry.refusals;
 }
 
 void RenderExecutor::NoteThinRefused(Thin::Refusal refusal, bool remember) {
 	auto& thin = OwnThin();
-	if (!thin.active) {
+	auto* op   = thin.current;
+	if (op == nullptr) {
 		return;
 	}
-	thin.refusals = Thin::Bit(refusal);
-	if (remember && thin.learning) {
-		thin.table.Learn(thin.key, {.refusals = thin.refusals, .learned = m_context.FrameNumber()});
+	op->m_refusals = Thin::Bit(refusal);
+	if (remember && op->m_learning) {
+		thin.table.Learn(op->m_key, {.refusals = op->m_refusals, .learned = m_context.FrameNumber()});
 	}
-	thin.learning = false;
+	op->m_learning = false;
+}
+
+void RenderExecutor::ClassifyThinDraw(std::span<PreparedBindings* const> stages, const PipelineCache::Pipeline& pipeline,
+                                      Thin::RefusalMask draw_refusals) {
+	auto* op = OwnThin().current;
+	if (op == nullptr) {
+		return;
+	}
+	const uint32_t    no_threads[3] {};
+	Thin::RefusalMask refusals = draw_refusals;
+	for (const auto* prepared: stages) {
+		const auto& runtime  = *prepared->runtime;
+		const auto& program  = runtime.module->info;
+		auto        facts    = Thin::DescribeProgram(program, *runtime.resources);
+		facts.pipeline_ready = pipeline.pipeline != nullptr;
+		facts.image_heap     = facts.image_heap || pipeline.uses_image_heap;
+		facts.lds_storage    = prepared->shared_memory.buffer != nullptr;
+		facts.indirect_args_on_cpu = op->m_kind == Thin::OperationKind::IndirectDraw;
+		Thin::PushPlan plan;
+		facts.push_layout = ThinPushLayout(program, runtime.resources->user_data, no_threads, prepared->shader_data, plan);
+		refusals |= Thin::Classify(facts);
+	}
+	op->m_refusals = refusals;
 }
 
 }

@@ -41,16 +41,16 @@ HW::CsStageRegisters Registers() {
 
 void Keys() {
 	const auto regs = Registers();
-	const auto base = Thin::MakeDispatchKey(regs, 7, 0x41, false, Thin::DispatchKind::Direct);
-	Check(base == Thin::MakeDispatchKey(regs, 7, 0x41, false, Thin::DispatchKind::Direct), "key is deterministic");
+	const auto base = Thin::MakeDispatchKey(regs, 7, 0x41, false, Thin::OperationKind::Direct);
+	Check(base == Thin::MakeDispatchKey(regs, 7, 0x41, false, Thin::OperationKind::Direct), "key is deterministic");
 	Check(Thin::DispatchKeyHash {}(base) ==
-	          Thin::DispatchKeyHash {}(Thin::MakeDispatchKey(regs, 7, 0x41, false, Thin::DispatchKind::Direct)),
+	          Thin::DispatchKeyHash {}(Thin::MakeDispatchKey(regs, 7, 0x41, false, Thin::OperationKind::Direct)),
 	      "hash is deterministic");
 	std::vector<Thin::DispatchKey> variants;
 	const auto with = [&](auto change) {
 		auto copy = regs;
 		change(copy);
-		variants.push_back(Thin::MakeDispatchKey(copy, 7, 0x41, false, Thin::DispatchKind::Direct));
+		variants.push_back(Thin::MakeDispatchKey(copy, 7, 0x41, false, Thin::OperationKind::Direct));
 	};
 	with([](auto& r) { r.data_addr += 0x100; });
 	with([](auto& r) { r.num_thread_x = 32; });
@@ -75,10 +75,10 @@ void Keys() {
 	with([](auto& r) { r.tidig_comp_cnt = 2; });
 	with([](auto& r) { r.lds_size = 17; });
 	with([](auto& r) { r.shared_vgprs = 3; });
-	variants.push_back(Thin::MakeDispatchKey(regs, 8, 0x41, false, Thin::DispatchKind::Direct));
-	variants.push_back(Thin::MakeDispatchKey(regs, 7, 0x61, false, Thin::DispatchKind::Direct));
-	variants.push_back(Thin::MakeDispatchKey(regs, 7, 0x41, true, Thin::DispatchKind::Direct));
-	variants.push_back(Thin::MakeDispatchKey(regs, 7, 0x41, false, Thin::DispatchKind::Indirect));
+	variants.push_back(Thin::MakeDispatchKey(regs, 8, 0x41, false, Thin::OperationKind::Direct));
+	variants.push_back(Thin::MakeDispatchKey(regs, 7, 0x61, false, Thin::OperationKind::Direct));
+	variants.push_back(Thin::MakeDispatchKey(regs, 7, 0x41, true, Thin::OperationKind::Direct));
+	variants.push_back(Thin::MakeDispatchKey(regs, 7, 0x41, false, Thin::OperationKind::Indirect));
 	for (size_t i = 0; i < variants.size(); ++i) {
 		Check(!(variants[i] == base), "register change " + std::to_string(i) + " changes the key");
 		for (size_t j = i + 1; j < variants.size(); ++j) {
@@ -188,6 +188,14 @@ void Classification() {
 	for (uint32_t index = 0; index < Thin::RefusalCount; ++index) {
 		Check(Thin::RefusalName(static_cast<Refusal>(index)) != "?", "refusal " + std::to_string(index) + " is named");
 	}
+	Check(Thin::RefusalOwner(Refusal::VertexBuffers) == Thin::Owner::A &&
+	          Thin::RefusalOwner(Refusal::IndexBuffer) == Thin::Owner::A &&
+	          Thin::RefusalOwner(Refusal::Targets) == Thin::Owner::C &&
+	          Thin::RefusalOwner(Refusal::MeshDraw) == Thin::Owner::C,
+	      "draw refusals belong to their owners");
+	Check(Thin::RefusalName(Refusal::MeshDraw) == "mesh draw" && Thin::RefusalName(Refusal::Targets) == "targets" &&
+	          Thin::RefusalName(Refusal::Count) == "?",
+	      "names follow the refusal order");
 }
 
 void Description() {
@@ -339,7 +347,7 @@ void PushPacking() {
 
 void Table() {
 	Thin::DispatchTable table;
-	const auto          key = Thin::MakeDispatchKey(Registers(), 1, 0x41, false, Thin::DispatchKind::Direct);
+	const auto          key = Thin::MakeDispatchKey(Registers(), 1, 0x41, false, Thin::OperationKind::Direct);
 	Check(table.Find(key, 10) == nullptr, "an unknown key is not served");
 	Thin::DispatchEntry entry;
 	entry.learned          = 10;
@@ -357,20 +365,22 @@ void Table() {
 	for (uint64_t i = 0; i < Thin::DispatchTable::MaxEntries; ++i) {
 		auto regs      = Registers();
 		regs.data_addr = 0x1000 + i * 0x100;
-		table.Learn(Thin::MakeDispatchKey(regs, 1, 0x41, false, Thin::DispatchKind::Direct), entry);
+		table.Learn(Thin::MakeDispatchKey(regs, 1, 0x41, false, Thin::OperationKind::Direct), entry);
 	}
 	Check(table.Size() <= Thin::DispatchTable::MaxEntries, "the table stays bounded");
 }
 
 void Counting() {
 	Thin::Counters counters;
-	counters.NoteServed(Thin::DispatchKind::Direct);
-	counters.NoteServed(Thin::DispatchKind::Direct);
-	counters.NoteRefused(Thin::DispatchKind::Direct, Thin::Bit(Refusal::CpuImages) | Thin::Bit(Refusal::CpuBuffers));
-	counters.NoteRefused(Thin::DispatchKind::Direct, Thin::Bit(Refusal::Gds));
-	counters.NoteRefused(Thin::DispatchKind::Indirect, Thin::Bit(Refusal::IndirectArgs));
-	counters.NoteTime(Thin::DispatchKind::Direct, true, 2000);
-	counters.NoteTime(Thin::DispatchKind::Direct, false, 600000);
+	counters.NoteServed(Thin::OperationKind::Direct);
+	counters.NoteServed(Thin::OperationKind::Direct);
+	counters.NoteRefused(Thin::OperationKind::Direct, Thin::Bit(Refusal::CpuImages) | Thin::Bit(Refusal::CpuBuffers));
+	counters.NoteRefused(Thin::OperationKind::Direct, Thin::Bit(Refusal::Gds));
+	counters.NoteRefused(Thin::OperationKind::Indirect, Thin::Bit(Refusal::IndirectArgs));
+	counters.NoteRefused(Thin::OperationKind::Draw, Thin::Bit(Refusal::VertexBuffers) | Thin::Bit(Refusal::IndexBuffer));
+	counters.NoteRefused(Thin::OperationKind::Draw, Thin::Bit(Refusal::VertexBuffers) | Thin::Bit(Refusal::Targets));
+	counters.NoteTime(Thin::OperationKind::Direct, true, 2000);
+	counters.NoteTime(Thin::OperationKind::Direct, false, 600000);
 	const auto& direct = counters.kinds[0];
 	Check(direct.operations == 4 && direct.served == 2, "direct operations and thin ones are counted");
 	Check(direct.without_c == 3 && direct.without_cd == 3, "a GDS refusal is C's");
@@ -379,6 +389,8 @@ void Counting() {
 	          direct.first[static_cast<size_t>(Refusal::CpuImages)] == 0 &&
 	          direct.refused[static_cast<size_t>(Refusal::CpuImages)] == 1,
 	      "the first refusal follows the dependency order");
+	const auto& draws = counters.kinds[static_cast<size_t>(Thin::OperationKind::Draw)];
+	Check(draws.operations == 2 && draws.without_c == 1 && draws.without_cd == 1, "draw targets are C's");
 	const auto line = counters.Summary(10.0, 2);
 	std::printf("%s", line.c_str());
 	Check(line.find("[kyty-thin]") == 0, "summary prefix");
@@ -386,6 +398,11 @@ void Counting() {
 	Check(line.find("us per operation thin 2.00 full 600.00") != std::string::npos, "timing summary");
 	Check(line.find("CPU images (E) 1 (first 0)") != std::string::npos, "refusal owner in the summary");
 	Check(line.find("indirect args (D) 1 (first 1)") != std::string::npos, "indirect refusal in the summary");
+	Check(line.find("draws: 2 (1.0 per frame), thin 0 (0.0 %), without C refusals 50.0 %") != std::string::npos,
+	      "draw summary");
+	Check(line.find("vertex buffers (A) 2 (first 2), index buffer (A) 1 (first 0), targets (C) 1 (first 0)") !=
+	          std::string::npos,
+	      "draw refusals in the summary");
 }
 
 }

@@ -525,7 +525,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		return;
 	}
 
-	const ThinOperation thin_operation(*this, false);
+	const ThinOperation thin_operation(*this, Thin::OperationKind::Direct);
 	const uint32_t      thin_groups[] {thread_group_x, thread_group_y, thread_group_z};
 	if (TryThinDispatch(buffer, cs_regs, thin_groups, mode, async_compute)) {
 		return;
@@ -1125,7 +1125,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
-	const ThinOperation thin_operation(*this, true);
+	const ThinOperation thin_operation(*this, Thin::OperationKind::Indirect);
 	const uint32_t      thin_groups[3] {};
 	if (TryThinDispatch(buffer, cs_regs, thin_groups, mode, async_compute)) {
 		return;
