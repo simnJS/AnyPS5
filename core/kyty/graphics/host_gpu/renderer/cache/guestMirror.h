@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/memoryTelemetry.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/cache/mirrorWindowTable.h"
+#include "graphics/host_gpu/renderer/cache/usageBitmap.h"
 #include "common/threadSafety.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -207,8 +208,6 @@ private:
 		}
 		if (run != UINT64_MAX) func(std::max(begin, m_base + (run << shift)), end);
 	}
-	[[nodiscard]] uint32_t AgeOf(uint64_t block) const noexcept;
-	static constexpr uint64_t AgeChunkBlocks = 16384;
 
 	GraphicContext& m_graphics;
 	uint64_t        m_guest_span = 0;
@@ -225,10 +224,8 @@ private:
 	std::unique_ptr<std::atomic<uint64_t>[]> m_ready;
 	std::unique_ptr<std::atomic<uint64_t>[]> m_owned;
 	uint64_t                                 m_words          = 0;
-	std::vector<uint64_t>                    m_used;
-	std::vector<uint64_t>                    m_used_words;
+	UsageBitmap                              m_used;
 	std::vector<uint64_t>                    m_device;
-	std::vector<std::unique_ptr<uint32_t[]>> m_ages;
 	std::vector<Run>                         m_pending;
 	uint64_t                                 m_pending_blocks = 0;
 	uint64_t                                 m_first_pending  = 0;

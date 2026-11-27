@@ -252,9 +252,8 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 	m_bound        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
 	m_ready        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
 	m_owned        = std::make_unique<std::atomic<uint64_t>[]>(((m_guest_span >> PageBits) + 63) / 64);
-	m_used.assign(m_words, 0);
+	m_used.Resize(m_words * 64);
 	m_device.assign(m_words, 0);
-	m_ages.resize(((m_guest_span >> m_block_bits) + AgeChunkBlocks - 1) / AgeChunkBlocks);
 	vk::PhysicalDeviceVulkan13Properties properties13 {};
 	vk::PhysicalDeviceProperties2        properties {.pNext = &properties13};
 	graphics.physical_device.getProperties2(&properties);
@@ -457,15 +456,7 @@ bool GuestMirror::AnyRequested(uint64_t vaddr, uint64_t size) const noexcept {
 
 void GuestMirror::Use(uint64_t vaddr, uint64_t size) noexcept {
 	if (!Holds(vaddr, size)) return;
-	const auto first = (vaddr - m_base) >> m_block_bits;
-	const auto last  = (vaddr - m_base + size - 1) >> m_block_bits;
-	for (auto word = first / 64; word <= last / 64; word++) {
-		const auto low  = word == first / 64 ? first % 64 : 0;
-		const auto high = word == last / 64 ? last % 64 : 63;
-		const auto mask = (high == 63 ? ~uint64_t {0} : (uint64_t {2} << high) - 1) & ~((uint64_t {1} << low) - 1);
-		if (m_used[word] == 0) m_used_words.push_back(word);
-		m_used[word] |= mask;
-	}
+	m_used.Mark((vaddr - m_base) >> m_block_bits, (vaddr - m_base + size - 1) >> m_block_bits);
 }
 
 void GuestMirror::NoteDevice(uint64_t vaddr, uint64_t size) noexcept {
@@ -477,22 +468,8 @@ void GuestMirror::NoteDevice(uint64_t vaddr, uint64_t size) noexcept {
 	}
 }
 
-uint32_t GuestMirror::AgeOf(uint64_t block) const noexcept {
-	const auto& chunk = m_ages[block / AgeChunkBlocks];
-	return chunk ? chunk[block % AgeChunkBlocks] : 0;
-}
-
 void GuestMirror::Age(uint32_t frame) {
-	for (const auto word: m_used_words) {
-		for (auto bits = m_used[word]; bits != 0; bits &= bits - 1) {
-			const auto block = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
-			auto&      chunk = m_ages[block / AgeChunkBlocks];
-			if (!chunk) chunk = std::make_unique<uint32_t[]>(AgeChunkBlocks);
-			chunk[block % AgeChunkBlocks] = frame;
-		}
-		m_used[word] = 0;
-	}
-	m_used_words.clear();
+	m_used.Fold(frame);
 }
 
 void GuestMirror::PickOldest(uint64_t max_blocks, uint32_t older_than, Runs& victims) const {
@@ -505,9 +482,9 @@ void GuestMirror::PickOldest(uint64_t max_blocks, uint32_t older_than, Runs& vic
 	};
 	std::vector<Candidate> candidates;
 	for (uint64_t word = 0; word < m_words; word++) {
-		for (auto bits = m_bound[word].load(std::memory_order_acquire) & ~m_used[word]; bits != 0; bits &= bits - 1) {
+		for (auto bits = m_bound[word].load(std::memory_order_acquire) & ~m_used.PendingWord(word); bits != 0; bits &= bits - 1) {
 			const auto block = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
-			const auto age   = AgeOf(block);
+			const auto age   = m_used.Stamp(block);
 			if (age >= older_than) continue;
 			candidates.push_back({(m_device[word] >> (block % 64) & 1u) != 0, age, block});
 		}
