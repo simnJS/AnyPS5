@@ -34,8 +34,13 @@ struct VulkanDeviceIdentity {
 
 [[nodiscard]] VulkanDeviceIdentity GetVulkanDeviceIdentity(const GraphicContext& graphics);
 
-bool CreateHeadlessVulkan(GraphicContext& graphics, const VulkanDeviceIdentity* identity,
-                          std::string& error);
+bool CreateHeadlessVulkanChecked(GraphicContext& graphics, const VulkanDeviceIdentity* identity, std::string& error,
+                                 size_t context_bytes);
+
+template <typename Context>
+bool CreateHeadlessVulkan(Context& graphics, const VulkanDeviceIdentity* identity, std::string& error) {
+	return CreateHeadlessVulkanChecked(graphics, identity, error, sizeof(Context));
+}
 
 }
 

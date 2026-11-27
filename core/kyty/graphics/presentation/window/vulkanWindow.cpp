@@ -1265,8 +1265,14 @@ VulkanDeviceIdentity GetVulkanDeviceIdentity(const GraphicContext& graphics) {
 	return identity;
 }
 
-bool CreateHeadlessVulkan(GraphicContext& graphics, const VulkanDeviceIdentity* identity,
-                          std::string& error) {
+bool CreateHeadlessVulkanChecked(GraphicContext& graphics, const VulkanDeviceIdentity* identity, std::string& error,
+                                 size_t context_bytes) {
+	if (context_bytes != sizeof(GraphicContext)) {
+		error = fmt::format("the caller was compiled with a GraphicContext of {} bytes and this library with {} bytes; "
+		                    "build both from the same sources",
+		                    context_bytes, sizeof(GraphicContext));
+		return false;
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	static const vk::detail::DynamicLoader loader;
 	if (!loader.success()) {

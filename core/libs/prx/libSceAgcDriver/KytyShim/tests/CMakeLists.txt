@@ -176,6 +176,16 @@ set_tests_properties(kyty_shim_completion_invalidation PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_completion_invalidation: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 
 if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/HeadlessLayout.cpp)
+    add_test_executable(kyty_shim_headless_layout_tests ${CMAKE_CURRENT_SOURCE_DIR}/HeadlessLayoutMain.cpp)
+    configure_host_test_executable(kyty_shim_headless_layout_tests)
+    target_link_libraries(kyty_shim_headless_layout_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_headless_layout COMMAND kyty_shim_headless_layout_tests)
+    set_tests_properties(kyty_shim_headless_layout PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_headless_layout: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+
+if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/CrossQueueLabelOrder.cpp)
     add_test_executable(kyty_shim_cross_queue_label_order_tests ${CMAKE_CURRENT_SOURCE_DIR}/CrossQueueLabelOrderMain.cpp)
     configure_host_test_executable(kyty_shim_cross_queue_label_order_tests)
