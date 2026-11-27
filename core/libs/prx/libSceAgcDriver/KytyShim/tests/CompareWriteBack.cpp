@@ -143,12 +143,44 @@ void NothingProducedWritesNothing() {
     Require(counts.written == 0, "wrong written count for an unchanged image");
 }
 
+void CompareAcrossPieces() {
+    using namespace Libs::Graphics;
+    const uint64_t size = 2 * WriteBackPieceSize + 37;
+    std::vector<uint8_t> snapshot(size), current(size), result(size);
+    for (uint64_t i = 0; i < size; ++i) {
+        snapshot[i] = current[i] = Old(i);
+        result[i] = Produced(i);
+    }
+    current[WriteBackPieceSize - 1] = current[WriteBackPieceSize + 2] = 0;
+    current.back() ^= 0x7f;
+    Guest reference, pieces;
+    reference.bytes = pieces.bytes = current;
+    const auto counts = CompareWriteBack(reference.base, result.data(), snapshot.data(), current.data(), size,
+        [&](auto at, auto data, auto n) { reference.Write(at, data, n); });
+    const auto read = [&](uint64_t at, uint8_t* bytes, uint64_t n) {
+        Require(n <= WriteBackPieceSize, "comparison read exceeded the scratch limit");
+        Require(pieces.writes == 0, "published before checking all backing, including possible aliases");
+        std::memcpy(bytes, current.data() + (at - pieces.base), n);
+        return true;
+    };
+    auto partial = snapshot;
+    CompareWriteBackPieces(pieces.base, result.data(), partial.data(), size,
+        [&](auto at, auto bytes, auto n) { return at == pieces.base && read(at, bytes, n); },
+        [&](auto, auto, auto) { Require(false, "a missing backing page allowed a partial write"); });
+    const auto piece_counts = CompareWriteBackPieces(pieces.base, result.data(), snapshot.data(), size, read,
+        [&](auto at, auto data, auto n) { pieces.Write(at, data, n); });
+    Require(pieces.bytes == reference.bytes && pieces.writes == reference.writes &&
+            piece_counts.written == counts.written && piece_counts.kept == counts.kept,
+            "piecewise comparison changed the result, runs or counts");
+}
+
 }
 
 int main() {
     ProducedTexelsOnlyOverwriteTexels();
     UnchangedGuestIsWrittenInFewRuns();
     NothingProducedWritesNothing();
+    CompareAcrossPieces();
     std::printf("kyty_shim_compare_write_back: ok\n");
     return 0;
 }

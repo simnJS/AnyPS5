@@ -16,8 +16,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
-constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
+constexpr size_t InitialWatchCount = 256;
 
 constexpr vk::AccessFlags MEMORY_ACCESS =
     vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -273,7 +272,7 @@ StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler
                            uint64_t size, MemoryTelemetry::Kind category)
     : Buffer(graphics, scheduler, usage, 0,
              AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size, category),
-      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
+      m_current_watches(InitialWatchCount), m_previous_watches(InitialWatchCount) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
                                         uint64_t& alignment) {
@@ -329,6 +328,10 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 		m_invalidation_mark    = invalidation_mark;
 		m_current_watch_cursor = 0;
 		std::swap(m_previous_watches, m_current_watches);
+		const auto demand = std::max(InitialWatchCount, *invalidation_mark);
+		if (m_current_watches.size() / 4 >= demand) {
+			std::vector<Watch>(demand).swap(m_current_watches);
+		}
 		m_lap++;
 	}
 	m_wait_cursor = wait_cursor;
@@ -349,8 +352,8 @@ void StreamBuffer::Commit() {
 		m_current_watches[m_current_watch_cursor - 1].upper_bound = m_offset;
 		return;
 	}
-	if (m_current_watch_cursor + 1 >= m_current_watches.size()) {
-		m_current_watches.resize(m_current_watches.size() + WATCHES_RESERVE_CHUNK);
+	if (m_current_watch_cursor == m_current_watches.size()) {
+		m_current_watches.resize(2 * m_current_watches.size());
 	}
 	auto& watch       = m_current_watches[m_current_watch_cursor++];
 	watch.upper_bound = m_offset;

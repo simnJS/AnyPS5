@@ -29,6 +29,7 @@
 #endif
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -474,7 +475,9 @@ bool TileManager::TileThroughDevice(vk::Buffer linear, uint64_t linear_offset,
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
 	EXIT_IF(size == 0);
 	size = Common::AlignUp(size, 4);
-	auto& buffer = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
+	const size_t index = m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0;
+	m_scratch_peak[index] = std::max(m_scratch_peak[index], size);
+	auto& buffer = m_scratch[index];
 	if (!buffer || buffer->Size() < size) {
 		if (buffer) {
 			m_scheduler.DeferHostOperation([old = std::move(buffer)]() mutable { old.reset(); });
@@ -484,6 +487,20 @@ TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer inpu
 		        vk::BufferUsageFlagBits::eTransferDst, size, MemoryTelemetry::Kind::Tiling);
 	}
 	return {buffer->Handle(), 0, size};
+}
+
+void TileManager::TrimScratch() {
+	if (++m_scratch_frames < 120) {
+		return;
+	}
+	m_scratch_frames = 0;
+	for (size_t i = 0; i < m_scratch.size(); ++i) {
+		auto& buffer = m_scratch[i];
+		const auto peak = std::exchange(m_scratch_peak[i], 0);
+		if (buffer && buffer->Size() > 64ull * 1024 * 1024 && peak <= buffer->Size() / 2) {
+			m_scheduler.DeferHostOperation([old = std::move(buffer)]() mutable { old.reset(); });
+		}
+	}
 }
 
 TileManager::StorageBinding TileManager::BindStorage(Result buffer, uint64_t size) const {

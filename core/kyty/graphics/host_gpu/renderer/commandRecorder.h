@@ -31,7 +31,7 @@ public:
 		size_t     arrays   = 0;
 	};
 
-	enum class RecordKind : uint32_t { Command, Submit };
+	enum class RecordKind : uint32_t { Command, Submit, TrimPool };
 
 	struct Entry {
 		using Fn = void (*)(vk::CommandBuffer command, const void* payload);

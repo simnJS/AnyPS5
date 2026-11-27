@@ -1327,6 +1327,9 @@ void RenderContext::PrepareHackMarks() {
 
 void RenderContext::RunGarbageCollector() {
 	m_frame_number++;
+	if (m_frame_number % 120 == 0) {
+		m_command_scheduler.TrimCommandPool();
+	}
 	m_descriptor_heap.TrimCompletedPools();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

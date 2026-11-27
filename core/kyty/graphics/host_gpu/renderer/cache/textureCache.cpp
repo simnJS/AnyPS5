@@ -164,20 +164,15 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	m_readback_storage_images = write_back_value != "0";
 #endif
 	if (m_graphics.CanReportMemoryUsage()) {
-		UpdateMemoryThresholds(m_graphics.GetTotalMemoryBudget());
+		UpdateMemoryThresholds(m_graphics.GetLocalMemoryUsage().budget);
 	}
 }
 
 void TextureCache::UpdateMemoryThresholds(uint64_t budget_bytes) {
 	m_memory_budget = budget_bytes;
-	constexpr int64_t GiB = 1024ll * 1024 * 1024;
-	const auto        budget = static_cast<int64_t>(std::min<uint64_t>(budget_bytes, INT64_MAX));
-	const auto        threshold = std::min<int64_t>(budget, 8 * GiB);
-	m_pressure_gc_memory = static_cast<uint64_t>(
-	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-	m_critical_gc_memory = static_cast<uint64_t>(
-	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-	m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+	m_stop_gc_memory = budget_bytes / 2;
+	m_pressure_gc_memory = budget_bytes / 5 * 3 + (budget_bytes % 5 * 3 + 4) / 5;
+	m_critical_gc_memory = budget_bytes - budget_bytes / 5;
 }
 
 TextureCache::~TextureCache() {
@@ -542,7 +537,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		m_registered_pages.Add(page, -1);
 	});
 	m_lru_cache.Free(image.lru_id);
-	m_total_used_memory -= image.AccountedSize();
+	m_total_used_memory -= std::min(m_total_used_memory, image.AccountedSize());
 	image.registered = false;
 	const auto epoch = ++m_image_set_epoch;
 	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
@@ -3421,7 +3416,7 @@ private:
 		std::vector<Free> free;
 		uint64_t          bytes = 0;
 	};
-	static constexpr uint64_t MaxPooledBytes = 256ull * 1024 * 1024;
+	static constexpr uint64_t MaxPooledBytes = 64ull * 1024 * 1024;
 	static Pool&              Shared() {
 		static Pool pool;
 		return pool;
@@ -3455,7 +3450,8 @@ PooledBytes PooledBytes::Acquire(uint64_t size) {
 }
 
 void PooledBytes::Return() noexcept {
-	if (!m_data) {
+	if (!m_data || m_capacity > MaxPooledBytes) {
+		m_data.reset();
 		return;
 	}
 	auto&            pool = Shared();
@@ -3470,14 +3466,10 @@ void PooledBytes::Return() noexcept {
 	}
 }
 
-void WriteBackChanged(uint64_t address, const uint8_t* result, const uint8_t* snapshot,
+void WriteBackChanged(uint64_t address, const uint8_t* result, uint8_t* snapshot,
                       uint64_t size, RangeSet& written) {
-	const auto current = PooledBytes::Acquire(size);
-	if (!LibKernel::Memory::TryReadBacking(address, current.Data(), size)) {
-		return;
-	}
-	const auto counts = CompareWriteBack(
-	    address, result, snapshot, current.Data(), size,
+	const auto counts = CompareWriteBackPieces(
+	    address, result, snapshot, size, LibKernel::Memory::TryReadBacking,
 	    [&written](uint64_t at, const uint8_t* data, uint64_t bytes) {
 		    LibKernel::Memory::WriteBacking(at, data, bytes);
 		    AddWrittenPages(written, at, bytes);
@@ -4206,6 +4198,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	Common::ScopedLock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	m_tiler.TrimScratch();
 	{
 		Common::ScopedLock pending {m_pending_meta_lock};
 		for (auto it = m_pending_meta_clears.begin(); it != m_pending_meta_clears.end();) {
@@ -4225,19 +4218,25 @@ void TextureCache::RunGarbageCollector() {
 		UpdatePendingMetaBoundsLocked();
 	}
 	DiscardParkedImages(0, 0);
-	if (m_graphics.CanReportMemoryUsage()) {
-		const auto budget = m_graphics.GetTotalMemoryBudget();
-		if (budget != m_memory_budget) {
-			UpdateMemoryThresholds(budget);
-		}
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const auto local = m_graphics.GetLocalMemoryUsage();
+	auto used = m_total_used_memory;
+	if (local.budget == 0 && m_graphics.CanReportMemoryUsage()) {
+		m_collecting = false;
 		return;
 	}
+	if (local.budget != 0) {
+		if (local.budget != m_memory_budget) {
+			UpdateMemoryThresholds(local.budget);
+		}
+		used = local.usage;
+		m_collecting = m_collecting ? used > m_stop_gc_memory : used >= m_pressure_gc_memory;
+		if (!m_collecting) {
+			return;
+		}
+	}
 	const auto collect = [&](bool allow_aggressive) KYTY_REQUIRES(m_lock) {
-		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		bool     pressured  = used >= m_pressure_gc_memory;
+		bool     aggressive = allow_aggressive && used >= m_critical_gc_memory;
 		uint64_t age        = 16;
 		size_t   deletions  = 10;
 		if (aggressive) {
@@ -4251,11 +4250,12 @@ void TextureCache::RunGarbageCollector() {
 		std::vector<ImageId> candidates;
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
 		for (const auto id: candidates) {
-			if (deletions == 0) {
+			if (deletions == 0 || (local.budget != 0 && used <= m_stop_gc_memory)) {
 				break;
 			}
 			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			if (owner == nullptr || !owner->registered || owner->depth_id || !owner->stencil_ids.empty() ||
+			    owner->usage.video_out || owner->binding.is_bound || owner->binding.is_target) {
 				continue;
 			}
 			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u || owner->table_pins != 0) {
@@ -4266,29 +4266,30 @@ void TextureCache::RunGarbageCollector() {
 			    owner->info.extent.height <= 1024) {
 				continue;
 			}
-			if (owner->SafeToDownload() &&
-			    ((!pressured && owner->lru_tick + GcDownloadAge > tick) || owner->info.HasStencil() ||
+			if (owner->IsGpuModified() &&
+			    (!owner->SafeToDownload() || (!pressured && owner->lru_tick + GcDownloadAge > tick) || owner->info.HasStencil() ||
 			     !DownloadImageMemory(id))) {
 				continue;
 			}
 			--deletions;
+			used -= std::min(used, owner->AccountedSize());
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			if (used < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+			if (used < m_pressure_gc_memory && pressured) {
 				deletions >>= 1;
 				pressured = false;
 			}
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (used >= m_critical_gc_memory) {
 		collect(true);
 	}
-	if (m_total_used_memory >= m_pressure_gc_memory) {
+	if (m_collecting || used >= m_pressure_gc_memory) {
 		m_graphics.TrimRecycledImages();
 	}
 }

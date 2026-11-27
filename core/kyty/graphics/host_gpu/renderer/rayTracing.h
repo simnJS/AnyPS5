@@ -200,6 +200,7 @@ public:
 
 private:
 	friend struct RayTracingTestAccess;
+	friend struct VramBudgetTestAccess;
 
 
 	GraphicContext&                                   m_graphics;

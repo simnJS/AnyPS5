@@ -58,6 +58,7 @@ public:
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0);
 #endif
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
+	void                 TrimScratch();
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
@@ -68,6 +69,7 @@ public:
 
 private:
 	friend struct TileManagerTestAccess;
+	friend struct VramBudgetTestAccess;
 
 	static constexpr uint32_t FamilyCount          = static_cast<uint32_t>(TileBlockFamily::Count);
 	static constexpr uint32_t BytesPerElementCount = 5;
@@ -145,6 +147,8 @@ private:
 	CommandScheduler&                       m_scheduler;
 	StreamBuffer&                           m_stream_buffer;
 	std::array<std::unique_ptr<Buffer>, 2>   m_scratch;
+	std::array<uint64_t, 2>                  m_scratch_peak {};
+	uint32_t                                m_scratch_frames = 0;
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};

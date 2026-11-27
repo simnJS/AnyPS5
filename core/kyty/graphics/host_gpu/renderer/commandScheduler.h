@@ -37,6 +37,7 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           Finish();
+	void           TrimCommandPool();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	void                      Shutdown();
@@ -80,6 +81,7 @@ public:
 	}
 
 private:
+	friend struct VramBudgetTestAccess;
 	void QueueOperation(Common::UniqueFunction<void>&& operation);
 	void QueuePriorityOperation(Common::UniqueFunction<void>&& operation);
 	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&& operation,
@@ -93,6 +95,7 @@ private:
 		~CommandPool();
 		KYTY_CLASS_NO_COPY(CommandPool);
 
+		void              TrimCompleted();
 		vk::CommandBuffer Commit();
 		[[nodiscard]] std::pair<vk::CommandBuffer, size_t> CommitDeferred();
 		void                                               Retire(size_t index, uint64_t tick);
@@ -102,6 +105,7 @@ private:
 
 		size_t Grow();
 		size_t Acquire(uint64_t busy_until);
+		friend struct VramBudgetTestAccess;
 
 		GraphicContext&                m_graphics;
 		MasterSemaphore&               m_master;
