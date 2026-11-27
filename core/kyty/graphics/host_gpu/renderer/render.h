@@ -348,8 +348,6 @@ private:
 		uint64_t elements     = 0;
 		uint64_t candidates   = 0;
 		uint64_t full_scans   = 0;
-		uint64_t shadow_passes     = 0;
-		uint64_t shadow_mismatches = 0;
 		uint64_t resets       = 0;
 		uint64_t window_ns    = 0;
 		bool     idle_logged  = false;

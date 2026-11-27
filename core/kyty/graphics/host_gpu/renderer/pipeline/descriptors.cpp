@@ -8,7 +8,6 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/runtimeSwitches.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -43,7 +42,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
-#include <iterator>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -1364,14 +1362,13 @@ void RenderExecutor::LogTableSummary(size_t binding_slots) {
 	    "{} keys made again after an eviction, {} evictions, {} cleared past {} elements, {} cleared for the element "
 	    "budget, {} generation bumps; {} entries in use, {} keys seen, {} elements; "
 	    "{} shader bindings retained with {} slots, {} bindings retired; {} reused tables rebound over {} elements, "
-	    "{} elements checked, {} full scans; shadow: {} journal passes compared, {} mismatched elements\n",
+	    "{} elements checked, {} full scans\n",
 	    seconds, taken.prepared, taken.bindings, taken.reused, taken.prepared - taken.reused, taken.unfinished,
 	    taken.renewed, taken.layout, taken.left_renewed + taken.left_size, taken.left_renewed, taken.left_size,
 	    m_table_resolutions.Capacity(), cache.lookups, cache.hits, cache.created, cache.recreated, cache.evicted,
 	    cache.overflowed, MaxTableElements, cache.trimmed, cache.generations, m_table_resolutions.Size(),
 	    m_table_resolutions.KnownKeys(), m_table_element_count, m_table_states.size(), binding_slots,
-	    taken.retired_bindings, taken.rebinds, taken.elements, taken.candidates, taken.full_scans,
-	    taken.shadow_passes, taken.shadow_mismatches));
+	    taken.retired_bindings, taken.rebinds, taken.elements, taken.candidates, taken.full_scans));
 }
 
 RenderExecutor::TableResolution&
@@ -2110,8 +2107,7 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 			m_bound_image_indices.push_back(id.index);
 		}
 	}
-	const bool journal = Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::TableJournal);
-	const bool full = !journal || !watch.Collect(Image::change_journal, image_seq, *m_table_element_journal, element_seq,
+	const bool full = !watch.Collect(Image::change_journal, image_seq, *m_table_element_journal, element_seq,
 	                                 m_bound_image_indices, [&](uint32_t index) {
 		                                 if (!watch.Consider(index)) {
 			                                 return;
@@ -2124,23 +2120,6 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 	                                 });
 	if (!full) {
 		std::ranges::sort(m_table_checks);
-		static const bool shadow = [] {
-			const char* value = std::getenv("KYTY_TABLE_JOURNAL_SHADOW");
-			return value != nullptr && std::string_view {value} == "1";
-		}();
-		static uint64_t shadow_turn = 0;
-		if (shadow && (++shadow_turn & 15u) == 0) {
-			std::vector<uint32_t> reference;
-			for (uint32_t index = 0; index < element_count; index++) {
-				if (state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index])) {
-					reference.push_back(index);
-				}
-			}
-			std::vector<uint32_t> missed;
-			std::ranges::set_difference(reference, m_table_checks, std::back_inserter(missed));
-			m_table_stats.shadow_passes++;
-			m_table_stats.shadow_mismatches += missed.size() + (m_table_checks.size() + missed.size() - reference.size());
-		}
 	} else {
 		m_table_checks.clear();
 		considered = element_count;
@@ -3491,8 +3470,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
 				              range, vk_buffer);
-			} else if (!Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::TableJournal) ||
-			           !image.Settled(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead)) {
+			} else if (!image.Settled(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead)) {
 				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
 			binding.layout = image.backing.state.layout;

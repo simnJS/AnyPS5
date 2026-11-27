@@ -25,7 +25,6 @@ struct Entry {
 
 constexpr Entry Entries[] = {
     {"KYTY_GENERIC_COMPUTE_VARIANT", "0", "1"},
-    {"KYTY_TABLE_JOURNAL", "0", "1"},
 };
 
 static_assert(std::size(Entries) == SwitchCount);
@@ -38,7 +37,7 @@ bool Initial(size_t index) {
 }
 
 namespace Detail {
-constinit std::atomic<bool> g_on[SwitchCount] {true, true};
+constinit std::atomic<bool> g_on[SwitchCount] {true};
 }
 
 namespace {
