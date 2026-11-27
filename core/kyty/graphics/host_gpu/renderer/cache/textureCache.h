@@ -201,6 +201,35 @@ public:
 	void RunGarbageCollector();
 
 private:
+	struct ColorClearKey {
+		uint64_t serial;
+		GuestRange viewed;
+		uint64_t stride;
+		uint64_t clear_word;
+		uint32_t first, count, level;
+		vk::Format format;
+		Prospero::BufferFormat guest_format;
+		ImageMetadataKind kind;
+		BindingType binding;
+		bool depth, alpha_msb, register_valid, candidate;
+		bool operator==(const ColorClearKey&) const = default;
+	};
+	struct ColorClearMemo {
+		ColorClearKey key {};
+		uint64_t clear_epoch = 0, cpu_epoch = 0, mapping = 0, writes = 0;
+		uint32_t version = 0;
+		bool settled = false;
+		std::vector<uint8_t> codes;
+	};
+	using ColorClearMemos = std::array<ColorClearMemo, 256>;
+	std::unique_ptr<ColorClearMemos> m_clear_memos = std::make_unique<ColorClearMemos>();
+	struct DetileCopy {
+		uint64_t serial, destination, source, size, cpu_epoch, mapping, image_set, registration, writes;
+		uint32_t version;
+		bool operator==(const DetileCopy&) const = default;
+	};
+	using DetileCopies = std::array<DetileCopy, 256>;
+	std::unique_ptr<DetileCopies> m_detile_copies = std::make_unique<DetileCopies>();
 	struct PendingMetaClear {
 		uint64_t size          = 0;
 		uint64_t tick          = 0;
@@ -419,6 +448,12 @@ private:
 	void CommitGpuWrite(Image& image);
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) KYTY_REQUIRES(m_lock);
+	struct ClearLayers {
+		uint32_t first, count;
+		vk::ClearValue clear;
+	};
+	void ClearImageLayers(CommandBuffer& command, ImageId id, vk::Format format,
+	                      const vk::ImageSubresourceRange& range, std::span<const ClearLayers> runs) KYTY_REQUIRES(m_lock);
 	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
 	                               const CommandRecorder& command);

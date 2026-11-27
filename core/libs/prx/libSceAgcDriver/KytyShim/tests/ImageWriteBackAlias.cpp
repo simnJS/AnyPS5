@@ -584,6 +584,138 @@ const char* CheckWriteBackRefreshesBufferCopy(GraphicContext& graphics, uint64_t
 	return nullptr;
 }
 
+const char* CheckLayeredColorClear(GraphicContext& graphics, uint64_t address) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	auto& buffers = renderer.GetBufferCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint32_t Width = 32, Layers = 4, Slice = 4096;
+	const auto metadata = address + 0x40000;
+	TextureCache::ImageDesc desc {};
+	desc.info.data.address = address;
+	desc.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+	desc.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+	desc.info.extent = {Width, Width, 1};
+	desc.info.resources.layers = Layers;
+	desc.info.UpdateSize();
+	desc.info.metadata.kind = ImageMetadataKind::Dcc;
+	desc.info.metadata.range = {metadata, Layers * Slice};
+	desc.view_info.format = desc.info.pixel_format;
+	desc.view_info.type = vk::ImageViewType::e2DArray;
+	desc.view_info.layer_count = Layers;
+	desc.candidate = true;
+	std::array<uint8_t, Layers * Slice> codes {};
+	Libs::LibKernel::Memory::WriteBacking(metadata, codes.data(), codes.size());
+	(void)buffers.ObtainBuffer(metadata, codes.size(), false, true);
+	const auto id = textures.FindImage(desc);
+	auto& image = textures.GetImage(id);
+	const auto initial = image.write_count;
+	const bool unchanged = textures.FindImage(desc) == id && image.write_count == initial;
+	std::fill(codes.begin() + Slice, codes.begin() + 2 * Slice, uint8_t {0xc0});
+	std::fill(codes.begin() + 2 * Slice, codes.end(), uint8_t {0x40});
+	codes.back() = 0xff;
+	buffers.InvalidateMemory(metadata, codes.size());
+	Libs::LibKernel::Memory::WriteBacking(metadata, codes.data(), codes.size());
+	(void)textures.FindImage(desc);
+	const bool grouped = image.write_count == initial + 1;
+
+	constexpr uint64_t Bytes = Width * Width * Layers * sizeof(uint32_t);
+	Buffer output(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, Bytes);
+	const std::array copies {vk::BufferImageCopy {0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, Layers},
+	                                             {}, desc.info.extent}};
+	image.Download(copies, output.Handle(), 0, Bytes);
+	scheduler.Finish();
+	output.Invalidate(0, Bytes);
+	constexpr std::array<uint32_t, Layers> expected {0, 0xffffffffu, 0xff000000u, 0};
+	const auto* pixels = reinterpret_cast<const uint32_t*>(output.Mapped().data());
+	for (uint32_t layer = 0; layer < Layers; ++layer) {
+		if (!std::all_of(pixels + layer * Width * Width, pixels + (layer + 1) * Width * Width,
+		                 [&](uint32_t pixel) { return pixel == expected[layer]; })) {
+			return "mixed clear codes or nonuniform metadata produced incorrect layer bytes";
+		}
+	}
+	if (initial != 1 || !unchanged || !grouped) return "layered clear repeated an upload, transition or settled clear";
+	return nullptr;
+}
+
+const char* CheckRepeatedDetile(GraphicContext& graphics, uint64_t address) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	auto& buffers = renderer.GetBufferCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	ImageInfo info;
+	info.data.address = address;
+	info.pixel_format = vk::Format::eR32Uint;
+	info.guest_format = Prospero::BufferFormat::k32UInt;
+	info.extent = {128, 128, 1};
+	info.tile_mode = Prospero::TileMode::kStandard4KB;
+	info.UpdateSize();
+	const auto bytes = info.data.size;
+	const auto source = address + 4 * bytes;
+	const auto target = TextureCacheTestAccess::Create(textures, info);
+	info.data.address += 2 * bytes;
+	const auto reference = TextureCacheTestAccess::Create(textures, info);
+	textures.MarkGpuWritten(target);
+	textures.MarkGpuWritten(reference);
+	std::vector<uint32_t> data(bytes / sizeof(uint32_t));
+	for (uint32_t i = 0; i < data.size(); ++i) data[i] = ImageValue ^ i;
+	Libs::LibKernel::Memory::WriteBacking(source, data.data(), bytes);
+	(void)buffers.ObtainBuffer(source, bytes, false, true);
+	auto& image = textures.GetImage(target);
+	auto& shadow = textures.GetImage(reference);
+	Buffer output(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst,
+	              2 * info.LinearSize());
+	const auto compare = [&] {
+		const auto copies = info.BufferCopies(0);
+		image.Download(copies, output.Handle(), 0, info.LinearSize());
+		shadow.Download(info.BufferCopies(info.LinearSize()), output.Handle(), info.LinearSize(), info.LinearSize());
+		const auto tick = scheduler.CurrentTick();
+		scheduler.Wait(tick);
+		scheduler.WaitPriorityOperations(tick);
+		output.Invalidate(0, 2 * info.LinearSize());
+		return std::memcmp(output.Mapped().data(), output.Mapped().data() + info.LinearSize(), info.LinearSize()) == 0;
+	};
+	const char* failure = nullptr;
+	for (uint32_t step = 0; step < 4 && failure == nullptr; ++step) {
+		if (step == 1) {
+			buffers.InvalidateMemory(source, bytes);
+			data[17] ^= 0xffffffffu;
+			Libs::LibKernel::Memory::WriteBacking(source, data.data(), bytes);
+		} else if (step == 2) {
+			(void)textures.InvalidateMemory(address, bytes);
+			textures.UpdateImage(target);
+			textures.MarkGpuWritten(target);
+		} else if (step == 3) {
+			const auto [buffer, offset] = buffers.ObtainBuffer(source, bytes, true, false);
+			buffer->Fill(offset, bytes, FillValue);
+		}
+		const auto before = image.write_count;
+		if (!textures.CopyToImage(address, source, bytes) || image.write_count == before ||
+		    !textures.CopyToImage(info.data.address, source, bytes)) {
+			failure = "a changed tiled copy did not refresh both images";
+			break;
+		}
+		const auto copied = image.write_count;
+		if (!textures.CopyToImage(address, source, bytes) || (step == 0 && image.write_count != copied)) {
+			failure = "the unchanged tracked copy ran the detiler again";
+			break;
+		}
+		if (!compare()) failure = "the resident tiled copy differs from the reference detile";
+	}
+	scheduler.Finish();
+	BufferCacheTestAccess::DiscardGpuWrites(buffers, address, 5 * bytes);
+	(void)buffers.DropFreedRange(address, 5 * bytes, nullptr, nullptr);
+	return failure;
+}
+
 const char* CheckPartialBufferWrite(GraphicContext& graphics, uint64_t address,
                                     Prospero::TileMode mode, bool fill) {
 	RenderContext renderer(graphics);
@@ -1004,7 +1136,9 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 			failure = "could not map the depth backing";
 		} else {
 			const auto depth_address = reinterpret_cast<uint64_t>(depth_guest);
-			failure = CheckFilledMetaClearReachesBind(graphics, depth_address);
+			failure = CheckLayeredColorClear(graphics, depth_address);
+			if (failure == nullptr) failure = CheckRepeatedDetile(graphics, depth_address);
+			if (failure == nullptr) failure = CheckFilledMetaClearReachesBind(graphics, depth_address);
 			if (sceKernelMunmap(depth_address, DepthGuestBytes) != 0 && failure == nullptr) {
 				failure = "could not unmap the depth backing";
 			}

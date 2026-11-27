@@ -249,7 +249,6 @@ public:
 	ImageId          depth_id {};
 	uint64_t         write_count        = 0;
 	uint64_t         gpu_write_sequence = 0;
-	uint64_t         candidate_clear_key = 0;
 	bool             is_depth_copy      = false;
 	ImageId          depth_copy_source {};
 	uint64_t         depth_copy_writes  = UINT64_MAX;
