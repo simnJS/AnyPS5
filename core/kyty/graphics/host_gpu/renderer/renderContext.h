@@ -43,6 +43,8 @@ class GuestGpu;
 
 class RenderContext {
 public:
+	static constexpr uint64_t SelfSizedHeaderBytes = 4 * BufferCache::CACHING_PAGESIZE;
+
 	explicit RenderContext(GraphicContext&              graphics,
 	                       const std::filesystem::path& shader_store = ShaderStorePath());
 	~RenderContext();

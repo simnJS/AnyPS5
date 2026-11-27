@@ -658,6 +658,28 @@ static bool FlatWordsReadOnCpu(const ShaderRecompiler::IR::CompiledShaderInfo& p
 	return false;
 }
 
+static bool InSelfSizedHeader(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                              const ShaderRecompiler::IR::ResourceSnapshot& snapshot, uint64_t address, uint64_t bytes) {
+	const auto& user = snapshot.user_data;
+	const auto  word = [&](uint32_t reg, uint32_t& value) {
+		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
+		if (reg < program.user_data_base || index >= user.size()) return false;
+		value = user[index];
+		return true;
+	};
+	for (const auto& buffer: program.info.self_sized_buffers) {
+		uint32_t low  = 0;
+		uint32_t high = 0;
+		if (!word(buffer.base_low_register, low) || !word(buffer.base_high_register, high)) continue;
+		const auto base = low | (uint64_t {high & 0xffffu} << 32u);
+		if (base != 0 && address >= base && address - base < RenderContext::SelfSizedHeaderBytes &&
+		    bytes <= RenderContext::SelfSizedHeaderBytes - (address - base)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void GuestReadLog::NoteDeferredLoads(std::span<uint64_t> addresses) {
 	std::ranges::sort(addresses);
 	for (auto& load: m_flat_loads) {
@@ -712,8 +734,13 @@ void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnap
 		}
 		auto*      values = resources[load.stage].flattened_srt.data() + load.slot;
 		const auto bytes  = load.count * sizeof(uint32_t);
-		if (gpu_copies && page.owned && page.backing != nullptr &&
-		    Libs::LibKernel::Memory::HasGpuWrittenBytes(load.address, bytes)) {
+#if defined(ANYPS5_KYTY)
+		const bool header = program != nullptr && InSelfSizedHeader(*program, resources[load.stage], load.address, bytes);
+#else
+		const bool header = false;
+#endif
+		if (gpu_copies && (header || (page.owned && page.backing != nullptr &&
+		                              Libs::LibKernel::Memory::HasGpuWrittenBytes(load.address, bytes)))) {
 			resources[load.stage].gpu_flat_loads.push_back({load.address, load.slot, load.count});
 #if defined(ANYPS5_KYTY)
 			if (load.deferred) m_deferred_gpu_words += load.count;

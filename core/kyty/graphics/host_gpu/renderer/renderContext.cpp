@@ -543,7 +543,7 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 }
 
 bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
-	constexpr uint64_t CachedBytes = 4 * BufferCache::CACHING_PAGESIZE;
+	constexpr uint64_t CachedBytes = SelfSizedHeaderBytes;
 	const auto&        program     = runtime.module->info;
 	const auto&        user_data   = runtime.resources->user_data;
 	const auto         value       = [&](uint32_t reg, uint32_t& result) {
