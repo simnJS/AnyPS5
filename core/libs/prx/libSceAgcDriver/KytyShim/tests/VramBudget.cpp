@@ -18,6 +18,25 @@
 
 namespace Libs::Graphics {
 
+struct StreamBufferTestAccess {
+	static bool CheckWatchRetention(GraphicContext& graphics, CommandScheduler& scheduler) {
+		const uint64_t stride = std::max<uint64_t>(4, graphics.physical_device_properties.limits.nonCoherentAtomSize);
+		const uint64_t size = 1024 * stride;
+		StreamBuffer ring(graphics, scheduler, MemoryUsage::Upload, size);
+		for (uint32_t value = 0; value < 1024; ++value) {
+			if (ring.Copy(&value, sizeof(value), stride) != value * stride) return false;
+			scheduler.Flush();
+		}
+		const auto peak = ring.m_current_watches.size();
+		std::vector<uint8_t> pattern(size, 0x96);
+		(void)ring.Copy(pattern.data(), size);
+		scheduler.Flush();
+		(void)ring.Copy(pattern.data(), size);
+		return peak == 1024 && ring.m_lap == 2 && ring.m_current_watches.size() == 256 &&
+		       std::memcmp(ring.Mapped().data(), pattern.data(), size) == 0;
+	}
+};
+
 struct VramBudgetTestAccess {
 	static void SetReportedMemory(GraphicContext& graphics, uint64_t budget, uint64_t usage) {
 		graphics.m_memory_override_enabled = true;
@@ -339,6 +358,7 @@ const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool accel
 
 	if (address == 0) {
 		if (!VramBudgetTestAccess::CheckCommandPool(graphics, scheduler)) return "command pool retirement lost a recording";
+		if (!StreamBufferTestAccess::CheckWatchRetention(graphics, scheduler)) return "stream ring did not release idle timeline watches";
 		if (!VramBudgetTestAccess::CheckReadbackReserve(graphics, scheduler)) return "readback retained an oversized buffer";
 		if (!VramBudgetTestAccess::CheckScratch(textures)) return "scratch did not shrink and regrow after a burst";
 		if (renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Upload).Size() != (256ull << 20)) return "upload ring capacity";
