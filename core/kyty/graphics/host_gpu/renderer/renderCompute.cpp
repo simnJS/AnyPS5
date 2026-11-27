@@ -950,7 +950,7 @@ struct IndirectThreadPass {
 		before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
 		                       vk::AccessFlagBits::eHostWrite;
 		before.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 		                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &before, 0, nullptr,
 		                          0, nullptr);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
