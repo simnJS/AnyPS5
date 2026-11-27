@@ -11,12 +11,18 @@ using ShaderRecompiler::IR::IoAll;
 using ShaderRecompiler::IR::Writer;
 
 struct NoIndexedReadsWriter: Writer {
-	static constexpr bool shader_info_has_indexed_buffer_reads = false;
+	static constexpr bool shader_info_has_indexed_buffer_reads      = false;
+	static constexpr bool shader_info_has_ray_query_header_programs = false;
+};
+
+struct NoHeaderProgramsWriter: Writer {
+	static constexpr bool shader_info_has_ray_query_header_programs = false;
 };
 
 struct NoExtraSourcesWriter: Writer {
-	static constexpr bool shader_info_has_ray_query_extra_sources = false;
-	static constexpr bool shader_info_has_extended_resources = false;
+	static constexpr bool shader_info_has_ray_query_extra_sources   = false;
+	static constexpr bool shader_info_has_extended_resources        = false;
+	static constexpr bool shader_info_has_ray_query_header_programs = false;
 };
 
 struct CommonWriter: NoExtraSourcesWriter {
@@ -126,6 +132,11 @@ int main() {
 	WriteModule<NoExtraSourcesWriter>(no_extra, 0x102, 0x201, ShaderType::Vertex, vertex, {});
 	WriteModule<NoExtraSourcesWriter>(no_extra, 0x101, 0x201, ShaderType::Vertex, vertex, {});
 	no_extra.close();
+	std::ofstream no_programs("no-header-programs.shaders", std::ios::binary);
+	Write(no_programs, header.bytes);
+	WriteModule<NoHeaderProgramsWriter>(no_programs, 0x102, 0x201, ShaderType::Vertex, vertex, {});
+	WriteModule<NoHeaderProgramsWriter>(no_programs, 0x101, 0x201, ShaderType::Vertex, vertex, {});
+	no_programs.close();
 
 	std::ofstream no_indexed("no-indexed-reads.shaders", std::ios::binary);
 	Writer subgroup_header;

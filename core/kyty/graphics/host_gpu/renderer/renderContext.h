@@ -117,6 +117,7 @@ public:
 	void               PrepareHackMarks();
 	void PrepareShaderBda(std::span<const ShaderStageRuntime* const> stages, bool may_write);
 	void               RunGarbageCollector();
+	[[nodiscard]] uint64_t RayQueryUserPointer(const RayTracing::TlasSource& source, std::span<const uint32_t> user);
 	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);
 	void ForgetHleTlas(uint64_t header);
 	void NoteGuestBvhMemory(uint64_t address, uint64_t size);
@@ -127,6 +128,7 @@ public:
 
 private:
 	bool ReserveMirrorRange(uint64_t address, uint64_t size);
+	[[nodiscard]] bool RayQueryMemoryReadable(uint64_t address, uint64_t size);
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
 	void CacheTlasMemory(const ShaderStageRuntime& runtime, const RayTracing::TlasSource& source, bool note_instances);
 	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages, bool bind_spans = false);

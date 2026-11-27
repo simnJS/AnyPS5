@@ -192,10 +192,14 @@ void main() {
 				state.exact_context  = pc.context;
 			}
 		} else if (cached) {
-			state.instance_base = header + LoadGuestU64(header + LayoutInstanceOffset(pc.instance_layout));
-			if ((state.instance_base & 3u) != 0) s_valid = 0u;
-			state.node_limit    = LayoutNodeCountAt80(pc.instance_layout) ? LoadGuestU32(header + 80) - 1u
-			                                                              : LoadGuestU32(header + 88);
+			const uint64_t records = header + LoadGuestU64(header + LayoutInstanceOffset(pc.instance_layout));
+			if ((records & 3) != 0) {
+				s_valid = 0u;
+			} else {
+				state.instance_base = records;
+				state.node_limit    = LayoutNodeCountAt80(pc.instance_layout) ? LoadGuestU32(header + 80) - 1u
+				                                                              : LoadGuestU32(header + 88);
+			}
 		} else if (s_valid != 0) {
 			atomicOr(state.overflow, kUnmapped);
 		}

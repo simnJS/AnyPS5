@@ -686,6 +686,7 @@ struct RayQueryExtraSource {
 	uint32_t                header_vsharp = 0xffffffffu;
 	uint32_t                root          = 0;
 	std::array<uint32_t, 4> layout {};
+	std::vector<uint32_t>   program;
 
 	bool operator==(const RayQueryExtraSource& other) const = default;
 };

@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/RayQuerySource.h"
 
 #include "graphics/shader/recompiler/ir/RayQuery.h"
+#include "graphics/shader/recompiler/ir/RayQueryHeaderProgram.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,8 @@ constexpr uint64_t Literal       = 1ull << 63;
 constexpr uint64_t Zext          = 0x10000;
 constexpr uint64_t Base48        = 0x10001;
 constexpr uint64_t DwordBase     = 0x10002;
+constexpr uint64_t BufferRecord  = 0x10003;
+constexpr uint64_t ScalarBuffer  = 0x10004;
 constexpr uint32_t None          = 0xffffffffu;
 constexpr uint32_t One           = 0xfffffffeu;
 
@@ -94,6 +97,17 @@ public:
 	uint32_t Of(uint32_t atom, uint32_t width) { return Make({width, 0, {{atom, 1}}}); }
 	uint32_t Op(uint32_t width, Key args) { return Of(Atomic(Kind::Op, width, std::move(args)), width); }
 
+	uint32_t Load(uint32_t address, uint32_t bytes, uint32_t checked_address = None) {
+		const uint32_t width = bytes * 8u;
+		return Of(Atomic(Kind::Load, width, {address, bytes, checked_address}), width);
+	}
+
+	uint32_t NextCheckedAddress(uint32_t address) {
+		if (address == None || address == One) return address;
+		const auto args = OpOf(address, ScalarBuffer)->args;
+		return Op(64, {ScalarBuffer, args[1], args[2], Add(static_cast<uint32_t>(args[3]), Constant(64, 4))});
+	}
+
 	uint32_t Add(uint32_t a, uint32_t b, uint64_t factor = 1) {
 		auto       form  = m_forms[a];
 		const auto other = m_forms[b];
@@ -160,7 +174,7 @@ public:
 			if (atom.width == 32) return Constant(32, 0);
 			if (atom.kind == Kind::Pointer) return Of(Atomic(Kind::Word, 32, {atom.args[0] + 1u}), 32);
 			if (atom.kind == Kind::Load) {
-				return Of(Atomic(Kind::Load, 32, {Add(static_cast<uint32_t>(atom.args[0]), Constant(64, 4)), 4}), 32);
+				return Load(Add(static_cast<uint32_t>(atom.args[0]), Constant(64, 4)), 4, NextCheckedAddress(static_cast<uint32_t>(atom.args[2])));
 			}
 			if (atom.kind == Kind::Join) return static_cast<uint32_t>(atom.args[1]);
 		}
@@ -179,7 +193,8 @@ public:
 			}
 			if (l.kind == Kind::Load && h.kind == Kind::Load && l.args[1] == 4 && h.args[1] == 4 &&
 			    h.args[0] == Add(static_cast<uint32_t>(l.args[0]), Constant(64, 4))) {
-				return Of(Atomic(Kind::Load, 64, {l.args[0], 8}), 64);
+				const auto checked = static_cast<uint32_t>(l.args[2]);
+				return Load(static_cast<uint32_t>(l.args[0]), 8, NextCheckedAddress(checked) == h.args[2] ? checked : One);
 			}
 			if (l.kind == Kind::Half && h.kind == Kind::Half && l.args[0] == h.args[0] && l.args[1] == 0 && h.args[1] == 1) {
 				return static_cast<uint32_t>(l.args[0]);
@@ -201,7 +216,7 @@ private:
 		if (atom.width == 32) return Of(id, 32);
 		switch (atom.kind) {
 			case Kind::Pointer: return Of(Atomic(Kind::Word, 32, {atom.args[0]}), 32);
-			case Kind::Load: return Of(Atomic(Kind::Load, 32, {atom.args[0], 4}), 32);
+			case Kind::Load: return Load(static_cast<uint32_t>(atom.args[0]), 4, static_cast<uint32_t>(atom.args[2]));
 			case Kind::Join: return static_cast<uint32_t>(atom.args[0]);
 			default: return Of(Atomic(Kind::Half, 32, {Of(id, 64), 0}), 32);
 		}
@@ -579,16 +594,21 @@ public:
 		return result;
 	}
 
-	Choices BufferAddress(const Inst& read) {
+	Choices ScalarBufferLoads(const Inst& read, uint32_t bytes) {
 		const auto& memory = m_program.memory_info[read.Flags<MemoryFlags>().index];
 		const auto* buffer = ProducerOf(read.Arg(0), ValueOpcode::GetBufferResource);
 		if (buffer == nullptr) return {};
+		const auto counts = Word(buffer->Arg(2));
 		Choices result;
 		for (const auto base: Pair(buffer->Arg(0), buffer->Arg(1))) {
 			const auto start = m_store.Op(64, {Base48, base});
 			for (const auto index: Word(read.Arg(1))) {
-				result.push_back(m_store.Add(m_store.Add(start, m_store.Widen(AlignDword(index))),
-				                             m_store.Constant(64, memory.offset & ~3u)));
+				const auto aligned = AlignDword(index);
+				const auto immediate = m_store.Constant(64, memory.offset & ~3u);
+				const auto offset = m_store.Add(m_store.Widen(aligned), immediate);
+				const auto exact_offset = m_store.Add(m_store.Op(64, {Zext, aligned}), immediate);
+				const auto checked = counts.size() == 1 ? m_store.Op(64, {ScalarBuffer, base, counts[0], exact_offset}) : One;
+				result.push_back(m_store.Load(m_store.Add(start, offset), bytes, checked));
 			}
 		}
 		Cap(result);
@@ -660,10 +680,30 @@ public:
 		return result;
 	}
 
+	Choices RuntimeBufferAddress(const Inst& load) {
+		const auto& memory = m_program.memory_info[load.Flags<MemoryFlags>().index];
+		const auto* buffer = ProducerOf(load.Arg(0), ValueOpcode::GetBufferResource);
+		if (buffer == nullptr || memory.typed || memory.formatted || memory.data_bits != 32u || memory.offen) return {};
+		if (const auto word3 = ImmediateU32(buffer->Arg(3)); word3 && (*word3 & (1u << 23u)) != 0u) return {};
+		if (ImmediateU32(load.Arg(3)) != 0u) return {};
+		const auto bases = Pair(buffer->Arg(0), buffer->Arg(1));
+		const auto sizes = Word(buffer->Arg(2));
+		const auto flags = Word(buffer->Arg(3));
+		const auto index = memory.idxen ? Word(load.Arg(1)) : Choices {m_store.Constant(32, 0)};
+		if (bases.size() != 1 || sizes.size() != 1 || flags.size() != 1 || index.size() != 1) return {};
+		return {m_store.Op(64, {BufferRecord, bases[0], sizes[0], flags[0], m_store.Widen(index[0]), m_store.Constant(64, memory.offset)})};
+	}
+
+	uint32_t RuntimeBufferWord(const Inst& load) {
+		const auto address = RuntimeBufferAddress(load);
+		if (address.empty()) return Opaque(load, 32);
+		return m_store.Of(m_store.Atomic(Kind::Opaque, 32, {address[0]}, &load), 32);
+	}
+
 	Choices LoadedBufferWord(const Inst& load, uint32_t component) {
 		Choices result;
 		for (const auto address: LoadedBufferAddress(load)) {
-			result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {m_store.Add(address, m_store.Constant(64, component * 4u)), 4}), 32));
+			result.push_back(m_store.Load(m_store.Add(address, m_store.Constant(64, component * 4u)), 4, One));
 		}
 		return result;
 	}
@@ -1032,14 +1072,13 @@ private:
 				}
 				break;
 			case ValueOpcode::ReadConstBuffer:
-				for (const auto address: BufferAddress(*inst)) {
-					const auto wide = m_store.Of(m_store.Atomic(Kind::Load, 64, {address, 8}), 64);
+				for (const auto wide: ScalarBufferLoads(*inst, 8)) {
 					result.push_back({wide, m_store.Hi(wide), {}});
 				}
 				break;
 			case ValueOpcode::LoadAddressU32:
 				for (const auto address: Address(*inst)) {
-					const auto wide = m_store.Of(m_store.Atomic(Kind::Load, 64, {address, 8}), 64);
+					const auto wide = m_store.Load(address, 8);
 					result.push_back({wide, m_store.Hi(wide), {}});
 				}
 				break;
@@ -1094,7 +1133,8 @@ private:
 					continue;
 				}
 				if (arg.GetType() == Type::U64) {
-					for (auto& key: keys) key.push_back(Literal | (arg.U64() & ~Literal));
+					const auto operand = (arg.U64() & Literal) != 0 ? m_store.Constant(64, arg.U64()) : Literal | arg.U64();
+					for (auto& key: keys) key.push_back(operand);
 					continue;
 				}
 				for (auto& key: keys) key.push_back(Literal);
@@ -1181,17 +1221,16 @@ private:
 			}
 			case ValueOpcode::LoadAddressU32: {
 				Choices result;
-				for (const auto address: Address(inst)) result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {address, 4}), 32));
+				for (const auto address: Address(inst)) result.push_back(m_store.Load(address, 4));
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
 			case ValueOpcode::ReadConstBuffer: {
-				Choices result;
-				for (const auto address: BufferAddress(inst)) result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {address, 4}), 32));
+				auto result = ScalarBufferLoads(inst, 4);
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
 			case ValueOpcode::LoadBufferU32: {
 				auto result = LoadedBufferWord(inst, 0);
-				return result.empty() ? Choices {Opaque(inst, 32)} : result;
+				return result.empty() ? Choices {RuntimeBufferWord(inst)} : result;
 			}
 			case ValueOpcode::CompositeExtractU32x2:
 			case ValueOpcode::CompositeExtractU32x3:
@@ -1261,9 +1300,10 @@ private:
 };
 
 struct Source {
-	uint32_t user_sgpr     = 0;
-	uint32_t header_offset = 0;
-	uint32_t header_vsharp = 0xffffffffu;
+	uint32_t              user_sgpr     = 0;
+	uint32_t              header_offset = 0;
+	uint32_t              header_vsharp = 0xffffffffu;
+	std::vector<uint32_t> program;
 
 	bool operator==(const Source&) const = default;
 };
@@ -1275,7 +1315,148 @@ const Atom* UserTablePointer(const Store& store, const Atom& base) {
 	return atom && store.A(*atom).kind == Kind::Pointer ? &store.A(*atom) : nullptr;
 }
 
-std::optional<Source> SourceOf(const Store& store, uint32_t form) {
+class HeaderProgramWriter {
+public:
+	explicit HeaderProgramWriter(const Store& store): m_store(store) {}
+
+	std::optional<std::vector<uint32_t>> Write(const IR::Atom& load) {
+		if (!Address(load, 0) || !ValidHeaderProgram(m_program, 16)) return std::nullopt;
+		return std::move(m_program);
+	}
+
+private:
+	void Emit(HeaderOp op, std::initializer_list<uint32_t> args = {}) {
+		m_program.push_back(static_cast<uint32_t>(op));
+		m_program.insert(m_program.end(), args);
+	}
+
+	void Constant(uint64_t value) { Emit(HeaderOp::Const, {static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u)}); }
+
+	bool Form(uint32_t id, uint32_t depth) {
+		if (depth > 24 || m_program.size() > MaxRayQueryHeaderProgramSize) return false;
+		const auto& form  = m_store.F(id);
+		bool        first = true;
+		if (form.constant != 0 || form.terms.empty()) {
+			Constant(form.constant);
+			first = false;
+		}
+		for (const auto& [atom, scale]: form.terms) {
+			if (!Atom(atom, depth + 1)) return false;
+			if (scale != 1) Emit(HeaderOp::Mul, {static_cast<uint32_t>(scale), static_cast<uint32_t>(scale >> 32u)});
+			if (!first) Emit(HeaderOp::Add);
+			first = false;
+		}
+		if (form.width == 32) Emit(HeaderOp::Mask, {32});
+		return true;
+	}
+
+	bool Address(const IR::Atom& load, uint32_t depth) {
+		const auto checked = static_cast<uint32_t>(load.args[2]);
+		if (checked == None) return Form(static_cast<uint32_t>(load.args[0]), depth);
+		if (checked == One) return false;
+		const auto& args = m_store.OpOf(checked, ScalarBuffer)->args;
+		for (size_t i = 1; i < args.size(); ++i) {
+			if (!Form(static_cast<uint32_t>(args[i]), depth)) return false;
+		}
+		Emit(HeaderOp::ScalarBuffer, {static_cast<uint32_t>(load.args[1])});
+		return true;
+	}
+
+	bool Operand(uint64_t arg, uint32_t depth) {
+		if ((arg & Literal) != 0) {
+			Constant(arg & ~Literal);
+			return true;
+		}
+		return Form(static_cast<uint32_t>(arg), depth);
+	}
+
+	bool Atom(uint32_t id, uint32_t depth) {
+		const auto& a = m_store.A(id);
+		switch (a.kind) {
+			case Kind::Word: Emit(HeaderOp::User, {static_cast<uint32_t>(a.args[0])}); return true;
+			case Kind::Pointer:
+				Emit(HeaderOp::User, {static_cast<uint32_t>(a.args[0])});
+				Emit(HeaderOp::User, {static_cast<uint32_t>(a.args[0]) + 1u});
+				Emit(HeaderOp::Join);
+				return true;
+			case Kind::Load:
+				if (!Address(a, depth)) return false;
+				Emit(HeaderOp::Load, {static_cast<uint32_t>(a.args[1])});
+				return true;
+			case Kind::Half:
+				if (!Form(static_cast<uint32_t>(a.args[0]), depth)) return false;
+				if (a.args[1] == 0) {
+					Emit(HeaderOp::Mask, {32});
+				} else {
+					Emit(HeaderOp::Hi);
+				}
+				return true;
+			case Kind::Join:
+				if (!Form(static_cast<uint32_t>(a.args[0]), depth) || !Form(static_cast<uint32_t>(a.args[1]), depth)) return false;
+				Emit(HeaderOp::Join);
+				return true;
+			case Kind::Opaque:
+				if (a.width != 32 || a.args.size() != 1 || a.inst == nullptr || a.inst->GetOpcode() != ValueOpcode::LoadBufferU32) return false;
+				if (!Form(static_cast<uint32_t>(a.args[0]), depth)) return false;
+				Emit(HeaderOp::Load, {4});
+				return true;
+			case Kind::Op: return Op(a, depth);
+		}
+		return false;
+	}
+
+	bool Op(const IR::Atom& a, uint32_t depth) {
+		const auto opcode = a.args[0];
+		if (opcode == Zext && a.args.size() == 2) return Form(static_cast<uint32_t>(a.args[1]), depth);
+		if (opcode == DwordBase && a.args.size() == 2) {
+			if (!Form(static_cast<uint32_t>(a.args[1]), depth)) return false;
+			Constant(~uint64_t {3});
+			Emit(HeaderOp::And);
+			return true;
+		}
+		if (opcode == Base48 && a.args.size() == 2) {
+			if (!Form(static_cast<uint32_t>(a.args[1]), depth)) return false;
+			Emit(HeaderOp::Mask, {48});
+			return true;
+		}
+		if (opcode == BufferRecord && a.args.size() == 6) {
+			for (size_t index = 1; index < 6; ++index) {
+				if (!Form(static_cast<uint32_t>(a.args[index]), depth)) return false;
+			}
+			Emit(HeaderOp::Record);
+			return true;
+		}
+		struct Mapping {
+			ValueOpcode op;
+			HeaderOp    header;
+			uint32_t    arity;
+			uint32_t    width;
+		};
+		static constexpr std::array Mappings {
+		    Mapping {ValueOpcode::BitwiseAnd32, HeaderOp::And, 2, 0},       Mapping {ValueOpcode::BitwiseOr32, HeaderOp::Or, 2, 0},
+		    Mapping {ValueOpcode::BitwiseXor32, HeaderOp::Xor, 2, 0},       Mapping {ValueOpcode::UMin32, HeaderOp::UMin, 2, 0},
+		    Mapping {ValueOpcode::UMax32, HeaderOp::UMax, 2, 0},            Mapping {ValueOpcode::BitwiseAnd64, HeaderOp::And, 2, 0},
+		    Mapping {ValueOpcode::ShiftRightLogical32, HeaderOp::Shr, 2, 32}, Mapping {ValueOpcode::ShiftRightLogical64, HeaderOp::Shr, 2, 64},
+		    Mapping {ValueOpcode::ShiftLeftLogical64, HeaderOp::Shl, 2, 64},  Mapping {ValueOpcode::BitFieldUExtract, HeaderOp::Bfe, 3, 0},
+		};
+		const auto at = std::ranges::find_if(Mappings, [&](const Mapping& m) { return static_cast<uint64_t>(m.op) == opcode; });
+		if (at == Mappings.end() || a.args.size() != at->arity + 1u) return false;
+		for (size_t index = 1; index < a.args.size(); ++index) {
+			if (!Operand(a.args[index], depth)) return false;
+		}
+		if (at->width != 0) {
+			Emit(at->header, {at->width});
+		} else {
+			Emit(at->header);
+		}
+		return true;
+	}
+
+	const Store&          m_store;
+	std::vector<uint32_t> m_program;
+};
+
+std::optional<Source> NamedSourceOf(const Store& store, uint32_t form) {
 	const auto atom = store.AtomOf(form);
 	if (!atom) return std::nullopt;
 	const auto& a = store.A(*atom);
@@ -1303,6 +1484,16 @@ std::optional<Source> SourceOf(const Store& store, uint32_t form) {
 	if (pointer == nullptr) return std::nullopt;
 	const auto offset = static_cast<uint32_t>(table.constant);
 	return Source {static_cast<uint32_t>(pointer->args[0]), at, pointer == &user ? offset : ScalarRayQueryVsharpAt(offset)};
+}
+
+std::optional<Source> ProgramSourceOf(const Store& store, uint32_t form) {
+	const auto atom = store.AtomOf(form);
+	if (!atom) return std::nullopt;
+	const auto& a = store.A(*atom);
+	if (a.kind != Kind::Load || a.args[1] != 8) return std::nullopt;
+	auto program = HeaderProgramWriter(store).Write(a);
+	if (!program) return std::nullopt;
+	return Source {0, 0, RayQueryHeaderProgram, std::move(*program)};
 }
 
 struct Record {
@@ -1884,7 +2075,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 			}
 		}
 		for (const auto base: site.bases) {
-			if (const auto named = SourceOf(store, base)) {
+			if (const auto named = NamedSourceOf(store, base)) {
 				const auto at = std::ranges::find_if(named_sources, [&](const auto& entry) { return std::get<0>(entry) == *named; });
 				if (at == named_sources.end()) {
 					named_sources.emplace_back(*named, base, 1u);
@@ -1901,8 +2092,42 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 			}
 		}
 	}
+	std::map<uint32_t, Source> computed;
+	for (auto& site: sites) {
+		if (site.top) continue;
+		Evaluator ev(program, order, store, site.bvh->Arg(2));
+		for (const auto base: site.bases) {
+			const auto blas = BlasOf(store, base);
+			if (!blas) continue;
+			const auto unrolled = ev.Unroll(blas->address);
+			const bool record   = std::ranges::any_of(named_sources, [&](const auto& named) {
+				return std::ranges::any_of(unrolled, [&](uint32_t address) { return RecordOf(store, address, std::get<1>(named)).has_value(); });
+			});
+			if (record) continue;
+			auto source = ProgramSourceOf(store, base);
+			if (!source) continue;
+			std::erase_if(site.blases, [&](const Blas& entry) { return std::ranges::find(unrolled, entry.address) != unrolled.end(); });
+			const auto at = std::ranges::find_if(named_sources, [&](const auto& entry) { return std::get<0>(entry) == *source; });
+			if (at == named_sources.end()) {
+				named_sources.emplace_back(*source, base, 1u);
+			} else {
+				++std::get<2>(*at);
+			}
+			computed.emplace(base, std::move(*source));
+			site.top = true;
+		}
+	}
+	const auto source_of = [&](uint32_t base) -> std::optional<Source> {
+		if (auto named = NamedSourceOf(store, base)) return named;
+		const auto at = computed.find(base);
+		return at == computed.end() ? std::nullopt : std::optional<Source> {at->second};
+	};
 	if (named_sources.empty()) return Refuse("no intersection reads a structure named by the user data");
-	std::ranges::stable_sort(named_sources, [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
+	std::ranges::stable_sort(named_sources, [](const auto& a, const auto& b) {
+		const auto a_named = std::get<0>(a).program.empty(), b_named = std::get<0>(b).program.empty();
+		return a_named != b_named ? a_named : std::get<2>(a) > std::get<2>(b);
+	});
+	if (!std::get<0>(named_sources.front()).program.empty()) return Refuse("only computed headers name a structure");
 	const auto header = std::get<1>(named_sources.front());
 	std::optional<Record> indexed;
 	std::vector<uint32_t> keys;
@@ -2325,7 +2550,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		if (!accepted[named]) continue;
 		const auto& source = std::get<0>(named_sources[named]);
 		listed[named]      = static_cast<uint32_t>(walks.headers.size());
-		walks.headers.push_back({source.user_sgpr, source.header_offset, source.header_vsharp, 0, {}});
+		walks.headers.push_back({source.user_sgpr, source.header_offset, source.header_vsharp, 0, {}, source.program});
 	}
 	for (const auto& site: sites) {
 		if (!site.top) continue;
@@ -2341,7 +2566,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 			at = walks.loops.size() - 1;
 		}
 		for (const auto base: site.bases) {
-			const auto named = SourceOf(store, base);
+			const auto named = source_of(base);
 			if (!named) continue;
 			const auto found = std::ranges::find_if(named_sources, [&](const auto& entry) { return std::get<0>(entry) == *named; });
 			const auto index = listed[static_cast<size_t>(found - named_sources.begin())];
@@ -2357,7 +2582,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	}
 	std::vector<std::array<size_t, 5>> picks;
 	for (size_t source = 0; source < named_sources.size(); ++source) {
-		if (!accepted[source]) continue;
+		if (!accepted[source] || !std::get<0>(named_sources[source]).program.empty()) continue;
 		for (size_t count = 0; count < node_counts.size(); ++count) {
 			for (size_t tlas_root = 0; tlas_root < tops.size(); ++tlas_root) {
 				for (size_t root = 0; root < candidates.size() && picks.size() < 4096; ++root) {

@@ -2,12 +2,14 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
+#include "graphics/shader/recompiler/ir/RayQueryHeaderProgram.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryResults.h"
 #include "graphics/shader/recompiler/ir/passes/RayQuerySource.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 
 #include <array>
+#include <optional>
 #include <bit>
 #include <cstring>
 #include <cstdint>
@@ -233,6 +235,7 @@ struct SourceWalk {
     IR::Block*             block = &entry;
     IR::ResourceKind       address_kind = IR::ResourceKind::None;
     std::vector<IR::Inst*> sites;
+    std::optional<IR::ResourceKind> user_kind;
 
     IR::Value Add(IR::ValueOpcode opcode, std::initializer_list<IR::Value> args, uint64_t flags = 0) {
         return IR::Value(&block->AppendNewInst(opcode, args, flags));
@@ -301,7 +304,11 @@ std::array<IR::Value, 2> UserHeader(SourceWalk& walk, uint32_t offset, uint32_t 
     walk.block         = &walk.entry;
     const auto user    = [&](uint32_t reg) { return walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {reg})}); };
     const auto pointer = walk.Add(Op::GetAddressResource, {user(4), user(5)});
-    return {walk.LoadAddress(pointer, offset, displacement), walk.LoadAddress(pointer, offset + 4, displacement)};
+    const auto kind    = walk.address_kind;
+    walk.address_kind  = walk.user_kind.value_or(kind);
+    const std::array<IR::Value, 2> header {walk.LoadAddress(pointer, offset, displacement), walk.LoadAddress(pointer, offset + 4, displacement)};
+    walk.address_kind  = kind;
+    return header;
 }
 
 std::array<IR::Value, 6> UserRay(SourceWalk& walk) {
@@ -400,12 +407,15 @@ void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> head
     loop.merge.AppendNewInst(Op::Phi, {}, word).AddPhiOperand(&loop.body, child);
 }
 
-IR::OracleWalks DeriveWithHighWord(HighWord kind) {
+IR::OracleWalks DeriveWithHighWord(HighWord kind, IR::ResourceKind address_kind = {}, uint32_t header_at = 0x20,
+                                   std::optional<IR::ResourceKind> user_kind = std::nullopt) {
     SourceWalk walk;
+    walk.address_kind   = address_kind;
+    walk.user_kind      = user_kind;
     walk.program.blocks = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge};
     Number(walk);
     const auto ray    = UserRay(walk);
-    const auto header = UserHeader(walk, 0x20);
+    const auto header = UserHeader(walk, header_at);
     BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, header, ray, kind);
     return IR::DeriveOracleWalks(walk.program, walk.sites);
 }
@@ -475,27 +485,156 @@ void TwoTlasWalks() {
            "two walks over one TLAS bind no extra source and keep the single-TLAS query");
 }
 
-void UntracedWalk() {
+struct ChasedWalks {
     TwoWalks two;
-    auto&    walk        = two.walk;
-    walk.program.blocks  = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge,
-                            &walk.second_header, &walk.second_body, &walk.second_latch, &walk.second_merge};
+    uint32_t first  = 0;
+    uint32_t second = 0;
+};
+
+enum class ChasedSource { Address, Scalar, Lane, ScalarBuffer };
+
+void TraceChasedWalks(ChasedWalks& chased, ChasedSource source) {
+    auto& walk          = chased.two.walk;
+    walk.program.blocks = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge,
+                           &walk.second_header, &walk.second_body, &walk.second_latch, &walk.second_merge};
     Number(walk);
-    const auto ray       = UserRay(walk);
-    const auto named     = UserHeader(walk, 0x20);
-    const auto chased    = UserHeader(walk, 0x1b4);
-    const auto high      = walk.Add(IR::ValueOpcode::BitwiseAnd32, {chased[1], IR::Value(uint32_t {0xffffu})});
-    const auto table     = walk.Add(IR::ValueOpcode::GetAddressResource, {chased[0], high});
-    const std::array<IR::Value, 2> untraced {walk.LoadAddress(table, 0), walk.LoadAddress(table, 4)};
+    const auto ray    = UserRay(walk);
+    const auto named  = UserHeader(walk, 0x20);
+    const bool scalar = source == ChasedSource::Scalar;
+    if (scalar) walk.address_kind = IR::ResourceKind::ScalarAddress;
+    auto table = scalar ? UserHeader(walk, 0x23, 7) : UserHeader(walk, 0x1b4);
+    if (source == ChasedSource::ScalarBuffer) {
+        using Op = IR::ValueOpcode;
+        const auto reg = [&](uint32_t n) { return walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {n})}); };
+        const auto buffer = walk.Add(Op::GetBufferResource, {reg(4), reg(5), reg(7), IR::Value(0x4000u)});
+        table = {walk.Load(Op::ReadConstBuffer, {buffer, IR::Value(0u)}, 0x1b4, false),
+                 walk.Load(Op::ReadConstBuffer, {buffer, IR::Value(0u)}, 0x1b8, false)};
+    }
+    auto low = table[0];
+    if (source == ChasedSource::Lane) low = walk.Add(IR::ValueOpcode::IAdd32, {low, walk.Add(IR::ValueOpcode::LaneId, {})});
+    const auto high     = walk.Add(IR::ValueOpcode::BitwiseAnd32, {table[1], IR::Value(uint32_t {0xffffu})});
+    const auto resource = walk.Add(IR::ValueOpcode::GetAddressResource, {low, high});
+    const uint32_t offset = scalar ? 0x43 : 0x40;
+    const uint32_t displacement = scalar ? 7 : 0;
+    const std::array<IR::Value, 2> header {walk.LoadAddress(resource, offset, displacement),
+                                           walk.LoadAddress(resource, offset + 4, displacement)};
+    walk.address_kind = IR::ResourceKind::None;
     BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, named, ray, HighWord::Exact);
-    BuildWalk(walk, {walk.merge, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge}, untraced, ray, HighWord::Masked);
-    two.traced = IR::TraceNativeTraversals(walk.program, {.wave_size = 32, .rewrite = true, .oracle = IR::OracleRemaining | IR::OracleOnly});
-    const auto first  = walk.sites[0]->Flags<uint32_t>();
-    const auto second = walk.sites[1]->Flags<uint32_t>();
-    Expect(two.traced.sites == 1 && two.traced.source_valid && two.traced.header_offset == 0x20u,
+    BuildWalk(walk, {walk.merge, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge}, header, ray, HighWord::Masked);
+    chased.two.traced = IR::TraceNativeTraversals(walk.program, {.wave_size = 32, .rewrite = true, .oracle = IR::OracleRemaining | IR::OracleOnly});
+    chased.first      = walk.sites[0]->Flags<uint32_t>();
+    chased.second     = walk.sites[1]->Flags<uint32_t>();
+}
+
+void UntracedWalk() {
+    ChasedWalks chased;
+    TraceChasedWalks(chased, ChasedSource::Lane);
+    const auto& traced = chased.two.traced;
+    Expect(traced.sites == 1 && traced.source_valid && traced.header_offset == 0x20u && traced.extra_sources.empty(),
            "a walk over a named TLAS is served although another walk's TLAS is not traced");
-    Expect((first & IR::BvhIntersectOracle) != 0, "the walk over the named TLAS is answered from the host query");
-    Expect((second & IR::BvhIntersectOracle) == 0 && (second & IR::BvhIntersectEmpty) != 0, "the walk over the untraced TLAS stays empty");
+    Expect((chased.first & IR::BvhIntersectOracle) != 0, "the walk over the named TLAS is answered from the host query");
+    Expect((chased.second & IR::BvhIntersectOracle) == 0 && (chased.second & IR::BvhIntersectEmpty) != 0,
+           "the walk stays empty when its header depends on a lane");
+}
+
+void ComputedHeader(ChasedSource source) {
+    const bool scalar = source == ChasedSource::Scalar;
+    ChasedWalks chased;
+    TraceChasedWalks(chased, source);
+    const auto& traced = chased.two.traced;
+    Expect(traced.source_valid && traced.header_offset == 0x20u && traced.extra_sources.size() == 1,
+           "a walk over a TLAS reached through a pointer chain is served as an extra tree");
+    Expect((chased.first & IR::BvhIntersectOracle) != 0 && (chased.second & IR::BvhIntersectOracle) != 0 &&
+               (chased.second & IR::BvhIntersectEmpty) == 0,
+           "both walks are answered from the host query");
+    if (traced.extra_sources.size() != 1) return;
+    const auto& extra = traced.extra_sources[0];
+    Expect(extra.header_vsharp == IR::RayQueryHeaderProgram && !extra.program.empty(), "the extra tree names its header with a program");
+    std::array<uint32_t, 16> user {};
+    user[4] = scalar ? 0x1003u : 0x10000u;
+    user[5] = scalar ? 0u : 2u;
+    user[7] = 0x1bcu;
+    if (source == ChasedSource::ScalarBuffer) user[4] |= 3u;
+    const uint64_t first = scalar ? 0x1024u : 0x2000101b4ull;
+    const uint64_t table = scalar ? 0x1234500003ull : 0x1234500000ull;
+    const auto     read    = [&](uint64_t address, uint32_t bytes, uint64_t& value) {
+        if (address == first && bytes == 8) {
+            value = table | 0xabcd000000000000ull;
+            return true;
+        }
+        if (address == first && bytes == 4) {
+            value = static_cast<uint32_t>(table);
+            return true;
+        }
+        if (address == first + 4 && bytes == 4) {
+            value = static_cast<uint32_t>((table | 0xabcd000000000000ull) >> 32u);
+            return true;
+        }
+        return false;
+    };
+    const auto at = IR::EvaluateHeaderProgram(extra.program, user, read);
+    Expect(at == (scalar ? 0x1234500044ull : table + 0x40), "each scalar load aligns its base, displacement and immediate independently");
+    if (source == ChasedSource::ScalarBuffer) {
+        user[7] -= 4;
+        Expect(!IR::EvaluateHeaderProgram(extra.program, user, read), "a scalar buffer must contain both dwords of the pointer");
+    }
+    const auto unreadable = IR::EvaluateHeaderProgram(extra.program, user, [](uint64_t, uint32_t, uint64_t&) { return false; });
+    Expect(!unreadable, "a program whose pointer chain is unreadable yields no header");
+}
+
+void HeaderPrograms() {
+    using Op = IR::HeaderOp;
+    const auto op = [](Op value) { return static_cast<uint32_t>(value); };
+    std::array<uint32_t, 16> user {};
+    user[0] = 0x1000u;
+    user[1] = 0x0040u << 16u;
+    user[2] = 8u;
+    user[3] = 1u << 12u;
+    user[4] = 3u;
+    const std::vector<uint32_t> record {op(Op::User), 0, op(Op::User), 1, op(Op::Join), op(Op::User), 2, op(Op::User), 3,
+                                        op(Op::User), 4, op(Op::Const), 4, 0, op(Op::Record)};
+    const auto none = [](uint64_t, uint32_t, uint64_t&) { return false; };
+    Expect(IR::EvaluateHeaderProgram(record, user, none) == 0x1000u + 3u * 0x40u + 4u,
+           "a buffer record address adds the index times the descriptor stride and the offset");
+    user[3] |= 3u << 28u;
+    Expect(!IR::EvaluateHeaderProgram(record, user, none), "a raw descriptor bounds the byte offset against its byte count");
+    user[3] = 0u;
+    Expect(!IR::EvaluateHeaderProgram(record, user, none), "a null buffer format yields no address");
+    user[3] = 1u << 12u;
+    user[4] = 8u;
+    Expect(!IR::EvaluateHeaderProgram(record, user, none), "a buffer index past the record count yields no address");
+    user[4] = 3u;
+    user[3] |= 1u << 23u;
+    Expect(!IR::EvaluateHeaderProgram(record, user, none), "a descriptor that adds the thread ID to its index yields no address");
+    user[3] = 1u << 12u;
+    user[1] |= 1u << 31u;
+    Expect(!IR::EvaluateHeaderProgram(record, user, none), "a descriptor with swizzle enabled in its base yields no address");
+    user[1] &= ~(1u << 31u);
+    user[1] |= 1u << 30u;
+    Expect(!IR::EvaluateHeaderProgram(record, user, none), "a descriptor with a cache swizzle in its base yields no address");
+    user[1] &= ~(1u << 30u);
+    const std::vector<uint32_t> past_stride {op(Op::User), 0, op(Op::User), 1, op(Op::Join), op(Op::User), 2, op(Op::User), 3,
+                                             op(Op::User), 4, op(Op::Const), 0x3e, 0, op(Op::Record)};
+    Expect(!IR::EvaluateHeaderProgram(past_stride, user, none), "a record read that crosses its stride yields no address");
+    const std::vector<uint32_t> aligned_pair {op(Op::Const), 0x2004, 0, op(Op::Load), 8};
+    Expect(IR::EvaluateHeaderProgram(aligned_pair, user, [](uint64_t, uint32_t, uint64_t& value) {
+               value = 0x5000;
+               return true;
+           }) == 0x5000u,
+           "a 64-bit pointer load needs only dword alignment");
+    Expect(!IR::EvaluateHeaderProgram(record, std::span(user).first(4), none), "a program that reads a missing user register is invalid");
+    const std::vector<uint32_t> unbalanced {op(Op::User), 0, op(Op::User), 1};
+    Expect(!IR::ValidHeaderProgram(unbalanced, 16) && !IR::ValidHeaderProgram({}, 16), "a program must leave exactly one value");
+    const std::vector<uint32_t> misaligned {op(Op::Const), 3, 0, op(Op::Load), 8};
+    Expect(!IR::EvaluateHeaderProgram(misaligned, user, [](uint64_t, uint32_t, uint64_t& value) {
+               value = 1;
+               return true;
+           }),
+           "a misaligned load yields no address");
+    const std::vector<uint32_t> fields {op(Op::Const), 0x12345678u, 0, op(Op::Const), 22, 0, op(Op::Const), 9, 0, op(Op::Bfe)};
+    Expect(IR::EvaluateHeaderProgram(fields, user, none) == (0x12345678u >> 22u & 0x1ffu), "a bit-field extract reads the field");
+    const std::vector<uint32_t> full {op(Op::User), 0, op(Op::Const), 0, 0, op(Op::Const), 32, 0, op(Op::Bfe)};
+    Expect(IR::EvaluateHeaderProgram(full, user, none) == user[0], "a full-width bit-field extract preserves every bit");
 }
 
 void CodeWaveSize() {
@@ -551,6 +690,19 @@ void DescriptorHighWord() {
     Expect(exact.refusal == nullptr && !exact.sources.empty(), "a walk whose descriptor high word is the high dword of header plus instance offset is derived");
     Expect(!exact.sources.empty() && exact.sources.front().user_sgpr == 4u && exact.sources.front().header_offset == 0x20u,
            "the derived walk reads the TLAS header the user data names");
+    const auto scalar = DeriveWithHighWord(HighWord::Exact, IR::ResourceKind::ScalarAddress);
+    Expect(scalar.refusal == nullptr && !scalar.sources.empty() && scalar.sources.front().user_sgpr == 4u &&
+               scalar.sources.front().header_offset == 0x20u,
+           "a TLAS header read with scalar loads through the user data pointer is derived");
+    const auto plain  = DeriveWithHighWord(HighWord::Exact);
+    const auto loaded = DeriveWithHighWord(HighWord::Exact, IR::ResourceKind::ScalarAddress, 0x20, IR::ResourceKind {});
+    Expect(loaded.refusal == nullptr && !loaded.sources.empty() && !plain.sources.empty() && loaded.sources.front().user_sgpr == plain.sources.front().user_sgpr &&
+               loaded.sources.front().header_offset == plain.sources.front().header_offset &&
+               loaded.sources.front().root == plain.sources.front().root && loaded.sources.front().layout == plain.sources.front().layout,
+           "scalar reads through a header pointer loaded from memory name the same source as plain reads");
+    const auto unaligned = DeriveWithHighWord(HighWord::Exact, IR::ResourceKind::ScalarAddress, 0x22);
+    Expect(!unaligned.sources.empty() && unaligned.sources.front().header_offset == 0x20u,
+           "a scalar header read at an unaligned offset names the dword the hardware reads");
     Expect(refused(HighWord::StrideBit), "a computed high word that sets a stride bit is refused");
     Expect(refused(HighWord::SwizzleBit), "a computed high word that sets a swizzle bit is refused");
 }
@@ -619,6 +771,10 @@ int main() {
     TwoTlasWalks();
     RecordLayouts();
     UntracedWalk();
+    ComputedHeader(ChasedSource::Address);
+    ComputedHeader(ChasedSource::Scalar);
+    ComputedHeader(ChasedSource::ScalarBuffer);
+    HeaderPrograms();
     CodeWaveSize();
     DescriptorHighWord();
     Marking();

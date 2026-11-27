@@ -207,6 +207,11 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 		std::printf("%s: extra source %zu/%zu user_sgpr=%u header=0x%x vsharp=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", label, at,
 		            info.ray_query_extra_sources.size(), extra.user_sgpr, extra.header_offset, extra.header_vsharp, extra.root, extra.layout[0],
 		            extra.layout[1], extra.layout[2], extra.layout[3]);
+		if (!extra.program.empty()) {
+			std::printf("%s: extra source %zu header program", label, at);
+			for (const auto word: extra.program) std::printf(" %x", word);
+			std::printf("\n");
+		}
 	}
 	for (size_t at = 0; at < translated.oracle_improvements.size(); ++at) {
 		const auto& improvement = translated.oracle_improvements[at];

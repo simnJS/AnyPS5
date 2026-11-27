@@ -49,6 +49,7 @@ struct Reader {
 	bool                     shader_info_has_ray_query_extra_sources = true;
 	bool                     shader_info_has_indexed_buffer_reads = true;
 	bool                     shader_info_has_extended_resources = true;
+	bool                     shader_info_has_ray_query_header_programs = true;
 
 	void Raw(void* data, size_t size) {
 		ok = ok && size <= bytes.size();
@@ -203,7 +204,20 @@ KYTY_IO_FIELDS(ShaderInfo::DmaDescriptorTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::DmaRecordTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::IndexedBufferRead, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo::SelfSizedBuffer, a, b, c)
-KYTY_IO_FIELDS(RayQueryExtraSource, a, b, c, d, e)
+template <class Stream, Is<RayQueryExtraSource> Object>
+void Io(Stream& io, Object& object) {
+	auto& [a, b, c, d, e, f] = object;
+	IoAll(io, a, b, c, d, e);
+	if constexpr (requires { io.shader_info_has_ray_query_header_programs; }) {
+		if (io.shader_info_has_ray_query_header_programs) {
+			IoAll(io, f);
+		} else if constexpr (Reading<Stream>) {
+			f.clear();
+		}
+	} else {
+		IoAll(io, f);
+	}
+}
 template <class Stream, Is<ShaderInfo> Object>
 void Io(Stream& io, Object& object) {
 	auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,

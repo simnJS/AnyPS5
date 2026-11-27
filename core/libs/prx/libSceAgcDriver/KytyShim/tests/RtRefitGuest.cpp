@@ -80,11 +80,25 @@ void KeepsEverythingInside() {
            "nothing is dropped inside guest memory, and the sizes are those of this call only");
 }
 
+void InternsHeaderPrograms() {
+    Libs::Graphics::RayTracingProgramKeys keys;
+    const std::vector<uint32_t> first {1u, 2u, 3u};
+    const std::vector<uint32_t> second {1u, 2u, 4u};
+    const std::vector<uint32_t> prefix {1u, 2u};
+    const auto a = keys.Key(first);
+    const auto b = keys.Key(second);
+    const auto c = keys.Key(prefix);
+    const std::vector<uint32_t> again {1u, 2u, 3u};
+    Expect(a != b && a != c && b != c, "distinct header programs get distinct keys");
+    Expect(keys.Key(again) == a && keys.Key(second) == b, "an equal header program shares its key");
+}
+
 }
 
 extern "C" int RunKytyRtRefitGuestTest() {
     DropsOutsideGuest();
     KeepsEverythingInside();
+    InternsHeaderPrograms();
     using Libs::Graphics::RayTracingTestAccess;
     Expect(RayTracingTestAccess::CanGather(false, 8, 0), "a consecutive refit gathers its triangle entries");
     Expect(!RayTracingTestAccess::CanGather(true, 8, 0), "a replacement during a consecutive refit needs a walk");

@@ -7,8 +7,10 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
+#include "graphics/shader/recompiler/ir/RayQueryHeaderProgram.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -44,6 +46,26 @@ struct RayTracingGuestTlas {
 	uint32_t instances = 0;
 };
 
+class RayTracingProgramKeys {
+public:
+	uint32_t Key(std::span<const uint32_t> program) {
+		if (const auto at = m_keys.find(program); at != m_keys.end()) return at->second;
+		const auto key = static_cast<uint32_t>(m_keys.size());
+		m_keys.emplace(std::vector<uint32_t>(program.begin(), program.end()), key);
+		return key;
+	}
+
+private:
+	struct Less {
+		using is_transparent = void;
+		template <class A, class B>
+		bool operator()(const A& a, const B& b) const {
+			return std::ranges::lexicographical_compare(a, b);
+		}
+	};
+	std::map<std::vector<uint32_t>, uint32_t, Less> m_keys;
+};
+
 
 class RayTracing {
 public:
@@ -67,9 +89,10 @@ public:
 		std::array<uint32_t, 2> header_slots {};
 		uint32_t                header_vsharp = 0xffffffffu;
 		uint64_t                header        = 0;
+		std::span<const uint32_t> program;
 	};
 	static constexpr uint32_t PsrHeaderLayout = 1u << 30u;
-	[[nodiscard]] static uint64_t UserPointer(const TlasSource& source, uint64_t pointer,
+	[[nodiscard]] static uint64_t UserPointer(const TlasSource& source, std::span<const uint32_t> user, uint32_t user_base,
 	                                          const std::function<bool(uint64_t, uint64_t)>& readable);
 	[[nodiscard]] static bool HeaderInUserData(const TlasSource& source) noexcept;
 	[[nodiscard]] static constexpr uint64_t UserDataHeader(uint64_t pointer) noexcept {
@@ -397,6 +420,7 @@ private:
 	std::unordered_map<uint32_t, uint32_t> m_instance_floors;
 	std::unordered_map<uint32_t, IncompleteRun> m_incomplete;
 	std::unordered_set<uint32_t>           m_cpu_counted_sources;
+	RayTracingProgramKeys                  m_program_keys;
 	std::array<std::pair<uint64_t, GuestTlas>, 8> m_guest_tlases {};
 	uint32_t                                      m_guest_tlas_next = 0;
 	uint32_t                                      m_next_instances  = 0;

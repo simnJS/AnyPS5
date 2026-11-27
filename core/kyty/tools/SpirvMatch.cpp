@@ -25,12 +25,13 @@ struct ShaderInfoLayout {
 	bool ray_query_extra_sources;
 	bool indexed_buffer_reads;
 	bool extended_resources;
+	bool ray_query_header_programs;
 };
 
-constexpr std::array<ShaderInfoLayout, 7> ShaderInfoLayouts {{
-    {true, true, true, true}, {true, true, false, true}, {true, false, true, false},
-    {true, false, false, true}, {true, false, false, false},
-    {false, false, false, true}, {false, false, false, false},
+constexpr std::array<ShaderInfoLayout, 8> ShaderInfoLayouts {{
+    {true, true, true, true, true},     {true, true, true, true, false},    {true, true, false, true, false},
+    {true, false, true, false, false},  {true, false, false, true, false},  {true, false, false, false, false},
+    {false, false, false, true, false}, {false, false, false, false, false},
 }};
 
 struct Dump {
@@ -118,7 +119,8 @@ bool MatchShaderDump(std::span<const uint8_t> raw, std::span<Dump> dumps,
 		                     .shader_info_has_relative_vgprs = layout.relative_vgprs,
 		                     .shader_info_has_ray_query_extra_sources = layout.ray_query_extra_sources,
 		                     .shader_info_has_indexed_buffer_reads = layout.indexed_buffer_reads,
-		                     .shader_info_has_extended_resources = layout.extended_resources};
+		                     .shader_info_has_extended_resources = layout.extended_resources,
+		                     .shader_info_has_ray_query_header_programs = layout.ray_query_header_programs};
 		ShaderStoreFormat::Key key;
 		ShaderModule module;
 		std::vector<uint32_t> spirv;

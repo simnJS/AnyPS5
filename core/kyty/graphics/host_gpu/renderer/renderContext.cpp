@@ -601,6 +601,19 @@ bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
 	return written;
 }
 
+bool RenderContext::RayQueryMemoryReadable(uint64_t address, uint64_t size) {
+	return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
+	       !(m_buffer_cache.MayBeGpuModified(address, size) && m_buffer_cache.IsRegionGpuModified(address, size));
+}
+
+uint64_t RenderContext::RayQueryUserPointer(const RayTracing::TlasSource& source, std::span<const uint32_t> user) {
+	std::shared_lock lock(m_mapped_ranges_mutex, std::defer_lock);
+	return RayTracing::UserPointer(source, user, 0, [&](uint64_t address, uint64_t size) {
+		if (!lock.owns_lock()) lock.lock();
+		return RayQueryMemoryReadable(address, size);
+	});
+}
+
 void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 	const auto&            program = runtime.module->info;
 	RayTracing::TlasSource source;
@@ -621,9 +634,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime, const Ray
 	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
 	const auto readable = [this](uint64_t address, uint64_t size) {
-		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
-		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
-		         m_buffer_cache.IsRegionGpuModified(address, size));
+		return RayQueryMemoryReadable(address, size);
 	};
 	uint64_t    header = 0;
 	const auto& srt    = resources.flattened_srt;
@@ -633,16 +644,13 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime, const Ray
 	if (in_srt(source.header_slots[0]) && in_srt(source.header_slots[1])) {
 		header = srt[source.header_slots[0]] | (uint64_t {srt[source.header_slots[1]]} << 32u);
 	} else {
-		const auto& user_data = resources.user_data;
-		const auto  index     = uint64_t {source.user_sgpr} - program.user_data_base;
-		if (source.user_sgpr < program.user_data_base || index + 1u >= user_data.size()) {
+		const auto pointer = RayTracing::UserPointer(source, resources.user_data, program.user_data_base, readable);
+		if (pointer == 0) {
 			return;
 		}
-		const auto pointer = RayTracing::UserPointer(
-		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
 		if (RayTracing::HeaderInUserData(source)) {
 			header = RayTracing::UserDataHeader(pointer);
-		} else if (pointer == 0 || pointer > UINT64_MAX - source.header_offset ||
+		} else if (pointer > UINT64_MAX - source.header_offset ||
 		           !readable(pointer + source.header_offset, sizeof(header))) {
 			return;
 		} else {
@@ -1014,18 +1022,10 @@ bool RenderContext::GuestTlasHeader(const ShaderStageRuntime& runtime, const Ray
 	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
 	const auto readable = [this](uint64_t address, uint64_t size) {
-		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
-		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
-		         m_buffer_cache.IsRegionGpuModified(address, size));
+		return RayQueryMemoryReadable(address, size);
 	};
 	header_at             = 0;
-	const auto& user_data = resources.user_data;
-	const auto  index     = uint64_t {source.user_sgpr} - program.user_data_base;
-	uint64_t    pointer   = 0;
-	if (source.user_sgpr >= program.user_data_base && index + 1u < user_data.size()) {
-		pointer = RayTracing::UserPointer(
-		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
-	}
+	const auto pointer = RayTracing::UserPointer(source, resources.user_data, program.user_data_base, readable);
 	if (RayTracing::HeaderInUserData(source)) {
 		header = RayTracing::UserDataHeader(pointer);
 		return header != 0;

@@ -512,8 +512,28 @@ bool RayTracing::HeaderInUserData(const TlasSource& source) noexcept {
 	return source.header_offset == ShaderRecompiler::IR::ShaderInfo::UserDataRayQueryHeader;
 }
 
-uint64_t RayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
+uint64_t RayTracing::UserPointer(const TlasSource& source, std::span<const uint32_t> user, uint32_t user_base,
                                        const std::function<bool(uint64_t, uint64_t)>& readable) {
+	if (!source.program.empty()) {
+		if (user_base != 0) {
+			return 0;
+		}
+		const auto read = [&](uint64_t address, uint32_t bytes, uint64_t& value) {
+			if (!readable(address, bytes)) {
+				return false;
+			}
+			value = 0;
+			std::memcpy(&value, reinterpret_cast<const void*>(address), bytes);
+			return true;
+		};
+		const auto address = ShaderRecompiler::IR::EvaluateHeaderProgram(source.program, user, read).value_or(0);
+		return (address & 3u) == 0u ? address : 0;
+	}
+	const auto index = uint64_t {source.user_sgpr} - user_base;
+	if (source.user_sgpr < user_base || index + 1u >= user.size()) {
+		return 0;
+	}
+	auto pointer = uint64_t {user[index]} | (uint64_t {user[index + 1u]} << 32u);
 	const auto offset = ShaderRecompiler::IR::ResolveRayQueryUserTable(pointer, source.header_vsharp);
 	if (offset == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
 		return pointer;
@@ -544,9 +564,9 @@ void RayTracing::InvalidateContext(const CommandRecorder& command, uint32_t cont
 }
 
 RayTracing::TlasSource RayTracing::ExtraTlasSource(const ShaderRecompiler::IR::RayQueryExtraSource& extra) noexcept {
-	return {extra.user_sgpr, extra.header_offset, extra.root, extra.layout,
+	return {extra.user_sgpr,    extra.header_offset, extra.root, extra.layout,
 	        {ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot, ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot},
-	        extra.header_vsharp};
+	        extra.header_vsharp, 0, extra.program};
 }
 
 bool RayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
@@ -1528,6 +1548,10 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	if (!m_enabled || context >= MaxContexts) {
 		return;
 	}
+	if (!source.program.empty() && user_pointer == 0) {
+		InvalidateContext(command, context);
+		return;
+	}
 	auto& tlas_object = m_tlases[context];
 	if (tlas_object.handle == nullptr) {
 		CreateTlasObject(tlas_object, m_tlas_capacity);
@@ -1543,9 +1567,11 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	readback.build_slots.clear();
 	const bool psr        = (source.layout[3] & PsrHeaderLayout) != 0;
 	const bool in_user    = HeaderInUserData(source);
-	const auto source_key = psr       ? UINT32_MAX
-	                        : in_user ? 0xffff0000u | source.user_sgpr
-	                                  : source.user_sgpr << 16u | source.header_offset;
+	const auto program_key = [&] { return 0xfe000000u | (m_program_keys.Key(source.program) & 0x00ffffffu); };
+	const auto source_key = psr                     ? UINT32_MAX
+	                        : !source.program.empty() ? program_key()
+	                        : in_user               ? 0xffff0000u | source.user_sgpr
+	                                                : source.user_sgpr << 16u | source.header_offset;
 	readback.source_key   = source_key;
 	readback.frame        = frame;
 	readback.shader_hash  = shader_hash;
