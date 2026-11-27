@@ -1191,6 +1191,21 @@ struct IndirectBufferAccess {
 	uint32_t linear;
 };
 
+void ApplyIndirectTypedFormat(EmitterState& state, const IR::MemoryInfo& mem, std::array<uint32_t, 8>& args) {
+	if (!mem.typed) return;
+	const auto format = Format::DecodeTBufferFormat(mem.data_format, mem.number_format);
+	const auto info   = Format::GetFormatInfo(format);
+	uint32_t   fields = static_cast<uint32_t>(format) << 12u;
+	for (uint32_t component = 0; component < info.component_count; ++component) fields |= (4u + component) << (component * 3u);
+	const auto descriptor = args[3];
+	const auto control    = Binary(state, spv::OpBitwiseAnd, TypeU32(state), descriptor, ConstantU32(state, ~0x7ffffu));
+	const auto valid      = Binary(state, spv::OpINotEqual, TypeBool(state),
+	                               EmitBitFieldUExtract(state, descriptor, ConstantU32(state, 12u), ConstantU32(state, 7u)),
+	                               ConstantU32(state, 0u));
+	args[3] = Select(state, TypeU32(state), valid,
+	                 Binary(state, spv::OpBitwiseOr, TypeU32(state), control, ConstantU32(state, fields)), control);
+}
+
 std::array<uint32_t, 8> IndirectBufferArgs(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	const auto& handle = *inst.Arg(0).ResolveInstruction();
@@ -1435,6 +1450,25 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 
 static uint32_t ExtractU32(EmitterState& state, uint32_t composite, uint32_t component);
 
+void MergeBdaBits(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value, uint32_t bits);
+
+void StoreIndirectSubword(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t bits) {
+	auto& state = ctx.state;
+	const auto store = [&]() {
+		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		auto       valid  = AndCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0)),
+		                                 IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, bits / 8u), false));
+		if (state.converged_calls) valid = AndCondition(state, valid, ctx.Arg(inst, inst.NumArgs() - 1));
+		const auto address = bits == 16u ? Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address, ConstantU64(state, ~uint64_t {1}))
+		                                 : buffer.address;
+		const auto value = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, inst.NumArgs() - 2),
+		                          ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+		MergeBdaBits(ctx, address, valid, value, ConstantU32(state, bits));
+	};
+	if (state.converged_calls) store();
+	else EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), store);
+}
+
 enum class IndirectStoreKind : uint32_t { Drop, Raw, Uint, Sint, Unorm, Snorm, Half, Uscaled, Sscaled };
 
 uint32_t IndirectStoreFormat(EmitterState& state, uint32_t format) {
@@ -1559,7 +1593,9 @@ void StoreIndirectFormatted(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	const auto store = [&]() {
 		const auto u      = TypeU32(state);
 		const auto b      = TypeBool(state);
-		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), true);
+		auto args = IndirectBufferArgs(ctx, inst);
+		ApplyIndirectTypedFormat(state, ctx.Memory(inst), args);
+		const auto buffer = PrepareIndirectBuffer(state, args, true);
 		auto       valid  = Binary(state, spv::OpINotEqual, b, buffer.format, ConstantU32(state, 0));
 		if (state.converged_calls) valid = AndCondition(state, valid, ctx.Arg(inst, inst.NumArgs() - 1));
 		const auto layout = IndirectStoreFormat(state, buffer.format);
@@ -1834,22 +1870,7 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 		const auto function = state.indirect_buffer_load_functions.at(
 		    {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
 		auto args = IndirectBufferArgs(ctx, inst);
-		if (mem.typed) {
-			const auto format = Format::DecodeTBufferFormat(mem.data_format, mem.number_format);
-			const auto info = Format::GetFormatInfo(format);
-			uint32_t fields = static_cast<uint32_t>(format) << 12u;
-			for (uint32_t component = 0; component < info.component_count; ++component)
-				fields |= (4u + component) << (component * 3u);
-			const auto descriptor = args[3];
-			const auto control = Binary(state, spv::OpBitwiseAnd, TypeU32(state), descriptor,
-			                            ConstantU32(state, ~0x7ffffu));
-			const auto valid = Binary(state, spv::OpINotEqual, TypeBool(state),
-			    EmitBitFieldUExtract(state, descriptor, ConstantU32(state, 12u), ConstantU32(state, 7u)),
-			    ConstantU32(state, 0u));
-			args[3] = Select(state, TypeU32(state), valid,
-			                 Binary(state, spv::OpBitwiseOr, TypeU32(state), control, ConstantU32(state, fields)),
-			                 control);
-		}
+		ApplyIndirectTypedFormat(state, mem, args);
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components), result,
 		                          function, args, ctx.Arg(inst, inst.NumArgs() - 1));
@@ -3161,6 +3182,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		StoreLocalFlat(ctx, inst);
 	else if (mem.kind == IR::ResourceKind::IndirectBuffer && mem.formatted)
 		StoreIndirectFormatted(ctx, inst, std::max(buffer_components, 1u));
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer && (type == IR::Type::U8 || type == IR::Type::U16))
+		StoreIndirectSubword(ctx, inst, type == IR::Type::U8 ? 8u : 16u);
 	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
 		StoreIndirectBuffer(ctx, inst, std::max(buffer_components, 1u));
 	else if (buffer_components > 1u)

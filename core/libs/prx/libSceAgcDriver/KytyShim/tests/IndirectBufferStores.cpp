@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -33,9 +34,11 @@ constexpr std::uint32_t Lanes = 64;
 constexpr std::uint32_t Fill = 0xdeadbeefu;
 constexpr std::uint32_t Wave64Dispatch = 0x41;
 
-constexpr std::array<std::uint32_t, 12> StoreFormsCode{
-    0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0xbe8303ffu, 0x31014facu, 0x4a020081u, 0x340a0082u,
-    0xe0701300u, 0x80000105u, 0xe0c81600u, 0x80000105u, 0xbf810000u,
+constexpr std::array<std::uint32_t, 24> StoreFormsCode{
+    0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0xbe8303ffu, 0x31014facu, 0x4a020081u, 0x34060081u,
+    0xe0601100u, 0x80000103u, 0xe06017c0u, 0x80000103u, 0x340a0082u, 0xe0701300u, 0x80000105u,
+    0x380400ffu, 0x00007700u, 0xe0681200u, 0x80000205u, 0x7e080d00u, 0xe86c1402u, 0x80000405u,
+    0xe0c81600u, 0x80000105u, 0xbf810000u,
 };
 
 void append(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload) {
@@ -60,11 +63,25 @@ void write(std::span<std::byte> memory, std::uint64_t address, const void* data,
     std::memcpy(memory.data() + offset, data, bytes);
 }
 
+std::uint16_t half(std::uint32_t value) {
+    if (value == 0) return 0;
+    const auto exponent = static_cast<std::uint32_t>(std::bit_width(value)) - 1u;
+    return static_cast<std::uint16_t>(((exponent + 15u) << 10u) | ((value << (10u - exponent)) & 0x3ffu));
+}
+
 std::vector<std::uint8_t> expected() {
     std::vector<std::uint8_t> bytes(DumpBytes);
     for (std::size_t at = 0; at < bytes.size(); ++at) bytes[at] = static_cast<std::uint8_t>(Fill >> (8u * (at % 4u)));
     for (std::size_t k = 0; k < 4; ++k) bytes[k] = static_cast<std::uint8_t>(Records >> (8u * k));
     for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+        bytes[0x100 + 2 * lane] = static_cast<std::uint8_t>(lane + 1);
+        if (0x7c0 + 2 * lane + 1 <= Records) bytes[0x7c0 + 2 * lane] = static_cast<std::uint8_t>(lane + 1);
+        const std::uint16_t word = 0x7700u | lane;
+        bytes[0x200 + 4 * lane] = static_cast<std::uint8_t>(word);
+        bytes[0x201 + 4 * lane] = static_cast<std::uint8_t>(word >> 8u);
+        const auto value = half(lane);
+        bytes[0x402 + 4 * lane] = static_cast<std::uint8_t>(value);
+        bytes[0x403 + 4 * lane] = static_cast<std::uint8_t>(value >> 8u);
         const std::uint32_t stored = lane + 1u;
         const std::uint32_t sum = Fill + lane + 1u;
         for (std::size_t k = 0; k < 4; ++k) {

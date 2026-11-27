@@ -164,6 +164,60 @@ void RuntimeRows() {
 	      "run-time descriptors: the dispatch refused by the bound plan is materialized and compiled");
 }
 
+void SelfSizedStores() {
+	constexpr std::array<uint32_t, 20> code {
+	    0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0xbe8303ffu, 0x31014facu, 0x4a020081u, 0x34060081u,
+	    0xe0601100u, 0x80000103u, 0xe06017c0u, 0x80000103u, 0x340a0082u, 0x380400ffu, 0x00007700u,
+	    0xe0681200u, 0x80000205u, 0x7e080d00u, 0xe86c1402u, 0x80000405u, 0xbf810000u,
+	};
+	std::fill(g_guest.begin(), g_guest.end(), 0u);
+	Poke(OutputAddress, 0x800u);
+	const std::array<uint32_t, 2> user_data {static_cast<uint32_t>(OutputAddress), static_cast<uint32_t>(OutputAddress >> 32u)};
+	ShaderComputeInputInfo info {};
+	info.wave_size          = 64;
+	info.host_subgroup_size = 64;
+	info.threads_num[0]     = 64;
+	info.threads_num[1]     = 1;
+	info.threads_num[2]     = 1;
+	info.thread_ids_num     = 1;
+	Recompiler::CompileOptions options;
+	options.stage              = ShaderType::Compute;
+	options.wave_size          = 64;
+	options.shader_hash        = 0x55e1u;
+	options.dump_ir            = false;
+	options.user_data          = user_data;
+	options.input_info.compute = &info;
+	try {
+		const std::vector<uint32_t> words(code.begin(), code.end());
+		const auto source     = Recompiler::PrepareShaderSource(words, options);
+		auto       translated = Recompiler::TranslateProgram(source.decoded, options);
+		const auto& sized     = translated.program.info.self_sized_buffers;
+		Check(sized.size() == 1u && sized.front().written,
+		      "byte, short and typed stores through a self-sized V#: one written self-sized buffer");
+		uint32_t stores = 0;
+		for (const auto& memory: translated.program.memory_info) {
+			if (memory.planning_only ||
+			    (memory.kind != IR::ResourceKind::Buffer && memory.kind != IR::ResourceKind::IndirectBuffer)) continue;
+			Check(memory.kind == IR::ResourceKind::IndirectBuffer,
+			      "byte, short and typed stores through a self-sized V#: the stores read their V# at run time");
+			stores++;
+		}
+		Check(stores == 4u, "byte, short and typed stores through a self-sized V#: every store is planned");
+		const auto                 plan = IR::ExtractResourcePlan(translated.program);
+		const IR::SrtRuntime       runtime {.user_data = user_data, .read_specialization_memory = ReadMemory};
+		IR::ResourceSnapshot       snapshot;
+		IR::ResourceSpecialization specialization;
+		const bool materialized = IR::MaterializeResources(plan, runtime, snapshot, specialization);
+		Check(materialized, "byte, short and typed stores through a self-sized V#: the plan is materialized");
+		if (materialized) {
+			auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0);
+			Check(!compiled.spirv.empty(), "byte, short and typed stores through a self-sized V#: the program is compiled");
+		}
+	} catch (const std::exception& error) {
+		Check(false, std::string("byte, short and typed stores through a self-sized V#: ") + error.what());
+	}
+}
+
 }
 
 int main() {
@@ -171,6 +225,7 @@ int main() {
 	IR::SetComputeIndirectFloors(256, 8);
 	BoundRows();
 	RuntimeRows();
+	SelfSizedStores();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;
