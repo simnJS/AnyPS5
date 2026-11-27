@@ -108,28 +108,32 @@ def model_review(context, key):
         "additionalProperties": False,
     }
     request = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
+        "https://api.anthropic.com/v1/messages",
         data=json.dumps({
-            "model": "gpt-6.2-sol",
-            "instructions": INSTRUCTIONS,
-            "input": json.dumps(context, ensure_ascii=False),
-            "store": False,
-            "max_output_tokens": 900,
-            "reasoning": {"effort": "low"},
-            "text": {"format": {
-                "type": "json_schema", "name": "maintenance",
-                "strict": True, "schema": schema,
-            }},
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 900,
+            "system": INSTRUCTIONS,
+            "messages": [{"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
+            "tools": [{
+                "name": "maintenance",
+                "description": "Publish the triage decision for this thread.",
+                "input_schema": schema,
+            }],
+            "tool_choice": {"type": "tool", "name": "maintenance"},
         }).encode(),
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
     )
     with urllib.request.urlopen(request, timeout=90) as response:
         result = json.load(response)
-    if result["status"] == "completed":
-        for item in result["output"]:
-            for part in item.get("content", []):
-                if part["type"] == "output_text":
-                    return json.loads(part["text"])
+    for part in result.get("content", []):
+        if part.get("type") == "tool_use" and part.get("name") == "maintenance":
+            decision = part.get("input", {})
+            if decision.get("action") in schema["properties"]["action"]["enum"] and isinstance(decision.get("body"), str):
+                return {"action": decision["action"], "body": decision["body"]}
     return {"action": "escalate", "body": ""}
 
 
@@ -455,8 +459,8 @@ def run(mode):
     if not words.strip():
         note("Repository maintenance needs the private publication list.")
         return
-    if mode == "review" and not (key := os.environ.get("OPENAI_API_KEY")):
-        note("Hosted replies and reviews need an OpenAI API key.")
+    if mode == "review" and not (key := os.environ.get("ANTHROPIC_API_KEY")):
+        note("Hosted replies and reviews need an Anthropic API key.")
         return
     if mode == "merge":
         if not os.environ.get("GH_TOKEN"):

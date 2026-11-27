@@ -61,7 +61,7 @@ jobs:
           persist-credentials: false
       - env:
           GH_TOKEN: ${{ github.token }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PUBLIC_SCAN_WORDS: ${{ secrets.PUBLIC_SCAN_WORDS }}
         run: python3 -I tools/repository_maintenance.py review
 
