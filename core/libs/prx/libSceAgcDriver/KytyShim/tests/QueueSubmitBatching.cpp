@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -112,6 +113,7 @@ const char* ProbeQueueSubmitBatching(GraphicContext& graphics) {
 	const auto pre_wait_tick = scheduler.CurrentTick();
 	scheduler.Flush();
 
+	output.Fill(sizeof(uint32_t), sizeof(uint32_t), 0xfeedfaceu);
 	SubmitInfo wait_boundary;
 	wait_boundary.AddWait(boundary_gate.Handle(), 1);
 	const auto wait_tick = scheduler.CurrentTick();
@@ -125,9 +127,20 @@ const char* ProbeQueueSubmitBatching(GraphicContext& graphics) {
 	master.Refresh();
 	Require(!master.IsFree(wait_tick), "wait boundary must not complete before its semaphore is signaled");
 
+	output.Invalidate(0, 2 * sizeof(uint32_t));
+	std::array<uint32_t, 2> boundary_words {};
+	std::memcpy(boundary_words.data(), output.Mapped().data(), sizeof(boundary_words));
+	Require(boundary_words[0] == 0xdeadbeefu, "pre-wait fill must land before wait boundary unblocks");
+	Require(boundary_words[1] == 0x1001u,
+	        "wait-boundary commands must not execute while the wait semaphore is unsignaled");
+
 	boundary_gate.Signal(1);
 	scheduler.Wait(wait_tick);
 	Require(master.IsFree(wait_tick), "wait boundary must complete after its semaphore is signaled");
+	output.Invalidate(sizeof(uint32_t), sizeof(uint32_t));
+	std::memcpy(boundary_words.data(), output.Mapped().data(), sizeof(boundary_words));
+	Require(boundary_words[1] == 0xfeedfaceu,
+	        "wait-boundary fill must land after the wait semaphore is signaled");
 
 	renderer.ShutdownGpu();
 	return nullptr;

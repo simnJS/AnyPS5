@@ -688,12 +688,28 @@ void CommandScheduler::RecordingThread() {
 		batched = 0;
 		SubmitRecorded(buffer, buffer_index, pending);
 	};
+	const auto chunk_requires_pre_flush = [this](const CommandStream::Chunk& c) {
+		size_t offset = 0;
+		while (offset < c.used) {
+			const auto* record = reinterpret_cast<const CommandStream::Entry*>(c.data + offset);
+			if (record->kind == CommandStream::RecordKind::Submit) {
+				const auto& recorded      = *static_cast<const RecordedSubmit*>(record->Payload());
+				const bool  has_host_copy = m_host_copies != nullptr && recorded.host_copies != 0;
+				return recorded.info.num_wait_semaphores != 0 || has_host_copy;
+			}
+			offset += record->size;
+		}
+		return true;
+	};
 	for (;;) {
 		auto chunk = m_chunk_queue.Pop();
 		if (chunk == nullptr) {
 			break;
 		}
 		while (chunk != nullptr) {
+			if (pending_tick.has_value() && chunk_requires_pre_flush(*chunk)) {
+				flush_pending();
+			}
 			CommandStream::Replay(*chunk, acquire, [&](const CommandStream::Entry& entry) {
 				EXIT_IF(entry.kind != CommandStream::RecordKind::Submit);
 				const auto& recorded       = *static_cast<const RecordedSubmit*>(entry.Payload());
