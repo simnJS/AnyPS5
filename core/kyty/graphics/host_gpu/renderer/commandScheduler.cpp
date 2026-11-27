@@ -689,17 +689,21 @@ void CommandScheduler::RecordingThread() {
 		SubmitRecorded(buffer, buffer_index, pending);
 	};
 	const auto chunk_requires_pre_flush = [this](const CommandStream::Chunk& c) {
-		size_t offset = 0;
+		bool   saw_submit = false;
+		size_t offset     = 0;
 		while (offset < c.used) {
 			const auto* record = reinterpret_cast<const CommandStream::Entry*>(c.data + offset);
 			if (record->kind == CommandStream::RecordKind::Submit) {
+				saw_submit                = true;
 				const auto& recorded      = *static_cast<const RecordedSubmit*>(record->Payload());
 				const bool  has_host_copy = m_host_copies != nullptr && recorded.host_copies != 0;
-				return recorded.info.num_wait_semaphores != 0 || has_host_copy;
+				if (recorded.info.num_wait_semaphores != 0 || has_host_copy) {
+					return true;
+				}
 			}
 			offset += record->size;
 		}
-		return true;
+		return !saw_submit;
 	};
 	for (;;) {
 		auto chunk = m_chunk_queue.Pop();
