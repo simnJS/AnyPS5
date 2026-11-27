@@ -67,7 +67,36 @@ void CommandScheduler::CommandPool::Retire(size_t index, uint64_t tick) {
 	m_ticks[index] = tick;
 }
 
+void CommandScheduler::CommandPool::TrimCompleted() {
+	m_master.Refresh();
+	const auto done = m_master.KnownGpuTick();
+	size_t keep = m_ticks.size();
+	while (keep > GrowStep && m_ticks[keep - 1] <= done) {
+		--keep;
+	}
+	if (keep < m_ticks.size()) {
+		m_graphics.device.freeCommandBuffers(m_pool, static_cast<uint32_t>(m_ticks.size() - keep), m_buffers.data() + keep);
+		m_ticks.resize(keep);
+		m_buffers.resize(keep);
+		m_hint %= keep;
+	}
+	if (std::ranges::all_of(m_ticks, [done](uint64_t tick) { return tick <= done; })) {
+		EXIT_IF(m_graphics.device.resetCommandPool(m_pool, vk::CommandPoolResetFlagBits::eReleaseResources) != vk::Result::eSuccess);
+	} else {
+		for (size_t i = 0; i < keep; ++i) {
+			if (m_ticks[i] <= done) {
+				EXIT_IF(m_buffers[i].reset(vk::CommandBufferResetFlagBits::eReleaseResources) != vk::Result::eSuccess);
+			}
+		}
+		m_graphics.device.trimCommandPool(m_pool, {});
+	}
+}
+
 size_t CommandScheduler::CommandPool::Acquire(uint64_t busy_until) {
+	if (++m_acquisitions == 256) {
+		TrimCompleted();
+		m_acquisitions = 0;
+	}
 	auto       gpu_tick = m_master.KnownGpuTick();
 	const auto search   = [this, &gpu_tick, busy_until](size_t begin,
 	                                                  size_t end) -> std::optional<size_t> {

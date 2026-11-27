@@ -313,6 +313,26 @@ uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> 
 	return count;
 }
 
+GraphicContext::HeapUsage GraphicContext::GetLocalMemoryUsage() const {
+	if (m_memory_override_enabled) {
+		return {.usage = m_memory_usage_override, .budget = m_memory_budget_override};
+	}
+	HeapUsage local {};
+	if (memory_budget_ext_enabled) {
+		vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget {};
+		vk::PhysicalDeviceMemoryProperties2 properties {.pNext = &budget};
+		physical_device.getMemoryProperties2(&properties);
+		for (uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+			if (properties.memoryProperties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				local.usage += budget.heapUsage[i];
+				local.budget += budget.heapBudget[i];
+			}
+		}
+		local.budget = std::min(local.budget, MemoryBudgetCap());
+	}
+	return local;
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (m_memory_override_enabled) {
 		return m_memory_budget_override;

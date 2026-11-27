@@ -15,8 +15,9 @@ namespace KytyShimTests {
 struct TestVulkanDevice {
 	vk::detail::DynamicLoader loader;
 	Libs::Graphics::GraphicContext graphics;
+	bool acceleration_storage = false;
 
-	const char* Initialize(bool require_tiling = false, bool sparse = false) {
+	const char* Initialize(bool require_tiling = false, bool sparse = false, bool measure_acceleration_storage = false) {
 		if (!loader.success()) {
 			return "Vulkan loader unavailable";
 		}
@@ -37,7 +38,7 @@ struct TestVulkanDevice {
 			return "Vulkan device enumeration failed";
 		}
 		for (const auto device : devices.value) {
-			if (InitializeDevice(device, require_tiling, sparse)) {
+			if (InitializeDevice(device, require_tiling, sparse, measure_acceleration_storage)) {
 				return nullptr;
 			}
 		}
@@ -58,7 +59,7 @@ struct TestVulkanDevice {
 	}
 
 private:
-	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse) {
+	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse, bool measure_acceleration_storage) {
 		vk::PhysicalDeviceVulkan12Properties limits {};
 		vk::PhysicalDeviceVulkan11Properties properties11 {.pNext = &limits};
 		vk::PhysicalDeviceProperties2 properties {.pNext = &properties11};
@@ -88,7 +89,15 @@ private:
 		    })) {
 			return false;
 		}
-		vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness {};
+		const auto has_extension = [&](const char* name) {
+			return std::ranges::any_of(extensions.value, [name](const auto& e) {
+				return std::string_view(e.extensionName.data()) == name;
+			});
+		};
+		vk::PhysicalDeviceAccelerationStructureFeaturesKHR structures {};
+		const bool query_structures = measure_acceleration_storage && has_extension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+		                              has_extension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+		vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness {.pNext = query_structures ? &structures : nullptr};
 		vk::PhysicalDeviceVulkan12Features supported12 {.pNext = &supported_robustness};
 		vk::PhysicalDeviceVulkan11Features supported11 {.pNext = &supported12};
 		vk::PhysicalDeviceVulkan13Features supported13 {.pNext = &supported11};
@@ -168,9 +177,16 @@ private:
 			}
 		}
 		std::vector<const char*> enabled_extensions(required_extensions.begin(), required_extensions.end());
-		const bool host_memory = std::ranges::any_of(extensions.value, [](const auto& extension) {
-			return std::string_view(extension.extensionName.data()) == VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
-		});
+		const bool host_memory = has_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+		graphics.memory_budget_ext_enabled = measure_acceleration_storage && has_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		if (graphics.memory_budget_ext_enabled) enabled_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		acceleration_storage = structures.accelerationStructure;
+		if (acceleration_storage) {
+			enabled_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+			enabled_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+			structures = vk::PhysicalDeviceAccelerationStructureFeaturesKHR {.accelerationStructure = VK_TRUE};
+			robustness.pNext = &structures;
+		}
 		if (host_memory) enabled_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 		const vk::DeviceCreateInfo device_info {
 		    .pNext = &features13, .queueCreateInfoCount = queue_count, .pQueueCreateInfos = queue_infos.data(),

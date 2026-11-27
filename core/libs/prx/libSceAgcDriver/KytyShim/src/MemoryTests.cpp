@@ -1279,6 +1279,9 @@ void TestSparseReadsDirectFile() {
     std::printf("sparse-state direct-final: resident=%zu hole=%d st_blocks=%lld\n", finalResident, finalHole ? 1 : 0,
         FileBlocks(directFile));
     if (sparse) Require(finalHole && finalResident == 0);
+    Require(Memory::GpuCleanBackingEquals(address, expected.data(), expected.size()));
+    expected.back() ^= 1;
+    Require(!Memory::GpuCleanBackingEquals(address, expected.data(), expected.size()));
     Require(sceKernelMunmap(address, 2 * half) == 0);
     Require(sceKernelReleaseDirectMemory(low, half) == 0 && sceKernelReleaseDirectMemory(high, half) == 0);
     std::printf("direct memory file 0x%llx (two backings out of order): holes read as zeros%s, data across the backings read back exactly\n", static_cast<unsigned long long>(address),

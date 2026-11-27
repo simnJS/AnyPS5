@@ -476,6 +476,8 @@ private:
 		vk::CommandBuffer       command = nullptr;
 		vk::Fence               fence   = nullptr;
 		std::unique_ptr<Buffer> staging;
+		uint32_t                completed = 0;
+		void                    Finish(GraphicContext& graphics);
 	};
 	ReadbackQueue m_readback;
 	struct ReadbackQueueSlot {

@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
@@ -109,9 +111,16 @@ bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size, 
 	if (const void* backing = FindBackingPointer(vaddr, size); backing != nullptr) {
 		return equal != nullptr ? equal(backing, expected, size) : std::memcmp(backing, expected, size) == 0;
 	}
-	thread_local std::vector<uint8_t> bytes;
-	bytes.resize(size);
-	return TryReadBacking(vaddr, bytes.data(), size) && std::memcmp(bytes.data(), expected, size) == 0;
+	constexpr uint64_t PieceSize = 4096;
+	std::array<uint8_t, PieceSize> bytes;
+	for (uint64_t offset = 0; offset < size; offset += PieceSize) {
+		const auto length = std::min(size - offset, PieceSize);
+		if (!TryReadBacking(vaddr + offset, bytes.data(), length) ||
+		    std::memcmp(bytes.data(), static_cast<const uint8_t*>(expected) + offset, length) != 0) {
+			return false;
+		}
+	}
+	return size != 0;
 }
 
 uint64_t WatchStrictRead(uint64_t vaddr, uint64_t size) {

@@ -277,7 +277,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_null_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 256 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
@@ -1007,6 +1007,17 @@ void BufferCache::WaitReadbackQueueCopies() {
 	}
 }
 
+void BufferCache::ReadbackQueue::Finish(GraphicContext& graphics) {
+	const bool oversized = staging->Size() > 16 * MiB;
+	if (oversized) {
+		staging.reset();
+	}
+	if (++completed == 256 || oversized) {
+		EXIT_IF(graphics.device.resetCommandPool(pool, vk::CommandPoolResetFlagBits::eReleaseResources) != vk::Result::eSuccess);
+		completed = 0;
+	}
+}
+
 void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 	auto& queue = read.slot->queue;
 	if (m_graphics.device.waitForFences(1, &queue.fence, VK_TRUE, UINT64_MAX) !=
@@ -1024,6 +1035,7 @@ void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 			Libs::LibKernel::Memory::WriteBacking(m_storage->GuestAddress(copy.srcOffset), mapped + copy.dstOffset, copy.size);
 		}
 	}
+	queue.Finish(m_graphics);
 	read.slot->busy.store(false, std::memory_order_release);
 	read.published->store(true, std::memory_order_release);
 	read.published->notify_all();
@@ -2610,6 +2622,7 @@ bool BufferCache::DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies
 		Libs::LibKernel::Memory::WriteBacking(buffer.GuestAddress(copy.srcOffset),
 		                                      mapped + copy.dstOffset, copy.size);
 	}
+	m_readback.Finish(m_graphics);
 	return true;
 }
 

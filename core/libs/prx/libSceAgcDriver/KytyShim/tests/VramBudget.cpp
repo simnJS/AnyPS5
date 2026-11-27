@@ -1,11 +1,13 @@
 #include "TestVulkanDevice.h"
 #include "common/emulatorConfig.h"
+#include "common/hostStats.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "kernel/memory.h"
 #include "prx/libkernel/include/Api.hpp"
 
@@ -23,7 +25,124 @@ struct VramBudgetTestAccess {
 		graphics.m_memory_usage_override   = usage;
 	}
 
-	static uint64_t TextureTrigger(const TextureCache& cache) { return cache.m_trigger_gc_memory; }
+	static bool Collecting(const TextureCache& cache) { return cache.m_collecting; }
+
+	static bool CheckScratch(TextureCache& cache) {
+		constexpr uint64_t MiB = 1024 * 1024;
+		auto& tiler = cache.m_tiler;
+		const auto large = tiler.GetScratchBuffer(68 * MiB);
+		const auto small = tiler.GetScratchBuffer(4 * MiB, large.buffer);
+		auto& scheduler = tiler.m_scheduler;
+		Buffer download(tiler.m_graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, 8);
+		const auto copy = [&](uint32_t value, uint64_t offset) {
+			tiler.m_scratch[0]->Fill(0, 4, value);
+			download.CopyFrom(scheduler.Current(), *tiler.m_scratch[0], 0, offset, 4);
+		};
+		copy(0x77115aae, 0);
+		for (unsigned i = 0; i < 120; ++i) tiler.TrimScratch();
+		const bool kept = tiler.m_scratch[0] && tiler.m_scratch[0]->Handle() == large.buffer;
+		for (unsigned i = 0; i < 120; ++i) {
+			(void)tiler.GetScratchBuffer(MiB);
+			tiler.TrimScratch();
+		}
+		const bool shrank = !tiler.m_scratch[0] && tiler.m_scratch[1]->Handle() == small.buffer;
+		(void)tiler.GetScratchBuffer(MiB);
+		const bool small_again = tiler.m_scratch[0]->Size() == MiB;
+		(void)tiler.GetScratchBuffer(68 * MiB);
+		copy(0x22441234, 4);
+		scheduler.Wait(scheduler.CurrentTick());
+		download.Invalidate(0, 8);
+		const uint32_t expected[] = {0x77115aae, 0x22441234};
+		return kept && shrank && small_again && tiler.m_scratch[0]->Size() == 68 * MiB &&
+		       std::memcmp(download.Mapped().data(), expected, sizeof(expected)) == 0;
+	}
+
+	static bool CheckCommandPool(GraphicContext& graphics, CommandScheduler& scheduler) {
+		MasterSemaphore timeline(graphics);
+		CommandScheduler::CommandPool pool(graphics, timeline);
+		constexpr size_t Words = 16384;
+		std::vector<uint32_t> words(Words, 0xa55a4321);
+		Buffer download(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, Words * 4);
+		vk::CommandBuffer held;
+		for (size_t i = 0; i < 12; ++i) {
+			auto [command, slot] = pool.CommitDeferred();
+			vk::CommandBufferBeginInfo begin {};
+			EXIT_IF(command.begin(&begin) != vk::Result::eSuccess);
+			command.updateBuffer(download.Handle(), 0, Words * 4, words.data());
+			vk::MemoryBarrier barrier {.srcAccessMask = vk::AccessFlagBits::eTransferWrite, .dstAccessMask = vk::AccessFlagBits::eHostRead};
+			command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+			                        {}, 1, &barrier, 0, nullptr, 0, nullptr);
+			EXIT_IF(command.end() != vk::Result::eSuccess);
+			if (slot == 6) held = command;
+			else pool.Retire(slot, 1);
+			if (slot != i) return false;
+		}
+		const auto before = pool.m_buffers.size();
+		Common::HostStatsSampler stats;
+		const auto rss_before = stats.Sample().process_resident.value_or(0);
+		vk::SemaphoreSignalInfo signal {.semaphore = timeline.Handle(), .value = 1};
+		EXIT_IF(graphics.device.signalSemaphore(&signal) != vk::Result::eSuccess);
+		pool.TrimCompleted();
+		const auto partial = pool.m_buffers.size();
+		vk::SubmitInfo submit {.commandBufferCount = 1, .pCommandBuffers = &held};
+		EXIT_IF(graphics.queue.submit(1, &submit, {}) != vk::Result::eSuccess);
+		EXIT_IF(graphics.queue.waitIdle() != vk::Result::eSuccess);
+		pool.Retire(6, 0);
+		pool.TrimCompleted();
+		const auto rss_after = stats.Sample().process_resident.value_or(0);
+		std::printf("command buffers %zu -> %zu -> %zu, process resident bytes %llu -> %llu\n",
+		            before, partial, pool.m_buffers.size(), static_cast<unsigned long long>(rss_before),
+		            static_cast<unsigned long long>(rss_after));
+		download.Invalidate(0, Words * 4);
+		return before == 12 && partial == 7 && pool.m_buffers.size() == 4 &&
+		       std::memcmp(download.Mapped().data(), words.data(), Words * 4) == 0;
+	}
+
+	static bool CheckReadbackReserve(GraphicContext& graphics, CommandScheduler& scheduler) {
+		constexpr uint64_t MiB = 1024 * 1024;
+		BufferCache::ReadbackQueue queue;
+		vk::CommandPoolCreateInfo info {.queueFamilyIndex = graphics.queue_family};
+		EXIT_IF(graphics.device.createCommandPool(&info, nullptr, &queue.pool) != vk::Result::eSuccess);
+		const auto allocate = [&](uint64_t size) {
+			queue.staging = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+			                                         vk::BufferUsageFlagBits::eTransferDst, size);
+		};
+		allocate(16 * MiB);
+		for (size_t i = 0; i < 256; ++i) queue.Finish(graphics);
+		const bool retained = queue.staging && queue.completed == 0;
+		allocate(17 * MiB);
+		queue.Finish(graphics);
+		graphics.device.destroyCommandPool(queue.pool);
+		return retained && !queue.staging && queue.completed == 0;
+	}
+
+	static bool MeasureArena(RenderContext& renderer) {
+		auto& graphics = renderer.GetGraphics();
+		auto& scheduler = renderer.GetCommandScheduler();
+		constexpr uint64_t MiB = 1024 * 1024;
+		RayTracing::Arena arena(graphics, scheduler);
+		const auto a = arena.Allocate(24 * MiB, 256);
+		const auto b = arena.Allocate(24 * MiB, 256);
+		const auto c = arena.Allocate(24 * MiB, 256);
+		const auto d = arena.Allocate(40 * MiB, 256);
+		const auto used = arena.Used();
+		const auto reserved = arena.Reserved();
+		arena.Free(d);
+		arena.Free(c);
+		arena.Free(b);
+		arena.Free(a);
+		std::printf("BLAS arena MiB used/reserved %llu/%llu -> %llu/%llu\n",
+		            static_cast<unsigned long long>(used / MiB), static_cast<unsigned long long>(reserved / MiB),
+		            static_cast<unsigned long long>(arena.Used() / MiB), static_cast<unsigned long long>(arena.Reserved() / MiB));
+		RayTracing::TlasObject tlas {};
+		renderer.GetRayTracing()->CreateTlasObject(tlas, 65536);
+		std::printf("native TLAS storage for 65536 instances: %llu bytes\n",
+		            static_cast<unsigned long long>(tlas.storage->Size()));
+		graphics.device.destroyAccelerationStructureKHR(tlas.handle);
+		return used == 112 * MiB && reserved == 168 * MiB && arena.Used() == 0 && arena.Reserved() == 64 * MiB;
+	}
+
+	static uint64_t TextureStop(const TextureCache& cache) { return cache.m_stop_gc_memory; }
 	static uint64_t TexturePressure(const TextureCache& cache) { return cache.m_pressure_gc_memory; }
 	static uint64_t TextureCritical(const TextureCache& cache) { return cache.m_critical_gc_memory; }
 
@@ -38,6 +157,12 @@ struct VramBudgetTestAccess {
 	static ImageId CreateImage(TextureCache& cache, const ImageInfo& info) {
 		Common::ScopedLock lock {cache.m_lock};
 		return cache.InsertImage(info);
+	}
+
+	static void MarkMixedOwnership(TextureCache& cache, ImageId id) {
+		Common::ScopedLock lock {cache.m_lock};
+		cache.m_slot_images[id].MarkGpuModified();
+		cache.m_slot_images[id].MarkBufferModified();
 	}
 
 	static bool IsImageRegistered(TextureCache& cache, ImageId id) {
@@ -110,7 +235,7 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	if (const auto* failure = CheckDescriptorPoolRetirement(graphics)) {
 		return failure;
 	}
-	const auto tex_trigger_large  = VramBudgetTestAccess::TextureTrigger(textures);
+	const auto tex_stop_large  = VramBudgetTestAccess::TextureStop(textures);
 	const auto tex_pressure_large = VramBudgetTestAccess::TexturePressure(textures);
 	const auto tex_critical_large = VramBudgetTestAccess::TextureCritical(textures);
 
@@ -118,18 +243,28 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	textures.RunGarbageCollector();
 	buffers.RunGarbageCollector();
 
-	const auto tex_trigger_small  = VramBudgetTestAccess::TextureTrigger(textures);
+	const auto tex_stop_small  = VramBudgetTestAccess::TextureStop(textures);
 	const auto tex_pressure_small = VramBudgetTestAccess::TexturePressure(textures);
 	const auto tex_critical_small = VramBudgetTestAccess::TextureCritical(textures);
 
-	if (tex_trigger_small >= tex_trigger_large || tex_pressure_small >= tex_pressure_large ||
+	if (tex_stop_small >= tex_stop_large || tex_pressure_small >= tex_pressure_large ||
 	    tex_critical_small >= tex_critical_large) {
 		return "texture cache GC did not refresh thresholds when reported budget decreased";
 	}
-	if (tex_trigger_small != 0) {
-		return "texture cache trigger threshold was non-zero at <= 8 GiB budget";
+	if (tex_stop_small != 3 * GiB || tex_pressure_small != (18 * GiB + 4) / 5) {
+		return "unexpected eviction thresholds under the smaller budget";
 	}
 
+	const auto check_pressure = [&](uint64_t used, bool expected) {
+		VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, used);
+		textures.RunGarbageCollector();
+		return VramBudgetTestAccess::Collecting(textures) == expected;
+	};
+	if (!check_pressure(tex_pressure_small - 1, false) || !check_pressure(tex_pressure_small, true) ||
+	    !check_pressure(tex_stop_small + 1, true) || !check_pressure(tex_stop_small, false) ||
+	    !check_pressure(tex_stop_small + 1, false)) {
+		return "eviction hysteresis failed at a budget boundary";
+	}
 	vk::ImageCreateInfo recycle_info {};
 	recycle_info.imageType     = vk::ImageType::e2D;
 	recycle_info.format        = vk::Format::eR8G8B8A8Unorm;
@@ -173,6 +308,9 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 		return "test image was not registered";
 	}
 
+	info.data.address += info.data.size;
+	const auto mixed = VramBudgetTestAccess::CreateImage(textures, info);
+	VramBudgetTestAccess::MarkMixedOwnership(textures, mixed);
 	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 6 * GiB);
 	for (uint32_t i = 0; i < 4; i++) {
 		textures.RunGarbageCollector();
@@ -180,10 +318,16 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	if (VramBudgetTestAccess::IsImageRegistered(textures, id)) {
 		return "critical memory pressure did not evict a recent unused texture";
 	}
+	if (!VramBudgetTestAccess::IsImageRegistered(textures, mixed)) {
+		return "GC discarded an image with GPU writes and mixed ownership";
+	}
 	return nullptr;
 }
 
-const char* CheckVramCase(GraphicContext& graphics, uint64_t address) {
+const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool acceleration_storage) {
+	if (graphics.memory_budget_ext_enabled && graphics.GetLocalMemoryUsage().budget == 0) {
+		return "the driver reported an empty device-local memory budget";
+	}
 	VramBudgetTestAccess::SetReportedMemory(graphics, (address == 0 ? 16 : 6) * GiB, 0);
 
 	RenderContext    renderer(graphics);
@@ -193,6 +337,13 @@ const char* CheckVramCase(GraphicContext& graphics, uint64_t address) {
 	auto& textures  = renderer.GetTextureCache();
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 
+	if (address == 0) {
+		if (!VramBudgetTestAccess::CheckCommandPool(graphics, scheduler)) return "command pool retirement lost a recording";
+		if (!VramBudgetTestAccess::CheckReadbackReserve(graphics, scheduler)) return "readback retained an oversized buffer";
+		if (!VramBudgetTestAccess::CheckScratch(textures)) return "scratch did not shrink and regrow after a burst";
+		if (renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Upload).Size() != (256ull << 20)) return "upload ring capacity";
+		if (acceleration_storage && !VramBudgetTestAccess::MeasureArena(renderer)) return "acceleration storage retention";
+	}
 	const auto* failure = address == 0 ? CheckVramBudget(graphics, textures, renderer.GetBufferCache())
 	                                  : CheckGuestEviction(graphics, textures, address);
 	const auto last = scheduler.CurrentTick();
@@ -209,7 +360,7 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* unavailable = gpu.Initialize(false, true)) {
+	if (const auto* unavailable = gpu.Initialize(false, true, !guest_eviction)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n",
 		             name, required ? "FAILED" : "skipped", unavailable);
@@ -230,7 +381,7 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
 		address = reinterpret_cast<uint64_t>(guest);
 	}
 	const bool invalid_range = guest_eviction && !GuestRange {address, GuestBytes}.Valid();
-	const char* failure = invalid_range ? nullptr : CheckVramCase(gpu.graphics, address);
+	const char* failure = invalid_range ? nullptr : CheckVramCase(gpu.graphics, address, gpu.acceleration_storage);
 	if (guest_eviction && sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", name);
 		return 1;

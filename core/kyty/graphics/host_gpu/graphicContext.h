@@ -153,6 +153,7 @@ struct GraphicContext {
 		uint32_t allocations  = 0;
 		bool     device_local = false;
 	};
+	[[nodiscard]] HeapUsage GetLocalMemoryUsage() const;
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,

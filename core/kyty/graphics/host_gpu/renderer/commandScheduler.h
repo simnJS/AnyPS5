@@ -80,6 +80,7 @@ public:
 	}
 
 private:
+	friend struct VramBudgetTestAccess;
 	void QueueOperation(Common::UniqueFunction<void>&& operation);
 	void QueuePriorityOperation(Common::UniqueFunction<void>&& operation);
 	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&& operation,
@@ -102,6 +103,8 @@ private:
 
 		size_t Grow();
 		size_t Acquire(uint64_t busy_until);
+		void   TrimCompleted();
+		friend struct VramBudgetTestAccess;
 
 		GraphicContext&                m_graphics;
 		MasterSemaphore&               m_master;
@@ -109,6 +112,7 @@ private:
 		std::vector<vk::CommandBuffer> m_buffers;
 		std::vector<uint64_t>          m_ticks;
 		size_t                         m_hint = 0;
+		uint32_t                       m_acquisitions = 0;
 	};
 
 	enum class OperationState { Open, Draining, Closed };
