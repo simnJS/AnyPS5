@@ -37,9 +37,7 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
-constexpr uint64_t StaleAge      = 2048;
 constexpr uint64_t PinnedAge     = 4 * uint64_t {BufferCache::USE_SCAN_PERIOD};
-static_assert(PinnedAge < StaleAge);
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -1421,6 +1419,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
+			TouchBuffer(buffer);
 			return *owner;
 		}
 	}
@@ -3156,26 +3155,27 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::CollectStaleBuffers(uint64_t tick) {
+	static_assert(PinnedAge < StaleAge);
 	static constexpr uint64_t StalePeriod   = 8;
 	static constexpr size_t   StaleVisitMax = 64;
 	static constexpr size_t   StaleFreeMax  = 16;
-	if (tick < StaleAge || tick - m_last_stale_tick < StalePeriod) {
+	if (!m_gc_history.OldEnough<StaleAge>(tick, 0) ||
+	    !m_gc_history.OldEnough<StalePeriod>(tick, m_last_stale_tick)) {
 		return;
 	}
 	m_last_stale_tick = tick;
 	std::vector<BufferId> stale;
-	std::vector<BufferId> kept;
-	m_lru_cache.ForEachItemBelow(tick - StaleAge, [&](BufferId id) {
-		const auto& buffer = m_slot_buffers[id];
-		const bool  keep   = buffer.device_address_pinned ||
-		                  m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) ||
-		                  m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		(keep ? kept : stale).push_back(id);
-		return stale.size() == StaleFreeMax || stale.size() + kept.size() == StaleVisitMax;
-	});
-	for (const auto id: kept) {
-		m_lru_cache.Touch(m_slot_buffers[id].lru_id, tick);
+	auto it = m_buffers.lower_bound(m_next_stale_address);
+	for (size_t visited = 0; it != m_buffers.end() && visited < StaleVisitMax && stale.size() < StaleFreeMax;
+	     ++visited, ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (m_gc_history.OldEnough<StaleAge>(tick, m_lru_cache.TickOf(buffer.lru_id)) &&
+		    !buffer.device_address_pinned && !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) &&
+		    !m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			stale.push_back(it->second);
+		}
 	}
+	m_next_stale_address = it == m_buffers.end() ? 0 : it->first;
 	for (const auto id: stale) {
 		const auto& buffer = m_slot_buffers[id];
 		const auto slot =
@@ -3319,21 +3319,14 @@ uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQu
 	return deleted + SplitUnmappedBuffers(vaddr, size, free_blocks, splits);
 }
 
-uint64_t BufferCache::AdvanceGcTick() {
-	const auto now = std::chrono::steady_clock::now();
-	const auto elapsed_ms =
-	    std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_gc_time).count();
-	const uint64_t step = elapsed_ms >= 16 ? static_cast<uint64_t>(elapsed_ms) / 16 : 1;
-	if (elapsed_ms >= 16) {
-		m_last_gc_time += std::chrono::milliseconds(static_cast<int64_t>(step * 16));
-	}
-	m_gc_tick += step;
-	return m_gc_tick - 1;
+void BufferCache::RunGarbageCollector() {
+	CollectAt(std::chrono::steady_clock::now());
 }
 
-void BufferCache::RunGarbageCollector() {
+void BufferCache::CollectAt(std::chrono::steady_clock::time_point now) {
 	ServeInPlaceConversions();
-	const auto tick = AdvanceGcTick();
+	const auto tick = m_gc_tick++;
+	m_gc_history.FinishPass(tick, now);
 	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		const auto budget = m_graphics.GetTotalMemoryBudget();
@@ -3347,14 +3340,17 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
+	const auto cutoff = aggressive ? m_gc_history.Cutoff<80>(tick) : m_gc_history.Cutoff<160>(tick);
+	if (!cutoff) {
+		return;
+	}
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(*cutoff, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
-		if (buffer.device_address_pinned && m_lru_cache.TickOf(buffer.lru_id) + PinnedAge > tick) {
+		if (buffer.device_address_pinned && tick - m_lru_cache.TickOf(buffer.lru_id) < PinnedAge) {
 			return false;
 		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),

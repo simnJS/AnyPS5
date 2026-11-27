@@ -8,6 +8,7 @@
 #include "common/smallVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/cacheGcHistory.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -16,8 +17,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <bitset>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -517,10 +518,9 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	void             UpdateMemoryThresholds(uint64_t budget_bytes);
 	uint64_t         m_gc_tick                = 0;
-	std::atomic<uint64_t> m_gc_pass {0};
-	std::chrono::steady_clock::time_point m_last_gc_time KYTY_GUARDED_BY(m_lock) {
-	    std::chrono::steady_clock::now()};
-	[[nodiscard]] uint64_t AdvanceGcTick() KYTY_REQUIRES(m_lock);
+	static constexpr size_t GcDownloadAge = 80;
+	CacheGcHistory<GcDownloadAge> m_gc_history KYTY_GUARDED_BY(m_lock);
+	void CollectAt(std::chrono::steady_clock::time_point now);
 	std::atomic<uint32_t> m_partial_candidates {0};
 	uint64_t         m_image_set_epoch        = 0;
 	static constexpr uint64_t ImageSetChangeHistory = 1024;

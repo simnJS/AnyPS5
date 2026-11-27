@@ -270,6 +270,11 @@ target_include_directories(kyty_shim_compare_write_back_tests PRIVATE ${CMAKE_SO
 add_test(NAME kyty_shim_compare_write_back COMMAND kyty_shim_compare_write_back_tests)
 set_tests_properties(kyty_shim_compare_write_back PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_compare_write_back: ok")
 
+add_test_executable(kyty_shim_cache_gc_history_tests ${CMAKE_CURRENT_SOURCE_DIR}/CacheGcHistory.cpp)
+configure_host_test_executable(kyty_shim_cache_gc_history_tests)
+target_include_directories(kyty_shim_cache_gc_history_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty)
+add_test(NAME kyty_shim_cache_gc_history COMMAND kyty_shim_cache_gc_history_tests)
+
 if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ImageWriteBackAlias.cpp)
     add_test_executable(kyty_shim_image_write_back_alias_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageWriteBackAliasMain.cpp)

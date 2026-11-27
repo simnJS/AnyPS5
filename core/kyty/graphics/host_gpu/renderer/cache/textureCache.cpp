@@ -63,7 +63,6 @@ constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
 constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
 constexpr uint64_t PartialUploadMaxShare = 2;
 constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
-constexpr uint64_t GcDownloadAge = 80;
 
 void AddWrittenPages(RangeSet& written, uint64_t address, uint64_t size) {
 	const auto first = Common::AlignDown(address, TRACKER_PAGE_SIZE);
@@ -3751,7 +3750,7 @@ void TextureCache::NoteMetaFill(uint64_t address, uint64_t size, uint32_t value,
 	}
 	Common::ScopedLock pending {m_pending_meta_lock};
 	DropPendingMetaClearsLocked(address, size);
-	m_pending_meta_clears[address] = {size, m_gc_pass.load(std::memory_order_relaxed), value, in_memory, backing_stamp};
+	m_pending_meta_clears[address] = {size, m_gc_tick, value, in_memory, backing_stamp};
 	std::array<uint64_t, 64> granules {};
 	AddPendingMetaGranules(granules, address, size);
 	for (size_t word = 0; word < granules.size(); ++word) {
@@ -3939,10 +3938,9 @@ void TextureCache::ApplyPendingMetaClears(const ImageInfo& info, MetaDataInfo& m
 		}
 	}
 	const auto last = m_pending_meta_clears.lower_bound(range.End());
-	const auto pass = m_gc_pass.load(std::memory_order_relaxed);
 	for (auto it = first; slice != 0 && it != last; ++it) {
 		const auto [address, pending] = *it;
-		if (pass - pending.tick > 1 || (info.metadata.stencil_compressed && ((pending.value >> 8u) & 0x3u) != 0)) {
+		if (m_gc_tick - pending.tick > 1 || (info.metadata.stencil_compressed && ((pending.value >> 8u) & 0x3u) != 0)) {
 			continue;
 		}
 		uint64_t backing_stamp = 0;
@@ -4035,27 +4033,20 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
-uint64_t TextureCache::AdvanceGcTick() {
-	const auto now = std::chrono::steady_clock::now();
-	const auto elapsed_ms =
-	    std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_gc_time).count();
-	const uint64_t step = elapsed_ms >= 16 ? static_cast<uint64_t>(elapsed_ms) / 16 : 1;
-	if (elapsed_ms >= 16) {
-		m_last_gc_time += std::chrono::milliseconds(static_cast<int64_t>(step * 16));
-	}
-	m_gc_tick += step;
-	return m_gc_tick - 1;
+void TextureCache::RunGarbageCollector() {
+	CollectAt(std::chrono::steady_clock::now());
 }
 
-void TextureCache::RunGarbageCollector() {
+void TextureCache::CollectAt(std::chrono::steady_clock::time_point now) {
 	Common::ScopedLock lock {m_lock};
-	const uint64_t pass = m_gc_pass.fetch_add(1, std::memory_order_relaxed) + 1;
-	const uint64_t tick = AdvanceGcTick();
+	const uint64_t tick = m_gc_tick;
+	m_gc_history.FinishPass(tick, now);
 	{
 		Common::ScopedLock pending {m_pending_meta_lock};
+		++m_gc_tick;
 		for (auto it = m_pending_meta_clears.begin(); it != m_pending_meta_clears.end();) {
 			const auto next = std::next(it);
-			if (pass - it->second.tick > 1) {
+			if (m_gc_tick - it->second.tick > 1) {
 				ErasePendingMetaClearsLocked(it, next);
 			}
 			it = next;
@@ -4083,18 +4074,15 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) KYTY_REQUIRES(m_lock) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		uint64_t age        = 16;
-		size_t   deletions  = 10;
-		if (aggressive) {
-			age       = 2;
-			deletions = 40;
-		} else if (pressured) {
-			age       = 8;
-			deletions = 20;
+		size_t   deletions  = aggressive ? 40 : pressured ? 20 : 10;
+		const auto cutoff = aggressive ? m_gc_history.Cutoff<2>(tick)
+		                  : pressured  ? m_gc_history.Cutoff<8>(tick)
+		                               : m_gc_history.Cutoff<16>(tick);
+		if (!cutoff) {
+			return;
 		}
-		age = std::min(age, tick);
 		std::vector<ImageId> candidates;
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
+		m_lru_cache.ForEachItemBelow(*cutoff, [&](ImageId id) { candidates.push_back(id); });
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
@@ -4112,8 +4100,8 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->SafeToDownload() &&
-			    ((!pressured && owner->lru_tick + GcDownloadAge > tick) || owner->info.HasStencil() ||
-			     !DownloadImageMemory(id))) {
+			    ((!pressured && !m_gc_history.OldEnough<GcDownloadAge>(tick, owner->lru_tick)) ||
+			     owner->info.HasStencil() || !DownloadImageMemory(id))) {
 				continue;
 			}
 			--deletions;

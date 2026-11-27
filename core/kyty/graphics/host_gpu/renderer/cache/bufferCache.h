@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/cacheGcHistory.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/inPlaceMemory.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -199,6 +200,7 @@ public:
 	[[nodiscard]] Buffer* GetBufferIfLive(BufferId id) {
 		return IsBufferInvalid(id) ? nullptr : &m_slot_buffers[id];
 	}
+	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] bool TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr, uint64_t size);
 	void EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] static uint64_t BdaTableGeneration() noexcept { return 0; }
@@ -320,7 +322,6 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
-	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
@@ -612,8 +613,10 @@ private:
 	uint64_t m_gc_tick            = 0;
 	void     UpdateMemoryThresholds(uint64_t budget_bytes);
 	uint64_t m_last_stale_tick    = 0;
-	std::chrono::steady_clock::time_point m_last_gc_time {std::chrono::steady_clock::now()};
-	[[nodiscard]] uint64_t                AdvanceGcTick();
+	uint64_t m_next_stale_address = 0;
+	static constexpr size_t StaleAge = 2048;
+	CacheGcHistory<StaleAge> m_gc_history;
+	void CollectAt(std::chrono::steady_clock::time_point now);
 	void                                       NoteBufferRegions(const Buffer& buffer, bool insert);
 	void                                       GrowRegionTables(uint64_t region);
 	std::vector<uint32_t>                      m_region_buffer_count;

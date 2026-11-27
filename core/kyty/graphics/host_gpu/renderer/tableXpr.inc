@@ -316,7 +316,7 @@ struct RenderExecutor::TableXpr {
 	std::array<HeldBuffer, 8192> indices;
 	struct alignas(64) ResolvedBuffer {
 		std::array<uint32_t, 4> words {};
-		uint32_t                dwords = 0, special = 0;
+		uint32_t                last_touch_frame = 0, special = 0;
 		vk::DeviceAddress       device = 0;
 		uint64_t                address = 0, size = 0, cpu_epoch = 0, registration = 0;
 	};
@@ -922,7 +922,13 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		const bool held = !full && dep.proven && TableValidity(*image) == dep.validity &&
 		                  (!moved || !textures.RegistrationsSince(dep.desc.info.data.address, dep.desc.info.data.size,
 		                                                          set.resolution_epoch));
-		if (held) continue;
+		if (held) {
+			Common::ScopedLock lock {textures.m_lock};
+			auto* live = textures.m_slot_images.try_get(dep.id);
+			if (live == nullptr || live->serial != dep.serial || !live->registered) return false;
+			textures.TouchImage(*live);
+			continue;
+		}
 		if (TableRefreshPending(*image, dep.desc)) {
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
@@ -1257,6 +1263,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	auto&      upload       = buffer_cache.GetTableUploadBuffer();
 	const auto stages       = pair.programs[1] != nullptr ? 2u : 1u;
 	const auto start_epoch  = textures.StartEpoch();
+	const auto frame        = static_cast<uint32_t>(m_context.FrameNumber());
 	const auto image_starts = [&](uint64_t address) {
 		auto& known = table.no_image_start[(address * 0x9e3779b97f4a7c15ull) >> 54u];
 		if (known.first == address && known.second == start_epoch) return false;
@@ -1381,7 +1388,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					const auto [word, stride]      = word_of(words4);
 					block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
 					block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
-					block[plan.BufferDword(i) + 2] = held.dwords;
+					block[plan.BufferDword(i) + 2] = static_cast<uint32_t>(std::min<uint64_t>(held.size / 4, UINT32_MAX));
 					block[plan.BufferDword(i) + 3] = word;
 					block[plan.BufferDword(i) + 4] = stride;
 					continue;
@@ -1448,7 +1455,6 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						}
 						if (device != 0 && shared != nullptr && cpu != 0)
 							held = {.words        = words4,
-							        .dwords       = static_cast<uint32_t>(size / 4),
 							        .special      = fresh.special,
 							        .device       = device,
 							        .address      = address,
@@ -1478,18 +1484,21 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						       false;
 					if (Spec::Current() != nullptr && buffer_cache.IsRegionCpuDirty(address, size)) fresh.cpu_epoch = 0;
 					fresh.device       = owner->BufferDeviceAddress() + offset;
-					fresh.dwords       = static_cast<uint32_t>(std::min<uint64_t>(size / 4, UINT32_MAX));
+					fresh.last_touch_frame = frame;
 					fresh.address      = address;
 					fresh.size         = size;
 					fresh.registration = Spec::Current() != nullptr ? registration_before : buffer_cache.RegistrationEpoch();
 				}
 				held = fresh;
+			} else if (held.size != 0 && held.last_touch_frame != frame) {
+				(void)buffer_cache.FindBuffer(held.address, held.size);
+				held.last_touch_frame = frame;
 			}
 			if (auto* spec = Spec::Current(); spec != nullptr && held.size != 0) spec->NoteBufferRange(held.address, held.size);
 			const auto [word, stride]      = word_of(words4);
 			block[plan.BufferDword(i)]     = static_cast<uint32_t>(held.device);
 			block[plan.BufferDword(i) + 1] = static_cast<uint32_t>(held.device >> 32u);
-			block[plan.BufferDword(i) + 2] = held.dwords;
+			block[plan.BufferDword(i) + 2] = static_cast<uint32_t>(std::min<uint64_t>(held.size / 4, UINT32_MAX));
 			block[plan.BufferDword(i) + 3] = word;
 			block[plan.BufferDword(i) + 4] = stride;
 		}
@@ -1778,6 +1787,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		    cpu_epoch(held.begin, held.end - held.begin) == held.cpu_epoch &&
 		    (spec == nullptr || !spec->JournalIntersects(address, size))) {
 			if (spec != nullptr) spec_state->NoteBufferRange(address, size);
+			buffer_cache.TouchBuffer(*held.buffer);
 			return {held.buffer, held.buffer->Offset(address)};
 		}
 		held = {};
