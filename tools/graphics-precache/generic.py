@@ -33,7 +33,7 @@ def prepare_graphics(store, signatures, output):
         common.extend((f"cur={STAGE_CURSOR[stage]}", "gg"))
         static = [f"{k}={v}" if v else k for k, v in fields.items()
                   if k not in (*RESOURCES, "code", "back", "ud", "cur")]
-        shape = " ".join([stage, *common, *static])
+        shape = " ".join([stage, *common, *sorted(static)])
         raw = shape.encode()
         new_id = f"{hash64(raw, len(raw)) >> 16:012x}"
         if shapes.setdefault(new_id, shape) != shape:
@@ -41,14 +41,16 @@ def prepare_graphics(store, signatures, output):
         mapping[ident] = new_id
     if not shapes:
         raise ValueError("no graphics module recipes")
-    ready = set()
+    ready = {}
     unsupported = 0
     for line in pipelines:
         stages = pipeline_modules(line)
         if not stages or any(s not in mapping for s in stages):
             unsupported += 1
             continue
-        ready.add(remap_pipeline(line, mapping))
+        remapped = remap_pipeline(line, mapping)
+        signature = tuple(sorted(remapped.split()[1:]))
+        ready.setdefault(signature, remapped)
     if output.exists():
         raise FileExistsError(output)
     with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
@@ -60,7 +62,7 @@ def prepare_graphics(store, signatures, output):
             print("# kyty pipeline manifest v1", file=manifest)
             for ident, shape in sorted(shapes.items()):
                 print("M", ident, shape, file=manifest)
-            for line in sorted(ready):
+            for line in sorted(ready.values()):
                 print(line, file=manifest)
         root.rename(output)
     print(f"{len(mapping)} stage requests, {len(shapes)} generic modules, "
