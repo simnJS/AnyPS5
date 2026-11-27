@@ -267,15 +267,29 @@ def driver(args, binary):
                __GL_SHADER_DISK_CACHE_PATH=str(cache), MESA_SHADER_CACHE_DIR=str(cache), XDG_CACHE_HOME=str(cache))
     with args.gpu_lock.open('a') as lock, (root / 'driver.log').open('ab') as log:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        input_dirs = [manifest.parent]
+        if env.get('KYTY_RT_STATS', '0') not in ('', '0') and env.get('KYTY_NATIVE_RT') != '0':
+            profile = manifest.parent / 'rt-stats'
+            profile.mkdir(exist_ok=True)
+            for source in (manifest, manifest.parent / f'{title}_{version}.code'):
+                target = profile / source.name
+                if source.is_file():
+                    try:
+                        target.symlink_to(Path('..') / source.name)
+                    except FileExistsError:
+                        pass
+            input_dirs.append(profile)
         command = [binary, root, title, version, '28800']
         if args.modules_only:
             command.append('--modules-only')
         else:
             policy = args.denylist or binary.parent / 'driver-deny.json'
             if args.denylist or policy.exists():
-                device = excluded_device(policy, root / '_PipelineCache')
-                if device:
-                    command.extend(['--exclude-device', device])
+                for directory in input_dirs:
+                    device = excluded_device(policy, directory)
+                    if device:
+                        command.extend(['--exclude-device', device])
+                        break
         return run_guarded(command, root, log, env=env)
 
 
