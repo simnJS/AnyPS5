@@ -1644,14 +1644,6 @@ bool BufferCache::SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_writte
 	    },
 	    [&]() noexcept {
 		    const auto source = UploadCopies(copies, total_size);
-		    if (uploaded != nullptr) {
-			    for (const auto& copy: copies) {
-				    const auto address = m_storage->GuestAddress(copy.dstOffset);
-				    const auto first = std::max(address, vaddr);
-				    const auto last = std::min<uint64_t>(address + copy.size, vaddr + size);
-				    if (first < last) uploaded->Add(first, last - first);
-			    }
-		    }
 		    RecordUpload(copies, source);
 		    copies.clear();
 		    total_size = 0;
