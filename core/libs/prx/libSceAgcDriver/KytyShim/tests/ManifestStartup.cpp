@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/manifestAdmission.h"
 #include "graphics/host_gpu/renderer/pipeline/manifestStartup.h"
 
 #include <array>
@@ -84,30 +85,115 @@ void VideoWait() {
 	Check(wait.ReleaseReason(start + 900s) == "timed out", "progress cannot extend the maximum wait");
 }
 
-void MemoryPause() {
-	constexpr uint64_t GiB = uint64_t {1} << 30;
-	const auto now = ManifestMemoryPause::Clock::time_point {};
+void MemoryAdmission() {
+	constexpr uint64_t GiB = ManifestAdmission::GiB;
+	constexpr size_t   Words = 150'000;
+	const auto start = ManifestAdmission::Clock::time_point {};
 	const auto first = std::this_thread::get_id();
 	std::thread second_thread([] {});
 	const auto second = second_thread.get_id();
 	second_thread.join();
-	for (const auto total: {16 * GiB, 32 * GiB}) {
-		const auto low = std::min(12 * GiB, total / 2);
-		const auto high = std::min(14 * GiB, total / 12 * 7);
-		ManifestMemoryPause memory;
-		memory.Sample(now, total, low);
-		Check(memory.Admit(now, first), "work starts at the low threshold");
-		memory.Sample(now, total, low - 1);
-		Check(!memory.Admit(now + 29s, first), "work pauses below the low threshold");
-		memory.Sample(now + 30s, total, high);
-		Check(memory.Admit(now + 30s, first), "a persistent pause admits one worker");
-		Check(!memory.Admit(now + 31s, second), "other workers wait under pressure");
-		Check(memory.Admit(now + 31s, first), "a worker can finish its nested pipeline work");
-		memory.Finished(first);
-		Check(memory.Admit(now + 31s, second), "the next worker can make progress");
-		memory.Sample(now + 32s, total, high + 1);
-		Check(memory.Admit(now + 32s, first), "all workers resume above the high threshold");
+
+	ManifestAdmission admission(28);
+	admission.Sample(start, {.total = 60 * GiB, .available = 40 * GiB, .process = 4 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	Check(admission.Reserve() == 12 * GiB, "a fifth of the memory stays free, at most 12 GiB");
+	std::vector<uint64_t> running;
+	while (const auto ticket = admission.Admit(start, Words, true, first, start)) running.push_back(*ticket);
+	const auto fits = static_cast<size_t>((40 - 12) * GiB / admission.Estimate(Words, true));
+	Check(running.size() == fits, "compilations are admitted while their estimates fit above the reserve");
+	Check(admission.MemoryBlocked(), "the next compilation waits for memory");
+
+	admission.Sample(start + 5s, {.total = 60 * GiB, .available = 30 * GiB, .process = 14 * GiB, .busy_cpus = 20.0, .cpus = 32});
+	Check(!admission.Admit(start + 5s, Words, true, first, start), "memory taken by admitted compilations is not counted twice");
+
+	admission.Sample(start + 10s, {.total = 60 * GiB, .available = 6 * GiB, .process = 20 * GiB, .busy_cpus = 20.0, .cpus = 32});
+	for (auto time = start + 10s; time < start + 40s; time += 1s) {
+		Check(!admission.Admit(time, 1, false, first, start + 10s), "no translation is admitted under the reserve");
+		Check(!admission.Admit(time, Words, true, second, start + 10s), "no compilation is admitted under the reserve");
 	}
+	Check(admission.Running() == running.size(), "running compilations are never suspended");
+	for (const auto ticket: running) admission.Finish(ticket);
+	Check(admission.Running() == 0, "running compilations finish under memory pressure");
+	running.clear();
+
+	const auto low = start + 60s;
+	admission.Sample(low, {.total = 60 * GiB, .available = 6 * GiB, .process = 4 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	const auto alone = admission.Admit(low, Words, true, first, low);
+	Check(alone.has_value(), "under the reserve one compilation runs alone when it fits in what is available");
+	Check(!admission.Admit(low, Words, true, second, low), "only one compilation runs under the reserve");
+	admission.Finish(*alone);
+
+	admission.Sample(low + 1s, {.total = 60 * GiB, .available = 2 * GiB, .process = 4 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	Check(!admission.Admit(low + 1s, Words, true, first, low + 1s), "nothing starts when even one compilation does not fit");
+	Check(!admission.Admit(low + 30s, Words, true, first, low + 1s), "nothing starts for 30 s when even one does not fit");
+	const auto lone = admission.Admit(low + 31s, Words, true, first, low + 1s);
+	Check(lone.has_value(), "one compilation runs alone after 30 s so that work never stops");
+	Check(!admission.Admit(low + 32s, Words, true, second, low + 1s), "and only one");
+	admission.Finish(*lone);
+
+	admission.Sample(low + 40s, {.total = 60 * GiB, .available = 30 * GiB, .process = 4 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	Check(admission.Admit(low + 40s, Words, true, second, low + 40s).has_value(), "work resumes when memory comes back");
+	admission.Close();
+	Check(!admission.Admit(low + 41s, 1, false, first, low + 41s) && admission.LastRefusal() == ManifestAdmission::Refusal::Closed,
+	      "a closed admission takes no new work");
+}
+
+void CpuAdmission() {
+	constexpr uint64_t GiB = ManifestAdmission::GiB;
+	const auto now = ManifestAdmission::Clock::time_point {};
+	const auto id = std::this_thread::get_id();
+	ManifestAdmission admission(28);
+	admission.Sample(now, {.total = 60 * GiB, .available = 50 * GiB, .process = 1 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	Check(admission.CpuCap() == 28, "an idle machine runs as many compilations as the limit");
+	Check(admission.Admit(now, 1, false, id, now) && admission.Admit(now, 1, false, id, now), "two translations start");
+	admission.Sample(now + 1s, {.total = 60 * GiB, .available = 50 * GiB, .process = 1 * GiB, .busy_cpus = 30.0, .cpus = 32});
+	Check(admission.CpuCap() == 3, "threads busy elsewhere lower the cap, one CPU stays spare");
+	Check(admission.Admit(now + 1s, 1, false, id, now + 1s).has_value(), "the third compilation fits the free CPUs");
+	Check(!admission.Admit(now + 1s, 1, false, id, now + 1s) && admission.LastRefusal() == ManifestAdmission::Refusal::Cpu,
+	      "the fourth waits for a free CPU");
+	admission.Sample(now + 2s, {.total = 60 * GiB, .available = 50 * GiB, .process = 1 * GiB, .busy_cpus = 34.0, .cpus = 32});
+	Check(admission.CpuCap() == 1, "a saturated machine still keeps one compilation");
+}
+
+void LearnedEstimate() {
+	constexpr uint64_t GiB = ManifestAdmission::GiB;
+	const auto now = ManifestAdmission::Clock::time_point {};
+	const auto id = std::this_thread::get_id();
+	ManifestAdmission admission(4);
+	admission.Sample(now, {.total = 60 * GiB, .available = 50 * GiB, .process = 2 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	const auto before = admission.Estimate(100'000, true);
+	Check(admission.Estimate(100'000, false) == ManifestAdmission::LightBytes, "a translation has a fixed estimate");
+	Check(admission.Estimate(1, true) == ManifestAdmission::MinDriverBytes, "a driver compilation needs at least 1 GiB");
+	Check(admission.Estimate(1'000'000'000, true) == 15 * GiB, "an estimate never exceeds a quarter of the memory");
+	const auto ticket = admission.Admit(now, 100'000, true, id, now);
+	Check(ticket.has_value(), "a compilation starts");
+	admission.Sample(now + 10s, {.total = 60 * GiB, .available = 42 * GiB, .process = 10 * GiB, .busy_cpus = 1.0, .cpus = 32});
+	admission.Finish(*ticket);
+	Check(admission.Estimate(100'000, true) > before, "an observed peak raises the estimate");
+	const auto quick = admission.Admit(now + 11s, 100'000, true, id, now + 11s);
+	const auto learned = admission.Estimate(100'000, true);
+	admission.Finish(*quick);
+	Check(admission.Estimate(100'000, true) == learned, "a compilation shorter than a sample teaches nothing");
+}
+
+void LargeJobsDoNotStarve() {
+	constexpr uint64_t GiB = ManifestAdmission::GiB;
+	const auto start = ManifestAdmission::Clock::time_point {};
+	const auto big = std::this_thread::get_id();
+	std::thread other_thread([] {});
+	const auto small = other_thread.get_id();
+	other_thread.join();
+	ManifestAdmission admission(28);
+	admission.Sample(start, {.total = 60 * GiB, .available = 20 * GiB, .process = 1 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	const auto running = admission.Admit(start, 1, true, small, start);
+	Check(running.has_value(), "a small compilation runs");
+	Check(!admission.Admit(start + 59s, 2'000'000, true, big, start), "a large compilation waits for room");
+	Check(admission.Admit(start + 59s, 1, true, small, start + 59s).has_value(), "small work passes before the wait is long");
+	Check(!admission.Admit(start + 60s, 2'000'000, true, big, start) && admission.Reserved().has_value(),
+	      "after a minute the large compilation reserves its room");
+	Check(!admission.Admit(start + 60s, 1, true, small, start + 60s), "small work no longer passes the reservation");
+	admission.Sample(start + 63s, {.total = 60 * GiB, .available = 20 * GiB, .process = 1 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	Check(!admission.Reserved().has_value(), "a reservation its owner no longer renews expires");
 }
 
 void GenericRefusalSkipsPipelines() {
@@ -168,7 +254,10 @@ int main() {
 	ManifestDiscovery();
 	ModuleScheduling();
 	VideoWait();
-	MemoryPause();
+	MemoryAdmission();
+	CpuAdmission();
+	LearnedEstimate();
+	LargeJobsDoNotStarve();
 	GenericRefusalSkipsPipelines();
 	return 0;
 }

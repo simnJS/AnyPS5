@@ -1914,9 +1914,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
                              const std::filesystem::path&           shader_store, bool compile_compute_pipelines,
-                             size_t large_manifest_workers)
+                             size_t large_manifest_workers, size_t manifest_workers)
     : m_graphics(graphics), m_image_heap(image_heap), m_compile_compute_pipelines(compile_compute_pipelines),
-      m_large_manifest_workers(large_manifest_workers),
+      m_large_manifest_workers(large_manifest_workers), m_manifest_workers(manifest_workers),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	const bool driver_cache_restored = InitializeDriverCache();
