@@ -36,6 +36,10 @@ GuestHostView::GuestHostView(GraphicContext& graphics, CommandScheduler& schedul
     : m_graphics(graphics), m_scheduler(scheduler), m_staging(staging), m_base(base), m_size(size),
       m_alignment(graphics.host_pointer_alignment) {
 	if (size == 0) return;
+	m_chunks.resize((size + (uint64_t {1} << ChunkBits) - 1) >> ChunkBits);
+	m_root = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, TableUsage,
+	                                  m_chunks.size() * sizeof(uint64_t));
+	m_root->Fill(0, m_root->Size(), 0);
 	const char* missing = nullptr;
 	if (!graphics.external_memory_host_enabled) {
 		missing = "the device has no VK_EXT_external_memory_host";
@@ -59,10 +63,7 @@ GuestHostView::GuestHostView(GraphicContext& graphics, CommandScheduler& schedul
 		    missing));
 		return;
 	}
-	m_chunks.resize((size + (uint64_t {1} << ChunkBits) - 1) >> ChunkBits);
-	m_root = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, TableUsage,
-	                                  m_chunks.size() * sizeof(uint64_t));
-	m_root->Fill(0, m_root->Size(), 0);
+	m_enabled = true;
 }
 
 GuestHostView::~GuestHostView() {

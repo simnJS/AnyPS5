@@ -170,6 +170,7 @@ struct EmitterState {
 	std::vector<uint32_t>                           memory_byte_sizes;
 	std::vector<uint32_t>                           memory_strides;
 	uint32_t                                         fault_buffer_variable   = 0;
+	std::array<uint32_t, 4>                          mirror_metadata {};
 	uint32_t                                         bda_pointer_function    = 0;
 	bool                                             converged_calls         = false;
 	std::unordered_set<const IR::Inst*>             pair_shared;
@@ -672,6 +673,8 @@ void EmitProgram(EmitterState& state);
 
 uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent, bool in_page = false);
 uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset);
+void DeclareMirrorMetadata(EmitterState& state);
+void StoreMirrorMetadata(EmitterState& state);
 uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t size, uint32_t extent, bool in_page);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBdaLoads(EmitterState& state);
