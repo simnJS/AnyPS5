@@ -10,6 +10,8 @@ from session import pipeline_modules, read_manifest, subset_store
 
 
 def prepare_graphics(store, signatures, output):
+    if store.suffix != ".code":
+        raise ValueError("expected a .code shader store")
     with signatures.open() as source:
         if source.readline().rstrip() != "# kyty pipeline manifest v1":
             raise ValueError("unsupported pipeline manifest")
@@ -53,8 +55,8 @@ def prepare_graphics(store, signatures, output):
         root = Path(tmp) / "prepared"
         cache = root / "_PipelineCache"
         cache.mkdir(parents=True)
-        subset_store(store, cache / "offline_1.code", codes)
-        with (cache / "offline_1.kpm").open("x") as manifest:
+        subset_store(store, cache / store.name, codes)
+        with (cache / (store.stem + ".graphics.kpm")).open("x") as manifest:
             print("# kyty pipeline manifest v1", file=manifest)
             for ident, shape in sorted(shapes.items()):
                 print("M", ident, shape, file=manifest)

@@ -285,7 +285,8 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 	return result;
 }
 
-uint32_t ImageTableSlot(EmitterState& state, const IR::ImageResource& image, uint32_t key) {
+uint32_t ImageTableSlot(EmitterState& state, uint32_t resource, uint32_t key) {
+	const auto& image = state.program.info.images.at(resource);
 	const auto LoadTableMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, state.flattened_srt_pointer,
@@ -297,14 +298,18 @@ uint32_t ImageTableSlot(EmitterState& state, const IR::ImageResource& image, uin
 	};
 	const auto entry    = Binary(state, spv::OpBitwiseAnd, TypeU32(state), key,
 	                             ConstantU32(state, image.table_entry_mask));
-	const auto count    = LoadTableMapping(ConstantU32(state, image.table_mapping_offset));
+	const auto base = state.program.generic_graphics
+	                      ? EmitShaderDataDwordLoad(state, state.program.bindings.ImageBankDword() + resource)
+	                      : ConstantU32(state, image.table_mapping_offset);
+	const auto first = state.program.generic_graphics ? EmitAddU32(state, base, ConstantU32(state, 1u))
+	                                                 : ConstantU32(state, image.table_mapping_offset + 1u);
+	const auto count    = LoadTableMapping(base);
 	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), entry, count);
 	const auto clamped  = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), clamped, in_range, entry,
 	                          ConstantU32(state, 0));
 	const auto mapped =
-	    LoadTableMapping(Binary(state, spv::OpIAdd, TypeU32(state), clamped,
-	                            ConstantU32(state, image.table_mapping_offset + 1u)));
+	    LoadTableMapping(Binary(state, spv::OpIAdd, TypeU32(state), clamped, first));
 	const auto slot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, in_range, mapped,
 	                          ConstantU32(state, 0));
@@ -313,14 +318,15 @@ uint32_t ImageTableSlot(EmitterState& state, const IR::ImageResource& image, uin
 }
 
 uint32_t ImageTableElement(ValueEmitContext& ctx, const IR::Inst& inst,
-                           const IR::ImageResource& image, uint32_t key_override = 0u) {
+                           uint32_t resource, uint32_t key_override = 0u) {
 	auto&       state  = ctx.state;
+	const auto& image = state.program.info.images.at(resource);
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0 ||
 	    image.table_descriptor_base == UINT32_MAX) {
 		ctx.Fail(inst, "has no image table runtime mapping");
 	}
-	return ImageTableSlot(state, image, key_override != 0u ? key_override : ctx.Def(handle->Arg(0)));
+	return ImageTableSlot(state, resource, key_override != 0u ? key_override : ctx.Def(handle->Arg(0)));
 }
 
 uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
@@ -714,8 +720,13 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	auto& state = ctx.state;
 	if (view == IR::ImageResource::NoIndirectImage) view = ctx.Memory(inst).resource;
 	const auto& image = state.program.info.images.at(view);
-	if (image.table_capacity != 0u) return emit(view, ImageTableElement(ctx, inst, image, key_override));
+	if (image.table_capacity != 0u) return emit(view, ImageTableElement(ctx, inst, view, key_override));
 	if (image.indirect_root != view) return emit(view, 0u);
+	if (state.program.generic_graphics) {
+		const auto bank = EmitShaderDataDwordLoad(state, state.program.bindings.ImageBankDword() + view);
+		return EmitIndexSwitch(state, bank, static_cast<uint32_t>(image.indirect_resources.size()), result_type,
+		                       [&](uint32_t index) { return emit(image.indirect_resources[index], 0u); });
+	}
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	const auto* source = image.source < state.program.descriptor_sources.size()
 	                         ? &state.program.descriptor_sources[image.source]
@@ -1507,7 +1518,7 @@ uint32_t EmitImageTableSampleLod(ValueEmitContext& ctx, const IR::Inst& sample, 
 	const auto  samplers = LoadImageSamplers(ctx, sample);
 	const auto& sampler  = samplers[0];
 	const auto  sampled  = MakeSampledImage(state, mem.resource, sampler.id, 0u,
-	                                        ImageTableSlot(state, image, key), sampler.dynamic);
+	                                        ImageTableSlot(state, mem.resource, key), sampler.dynamic);
 	const auto  coord    = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), coord, u, v);
 	const auto texel = state.builder.AllocateId();

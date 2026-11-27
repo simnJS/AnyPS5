@@ -46,9 +46,11 @@ void ManifestDiscovery() {
 	write(primary);
 	write(shared);
 	write(versioned_compute);
+	const auto graphics = folders[0] / "fixture_1.graphics.kpm";
+	write(graphics);
 	Check(FindManifestFiles(folders, "fixture", "fixture_1") ==
-	          std::vector {primary, shared, packaged_compute, versioned_compute},
-	      "primary and shared manifests preserve priority and both compute manifests are loaded");
+	          std::vector {primary, shared, packaged_compute, graphics, versioned_compute},
+	      "primary and shared manifests preserve priority and compute and graphics sidecars are loaded");
 	fs::remove_all(root);
 }
 

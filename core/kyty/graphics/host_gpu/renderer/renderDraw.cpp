@@ -1791,11 +1791,12 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
                                             const DrawCallInfo& draw,
-                                            DrawRenderState&    state) {
+                                            DrawRenderState&    state, bool prefer_generic) {
+	m_prepared_graphics_pipeline = nullptr;
 	if (!shaders_resolved) {
 		m_context.GetImageHeap().BeginDraw();
 		const auto begin = Common::SteadyNs();
-		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state, prefer_generic);
 		Bump(g_execute_resolve.here_ns[0], Common::SteadyNs() - begin);
 		Bump(g_execute_resolve.here[0][static_cast<size_t>(m_execute_cause)]);
 	}
@@ -1854,6 +1855,27 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 	}
 
 	state.ps_plain = state.ps_active && RecordsNoMipStats(state.ps_input_info.stage);
+	const auto generic_stage = [](const ShaderStageRuntime& stage) {
+		return stage.module && stage.module->info.bindings.generic_graphics;
+	};
+	const bool generic = (state.ps_active && generic_stage(state.ps_input_info.stage)) ||
+	    std::ranges::any_of(state.VertexStages(), generic_stage, &ShaderVertexInputInfo::stage);
+	if (generic) {
+		m_prepared_graphics_pipeline =
+		    m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, *m_draw_targets, false, false, true);
+		if (m_prepared_graphics_pipeline != nullptr) return true;
+		const auto topology = state.topology;
+		const auto restart = state.primitive_restart_enable;
+		const auto offsets = state.indirect_offsets;
+		const bool indirect = state.indirect_draw;
+		ResetDrawRenderState(state, state.VertexStages().size() == 3);
+		state.topology = topology;
+		state.primitive_restart_enable = restart;
+		state.indirect_offsets = offsets;
+		state.indirect_draw = indirect;
+		m_draw_resource_key = 0;
+		return PrepareDrawRenderState(buffer, false, draw, state, false);
+	}
 	return true;
 }
 
@@ -2109,9 +2131,11 @@ static uint64_t DrawTemplateKey(uint64_t resource_key, const void* pipeline, con
 }
 
 static uint64_t DrawStateTemplateKey(uint64_t state_key, const DrawTargets& targets, const DrawRenderState& state) {
-	std::array<uint64_t, 2 + RENDER_COLOR_ATTACHMENTS_MAX + 1> words {};
+	std::array<uint64_t, 6 + RENDER_COLOR_ATTACHMENTS_MAX + 1> words {};
 	size_t                                                     count = 0;
 	words[count++] = state_key;
+	for (const auto& vertex: state.VertexStages()) words[count++] = vertex.stage.module->id;
+	words[count++] = state.ps_active ? state.ps_input_info.stage.module->id : 0u;
 	words[count++] = static_cast<uint64_t>(state.topology) | uint64_t {state.primitive_restart_enable} << 32u |
 	                 uint64_t {state.ps_plain} << 33u | uint64_t {targets.color_count} << 40u;
 	for (uint32_t i = 0; i < targets.color_count; i++) {
@@ -2193,14 +2217,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	}
 
-	auto* const pipeline_ptr =
-	    state_template != nullptr && state_template->pipeline != nullptr
-	        ? static_cast<PipelineCache::Pipeline*>(state_template->pipeline)
-	        : m_context.GetPipelineCache().GetGraphicsPipeline(
-	              buffer, state, *m_draw_targets,
-	              Config::AsyncPipelinesEnabled() &&
-	                  DrawOnlyChangesPicture(m_context, state, *m_draw_targets, vertex_stages) &&
-	                  !SmallColorTargetDraw(buffer.GetRegisters()));
+	auto* pipeline_ptr = m_prepared_graphics_pipeline;
+	if (pipeline_ptr == nullptr && state_template != nullptr) {
+		pipeline_ptr = static_cast<PipelineCache::Pipeline*>(state_template->pipeline);
+	}
+	if (pipeline_ptr == nullptr) {
+		pipeline_ptr = m_context.GetPipelineCache().GetGraphicsPipeline(
+		    buffer, state, *m_draw_targets,
+		    Config::AsyncPipelinesEnabled() && DrawOnlyChangesPicture(m_context, state, *m_draw_targets, vertex_stages) &&
+		        !SmallColorTargetDraw(buffer.GetRegisters()));
+	}
 	if (pipeline_ptr == nullptr) {
 		return;
 	}

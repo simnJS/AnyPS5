@@ -62,6 +62,7 @@ struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
+	std::vector<uint32_t>        graphics_image_banks;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<ImageTableSnapshotPtr> image_tables;
 	std::vector<uint32_t>        user_data;

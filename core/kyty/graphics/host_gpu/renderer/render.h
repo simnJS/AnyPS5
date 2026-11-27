@@ -560,7 +560,7 @@ private:
 	                                                      const ShaderIndirectOffsets& indirect_offsets,
 	                                                      bool indirect_draw);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
-	                                          const DrawCallInfo& draw, DrawRenderState& state);
+	                                          const DrawCallInfo& draw, DrawRenderState& state, bool prefer_generic = true);
 	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
 	                                       const DrawIndexBufferSource& index_source);
@@ -605,6 +605,7 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	DrawTargets                           m_targets;
 	DrawTargets*                          m_draw_targets = &m_targets;
+	PipelineCache::Pipeline*              m_prepared_graphics_pipeline = nullptr;
 	PreparedBindings                     m_compute_bindings;
 	std::shared_ptr<RayTracingCheck>     m_rt_check;
 	std::shared_ptr<WaveSplitCheck>      m_split_check;

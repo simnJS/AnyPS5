@@ -2975,6 +2975,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocati
 			prepared.uniform_buffers[resource.uniform_index] = view;
 		}
 	}
+	if (layout.format_count != 0) {
+		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
+			const auto& buffer = program.info.buffers[i];
+			if (buffer.formatted && buffer.descriptor_index < layout.format_count)
+				prepared.shader_data[layout.FormatDword() + buffer.descriptor_index] = snapshot.buffers[i].dwords[3];
+		}
+	}
+	if (layout.image_bank_count != 0) {
+		EXIT_IF(snapshot.graphics_image_banks.size() < layout.image_bank_count);
+		std::copy_n(snapshot.graphics_image_banks.begin(), layout.image_bank_count,
+		            prepared.shader_data.begin() + layout.ImageBankDword());
+	}
 	if (layout.stride_count != 0u) {
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto index = program.info.buffers[i].descriptor_index;

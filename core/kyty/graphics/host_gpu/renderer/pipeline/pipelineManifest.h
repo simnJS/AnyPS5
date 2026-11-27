@@ -47,6 +47,7 @@ struct ManifestModule {
 	uint32_t push_data_cursor = 0;
 	bool runtime_buffers      = false;
 	bool runtime_samplers     = false;
+	bool generic_graphics     = false;
 	std::variant<ShaderVertexInputInfo, ShaderPixelInputInfo, ShaderComputeInputInfo> input;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	bool from_assets = false;

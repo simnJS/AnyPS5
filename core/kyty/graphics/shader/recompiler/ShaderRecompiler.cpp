@@ -809,7 +809,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			                              options.shader_hash, empty, intersections));
 		}
 	}
-	IR::TrackResources(ir, *tracked, native_cfg, options.input_info, options.runtime_buffer_descriptors,
+	IR::TrackResources(ir, *tracked, native_cfg, options.input_info,
+	                   options.runtime_buffer_descriptors || options.generic_graphics,
 	                   options.runtime_sampler_descriptors);
 	TranslateResult result;
 	result.bvh = bvh ? ShaderBvh::Bvh4 : bvh8 ? ShaderBvh::Bvh8Only : ShaderBvh::None;
@@ -829,6 +830,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	const auto* stage = StageName(ir.stage);
+	ir.generic_graphics = options.generic_graphics;
 	const auto sampler_count = IR::ApplyResourceSpecialization(ir, specialization, options.sampler_limit);
 	if (sampler_count > options.sampler_limit) return {.required_samplers = sampler_count};
 	if (options.table_mode) {
@@ -859,7 +861,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&
-				                (ir.info.images[resource].indirect_root == resource ||
+				                ((!ir.generic_graphics && ir.info.images[resource].indirect_root == resource) ||
 				                 ir.info.images[resource].table_capacity != 0u) ? 1u : 0u;
 			} else if (op == IR::ValueOpcode::GetSamplerResource) {
 				const auto resource = inst.Flags<uint32_t>();

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStoreFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -152,6 +153,68 @@ void GraphicsStageDataRoundTrips() {
     Bindings restored;
     Io(reader, restored);
     Require(reader.ok && reader.bytes.empty() && restored == layout, "stored clip-plane layout changed");
+}
+
+void GenericStageDataRoundTrips() {
+    Bindings layout;
+    layout.stride_count = 3;
+    layout.generic_graphics = true;
+    layout.format_count = 2;
+    layout.image_bank_count = 7;
+    layout.clip_plane_dwords = 4;
+    Writer writer;
+    IoAll(writer, layout);
+    Reader reader{writer.bytes};
+    Bindings restored;
+    IoAll(reader, restored);
+    Require(reader.ok && reader.bytes.empty() && restored.generic_graphics && restored.stride_count == 3 &&
+            restored.format_count == 2 && restored.image_bank_count == 7 &&
+            restored.ClipPlaneDword() == layout.ClipPlaneDword() &&
+            restored.ShaderDataDwords() == layout.ShaderDataDwords(), "generic stage ABI did not round trip");
+    ResourcePlan plan;
+    plan.resource_tracking_complete = true;
+    plan.srt_plan_complete = true;
+    plan.srt_user_data = 2;
+    const std::array<uint32_t, 2> words{4, 7};
+    SrtRuntime runtime{.user_data = words};
+    ResourceSnapshot snapshot;
+    snapshot.graphics_image_banks.push_back(1);
+    snapshot.specialization_reads.emplace_back(0, 4);
+    ResourceSpecialization live;
+    live.images.emplace_back();
+    Require(MaterializeGenericGraphics(plan, runtime, snapshot, live, {}) && live.images.empty() &&
+            snapshot.graphics_image_banks.empty() && snapshot.specialization_reads.empty() &&
+            std::ranges::equal(snapshot.user_data, words), "register-only stage retained an earlier draw");
+    runtime.user_data = {};
+    Require(!MaterializeGenericGraphics(plan, runtime, snapshot, live, {}), "missing stage registers were accepted");
+}
+
+void GenericSampledImageBanks() {
+    ResourcePlan plan;
+    plan.stage = ShaderType::Pixel;
+    plan.resource_tracking_complete = true;
+    plan.srt_plan_complete = true;
+    plan.descriptor_sources.emplace_back();
+    auto& image = plan.info.images.emplace_back();
+    image.source = 0;
+    image.resource_class = ImageResourceClass::Sampled;
+    image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    ResourceSpecialization shape;
+    Require(GenericGraphicsShape(plan, shape) && shape.images.size() == 3, "missing typed sampled image banks");
+    for (size_t bank = 0; bank < shape.images.size(); ++bank) {
+        ResourceSpecialization live;
+        live.images.push_back(shape.images.front());
+        live.images.front().indirect_root = ImageResource::NoIndirectImage;
+        live.images.front().numeric_class = shape.images[bank].numeric_class;
+        ResourceSnapshot snapshot;
+        snapshot.images.resize(1);
+        snapshot.images[0].dwords[0] = 9;
+        Require(BindGenericGraphics(plan, snapshot, live, shape), "typed view refused");
+        Require(snapshot.images.size() == 3 && snapshot.graphics_image_banks.size() == 1 &&
+                snapshot.graphics_image_banks[0] == bank, "wrong per-draw bank");
+        for (size_t i = 0; i < snapshot.images.size(); ++i)
+            Require(snapshot.images[i].dwords[0] == (i == bank ? 9u : 0u), "descriptor bound to the wrong bank");
+    }
 }
 
 void TableGraphicsModuleRoundTrips() {
@@ -310,6 +373,8 @@ int main() {
     InstructionOutsideThePlanRefusesThePlan();
     RefusedPlanAbandonsTheStoreEntry();
     GraphicsStageDataRoundTrips();
+    GenericStageDataRoundTrips();
+    GenericSampledImageBanks();
     TableGraphicsModuleRoundTrips();
     NativeGraphicsRequiresExactTableStages();
     StoredComputeModuleSelection();

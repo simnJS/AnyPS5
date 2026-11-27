@@ -17,6 +17,13 @@ for source in "$tool/Precache.cpp" "$tool/ComputeRecipe.cpp" "$shim/src/Config.c
     "${CXX:-g++-14}" "${defs[@]}" "${inc[@]}" -O2 -DNDEBUG -std=c++20 -fPIE -c "$source" -o "$object"
     objects+=("$object")
 done
-cp "$build/core/libs/libs/unpatched/libc.prx" "$out/libc.prx"
-"${CXX:-g++-14}" -O2 -Wl,--gc-sections -Wl,--no-as-needed -fPIE -pie "${objects[@]}" '-Wl,-rpath,$ORIGIN' -L"$out" -l:libc.prx "$build/core/kyty/libkyty_gpu.a" -ldl -lpthread -o "$out/kyty_precache.new"
+cp "$build/core/libs/libs/unpatched/libc.prx" "$build/core/libs/libs/unpatched/libkernel.prx" "$out/"
+archives=("$build/core/kyty/libkyty_gpu.a")
+if grep -qx 'KYTY_THIN_LTO:BOOL=OFF' "$build/core/kyty/CMakeCache.txt"; then
+    archives+=("$build/core/kyty/libzarchive.a")
+    for lib in fmt/libfmt.a xxHash/libxxhash.a tracy/libTracyClient.a SPIRV-Tools/source/opt/libSPIRV-Tools-opt.a SPIRV-Tools/source/libSPIRV-Tools.a zstd/lib/libzstd.a; do
+        archives+=("$build/core/kyty/3rdparty/$lib")
+    done
+fi
+"${CXX:-g++-14}" -O2 -Wl,--gc-sections -Wl,--no-as-needed -fPIE -pie "${objects[@]}" '-Wl,-rpath,$ORIGIN' -L"$out" -l:libc.prx "${archives[@]}" -l:libkernel.prx -ldl -lpthread -o "$out/kyty_precache.new"
 mv "$out/kyty_precache.new" "$out/kyty_precache"

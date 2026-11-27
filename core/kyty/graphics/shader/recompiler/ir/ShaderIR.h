@@ -646,6 +646,9 @@ struct Bindings {
 	uint32_t clip_plane_dwords   = 0;
 	uint32_t mip_stats_count = 0;
 	uint32_t stride_count = 0;
+	uint32_t format_count = 0;
+	uint32_t image_bank_count = 0;
+	bool generic_graphics = false;
 	bool     flattened_srt_uniform = false;
 	uint32_t flattened_srt_uniform_index = UINT32_MAX;
 
@@ -658,7 +661,9 @@ struct Bindings {
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
 	}
 	[[nodiscard]] uint32_t StrideDword() const { return MipStatsDword() + mip_stats_count; }
-	[[nodiscard]] uint32_t TableBlockDword() const { return StrideDword() + stride_count; }
+	[[nodiscard]] uint32_t FormatDword() const { return StrideDword() + stride_count; }
+	[[nodiscard]] uint32_t ImageBankDword() const { return FormatDword() + format_count; }
+	[[nodiscard]] uint32_t TableBlockDword() const { return ImageBankDword() + image_bank_count; }
 	[[nodiscard]] uint32_t ClipPlaneDword() const { return TableBlockDword() + table_block_dwords; }
 	[[nodiscard]] uint32_t ShaderDataDwords() const { return ClipPlaneDword() + clip_plane_dwords; }
 	[[nodiscard]] bool UsesPushData() const {
@@ -1046,6 +1051,7 @@ struct Program: ResourcePlan {
 	bool                          scalar_cache_invalidates = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
+	bool                          generic_graphics = false;
 	bool                          table_mode = false;
 	TablePlan                     table_plan;
 

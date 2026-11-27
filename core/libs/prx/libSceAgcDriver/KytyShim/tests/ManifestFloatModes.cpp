@@ -57,6 +57,26 @@ std::string Replace(std::string text, std::string_view from, std::string_view to
 	return text;
 }
 
+void GenericGraphicsRecipes() {
+	auto manifest = DrawManifest();
+	for (auto& module: manifest.modules) module.generic_graphics = true;
+	const auto text = Text(SaveManifest(manifest));
+	PipelineManifest loaded;
+	uint32_t skipped = 0;
+	Check(LoadManifest(Bytes(text), loaded, &skipped) && skipped == 0 && loaded.modules.size() == 2 &&
+	      loaded.pipelines.size() == 1, "generic graphics signatures round trip");
+	for (auto& module: loaded.modules) {
+		Check(module.generic_graphics, "generic mode retained");
+		const auto generic = ManifestModuleIdentity(module, {});
+		module.generic_graphics = false;
+		Check(generic != ManifestModuleIdentity(module, {}), "exact and generic identities differ");
+	}
+	for (const auto invalid: {" gg rb", " gg rs", " gg sb=-", " gg si=-", " gg ss=-"}) {
+		Check(LoadManifest(Bytes(Replace(text, " gg", invalid)), loaded, &skipped) && skipped != 0 &&
+		      loaded.pipelines.empty(), "an incompatible generic stage cannot link a pipeline");
+	}
+}
+
 void RoundTrip() {
 	const auto text = Text(SaveManifest(DrawManifest()));
 	Check(text.find(" fv=c0.0.1") != std::string::npos, "the vertex stage's float mode is written");
@@ -157,6 +177,7 @@ void StageRegisters() {
 }
 
 int main() {
+	GenericGraphicsRecipes();
 	RoundTrip();
 	OlderManifest();
 	OlderGraphicsCursors();

@@ -550,11 +550,12 @@ void PipelineCache::DecideRuntimeStrides(std::span<PipelineManifest*> manifests)
 
 const ShaderModule* PipelineCache::FindCompiledModule(
     const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-    uint32_t push_data_cursor) const {
+    uint32_t push_data_cursor, bool generic_graphics) const {
 	const auto entry = m_program_cache.find(key);
 	if (entry == m_program_cache.end()) {
 		return nullptr;
 	}
+	if (generic_graphics) return entry->second.GenericModule(push_data_cursor);
 	for (const auto& module: entry->second.modules) {
 		const auto& layout = module.info.bindings;
 #if defined(ANYPS5_KYTY)
@@ -583,6 +584,7 @@ PipelineCache::ProgramKey PipelineCache::ManifestProgramKey(const ManifestModule
 	} else {
 		key.static_state = StaticKey(record);
 	}
+	if (record.generic_graphics) key.static_state.push_back(GenericGraphicsKey);
 	if (record.runtime_buffers) key.static_state.push_back(RuntimeBuffersKey);
 	if (record.runtime_samplers) key.static_state.push_back(RuntimeSamplersKey);
 	return key;
@@ -698,30 +700,53 @@ void PipelineCache::OpenManifest() {
 				pipeline.from_assets = true;
 			}
 		}
-		std::vector<uint32_t> indices(loaded.modules.size());
-		for (size_t i = 0; i < loaded.modules.size(); i++) {
-			auto& module = loaded.modules[i];
-			SetHostInput(module);
-			const auto [found, inserted] =
-			    state.module_index.try_emplace(ManifestModuleIdentity(module, StaticKey(module)),
-			                                   static_cast<uint32_t>(all.modules.size()));
-			if (inserted) {
-				all.modules.push_back(std::move(module));
-			}
-			indices[i] = found->second;
-		}
-		for (auto& pipeline: loaded.pipelines) {
-			for (auto& stage: pipeline.stages) {
-				stage = stage == ManifestPipeline::NoStage ? stage : indices[stage];
-			}
+		const auto add_module = [&](ManifestModule&& module) {
+			const auto [found, inserted] = state.module_index.try_emplace(
+			    ManifestModuleIdentity(module, StaticKey(module)), static_cast<uint32_t>(all.modules.size()));
+			if (inserted) all.modules.push_back(std::move(module));
+			return found->second;
+		};
+		const auto add_pipeline = [&](const ManifestPipeline& pipeline) {
 			const auto [found, inserted] = state.pipeline_index.try_emplace(
 			    ManifestPipelineIdentity(pipeline), static_cast<uint32_t>(all.pipelines.size()));
 			if (inserted) {
 				all.pipelines.push_back(pipeline);
-			} else if (MergeFloatModes(all.pipelines[found->second].float_modes, pipeline.float_modes)
-			               .mixed) {
+			} else if (MergeFloatModes(all.pipelines[found->second].float_modes, pipeline.float_modes).mixed) {
 				state.mixed_float_modes.insert(found->second);
 			}
+		};
+		std::vector<uint32_t> indices(loaded.modules.size());
+		std::vector<uint32_t> generic_indices(loaded.modules.size(), ManifestPipeline::NoStage);
+		for (size_t i = 0; i < loaded.modules.size(); i++) {
+			auto& module = loaded.modules[i];
+			SetHostInput(module);
+			if (warm && !module.generic_graphics && (module.stage == ShaderType::Vertex ||
+			    module.stage == ShaderType::Pixel || module.stage == ShaderType::Mesh)) {
+				ManifestModule generic {.stage = module.stage, .code_hash = module.code_hash,
+				    .back_hash = module.back_hash, .user_data_count = module.user_data_count,
+				    .push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsStageCursor(module.stage),
+				    .generic_graphics = true, .input = module.input};
+				generic_indices[i] = add_module(std::move(generic));
+			}
+			const bool generic = module.generic_graphics;
+			indices[i] = add_module(std::move(module));
+			if (generic) generic_indices[i] = indices[i];
+		}
+		for (auto& pipeline: loaded.pipelines) {
+			auto candidate = pipeline;
+			bool all_generic = true;
+			for (size_t slot = 0; slot < pipeline.stages.size(); ++slot) {
+				auto& stage = pipeline.stages[slot];
+				if (stage == ManifestPipeline::NoStage) continue;
+				candidate.stages[slot] = generic_indices[stage];
+				all_generic &= candidate.stages[slot] != ManifestPipeline::NoStage;
+				stage = indices[stage];
+			}
+			if (all_generic && candidate.stages != pipeline.stages) {
+				candidate.from_assets = false;
+				add_pipeline(candidate);
+			}
+			add_pipeline(pipeline);
 		}
 		for (const auto& layout: loaded.tessellation_layouts) {
 			if (state.layout_keys.insert(layout.first).second) {
@@ -875,7 +900,7 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 			for (const auto i: new_modules) {
 				const auto& record = loaded.modules[i];
 				const auto* hit = FindCompiledModule(ManifestProgramKey(record, false),
-				                                     record.specialization, record.push_data_cursor);
+				                                     record.specialization, record.push_data_cursor, record.generic_graphics);
 				if (hit && native && record.stage == ShaderType::Compute && hit->info.info.ray_query &&
 				    !FindCompiledModule(ManifestProgramKey(record, true), record.specialization, record.push_data_cursor)) {
 					continue;
@@ -3033,6 +3058,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	}
 	const auto key = ManifestProgramKey(record, guest_traversal, compute);
 	std::visit([&](const auto& info) { options = StageCompileOptions(info); }, input);
+	options.generic_graphics = record.generic_graphics;
 	options.runtime_buffer_descriptors = record.runtime_buffers;
 	options.runtime_sampler_descriptors = record.runtime_samplers;
 	options.shader_hash        = key.hash;
@@ -3122,7 +3148,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	auto                specialization = record.specialization;
 	const ShaderModule* compiled       = nullptr;
 	LockPrograms();
-	compiled = FindCompiledModule(key, specialization, record.push_data_cursor);
+	compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics);
 	UnlockPrograms();
 	if (compiled != nullptr) {
 		finish(compiled, false);
@@ -3138,15 +3164,16 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			return;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-		if (!ShaderRecompiler::IR::ResourceSpecializationFits(translated.program,
-		                                                      record.specialization)) {
+		plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		if (record.generic_graphics) {
+			if (!ShaderRecompiler::IR::GenericGraphicsShape(*plan, specialization)) return;
+		} else if (!ShaderRecompiler::IR::ResourceSpecializationFits(translated.program, record.specialization)) {
 			return;
 		}
-		plan            = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		if (record.stage == ShaderType::Compute && RuntimeStride(key.hash)) {
 			ShaderRecompiler::IR::ReadStridesAtRunTime(*plan, specialization);
 			LockPrograms();
-			compiled = FindCompiledModule(key, specialization, record.push_data_cursor);
+			compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics);
 			UnlockPrograms();
 			if (compiled != nullptr) {
 				return;
@@ -3154,11 +3181,13 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		}
 #if defined(ANYPS5_KYTY)
 		const auto recorded = specialization;
-		ShaderRecompiler::IR::ShareNullBufferVariants(
-		    *plan, specialization, record.stage == ShaderType::Compute && RuntimeStride(key.hash));
+		if (!record.generic_graphics) {
+			ShaderRecompiler::IR::ShareNullBufferVariants(
+			    *plan, specialization, record.stage == ShaderType::Compute && RuntimeStride(key.hash));
+		}
 		if (specialization != recorded) {
 			LockPrograms();
-			compiled = FindCompiledModule(key, specialization, record.push_data_cursor);
+			compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics);
 			UnlockPrograms();
 			if (compiled != nullptr) {
 				return;
@@ -3185,7 +3214,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			    m_program_cache.try_emplace(key, Program {.resource_plan = std::move(*plan)}).first;
 		}
 		auto& program = entry->second;
-		compiled      = FindCompiledModule(key, specialization, record.push_data_cursor);
+		compiled      = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics);
 		if (compiled != nullptr || program.skip_dispatch || program.call_source != nullptr) {
 			DestroyModule(*module);
 		} else {
@@ -3442,7 +3471,9 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 	                       .push_data_cursor = push_data_cursor,
 	                       .runtime_buffers  = options.runtime_buffer_descriptors,
 	                       .runtime_samplers = options.runtime_sampler_descriptors,
-	                       .specialization   = module.specialization};
+	                       .generic_graphics = options.generic_graphics,
+	                       .specialization   = options.generic_graphics ? ShaderRecompiler::IR::ResourceSpecialization {}
+	                                                                   : module.specialization};
 	if (!options.back_code.empty()) {
 		record.code_hash = XXH3_64bits(code.data(), code.size_bytes());
 		record.back_hash = XXH3_64bits(options.back_code.data(), options.back_code.size_bytes());

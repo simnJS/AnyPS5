@@ -407,6 +407,15 @@ void DefineDescriptors(EmitterState& state) {
 	    })) {
 		bindings.stride_count = counts[static_cast<size_t>(Kind::Buffers)];
 	}
+	bindings.generic_graphics = state.program.generic_graphics;
+	if (bindings.generic_graphics) {
+		if (std::ranges::any_of(info.buffers, &IR::BufferResource::formatted))
+			bindings.format_count = buffer_count;
+		for (uint32_t i = 0; i < info.images.size(); ++i) {
+			if (info.images[i].indirect_root == i || info.images[i].table_capacity != 0)
+				bindings.image_bank_count = i + 1;
+		}
+	}
 	bindings.table_block_dwords = table ? 2u : 0u;
 	bindings.clip_plane_dwords = 4u * std::bit_width(state.user_clip_planes);
 	bindings.push_data_start_dword =

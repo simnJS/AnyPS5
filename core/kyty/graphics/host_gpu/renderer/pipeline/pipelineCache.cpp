@@ -1504,6 +1504,14 @@ void PipelineCache::WidenComputeVariant(const ProgramKey& key, Program& program,
 }
 #endif
 
+const ShaderModule* PipelineCache::Program::GenericModule(uint32_t cursor) const {
+	if (modules.empty()) return nullptr;
+	const auto& module = modules.front();
+	const auto& layout = module.info.bindings;
+	return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(cursor, layout.ShaderDataDwords())
+	           ? &module : nullptr;
+}
+
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetRuntimeBufferProgram(const ShaderParams& params, InputInfo& input_info,
                                                            uint32_t& push_data_cursor) {
@@ -1524,7 +1532,7 @@ const ShaderModule* PipelineCache::GetRuntimeSamplerProgram(const ShaderParams& 
 
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
-                                              uint32_t& push_data_cursor) {
+                                              uint32_t& push_data_cursor, bool prefer_generic) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -1554,6 +1562,23 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	const bool runtime_samplers = m_runtime_samplers;
 	if (runtime_samplers) {
 		m_lookup_key.static_state.push_back(RuntimeSamplersKey);
+	}
+	if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		if (prefer_generic && !runtime_buffers && !runtime_samplers) {
+			m_lookup_key.static_state.push_back(GenericGraphicsKey);
+			const auto found = m_program_cache.find(m_lookup_key);
+			m_lookup_key.static_state.pop_back();
+			if (found != m_program_cache.end()) {
+				auto& program = found->second;
+				const auto* module = program.GenericModule(push_data_cursor);
+				if (module && ShaderRecompiler::IR::MaterializeGenericGraphics(program.resource_plan, runtime,
+				        program.resources, program.specialization, module->specialization)) {
+					input_info.stage = {.module = module, .resources = &program.resources};
+					module->info.bindings.AdvancePushData(push_data_cursor);
+					return module;
+				}
+			}
+		}
 	}
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
@@ -1725,7 +1750,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	const GuestClockHold clock_hold;
 	if (WaitForCompile(m_lookup_key)) {
-		return GetProgram(params, input_info, push_data_cursor);
+		return GetProgram(params, input_info, push_data_cursor, prefer_generic);
 	}
 
 #if defined(ANYPS5_KYTY)
@@ -2161,9 +2186,9 @@ void PipelineCache::WriteDriverCache() {
 	                 Common::PathToString(m_driver_cache_path));
 }
 
-void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state, bool prefer_generic) {
 	ResolveGraphicsPrograms(command.GetRegisters(), command.GetUserConfig(), command.GetShaders(),
-	                        state, nullptr);
+	                        state, nullptr, prefer_generic);
 }
 
 bool PipelineCache::GetGraphicsProgramsAhead(const HW::Context&    context,
@@ -2187,7 +2212,7 @@ struct PipelineCache::ChainJob {
 bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
                                             const HW::UserConfig& user_config,
                                             const HW::Shader& shaders, DrawRenderState& state,
-                                            ProgramResolution* ahead) KYTY_NO_THREAD_SAFETY_ANALYSIS {
+                                            ProgramResolution* ahead, bool prefer_generic) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 	const auto& sh                = context.GetShaderRegisters();
 	const auto& vertex_regs       = shaders.GetVs();
 	const auto& pixel_regs        = shaders.GetPs();
@@ -2597,7 +2622,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	}
 	if (pixel_active) {
 		auto push_data_cursor = PushData::GraphicsStageCursor(ShaderType::Pixel);
-		const auto* pixel_module = GetProgram(pixel_params, pixel_info, push_data_cursor);
+		const auto* pixel_module = GetProgram(pixel_params, pixel_info, push_data_cursor, prefer_generic);
 		if (pixel_module == nullptr) {
 			vertex_info[0].stage = {};
 			return true;
@@ -2612,7 +2637,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		auto push_data_cursor = PushData::GraphicsStageCursor(vertex_info[i].logical_stage);
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, prefer_generic);
 	}
 	return true;
 }
@@ -2634,9 +2659,17 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	BuildStageStaticKey(input_info, key.static_state);
 	const bool unlocked = t_ahead_unlocked;
 	Program*   program  = nullptr;
+	const ShaderModule* generic = nullptr;
 	{
 		const ProgramLockMaybe lock(m_program_lock, unlocked);
-		const auto             entry = m_program_cache.find(key);
+		auto entry = m_program_cache.end();
+		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			key.static_state.push_back(GenericGraphicsKey);
+			entry = m_program_cache.find(key);
+			key.static_state.pop_back();
+			if (entry != m_program_cache.end()) generic = entry->second.GenericModule(push_data_cursor);
+		}
+		if (!generic) entry = m_program_cache.find(key);
 		if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
 #if defined(ANYPS5_KYTY)
 			if (!m_speculative_failed_programs.contains(key)) {
@@ -2667,7 +2700,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	auto&      resources      = ahead.resources[stage_index];
 	auto&      specialization = ahead.specializations[stage_index];
 	ahead.plans[stage_index] = &program->resource_plan;
-	ahead.reads.SetStage(stage_index, &program->resource_plan);
+	ahead.reads.SetStage(stage_index, generic ? nullptr : &program->resource_plan);
 	const auto pending_write = t_ahead_guest_writes.writes.empty() ? nullptr : AheadPendingWrite;
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = std::span(params.user_data).first(params.user_data_count),
@@ -2691,8 +2724,11 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
 	ShaderRecompiler::IR::SrtAroundLoadsOfThread().clear();
 #endif
-	if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
-	                                                specialization)) {
+	const bool materialized = generic
+	    ? ShaderRecompiler::IR::MaterializeGenericGraphics(program->resource_plan, runtime, resources,
+	                                                       specialization, generic->specialization)
+	    : ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources, specialization);
+	if (!materialized) {
 		ahead.reads.Fail(AheadRefusal::Materialize);
 		return nullptr;
 	}
@@ -2703,6 +2739,11 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	ahead.reads.NoteAroundLoads(ShaderRecompiler::IR::SrtAroundLoadsOfThread());
 #endif
 	NoteAheadWrites(program->resource_plan, resources);
+	if (generic) {
+		input_info.stage = {.module = generic, .resources = &resources};
+		generic->info.bindings.AdvancePushData(push_data_cursor);
+		return generic;
+	}
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		return layout.push_data_start_dword ==
@@ -3871,7 +3912,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
                                                             const DrawRenderState& state,
                                                             const DrawTargets&     targets,
                                                             bool                   allow_async,
-                                                            bool                   native_bindings) {
+                                                            bool                   native_bindings, bool ready_only) {
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
@@ -4157,7 +4198,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const uint64_t stall_hash = stages[3] != nullptr ? stages[3]->info.shader_hash : stages[0]->info.shader_hash;
 	std::optional<GuestClockHold> async_wait_hold;
 #endif
-	if (m_async_handoff) {
+	if (m_async_handoff || ready_only) {
 #if defined(ANYPS5_KYTY)
 		if (allow_async && m_async_threads.empty()) {
 			sync_why = "no-threads";
@@ -4187,6 +4228,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				NoteFloatModes(ready, key, command.GetShaders());
 				return &ready;
 			}
+			if (ready_only) return nullptr;
 			if (!m_async_pending_graphics.contains(key)) {
 				if (!allow_async || m_async_failed_graphics.contains(key)) {
 #if defined(ANYPS5_KYTY)

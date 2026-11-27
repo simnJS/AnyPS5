@@ -45,6 +45,7 @@ inline std::vector<std::filesystem::path> FindManifestFiles(std::span<const std:
 	append(folders.back() / (stem + ".shared.kpm"));
 	for (const auto& folder: folders) {
 		append(folder / (stem + ".compute.kpm"));
+		append(folder / (stem + ".graphics.kpm"));
 	}
 	return files;
 }
