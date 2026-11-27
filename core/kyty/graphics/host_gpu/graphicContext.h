@@ -161,6 +161,7 @@ struct GraphicContext {
 
 private:
 	friend struct VramBudgetTestAccess;
+	friend struct VramTimeAgingTestAccess;
 	bool     m_memory_override_enabled = false;
 	uint64_t m_memory_budget_override  = 0;
 	uint64_t m_memory_usage_override   = 0;
