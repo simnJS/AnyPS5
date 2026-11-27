@@ -73,8 +73,12 @@ DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master
 
 DescriptorHeap::~DescriptorHeap() {
 	m_graphics.device.destroyDescriptorPool(m_current_pool.pool, nullptr);
-	for (const auto& [set, pool]: m_persistent_pools) {
-		m_graphics.device.destroyDescriptorPool(pool, nullptr);
+	for (const auto& [set, entry]: m_persistent_pools) {
+		m_graphics.device.destroyDescriptorPool(entry.pool, nullptr);
+	}
+	for (const auto& entry: m_retired_persistent_pools) {
+		m_master_semaphore.Wait(entry.tick);
+		m_graphics.device.destroyDescriptorPool(entry.pool, nullptr);
 	}
 	for (const auto& [pool, tick]: m_pending_pools) {
 		m_master_semaphore.Wait(tick);
@@ -126,7 +130,42 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	return large_batch.sets[--large_batch.size];
 }
 
+void DescriptorHeap::RetirePersistent(vk::DescriptorSet set, uint64_t tick) {
+	if (!set) {
+		return;
+	}
+	const auto found = m_persistent_pools.find(set);
+	if (found == m_persistent_pools.end()) {
+		return;
+	}
+	auto entry = found->second;
+	entry.tick = tick;
+	m_persistent_pools.erase(found);
+	m_retired_persistent_pools.push_back(entry);
+}
+
 vk::DescriptorSet DescriptorHeap::CommitPersistent(vk::DescriptorSetLayout layout) {
+	if (!m_retired_persistent_pools.empty()) {
+		if (!m_master_semaphore.IsFree(m_retired_persistent_pools.front().tick)) {
+			m_master_semaphore.Refresh();
+		}
+		for (auto it = m_retired_persistent_pools.begin();
+		     it != m_retired_persistent_pools.end();) {
+			if (!m_master_semaphore.IsFree(it->tick)) {
+				++it;
+				continue;
+			}
+			if (it->layout == layout) {
+				auto entry = *it;
+				entry.tick = 0;
+				m_retired_persistent_pools.erase(it);
+				m_persistent_pools.emplace(entry.set, entry);
+				return entry.set;
+			}
+			m_graphics.device.destroyDescriptorPool(it->pool, nullptr);
+			it = m_retired_persistent_pools.erase(it);
+		}
+	}
 	const auto&                  sizes = LayoutSizes(layout);
 	vk::DescriptorPoolCreateInfo create {};
 	create.maxSets       = 1;
@@ -141,7 +180,7 @@ vk::DescriptorSet DescriptorHeap::CommitPersistent(vk::DescriptorSetLayout layou
 	allocate.pSetLayouts        = &layout;
 	vk::DescriptorSet set;
 	EXIT_IF(m_graphics.device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
-	m_persistent_pools.emplace(set, pool);
+	m_persistent_pools.emplace(set, PersistentPool {pool, set, layout, 0});
 	return set;
 }
 
@@ -149,7 +188,7 @@ void DescriptorHeap::ReleasePersistent(vk::DescriptorSet set) {
 	if (set) {
 		const auto pool = m_persistent_pools.find(set);
 		EXIT_IF(pool == m_persistent_pools.end());
-		m_graphics.device.destroyDescriptorPool(pool->second, nullptr);
+		m_graphics.device.destroyDescriptorPool(pool->second.pool, nullptr);
 		m_persistent_pools.erase(pool);
 	}
 }
