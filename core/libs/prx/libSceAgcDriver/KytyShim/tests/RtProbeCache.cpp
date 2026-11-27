@@ -88,7 +88,7 @@ void WriteText(const std::filesystem::path& path, const std::string& content) {
 void WriteSurveyFixture(const std::filesystem::path& directory) {
     constexpr std::array driven{0xf19c8f01u, 0x00000008u, 0xe0700000u, 0x80000000u, 0xbefe047eu, 0xbf810000u};
     constexpr std::array cacheOnly{0xf19c8f01u, 0x00000010u, 0xe0700000u, 0x80000000u, 0xbefe037eu, 0xbf810000u};
-    constexpr std::array stopping{0x7e100500u, 0xf4080100u, 0x10000000u, 0xf19c8f01u, 0x00000018u, 0xe0600000u, 0x80010000u, 0xbf810000u};
+    constexpr std::array stopping{0x7e100500u, 0xf4080100u, 0x10000000u, 0xf19c8f01u, 0x00000018u, 0xe2100000u, 0x80010000u, 0xbf810000u};
     constexpr std::array plain{0xbf810000u};
     constexpr std::array absent{0xbf800000u, 0xbf810000u};
     constexpr std::array metadata{0xffffffffu, 2u};
