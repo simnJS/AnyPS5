@@ -255,7 +255,7 @@ inline Lookup ExpectedSlot(const Directory& directory, std::span<const uint32_t>
 	               std::span(job.kinds).first(std::min(job.arm_count, MaxArms)));
 }
 
-inline void AddJob(std::vector<Job>& jobs, std::vector<uint32_t>& groups, Job job) {
+inline void PushJob(std::vector<Job>& jobs, std::vector<uint32_t>& groups, Job job) {
 	if (job.end <= job.begin) return;
 	job.first_group = static_cast<uint32_t>(groups.size());
 	groups.insert(groups.end(), (uint64_t {job.end} - job.begin + GroupProbes - 1u) / GroupProbes,

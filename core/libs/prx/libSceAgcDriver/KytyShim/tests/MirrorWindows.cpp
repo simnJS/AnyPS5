@@ -734,10 +734,11 @@ const char* CheckDispatch(GraphicContext& graphics, uint64_t address) {
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 	auto* mirror = renderer.GetBufferCache().GetGuestMirror();
 	const auto block = mirror->BlockSize();
-	const auto boundary = Common::AlignUp(address + block, block);
+	const auto window = Common::AlignUp(address + block, GuestMirror::WindowSize);
+	const auto boundary = window + block;
 	const auto end = address + GuestBytes;
-	if (boundary + 3 * block > end) {
-		g_skipped = "the dispatch fixture needs four sparse blocks";
+	if (window - block < address || boundary + 3 * block > end) {
+		g_skipped = "the dispatch fixture needs four sparse blocks after a mirror window boundary";
 		return nullptr;
 	}
 

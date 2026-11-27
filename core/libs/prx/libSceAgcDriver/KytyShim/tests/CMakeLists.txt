@@ -1049,6 +1049,16 @@ add_dependencies(kyty_shim_bda_load_forms_tests agc_frame_replay)
 add_test(NAME kyty_shim_bda_load_forms COMMAND kyty_shim_bda_load_forms_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_bda_load_forms PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_bda_load_forms: ok")
+add_test_executable(kyty_shim_indirect_buffer_stores_tests ${CMAKE_CURRENT_SOURCE_DIR}/IndirectBufferStores.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_indirect_buffer_stores_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_indirect_buffer_stores_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_indirect_buffer_stores_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_indirect_buffer_stores_tests)
+add_dependencies(kyty_shim_indirect_buffer_stores_tests agc_frame_replay)
+add_test(NAME kyty_shim_indirect_buffer_stores COMMAND kyty_shim_indirect_buffer_stores_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_indirect_buffer_stores PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_indirect_buffer_stores: ok")
 add_test_executable(kyty_shim_bda_pointer_chase_tests ${CMAKE_CURRENT_SOURCE_DIR}/BdaPointerChase.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
 target_include_directories(kyty_shim_bda_pointer_chase_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
@@ -1100,7 +1110,7 @@ set_tests_properties(kyty_shim_cross_queue_recycled_label_own_tick PROPERTIES TI
         PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_recycled_label: ok")
 if(WIN32)
     set_property(TEST kyty_shim_buffer_null_range kyty_shim_uniform_scalar_replay kyty_shim_empty_buffer_replay
-            kyty_shim_empty_buffer_replay_off kyty_shim_bda_load_forms
+            kyty_shim_empty_buffer_replay_off kyty_shim_bda_load_forms kyty_shim_indirect_buffer_stores
             kyty_shim_generic_compute_replay kyty_shim_generic_compute_replay_wide
             kyty_shim_bda_submission_sync kyty_shim_indexed_buffer_reads
             kyty_shim_cross_queue_compute_waits_graphics_data kyty_shim_cross_queue_graphics_waits_compute_data

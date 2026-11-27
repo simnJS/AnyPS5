@@ -102,6 +102,8 @@ struct WriteBlockStats {
 	std::atomic<uint64_t> other {0};
 	std::atomic<uint64_t> already_open {0};
 	std::atomic<uint64_t> command_image {0};
+	std::atomic<uint64_t> address_bytes {0};
+	std::atomic<uint64_t> address_cpu_dirty_bytes {0};
 	std::atomic<int64_t>  last_line {0};
 };
 
@@ -608,6 +610,14 @@ void BufferCache::LogWriteBlockSummary() {
 	const auto textures = TrackingSpinLock::TakeContention(SpinLockClass::Textures);
 	const auto others   = TrackingSpinLock::TakeContention(SpinLockClass::Other);
 	const auto seconds  = static_cast<double>(now - last) / 1e9;
+	const auto address  = stats.address_bytes.exchange(0, std::memory_order_relaxed);
+	const auto dirty    = stats.address_cpu_dirty_bytes.exchange(0, std::memory_order_relaxed);
+	if (address != 0) {
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-address-writes] summary of the last {:.0f} s: {:.1f} MiB of resident mirror pages written by shaders through "
+		    "device addresses when the write bitmap was read, {:.1f} MiB of them already written by the CPU since\n",
+		    seconds, static_cast<double>(address) / (1 << 20), static_cast<double>(dirty) / (1 << 20)));
+	}
 	if (tracker.waits + pagelock.waits + textures.waits + others.waits != 0) {
 		::Log::WriteToConsoleAndLog(fmt::format(
 		    "[kyty-locks] summary of the last {:.0f} s: contended acquisitions of a TrackingSpinLock and time spent waiting: "
@@ -3178,13 +3188,18 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size, HeapWriteSource w
 	const auto written = [&](uint64_t start, uint64_t finish) {
 		m_guest_mirror->Use(start, finish - start);
 		NoteWrite(start, finish - start, writer);
+		uint64_t marked = 0;
 		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(start, finish - start, [&](uint64_t page, uint64_t bytes) {
 			const auto first = std::max(page, start);
 			const auto last  = std::min(page + bytes, finish);
+			marked += last - first;
 			if (m_gpu_modified_ranges.Add(first, last - first)) {
 				NoteGpuModifiedChange(first, last - first, true);
 			}
 		});
+		g_write_block_stats.address_bytes.fetch_add(finish - start, std::memory_order_relaxed);
+		g_write_block_stats.address_cpu_dirty_bytes.fetch_add(finish - start - std::min(marked, finish - start),
+		                                                      std::memory_order_relaxed);
 	};
 	m_guest_mirror->ForEachRequested(vaddr, size, [&](uint64_t start, uint64_t finish) {
 		uint64_t run = UINT64_MAX;

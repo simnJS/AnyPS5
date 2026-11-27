@@ -90,12 +90,12 @@ struct MemoryInfo {
 		       !typed && !formatted && data_bits == 32u;
 	}
 
+	[[nodiscard]] bool HasIndirectTypedFormat() const {
+		const auto format = Format::DecodeTBufferFormat(data_format, number_format);
+		return formatted && data_bits == 32u && Format::GetFormatComponentType(format) != Format::ComponentType::Unknown;
+	}
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		if (typed) {
-			const auto format = Format::DecodeTBufferFormat(data_format, number_format);
-			if (!formatted || data_bits != 32u || Format::GetFormatComponentType(format) == Format::ComponentType::Unknown)
-				return false;
-		}
+		if (typed && !HasIndirectTypedFormat()) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&
@@ -110,12 +110,15 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
-		return !formatted && !typed && data_bits == 32u &&
+		if (formatted || typed) return false;
+		if (data_bits == 8u) return opcode == ValueOpcode::StoreBufferU8;
+		if (data_bits == 16u) return opcode == ValueOpcode::StoreBufferU16;
+		return data_bits == 32u &&
 		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
 		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
 	}
 	[[nodiscard]] bool SupportsIndirectFormattedStore(ValueOpcode opcode) const {
-		return formatted && !typed && data_bits == 32u &&
+		return formatted && data_bits == 32u && (!typed || HasIndirectTypedFormat()) &&
 		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
 		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
 	}

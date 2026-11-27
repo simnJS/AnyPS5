@@ -5442,7 +5442,7 @@ private:
 			    (memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::IndirectBuffer)) {
 				return false;
 			}
-			if (memory.SupportsIndirectBufferWrite(op)) {
+			if (memory.SupportsIndirectBufferWrite(op) || memory.SupportsIndirectFormattedStore(op)) {
 				written = true;
 			} else if (!memory.SupportsIndirectBufferLoad(op)) {
 				return false;
@@ -5708,8 +5708,8 @@ private:
 					Fail(flags.pc, fmt::format(
 					    "buffer descriptor is not a valid runtime value for {} ({}-bit, typed={}, formatted={}); "
 					    "GPU-selected access requires a scalar, raw 8/16-bit, raw DWORD x1..x4, or 32-bit "
-					    "formatted load with a supported format, or a raw DWORD store or 32-bit integer atomic "
-					    "from a user-data base",
+					    "formatted load with a supported format, or a raw 8/16-bit or DWORD store, a 32-bit "
+					    "formatted or typed store or a 32-bit integer atomic from a user-data base",
 					    ValueOpcodeName(op), memory.data_bits, memory.typed, memory.formatted));
 				}
 				if (handle && buffer == BufferAccess::Read) NoteIndexedBufferReads(*handle);
