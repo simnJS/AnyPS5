@@ -1340,6 +1340,28 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
+template <typename Write>
+void WriteThroughGuest(EmitterState& state, uint32_t aligned, uint32_t bda, Write&& write) {
+	const auto u64        = TypeU64(state);
+	const auto boolean    = TypeBool(state);
+	const auto guest_base = LoadMirrorMetadata64(state, 8);
+	const auto size       = LoadMirrorMetadata64(state, 16);
+	const auto offset     = Binary(state, spv::OpISub, u64, aligned, guest_base);
+	const auto inside     = AndCondition(state, BdaAddressRepresentable(state, aligned),
+	                                     AndCondition(state, Binary(state, spv::OpUGreaterThanEqual, boolean, aligned, guest_base),
+	                                                  Binary(state, spv::OpULessThan, boolean, offset, size)));
+	const auto host = EmitValueOrDefaultIfCondition(state, inside, u64, ConstantU64(state, 0), [&] {
+		return EmitGuestHostAddress(state, offset, size, ConstantU32(state, sizeof(uint32_t)), true);
+	});
+	const auto through = AndCondition(state, Binary(state, spv::OpINotEqual, boolean, host, ConstantU64(state, 0)),
+	                                  Binary(state, spv::OpINotEqual, boolean, host, bda));
+	EmitIfCondition(state, through, [&]() {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, host);
+		write(pointer);
+	});
+}
+
 void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value) {
 	auto& state = ctx.state;
 	if (state.converged_calls) {
@@ -1352,6 +1374,9 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uin
 			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda);
 			constexpr uint32_t alignment = sizeof(uint32_t);
 			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask, alignment);
+			WriteThroughGuest(state, aligned, bda, [&](uint32_t host) {
+				state.builder.AddFunction(spv::OpStore, host, value, spv::MemoryAccessAlignedMask, alignment);
+			});
 			RecordBdaWrite(state, BdaPageIndex(state, aligned));
 		});
 		return;
@@ -1369,6 +1394,9 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uin
 			constexpr uint32_t alignment = sizeof(uint32_t);
 			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
 			                          alignment);
+			WriteThroughGuest(state, aligned, bda, [&](uint32_t host) {
+				state.builder.AddFunction(spv::OpStore, host, value, spv::MemoryAccessAlignedMask, alignment);
+			});
 			RecordBdaWrite(state, BdaPageIndex(state, aligned));
 		});
 	});
@@ -1510,6 +1538,12 @@ void MergeBdaBits(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint
 			                          Unary(state, spv::OpNot, u, mask));
 			state.builder.AddFunction(spv::OpAtomicOr, u, state.builder.AllocateId(), pointer, scope, relaxed,
 			                          bits_in_place);
+			WriteThroughGuest(state, aligned, bda, [&](uint32_t host) {
+				state.builder.AddFunction(spv::OpAtomicAnd, u, state.builder.AllocateId(), host, scope, relaxed,
+				                          Unary(state, spv::OpNot, u, mask));
+				state.builder.AddFunction(spv::OpAtomicOr, u, state.builder.AllocateId(), host, scope, relaxed,
+				                          bits_in_place);
+			});
 			RecordBdaWrite(state, BdaPageIndex(state, aligned));
 		});
 	};
@@ -1585,6 +1619,8 @@ uint32_t AtomicIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto pointer = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda);
 				const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				WriteThroughGuest(state, aligned, bda,
+				                  [&](uint32_t host) { (void)EmitAtomicOperation(ctx, inst, host, spv::ScopeDevice); });
 				EmitAtomicMemoryBarrier(state, IR::ResourceKind::IndirectBuffer);
 				RecordBdaWrite(state, BdaPageIndex(state, aligned));
 				return old;
