@@ -82,6 +82,12 @@ bool IndirectSamplerMaterializationFailed();
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shape);
+bool MaterializeGenericGraphics(const ResourcePlan& plan, const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                                ResourceSpecialization& live, const ResourceSpecialization& generic);
+bool BindGenericGraphics(const ResourcePlan& plan, ResourceSnapshot& snapshot,
+                         const ResourceSpecialization& live, const ResourceSpecialization& generic);
+
 bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
                           const ResourceSpecialization::Buffer& buffer);
 void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization);

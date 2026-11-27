@@ -771,6 +771,7 @@ std::string ModuleText(ManifestModule& module) {
 	w.Dec("cur", module.push_data_cursor, 0u);
 	w.Flag("rb", module.runtime_buffers);
 	w.Flag("rs", module.runtime_samplers);
+	w.Flag("gg", module.generic_graphics);
 	if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&module.input)) {
 		VisitVertexInput(w, *vertex, std::get<ShaderVertexInputInfo>(base.input));
 	} else if (auto* pixel = std::get_if<ShaderPixelInputInfo>(&module.input)) {
@@ -804,6 +805,9 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 	if (stage == ShaderType::Compute) module.push_data_cursor = cursor;
 	r.Flag("rb", module.runtime_buffers);
 	r.Flag("rs", module.runtime_samplers);
+	r.Flag("gg", module.generic_graphics);
+	if (module.generic_graphics && (module.runtime_buffers || module.runtime_samplers ||
+	    (stage != ShaderType::Vertex && stage != ShaderType::Pixel && stage != ShaderType::Mesh))) return false;
 	if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&module.input)) {
 		VisitVertexInput(r, *vertex, *vertex);
 	} else if (auto* pixel = std::get_if<ShaderPixelInputInfo>(&module.input)) {
@@ -816,6 +820,7 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 	ReadElements(r, "sb", buffers);
 	ReadElements(r, "si", images);
 	ReadElements(r, "ss", samplers);
+	if (module.generic_graphics && (!buffers.empty() || !images.empty() || !samplers.empty())) return false;
 	return r.ok && module.user_data_count <= ShaderParams {}.user_data.size();
 }
 
@@ -1208,7 +1213,8 @@ uint64_t ManifestModuleIdentity(const ManifestModule&     module,
 	auto   stage = static_cast<uint8_t>(module.stage);
 	IoAll(writer, stage, module.code_hash, module.back_hash, module.user_data_count,
 	      module.push_data_cursor, module.specialization);
-	auto modes = static_cast<uint8_t>(uint32_t(module.runtime_samplers) | (uint32_t(module.runtime_buffers) << 1u));
+	auto modes = static_cast<uint8_t>(uint32_t(module.runtime_samplers) | (uint32_t(module.runtime_buffers) << 1u) |
+	                                  (uint32_t(module.generic_graphics) << 2u));
 	if (modes != 0) Io(writer, modes);
 	writer.Raw(static_state.data(), static_state.size_bytes());
 	return XXH3_64bits(writer.bytes.data(), writer.bytes.size());

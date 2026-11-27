@@ -251,10 +251,20 @@ KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
 template <class Stream, Is<Bindings> Object>
 void Io(Stream& io, Object& object) {
-	auto& [a, b, c, d, e, f, g, clip_plane_dwords, i, j, k, l] = object;
-	IoAll(io, a, b, c, d, e, f, g);
-	IoExtendedResources(io, clip_plane_dwords);
-	IoAll(io, i, j, k, l);
+	auto& [counts, mask, push, dispatch, ray_query, offset, table, clip, mips, strides,
+	       formats, banks, generic, uniform, uniform_index] = object;
+	IoAll(io, counts, mask, push, dispatch, ray_query, offset, table);
+	IoExtendedResources(io, clip);
+	constexpr uint32_t extended = 1u << 31;
+	uint32_t encoded_strides = strides | (generic ? extended : 0u);
+	IoAll(io, mips, encoded_strides);
+	if constexpr (Reading<Stream>) {
+		strides = encoded_strides & ~extended;
+		generic = (encoded_strides & extended) != 0;
+		formats = banks = 0;
+	}
+	if (encoded_strides & extended) IoAll(io, formats, banks);
+	IoAll(io, uniform, uniform_index);
 }
 KYTY_IO_FIELDS(TablePlan::Operand, a, b)
 KYTY_IO_FIELDS(TablePlan::Slot, a, b, c, d, e, f)

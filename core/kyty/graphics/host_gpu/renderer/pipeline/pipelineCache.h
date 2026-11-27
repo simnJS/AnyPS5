@@ -457,7 +457,7 @@ public:
 		uint64_t                float_modes_generation = 0;
 	};
 
-	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
+	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state, bool prefer_generic = true);
 	bool GetGraphicsProgramsAhead(const HW::Context& context, const HW::UserConfig& user_config,
 	                              const HW::Shader& shaders, DrawRenderState& state,
 	                              ProgramResolution& ahead);
@@ -484,7 +484,7 @@ public:
 
 	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets, bool allow_async = false,
-	                              bool native_bindings = false);
+	                              bool native_bindings = false, bool ready_only = false);
 #if defined(ANYPS5_KYTY)
 	[[nodiscard]] bool PreparesGraphicsLibraries() const;
 	void SetRenderContext(RenderContext* context) { m_render = context; }
@@ -538,6 +538,7 @@ private:
 	friend struct PipelineCacheTestAccess;
 
 	struct Program {
+		const ShaderModule* GenericModule(uint32_t cursor) const;
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
@@ -650,10 +651,10 @@ private:
 
 	bool ResolveGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
 	                             const HW::Shader& shaders, DrawRenderState& state,
-	                             ProgramResolution* ahead);
+	                             ProgramResolution* ahead, bool prefer_generic = true);
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor) KYTY_REQUIRES(m_program_lock);
+	                               uint32_t& push_data_cursor, bool prefer_generic = true) KYTY_REQUIRES(m_program_lock);
 	template <typename InputInfo>
 	const ShaderModule* GetRuntimeBufferProgram(const ShaderParams& params, InputInfo& input_info,
 	                                            uint32_t& push_data_cursor) KYTY_REQUIRES(m_program_lock);
@@ -962,7 +963,7 @@ private:
 	void SetHostInput(ManifestModule& module) const;
 	const ShaderModule* FindCompiledModule(
 	    const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	    uint32_t push_data_cursor) const KYTY_REQUIRES(m_program_lock);
+	    uint32_t push_data_cursor, bool generic_graphics = false) const KYTY_REQUIRES(m_program_lock);
 	void ManifestProgress(bool force);
 	void SaveManifestRecording();
 	struct ManifestBacklog {
@@ -1000,6 +1001,7 @@ private:
 };
 
 inline constexpr uint32_t RuntimeBuffersKey = 0x52425546u;
+inline constexpr uint32_t GenericGraphicsKey = 0x47465847u;
 inline constexpr uint32_t RuntimeSamplersKey = 0x53414d50u;
 
 uint32_t RayTracingModuleMode(ShaderBvh bvh, ShaderType stage, bool native, bool emulation, uint32_t oracle);

@@ -14,7 +14,7 @@ class PrecacheSelectionTest(unittest.TestCase):
     def test_generic_draws_preserve_render_signatures(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            store = root / 'input.code'
+            store = root / 'fixture_1.code'
             store.write_bytes(struct.pack('<Q', 0x3145444F4359544B) +
                               b''.join(struct.pack('<QII', code, 1, 1) + b'x' for code in (1, 2, 3)))
             manifest = root / 'input.kpm'
@@ -29,14 +29,14 @@ class PrecacheSelectionTest(unittest.TestCase):
             command = [sys.executable, str(PRECACHE), 'prepare-graphics', str(store), str(manifest), str(output)]
             subprocess.run(command, check=True)
             cache = output / '_PipelineCache'
-            lines = (cache / 'offline_1.kpm').read_text().splitlines()
+            lines = (cache / 'fixture_1.graphics.kpm').read_text().splitlines()
             self.assertEqual(len(lines), 5)
             vs, ps = [next(line for line in lines if f' {stage} ' in line) for stage in ('vs', 'ps')]
             self.assertTrue(vs.endswith('cur=33 gg'))
             self.assertTrue(ps.endswith('cur=19 gg'))
             prefix = f'P v={vs.split()[1]} p={ps.split()[1]}'
             self.assertEqual(set(lines[-2:]), {prefix + ' c0=R8Unorm', prefix + ' c0=R8Uint plain'})
-            self.assertEqual((cache / 'offline_1.code').read_bytes(), store.read_bytes()[:-17])
+            self.assertEqual((cache / 'fixture_1.code').read_bytes(), store.read_bytes()[:-17])
             missing = root / 'missing'
             store.write_bytes(store.read_bytes()[:25])
             self.assertNotEqual(subprocess.run(command[:-1] + [str(missing)], capture_output=True).returncode, 0)

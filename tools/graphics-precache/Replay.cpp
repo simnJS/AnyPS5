@@ -56,7 +56,7 @@ struct PipelineCacheTestAccess {
 		cache.SetHostInput(record);
 		const auto key = PipelineCache::ManifestProgramKey(record, false);
 		cache.LockPrograms();
-		const auto* module = cache.FindCompiledModule(key, record.specialization, record.push_data_cursor);
+		const auto* module = cache.FindCompiledModule(key, record.specialization, record.push_data_cursor, record.generic_graphics);
 		cache.UnlockPrograms();
 		return module;
 	}

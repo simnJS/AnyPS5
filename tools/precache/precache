@@ -251,13 +251,9 @@ def driver(args, binary):
     root = args.work.resolve(strict=True)
     if root.parent != binary.parent or not root.name.startswith(('compute-', 'graphics-')):
         raise ValueError('expected a private preparation directory')
-    if root.name.startswith('graphics-'):
-        if not (root / '_PipelineCache/offline_1.kpm').is_file():
-            raise ValueError('missing graphics signature manifest')
-        title, version = 'offline', '1'
-    else:
-        manifest, = (root / '_PipelineCache').glob('*.compute.kpm')
-        title, version = manifest.name.removesuffix('.compute.kpm').rsplit('_', 1)
+    suffix = '.graphics.kpm' if root.name.startswith('graphics-') else '.compute.kpm'
+    manifest, = (root / '_PipelineCache').glob('*' + suffix)
+    title, version = manifest.name.removesuffix(suffix).rsplit('_', 1)
     cache = root / 'driver-cache'
     cache.mkdir(exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('KYTY_', '__GL_SHADER_DISK_CACHE', 'MESA_SHADER_CACHE'))}

@@ -2381,6 +2381,138 @@ void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& s
 	}
 }
 
+bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shape) {
+	if ((plan.stage != ShaderType::Vertex && plan.stage != ShaderType::Pixel && plan.stage != ShaderType::Mesh) ||
+	    !plan.resource_tracking_complete || !plan.srt_plan_complete || !plan.source_reads.empty())
+		return false;
+	uint32_t table_source = UINT32_MAX;
+	for (uint32_t i = 0; i < plan.descriptor_sources.size(); ++i) {
+		const auto& source = plan.descriptor_sources[i];
+		if (!source.indirect_descriptor) continue;
+		if (table_source != UINT32_MAX || !source.indirect_descriptor->table_array ||
+		    source.dword_count != 8u) return false;
+		table_source = i;
+	}
+	for (const auto& memory: plan.memory_info) {
+		if (memory.planning_only) continue;
+		if (memory.kind != ResourceKind::Buffer || !memory.formatted) continue;
+		if (memory.data_bits != 32u || (memory.typed &&
+		    Format::GetFormatInfo(Format::DecodeTBufferFormat(memory.data_format, memory.number_format)).type ==
+		        Format::ComponentType::Unknown))
+			return false;
+	}
+	shape = {};
+	shape.buffers.resize(plan.info.buffers.size());
+	for (const auto& buffer: plan.info.buffers) {
+		if (buffer.formatted && (buffer.written || buffer.atomic)) return false;
+	}
+	ReadStridesAtRunTime(plan, shape);
+	for (const auto& image: plan.info.images) {
+		const bool table = image.source == table_source && table_source != UINT32_MAX;
+		if (image.mip_mode != ImageMipMode::None ||
+		    (!table && image.paired_view != ImageResource::NoIndirectImage) ||
+		    (table && (image.resource_class != ImageResourceClass::Sampled || image.depth_compare ||
+		               image.atomic || image.written || image.r128))) return false;
+		auto& view = shape.images.emplace_back();
+		if (table) {
+			view.table = 0;
+			view.table_capacity = ImageTableCapacity(0);
+			view.table_entry_mask = plan.descriptor_sources[table_source].indirect_descriptor->table_mask >> 5u;
+			view.skip_degamma = image.skip_degamma;
+		}
+		view.dimension = image.dimension == Decoder::ImageDimension::Unknown ? Decoder::ImageDimension::Dim2D : image.dimension;
+		view.numeric_class = image.atomic ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float;
+		view.cube = image.cube;
+	}
+	for (uint32_t i = 0; i < plan.info.images.size(); ++i) {
+		const auto& resource = plan.info.images[i];
+		if (resource.depth_compare || resource.atomic || shape.images[i].table_capacity != 0u) continue;
+		shape.images[i].indirect_root = i;
+		auto view = shape.images[i];
+		view.numeric_class = Prospero::TextureNumericClass::Uint;
+		shape.images.push_back(view);
+		if (resource.resource_class == ImageResourceClass::Sampled) {
+			view.numeric_class = Prospero::TextureNumericClass::Sint;
+			shape.images.push_back(view);
+		}
+	}
+	shape.samplers.resize(plan.info.samplers.size());
+	return true;
+}
+
+bool BindGenericGraphics(const ResourcePlan& plan, ResourceSnapshot& snapshot,
+                         const ResourceSpecialization& live, const ResourceSpecialization& generic) {
+	if (live.images.size() > generic.images.size() || live.samplers != generic.samplers ||
+	    live.buffers.size() != generic.buffers.size() || snapshot.buffers.size() != generic.buffers.size() ||
+	    snapshot.images.size() != live.images.size() || snapshot.samplers.size() != live.samplers.size() ||
+	    plan.info.buffers.size() != live.buffers.size() || plan.info.images.size() != live.images.size()) return false;
+	snapshot.graphics_image_banks.assign(live.images.size(), 0);
+	for (size_t i = 0; i < live.images.size(); ++i) {
+		const auto& image = plan.info.images[i];
+		auto expected = generic.images[i];
+		if (expected.table_capacity != 0u) {
+			const auto& observed = live.images[i];
+			if (observed.table >= snapshot.image_tables.size() || observed.table != expected.table)
+				return false;
+			const auto& table = snapshot.image_tables[observed.table];
+			if (!table || table->slots.size() > expected.table_capacity || table->mapping.size() < 2u) return false;
+			for (const auto& value: table->slots) {
+				if (NullImageDescriptor(value)) continue;
+				const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
+				if (!TableExemplar(image, value, true) || format == Prospero::BufferFormat::k8Srgb ||
+				    format == Prospero::BufferFormat::k8_8Srgb) return false;
+			}
+			expected.table_mapping_offset = observed.table_mapping_offset;
+			snapshot.graphics_image_banks[i] = observed.table_mapping_offset;
+		}
+		if (expected.indirect_root == i) {
+			expected.indirect_root = ImageResource::NoIndirectImage;
+			if (live.images[i].numeric_class == Prospero::TextureNumericClass::Uint ||
+			    (image.resource_class == ImageResourceClass::Sampled &&
+			     live.images[i].numeric_class == Prospero::TextureNumericClass::Sint))
+				expected.numeric_class = live.images[i].numeric_class;
+		}
+		if (live.images[i] != expected) return false;
+		if ((image.written || image.atomic) &&
+		    (NullImageDescriptor(snapshot.images[i]) || !ValidImageDescriptor(snapshot.images[i], image.r128)))
+			return false;
+	}
+	for (uint32_t i = 0; i < live.buffers.size(); ++i) {
+		auto buffer = live.buffers[i];
+		const auto& resource = plan.info.buffers[i];
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], descriptor)) return false;
+		if ((resource.written || resource.atomic) && (!descriptor.Base48() || !descriptor.GetSize())) return false;
+		if (HasRuntimeStride(generic.buffers[i].packed_stride) && ReadsStrideAtRunTime(plan, i, buffer))
+			buffer.packed_stride |= RuntimeBufferStride;
+		if (resource.formatted) {
+			if (((descriptor.Base48() | descriptor.GetSize()) & 3u) != 0u) return false;
+			const auto components = FormattedReadComponents(plan, i);
+			if (components != 0u) {
+				const auto format = Format::GetFormatInfo(buffer.descriptor_format);
+				if (format.type == Format::ComponentType::Unknown) return false;
+				for (uint32_t component = 0; component < 4u; ++component) {
+					if ((components & (1u << component)) != 0u &&
+					    Format::ResolveFormattedSource(format, GetDstSel(buffer.descriptor_swizzle, component)).kind ==
+					        Format::FormattedSourceKind::Invalid) return false;
+				}
+			}
+			buffer.descriptor_format = Prospero::BufferFormat::kInvalid;
+			buffer.descriptor_swizzle = DstSel(4, 5, 6, 7);
+		}
+		if (!(buffer == generic.buffers[i])) return false;
+	}
+	snapshot.images.resize(generic.images.size(), {.dword_count = 8});
+	for (size_t i = live.images.size(); i < generic.images.size(); ++i) {
+		const auto& child = generic.images[i];
+		const auto root = child.indirect_root;
+		if (child.numeric_class != live.images[root].numeric_class) continue;
+		snapshot.images[i] = std::exchange(snapshot.images[root], DescriptorValue {.dword_count = 8});
+		snapshot.graphics_image_banks[root] = child.numeric_class == Prospero::TextureNumericClass::Uint ? 1u : 2u;
+	}
+	return true;
+}
+
 uint32_t FormattedReadComponents(const ResourcePlan& program, uint32_t index) {
 	uint32_t mask = 0;
 	for (const auto& memory: program.memory_info) {
@@ -2947,6 +3079,22 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return MaterializeResourcesForViews(program, runtime, snapshot, specialization, {});
 }
 
+bool MaterializeGenericGraphics(const ResourcePlan& plan, const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                                ResourceSpecialization& live, const ResourceSpecialization& generic) {
+	if (plan.resource_tracking_complete && plan.srt_plan_complete && plan.descriptor_sources.empty() &&
+	    plan.srt_reads.empty() && plan.source_reads.empty() && !plan.capture_specialization_reads &&
+	    plan.uniform_fill.fill.kind == UniformFillKind::None && runtime.call_words.empty() &&
+	    generic.buffers.empty() && generic.images.empty() && generic.samplers.empty()) {
+		if (runtime.user_data.size() < plan.srt_user_data) return false;
+		snapshot = {};
+		live = {};
+		snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		return true;
+	}
+	return MaterializeResourcesForViews(plan, runtime, snapshot, live, generic.images) &&
+	       BindGenericGraphics(plan, snapshot, live, generic);
+}
+
 bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                ResourceSpecialization& specialization) {
 	if (snapshot.buffers.size() != program.info.buffers.size() ||
@@ -3365,7 +3513,7 @@ uint64_t ApplyResourceSpecialization(Program& program, const ResourceSpecializat
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
-			EXIT_IF(image.indirect_root == memory.resource &&
+			EXIT_IF(!program.generic_graphics && image.indirect_root == memory.resource &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&

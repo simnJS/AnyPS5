@@ -1744,6 +1744,8 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 }
 
 bool UsesRuntimeFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
+	if (state.program.generic_graphics)
+		return mem.kind == IR::ResourceKind::Buffer && mem.formatted && !mem.typed;
 	return state.program.table_mode && mem.kind == IR::ResourceKind::Buffer && mem.formatted && !mem.typed &&
 	       mem.resource < 32u && ((state.program.table_plan.runtime_formats >> mem.resource) & 1u) != 0 &&
 	       mem.resource < state.table_buffer_words.size() && state.table_buffer_words[mem.resource] != 0u;
@@ -1753,7 +1755,10 @@ uint32_t LoadRuntimeFormatted(ValueEmitContext& ctx, const IR::Inst& inst, const
                               const MemoryResourceAccess& resource, uint32_t components) {
 	auto&      state = ctx.state;
 	const auto u32   = TypeU32(state);
-	const auto word  = state.table_buffer_words[mem.resource];
+	const auto word  = state.program.generic_graphics
+	    ? EmitShaderDataDwordLoad(state, state.program.bindings.FormatDword() +
+	                                   state.program.info.buffers[mem.resource].descriptor_index)
+	    : state.table_buffer_words[mem.resource];
 	const auto bits  = [&](uint32_t value, uint32_t offset, uint32_t count) {
 		return EmitBitFieldUExtract(state, value, ConstantU32(state, offset), ConstantU32(state, count));
 	};
@@ -2139,6 +2144,9 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 
 void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
+	if (state.program.generic_graphics && std::ranges::any_of(state.program.info.buffers, &IR::BufferResource::formatted)) {
+		DefineIndirectBufferFormats(ctx);
+	}
 	if (state.program.table_mode && state.indirect_format_function == 0u) {
 		const auto& buffers = state.program.info.buffers;
 		for (size_t i = 0; i < buffers.size() && i < 32; ++i) {
