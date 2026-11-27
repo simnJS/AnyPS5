@@ -35,6 +35,17 @@ target_link_libraries(kyty_shim_half_fallback_tests PRIVATE Kyty::gpu libkernel 
 add_test(NAME kyty_shim_half_fallback COMMAND kyty_shim_half_fallback_tests)
 set_tests_properties(kyty_shim_half_fallback PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_half_fallback: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
+add_test_executable(kyty_shim_thin_execute_tests ${CMAKE_CURRENT_SOURCE_DIR}/ThinExecute.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_thin_execute_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_thin_execute_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_thin_execute_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_thin_execute_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_thin_execute COMMAND kyty_shim_thin_execute_tests)
+set_tests_properties(kyty_shim_thin_execute PROPERTIES TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "kyty_shim_thin_execute: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 endif()
 
 if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/tableResolutionCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/thinExecute.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/upscaler/upscaler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -200,6 +201,16 @@ public:
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 	void DispatchIndirectThreads(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
 	                             bool async_compute);
+	class ThinOperation {
+	public:
+		ThinOperation(RenderExecutor& executor, bool indirect);
+		~ThinOperation();
+		KYTY_CLASS_NO_COPY(ThinOperation);
+
+	private:
+		RenderExecutor& m_executor;
+		uint64_t        m_begin = 0;
+	};
 	RayTracingCheck& RtCheck();
 	WaveSplitCheck&  SplitCheck();
 	bool BeginGenericCheck(const ShaderComputeInputInfo& exact, const CommandBuffer& buffer,
@@ -697,6 +708,15 @@ private:
 	uint64_t m_draw_window           = 0;
 	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
 	    nullptr, nullptr};
+	struct ThinDispatches;
+	std::unique_ptr<ThinDispatches, void (*)(ThinDispatches*)> m_thin {nullptr, nullptr};
+	ThinDispatches& OwnThin();
+	[[nodiscard]] bool TryThinDispatch(CommandBuffer& buffer, const HW::ComputeShaderInfo& cs_regs,
+	                                   const uint32_t (&groups)[3], uint32_t mode, bool async_compute);
+	void LearnThinDispatch(const ShaderComputeInputInfo& input_info, const PipelineCache::Pipeline& pipeline,
+	                       const PreparedBindings& bindings, const HW::ComputeShaderInfo& cs_regs, uint32_t mode,
+	                       bool writes, bool indirect_writes);
+	void NoteThinRefused(Thin::Refusal refusal, bool remember);
 	std::unique_ptr<NativeXprCache, void (*)(NativeXprCache*)> m_native_xpr {nullptr, nullptr};
 	struct TableXpr;
 	struct TablePair;

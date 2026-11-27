@@ -525,6 +525,12 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		return;
 	}
 
+	const ThinOperation thin_operation(*this, false);
+	const uint32_t      thin_groups[] {thread_group_x, thread_group_y, thread_group_z};
+	if (TryThinDispatch(buffer, cs_regs, thin_groups, mode, async_compute)) {
+		return;
+	}
+
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	const bool use_thread_dimensions =
@@ -587,6 +593,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 				m_linear_copy_uses       = 0;
 			}
 		}
+		NoteThinRefused(Thin::Refusal::CpuConsumed, true);
 		ResetBindings();
 		return;
 	}
@@ -658,6 +665,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		                                                              program.shader_hash);
 #endif
 		bool has_storage_writes = HasStorageWrites(input_info, bindings, indirect_writes);
+		if (rt_pass == 0) {
+			LearnThinDispatch(input_info, pipeline, bindings, cs_regs, mode, has_storage_writes, indirect_writes);
+		} else {
+			NoteThinRefused(Thin::Refusal::Checks, false);
+		}
 		const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
 		if (has_storage_writes && !chained) {
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -1113,6 +1125,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
+	const ThinOperation thin_operation(*this, true);
+	const uint32_t      thin_groups[3] {};
+	if (TryThinDispatch(buffer, cs_regs, thin_groups, mode, async_compute)) {
+		return;
+	}
 	ShaderComputeInputInfo input_info {};
 	m_context.GetImageHeap().BeginDraw();
 	ShaderComputeInputInfo pristine {};
@@ -1217,9 +1234,15 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		                                                              program.shader_hash);
 #endif
 		const auto vk_buffer = buffer.Handle();
+		const bool has_storage_writes = HasStorageWrites(input_info, bindings, indirect_writes);
+		if (rt_pass == 0) {
+			LearnThinDispatch(input_info, pipeline, bindings, cs_regs, mode, has_storage_writes, indirect_writes);
+		} else {
+			NoteThinRefused(Thin::Refusal::Checks, false);
+		}
 		const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
 		if (!chained) {
-			if (HasStorageWrites(input_info, bindings, indirect_writes)) {
+			if (has_storage_writes) {
 				ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 			}
 			vk::MemoryBarrier barrier {};
