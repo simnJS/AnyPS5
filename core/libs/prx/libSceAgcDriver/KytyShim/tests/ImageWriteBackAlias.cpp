@@ -1146,6 +1146,9 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 		             required ? "FAILED" : "skipped", unavailable);
 		return required ? 1 : 77;
 	}
+	if (graphics.mirror_size == 0) {
+		graphics.mirror_size = 32 * GuestMirror::WindowSize;
+	}
 	if (!graphics.CreateAllocator()) {
 		std::fputs("kyty_shim_image_write_back_alias: FAILED: could not create the allocator\n", stderr);
 		return 1;

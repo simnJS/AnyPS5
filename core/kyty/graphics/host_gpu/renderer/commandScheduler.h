@@ -37,6 +37,7 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           Finish();
+	void           TrimCommandPool();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	void                      Shutdown();
@@ -94,6 +95,7 @@ private:
 		~CommandPool();
 		KYTY_CLASS_NO_COPY(CommandPool);
 
+		void              TrimCompleted();
 		vk::CommandBuffer Commit();
 		[[nodiscard]] std::pair<vk::CommandBuffer, size_t> CommitDeferred();
 		void                                               Retire(size_t index, uint64_t tick);
@@ -103,7 +105,6 @@ private:
 
 		size_t Grow();
 		size_t Acquire(uint64_t busy_until);
-		void   TrimCompleted();
 		friend struct VramBudgetTestAccess;
 
 		GraphicContext&                m_graphics;
@@ -112,7 +113,6 @@ private:
 		std::vector<vk::CommandBuffer> m_buffers;
 		std::vector<uint64_t>          m_ticks;
 		size_t                         m_hint = 0;
-		uint32_t                       m_acquisitions = 0;
 	};
 
 	enum class OperationState { Open, Draining, Closed };

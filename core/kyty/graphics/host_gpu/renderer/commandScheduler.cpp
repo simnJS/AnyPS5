@@ -68,6 +68,7 @@ void CommandScheduler::CommandPool::Retire(size_t index, uint64_t tick) {
 }
 
 void CommandScheduler::CommandPool::TrimCompleted() {
+	if (m_ticks.empty()) return;
 	m_master.Refresh();
 	const auto done = m_master.KnownGpuTick();
 	size_t keep = m_ticks.size();
@@ -93,10 +94,6 @@ void CommandScheduler::CommandPool::TrimCompleted() {
 }
 
 size_t CommandScheduler::CommandPool::Acquire(uint64_t busy_until) {
-	if (++m_acquisitions == 256) {
-		TrimCompleted();
-		m_acquisitions = 0;
-	}
 	auto       gpu_tick = m_master.KnownGpuTick();
 	const auto search   = [this, &gpu_tick, busy_until](size_t begin,
 	                                                  size_t end) -> std::optional<size_t> {
@@ -218,6 +215,15 @@ void CommandScheduler::Flush() {
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
+}
+
+void CommandScheduler::TrimCommandPool() {
+	if (m_deferred) {
+		(void)m_stream.RecordSpecial<uint8_t>(CommandStream::RecordKind::TrimPool);
+		m_stream.Publish();
+	} else {
+		m_command_pool.TrimCompleted();
+	}
 }
 
 void CommandScheduler::Finish() {
@@ -672,6 +678,10 @@ void CommandScheduler::RecordingThread() {
 			break;
 		}
 		CommandStream::Replay(*chunk, acquire, [&](const CommandStream::Entry& entry) {
+			if (entry.kind == CommandStream::RecordKind::TrimPool) {
+				m_command_pool.TrimCompleted();
+				return;
+			}
 			EXIT_IF(entry.kind != CommandStream::RecordKind::Submit);
 			SubmitRecorded(buffer, buffer_index,
 			               *static_cast<const RecordedSubmit*>(entry.Payload()));

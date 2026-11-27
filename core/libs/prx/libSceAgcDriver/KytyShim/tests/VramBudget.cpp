@@ -343,6 +343,20 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	return nullptr;
 }
 
+bool CheckScheduledPoolTrim(RenderContext& renderer, CommandProcessor& producer, bool deferred) {
+	auto& graphics = renderer.GetGraphics();
+	CommandScheduler scheduler(renderer, graphics, deferred);
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+	const uint32_t expected[] = {0x2761548c, 0xd328cbe1};
+	Buffer output(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, sizeof(expected));
+	output.Fill(0, 4, expected[0]);
+	scheduler.TrimCommandPool();
+	output.Fill(4, 4, expected[1]);
+	scheduler.Wait(scheduler.CurrentTick());
+	output.Invalidate(0, sizeof(expected));
+	return std::memcmp(output.Mapped().data(), expected, sizeof(expected)) == 0;
+}
+
 const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool acceleration_storage) {
 	if (graphics.memory_budget_ext_enabled && graphics.GetLocalMemoryUsage().budget == 0) {
 		return "the driver reported an empty device-local memory budget";
@@ -357,6 +371,9 @@ const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool accel
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 
 	if (address == 0) {
+		for (const bool deferred: {false, true}) {
+			if (!CheckScheduledPoolTrim(renderer, producer, deferred)) return "scheduled command pool trim lost a GPU write";
+		}
 		if (!VramBudgetTestAccess::CheckCommandPool(graphics, scheduler)) return "command pool retirement lost a recording";
 		if (!StreamBufferTestAccess::CheckWatchRetention(graphics, scheduler)) return "stream ring did not release idle timeline watches";
 		if (!VramBudgetTestAccess::CheckReadbackReserve(graphics, scheduler)) return "readback retained an oversized buffer";
