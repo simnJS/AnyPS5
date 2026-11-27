@@ -82,7 +82,7 @@ bool IndirectSamplerMaterializationFailed();
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
-bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shape);
+bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shape, const char** refusal = nullptr);
 bool MaterializeGenericGraphics(const ResourcePlan& plan, const SrtRuntime& runtime, ResourceSnapshot& snapshot,
                                 ResourceSpecialization& live, const ResourceSpecialization& generic);
 bool BindGenericGraphics(const ResourcePlan& plan, ResourceSnapshot& snapshot,

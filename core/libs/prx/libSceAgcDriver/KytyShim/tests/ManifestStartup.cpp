@@ -110,6 +110,58 @@ void MemoryPause() {
 	}
 }
 
+void GenericRefusalSkipsPipelines() {
+	const auto pending = [](int stages) {
+		uint8_t missing = 0;
+		for (int i = 0; i < stages; ++i) AddManifestStage(missing, ManifestStage::Pending);
+		return missing;
+	};
+
+	auto both = pending(2);
+	Check(!FinishManifestPipelineStages(both).queue, "a pipeline waits for its pending stages");
+	auto change = SettleManifestStage(both, ManifestStage::Built);
+	Check(!change.queue && change.skipped == 0 && ManifestPipelineUnresolved(both), "one built stage is not enough");
+	change = SettleManifestStage(both, ManifestStage::Built);
+	Check(change.queue && !ManifestPipelineUnresolved(both), "the last built stage queues the pipeline");
+
+	auto generic = pending(2);
+	change = SettleManifestStage(generic, ManifestStage::Refused);
+	Check(!change.queue && change.skipped == 1 && !ManifestPipelineUnresolved(generic),
+	      "a refused generic stage skips its pipeline without leaving it unresolved");
+	change = SettleManifestStage(generic, ManifestStage::Built);
+	Check(!change.queue && change.skipped == 0 && generic == ManifestPipelineSkipped,
+	      "a skipped pipeline is not queued by its other stages");
+	change = SettleManifestStage(generic, ManifestStage::Refused);
+	Check(change.skipped == 0, "a skipped pipeline is counted once");
+	change = SettleManifestStage(generic, ManifestStage::Failed);
+	Check(change.skipped == -1 && ManifestPipelineUnresolved(generic),
+	      "a real failure still leaves a skipped pipeline unresolved");
+
+	auto failed = pending(1);
+	change = SettleManifestStage(failed, ManifestStage::Failed);
+	Check(!change.queue && change.skipped == 0 && ManifestPipelineUnresolved(failed),
+	      "a failed stage leaves its pipeline unresolved");
+	change = SettleManifestStage(failed, ManifestStage::Refused);
+	Check(change.skipped == 0 && ManifestPipelineUnresolved(failed), "a refusal cannot hide an earlier failure");
+
+	uint8_t late = 0;
+	AddManifestStage(late, ManifestStage::Refused);
+	AddManifestStage(late, ManifestStage::Pending);
+	change = FinishManifestPipelineStages(late);
+	Check(!change.queue && change.skipped == 1 && !ManifestPipelineUnresolved(late),
+	      "a pipeline added after its generic stage was refused is skipped at once");
+	Check(!SettleManifestStage(late, ManifestStage::Built).queue, "its pending stage does not queue it");
+
+	uint8_t mixed = 0;
+	AddManifestStage(mixed, ManifestStage::Failed);
+	AddManifestStage(mixed, ManifestStage::Refused);
+	change = FinishManifestPipelineStages(mixed);
+	Check(change.skipped == 0 && ManifestPipelineUnresolved(mixed), "a failed stage wins over a refused one");
+
+	uint8_t ready = 0;
+	Check(FinishManifestPipelineStages(ready).queue, "a pipeline with every stage built is queued at once");
+}
+
 }
 
 int main() {
@@ -117,5 +169,6 @@ int main() {
 	ModuleScheduling();
 	VideoWait();
 	MemoryPause();
+	GenericRefusalSkipsPipelines();
 	return 0;
 }

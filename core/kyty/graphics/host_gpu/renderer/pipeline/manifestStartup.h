@@ -63,6 +63,55 @@ inline auto NextManifestModule(std::deque<uint32_t>& jobs, std::span<const uint3
 	return jobs.begin();
 }
 
+inline constexpr uint8_t ManifestPipelineFailed  = UINT8_MAX;
+inline constexpr uint8_t ManifestPipelineSkipped = UINT8_MAX - 1;
+
+enum class ManifestStage { Pending, Built, Failed, Refused };
+
+struct ManifestPipelineChange {
+	bool queue   = false;
+	int  skipped = 0;
+};
+
+inline void AddManifestStage(uint8_t& missing, ManifestStage stage) {
+	if (stage == ManifestStage::Failed) {
+		missing = ManifestPipelineFailed;
+	} else if (stage == ManifestStage::Refused) {
+		if (missing != ManifestPipelineFailed) missing = ManifestPipelineSkipped;
+	} else if (stage == ManifestStage::Pending && missing != ManifestPipelineFailed &&
+	           missing != ManifestPipelineSkipped) {
+		++missing;
+	}
+}
+
+inline ManifestPipelineChange FinishManifestPipelineStages(uint8_t missing) {
+	if (missing == ManifestPipelineSkipped) return {.skipped = 1};
+	return {.queue = missing == 0};
+}
+
+inline ManifestPipelineChange SettleManifestStage(uint8_t& missing, ManifestStage stage) {
+	switch (stage) {
+		case ManifestStage::Pending: return {};
+		case ManifestStage::Built:
+			if (missing == ManifestPipelineFailed || missing == ManifestPipelineSkipped || missing == 0) return {};
+			return {.queue = --missing == 0};
+		case ManifestStage::Failed: {
+			const int skipped = missing == ManifestPipelineSkipped ? -1 : 0;
+			missing           = ManifestPipelineFailed;
+			return {.skipped = skipped};
+		}
+		case ManifestStage::Refused:
+			if (missing == ManifestPipelineFailed || missing == ManifestPipelineSkipped) return {};
+			missing = ManifestPipelineSkipped;
+			return {.skipped = 1};
+	}
+	return {};
+}
+
+[[nodiscard]] inline bool ManifestPipelineUnresolved(uint8_t missing) {
+	return missing != 0 && missing != ManifestPipelineSkipped;
+}
+
 struct ManifestStartupWait {
 	using Clock = std::chrono::steady_clock;
 
