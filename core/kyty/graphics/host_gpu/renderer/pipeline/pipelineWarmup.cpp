@@ -150,8 +150,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 			module->pipeline_requested = true;
 			auto& pipeline = m_compute_pipelines[module->id];
 			if (!lookup || !FindComputePipeline(m_graphics, pipeline, *module, m_driver_cache)) {
-				jobs.emplace_back([this, module, &pipeline](vk::PipelineCache cache) {
-					CreatePipelineInternal(m_graphics, pipeline, *module, cache);
+				jobs.emplace_back([this, module, &pipeline, lookup](vk::PipelineCache cache) {
+					const auto mode = lookup ? ComputePipelineCacheMode::KnownMiss : ComputePipelineCacheMode::Full;
+					CreatePipelineInternal(m_graphics, pipeline, *module, cache, mode);
 				});
 			}
 		}

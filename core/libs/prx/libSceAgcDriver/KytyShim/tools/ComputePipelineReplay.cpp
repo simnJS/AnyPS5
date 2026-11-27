@@ -5,14 +5,16 @@
 
 extern "C" int AgcDriverKytyReplayComputePipeline_nid_postfix(
     const std::filesystem::path::value_type* store, uint64_t moduleId,
-    const std::filesystem::path::value_type* output);
+    const std::filesystem::path::value_type* output, const std::filesystem::path::value_type* binaryCache);
 
 namespace {
 
 template <typename Char> int RunComputeReplay(int argc, Char** argv) {
     const bool help = argc == 2 && std::filesystem::path(argv[1]) == "--help";
-    if (help || argc != 5 || std::filesystem::path(argv[3]) != "--output") {
-        std::fputs("usage: kyty_compute_pipeline_replay <store.shaders> <decimal-module-id> --output <report.json>\n",
+    const bool binaries = argc == 7 && std::filesystem::path(argv[5]) == "--binary-cache";
+    if (help || (argc != 5 && !binaries) || std::filesystem::path(argv[3]) != "--output") {
+        std::fputs("usage: kyty_compute_pipeline_replay <store.shaders> <decimal-module-id> --output <report.json> "
+                   "[--binary-cache <directory>]\n",
                    help ? stdout : stderr);
         return help ? 0 : 64;
     }
@@ -25,7 +27,7 @@ template <typename Char> int RunComputeReplay(int argc, Char** argv) {
             std::fputs("Expected a nonzero decimal module ID\n", stderr);
             return 64;
         }
-        return AgcDriverKytyReplayComputePipeline_nid_postfix(argv[1], moduleId, argv[4]);
+        return AgcDriverKytyReplayComputePipeline_nid_postfix(argv[1], moduleId, argv[4], binaries ? argv[6] : nullptr);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 3;

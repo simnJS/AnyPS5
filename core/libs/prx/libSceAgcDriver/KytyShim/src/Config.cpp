@@ -139,7 +139,7 @@ Options OptionsFromEnvironment(std::string& applied) {
         const std::string_view text(value);
         if (text != "0" && text != "1" && text != "2") EXIT("KytyShim: KYTY_ASYNC_PIPELINES=%s is not 0, 1 or 2\n", value);
         options.async_pipelines_enabled = text != "0";
-        options.async_pipelines_skip_more = text == "2";
+        options.async_pipelines_probe = text == "2";
     }
     const char* nativeRt = Read("KYTY_NATIVE_RT", applied);
     const auto mode = NativeRt::ParseMode(nativeRt);

@@ -167,14 +167,9 @@ void PipelineCache::LogStallStats(bool force) {
 	              stats.over_100ms, stats.over_500ms, stats.pipelines);
 	if (!m_async_threads.empty()) {
 		const auto waits = m_async_first_waits.load(std::memory_order_relaxed);
-		PrecompileLog("[kyty-async] mode {}: draws skipped kyty {} occlusion {} small-target {} small-program {} "
-		              "layer {}; first draws waited {} times for {:.3f} s, {} ready in time; probes {} for {:.3f} s, "
-		              "{} created at once; flips {}",
-		              Config::AsyncPipelinesSkipMore() ? 2 : 1, m_async_skipped[0].load(std::memory_order_relaxed),
-		              m_async_skipped[1].load(std::memory_order_relaxed),
-		              m_async_skipped[2].load(std::memory_order_relaxed),
-		              m_async_skipped[3].load(std::memory_order_relaxed),
-		              m_async_skipped[4].load(std::memory_order_relaxed), waits,
+		PrecompileLog("[kyty-async] mode {}: first draws waited {} times for {:.3f} s, {} served by the worker; "
+		              "probes {} for {:.3f} s, {} created at once; flips {}",
+		              Config::AsyncPipelinesProbe() ? 2 : 1, waits,
 		              static_cast<double>(m_async_first_wait_ns.load(std::memory_order_relaxed)) / 1e9,
 		              m_async_first_ready.load(std::memory_order_relaxed),
 		              m_async_probes.load(std::memory_order_relaxed),

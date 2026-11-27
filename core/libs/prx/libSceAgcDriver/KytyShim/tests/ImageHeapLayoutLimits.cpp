@@ -71,7 +71,7 @@ Outcome CreateHeapPipeline(GraphicContext& graphics, const std::vector<uint32_t>
 	Outcome                 outcome;
 	try {
 		const Common::SoftExitScope soft_exit;
-		const auto                  result = CreateComputePipeline(graphics, pipeline, module, nullptr, false);
+		const auto                  result = CreateComputePipeline(graphics, pipeline, module, nullptr, ComputePipelineCacheMode::Full);
 		outcome.created                    = result == vk::Result::eSuccess;
 		if (!outcome.created) {
 			outcome.message = vk::to_string(result);

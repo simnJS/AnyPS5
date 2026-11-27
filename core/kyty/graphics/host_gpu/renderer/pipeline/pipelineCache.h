@@ -771,6 +771,7 @@ private:
 	std::unordered_set<uint64_t>                                               m_async_asked_compute;
 	std::mutex                                                       m_async_mutex;
 	std::condition_variable                                          m_async_available;
+	std::condition_variable                                          m_async_finished;
 	std::deque<AsyncPipelineJob>                                     m_async_jobs;
 	std::deque<AsyncPipelineJob>                                     m_async_sibling_jobs;
 	void QueueSiblingPipeline(const GraphicsPipelineKey& key, const std::array<const ShaderModule*, 4>& stages,
@@ -868,7 +869,6 @@ private:
 	std::deque<std::unique_ptr<ChainJob>>   m_chain_jobs;
 	bool                                    m_chain_stopping = false;
 	std::vector<std::jthread>               m_chain_threads;
-	std::array<std::atomic<uint64_t>, 5> m_async_skipped {};
 	std::atomic<uint64_t> m_async_first_waits {0}, m_async_first_wait_ns {0}, m_async_first_ready {0},
 	    m_async_probes {0}, m_async_probe_ns {0}, m_async_created_now {0};
 	std::atomic<uint64_t> m_chain_queued {0}, m_chain_dropped {0}, m_chain_prepared {0}, m_chain_failed {0},
@@ -887,6 +887,8 @@ private:
 	bool TakeQueuedAsyncPipeline(Matches&& matches);
 	void AsyncPipelineWorker();
 	void StopAsyncPipelines();
+	bool WaitGraphicsPipeline(std::unique_lock<std::mutex>& lock, const GraphicsPipelineKey& key,
+	                          std::optional<std::chrono::steady_clock::time_point> until);
 	void CreateComputePipelineAhead(const ShaderModule& module);
 #if defined(ANYPS5_KYTY)
 	void RequestComputePipelineAhead(const ShaderModule& module);
@@ -1009,6 +1011,7 @@ uint32_t RayTracingModuleMode(ShaderBvh bvh, ShaderType stage, bool native, bool
 std::string PipelineCacheTitleId();
 std::filesystem::path ShaderStorePath();
 std::filesystem::path PipelineCacheDirectory();
+std::string PipelineCacheTitleStem(const std::string& title);
 uint64_t ShaderStoreBuildStamp();
 std::string StoreMismatch(std::span<const uint8_t> bytes, std::span<const uint8_t> header, uint64_t current_stamp);
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics, uint64_t stamp);
@@ -1020,13 +1023,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const GraphicsPipelineKey&                 key,
                             const std::array<const ShaderModule*, 4>& stages,
                             vk::PipelineCache                          driver_cache);
+enum class ComputePipelineCacheMode { Full, Lookup, KnownMiss };
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache);
+                            const ShaderModule& module, vk::PipelineCache driver_cache,
+                            ComputePipelineCacheMode cache_mode = ComputePipelineCacheMode::Full);
 vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  const ShaderModule& module, vk::PipelineCache driver_cache,
-                                 bool lookup, std::chrono::nanoseconds* driver_time = nullptr);
+                                 ComputePipelineCacheMode cache_mode,
+                                 std::chrono::nanoseconds* driver_time = nullptr);
 bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                          const ShaderModule& module, vk::PipelineCache cache);
+#if defined(ANYPS5_KYTY)
+[[nodiscard]] bool CanUseComputeBinaries(const GraphicContext& graphics, const ShaderModule& module);
+#endif
 struct DriverCreations {
 	uint32_t running = 0;
 	uint32_t slow    = 0;
