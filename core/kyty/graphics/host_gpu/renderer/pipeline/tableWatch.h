@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/renderer/image/imageChangeJournal.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <unordered_map>
@@ -21,6 +22,7 @@ public:
 	void               Invalidate() noexcept { m_valid = false; }
 
 	void Begin(uint32_t count) {
+		m_tracked = std::min(m_tracked, count);
 		m_next.resize(count, None);
 		m_watched.resize(count, None);
 		m_considered.resize(count, 0);
@@ -44,6 +46,9 @@ public:
 			return false;
 		}
 		for (const auto element: m_pending) {
+			visit(element);
+		}
+		for (auto element = m_tracked; element < m_count; element++) {
 			visit(element);
 		}
 		const auto visit_image = [&](uint32_t image) {
@@ -106,6 +111,7 @@ public:
 	void Finish(uint64_t image_head, uint64_t element_head) {
 		m_image_seq   = image_head;
 		m_element_seq = element_head;
+		m_tracked     = m_count;
 		m_valid       = !m_conflict;
 	}
 
@@ -151,6 +157,7 @@ private:
 	bool                                   m_valid       = false;
 	bool                                   m_conflict    = false;
 	uint32_t                               m_count       = 0;
+	uint32_t                               m_tracked     = 0;
 	uint64_t                               m_image_seq   = 0;
 	uint64_t                               m_element_seq = 0;
 	uint64_t                               m_stamp       = 0;

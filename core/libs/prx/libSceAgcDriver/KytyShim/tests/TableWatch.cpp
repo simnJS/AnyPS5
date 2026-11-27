@@ -59,6 +59,8 @@ void JournalThreads() {
 	constexpr uint32_t       Writers = 4;
 	constexpr uint32_t       Pushes  = 12000;
 	std::atomic<uint32_t>    done {0};
+	uint64_t                 cursor = journal->Head();
+	const uint64_t           first  = cursor;
 	std::vector<std::thread> writers;
 	for (uint32_t writer = 0; writer < Writers; writer++) {
 		writers.emplace_back([&, writer] {
@@ -69,8 +71,6 @@ void JournalThreads() {
 		});
 	}
 	std::vector<uint64_t> counts(Writers, 0);
-	uint64_t              cursor  = journal->Head();
-	const uint64_t        first   = cursor;
 	uint64_t              retries = 0;
 	for (;;) {
 		const bool finished = done.load() == Writers;
