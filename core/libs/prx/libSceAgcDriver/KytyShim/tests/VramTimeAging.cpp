@@ -122,7 +122,8 @@ const char* CheckEviction(GraphicContext& graphics, TextureCache& textures, Buff
 
 const char* CheckTimeAging(GraphicContext& graphics, uint64_t address) {
 	VramTimeAgingTestAccess::SetMemoryUsage(graphics, 3ull << 30);
-	RenderContext    renderer(graphics);
+	RenderContext renderer(graphics);
+	renderer.InitializeGpu(nullptr);
 	CommandProcessor producer(renderer, 0);
 	producer.Reset();
 	auto& scheduler = renderer.GetCommandScheduler();
