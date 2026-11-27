@@ -786,8 +786,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				dep.access  = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
 				dep.storage = true;
 			} else {
-				dep.layout = image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-				                                  : vk::ImageLayout::eShaderReadOnlyOptimal;
+				dep.layout = image.ReadLayout();
 			}
 			binding.layout = dep.layout;
 		}

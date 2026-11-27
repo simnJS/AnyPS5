@@ -1585,9 +1585,9 @@ static bool ReadsStencilPlane(const Image& image, const TextureCache::ImageDesc&
 }
 
 static bool ImageReadReady(const Image& image, const TextureBinding& texture) {
-	const auto layout = image.info.data.Empty() && !image.is_depth_copy ? vk::ImageLayout::eGeneral
-	                    : image.info.IsDepth()  ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-	                                            : vk::ImageLayout::eShaderReadOnlyOptimal;
+	const auto layout = image.info.IsDepth() && (!image.info.data.Empty() || image.is_depth_copy)
+	                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+	                        : vk::ImageLayout::eGeneral;
 	if (texture.layout != layout) {
 		return false;
 	}
@@ -3470,7 +3470,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
 				              range, vk_buffer);
-			} else {
+			} else if (!image.Settled(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead)) {
 				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
 			binding.layout = image.backing.state.layout;

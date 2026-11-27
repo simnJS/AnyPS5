@@ -206,8 +206,11 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
-		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
+		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eGeneral;
+	}
+	[[nodiscard]] bool Settled(vk::ImageLayout layout, vk::AccessFlags2 access) const noexcept {
+		return backing.subresource_states.empty() && backing.state.layout == layout &&
+		       backing.state.access_mask == access;
 	}
 	struct HeapChange {
 		GuestRange data;
