@@ -4,8 +4,10 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/inPlaceMemory.h"
+#include "graphics/host_gpu/renderer/submitStats.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/guest_gpu/graphicsRun.h"
 #endif
@@ -182,31 +184,31 @@ void CommandScheduler::Begin(const HW::Context& registers, const HW::UserConfig&
 	BeginNext();
 }
 
-void CommandScheduler::Flush() {
+void CommandScheduler::Flush(std::source_location where) {
 	SubmitInfo submit;
-	Flush(submit);
+	Flush(submit, where);
 }
 
-void CommandScheduler::Flush(SubmitInfo& submit) {
-	Submit(submit);
+void CommandScheduler::Flush(SubmitInfo& submit, std::source_location where) {
+	Submit(submit, where);
 	BeginNext();
 }
 
-void CommandScheduler::Finish() {
+void CommandScheduler::Finish(std::source_location where) {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
-		Submit();
+		Submit({}, where);
 	}
 	m_master.Wait(CurrentTick() - 1);
 	BeginNext();
 	PopPendingOperations();
 }
 
-void CommandScheduler::Wait(uint64_t tick) {
+void CommandScheduler::Wait(uint64_t tick, std::source_location where) {
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
-		const auto submitted_tick = Submit();
+		const auto submitted_tick = Submit({}, where);
 		EXIT_IF(submitted_tick != tick);
 		m_master.Wait(tick);
 		BeginNext();
@@ -589,7 +591,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
-uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+uint64_t CommandScheduler::Submit(SubmitInfo submit, std::source_location where) {
 	EXIT_IF(m_command.IsInvalid());
 	if (m_submit_hook != nullptr) {
 		m_submit_hook(m_submit_hook_data, m_command);
@@ -610,17 +612,19 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		recorded->info = submit;
 		recorded->tick = tick;
 		recorded->host_copies = m_host_copies != nullptr ? m_host_copies->Flush() : 0;
+		recorded->where       = where;
 		m_stream.Publish();
 		m_command.m_open = false;
 		return tick;
 	}
 
-	QueueSubmit(m_command.m_buffer, submit, tick);
+	QueueSubmit(m_command.m_buffer, submit, tick, where);
 	m_command.m_buffer = nullptr;
 	return tick;
 }
 
-void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick) {
+void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
+                                   const std::source_location& where) {
 	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 	submit.AddSignal(m_master.Handle(), tick);
@@ -641,10 +645,16 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+	const bool stats      = SubmitStats::Enabled();
+	const auto lock_start = stats ? Common::SteadyNs() : 0;
+	uint64_t   call_start = 0;
+	uint64_t   call_end   = 0;
 	vk::Result result;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		call_start = stats ? Common::SteadyNs() : 0;
+		result     = graphics.queue.submit(1, &submit_info, nullptr);
+		call_end   = stats ? Common::SteadyNs() : 0;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
@@ -660,6 +670,18 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		m_flip_changed.notify_all();
 	}
 #endif
+	if (stats) {
+		const bool signal_only = submit_info.commandBufferCount == 0 && submit_info.waitSemaphoreCount == 0;
+		SubmitStats::Record({.queue           = SubmitStats::Queue::Graphics,
+		                     .batches         = 1,
+		                     .command_buffers = submit_info.commandBufferCount,
+		                     .signal_only     = signal_only ? 1u : 0u,
+		                     .waits           = submit_info.waitSemaphoreCount,
+		                     .lock_ns         = call_start - lock_start,
+		                     .call_ns         = call_end - call_start,
+		                     .tick            = tick,
+		                     .where           = where}, submit.ends_frame);
+	}
 }
 
 void CommandScheduler::RecordingThread() {
@@ -700,7 +722,7 @@ void CommandScheduler::SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_i
 		m_host_copies->WaitFor(recorded.host_copies);
 	}
 	auto submit = recorded.info;
-	QueueSubmit(buffer, submit, recorded.tick);
+	QueueSubmit(buffer, submit, recorded.tick, recorded.where);
 	if (buffer != nullptr) {
 		m_command_pool.Retire(buffer_index, recorded.tick);
 		buffer = nullptr;

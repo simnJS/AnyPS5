@@ -110,6 +110,7 @@ struct SubmitInfo {
 	std::array<uint64_t, MaxSemaphores>               signal_ticks {};
 	uint32_t                                          num_wait_semaphores   = 0;
 	uint32_t                                          num_signal_semaphores = 0;
+	bool                                              ends_frame            = false;
 
 	void AddWait(vk::Semaphore semaphore, uint64_t tick = 1,
 	             vk::PipelineStageFlags stage = vk::PipelineStageFlagBits::eAllCommands) {
