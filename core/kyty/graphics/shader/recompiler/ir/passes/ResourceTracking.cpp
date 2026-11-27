@@ -1106,8 +1106,9 @@ private:
 				if (inst->dst.kind != Decoder::OperandKind::Vgpr || inst->dst.reg > vgpr ||
 				    vgpr >= inst->dst.reg + width) continue;
 				if (inst->opcode != Decoder::Opcode::V_WRITELANE_B32 || inst->dst.reg != vgpr ||
-				    !constant(inst->src1) || inst->src0.kind != Decoder::OperandKind::Sgpr) return {};
+				    !constant(inst->src1)) return {};
 				if (inst->src1.value % m_program.wave_size != read_lane) continue;
+				if (inst->src0.kind != Decoder::OperandKind::Sgpr) return {};
 				if (spill != nullptr && spill != &*inst) return {};
 				spill   = &*inst;
 				written = true;
