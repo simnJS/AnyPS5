@@ -80,6 +80,10 @@ private:
 		}
 	};
 
+	struct SlotDemand {
+		uint64_t insertions = 0;
+		size_t   required   = 0;
+	};
 	enum class State : uint8_t { Live, Stale, Buried };
 	enum class Refusal : uint8_t { None, Capacity, Arms };
 	enum class Sweep : uint8_t { Idle, Snapshot, Removed, Confirm };
@@ -135,6 +139,7 @@ private:
 		std::unique_ptr<Buffer> buffer;
 		std::vector<Range>      pending;
 		std::vector<Range>      found;
+		SlotDemand              demand;
 		bool                    full         = true;
 		bool                    clear        = true;
 		bool                    discover     = true;
@@ -253,6 +258,11 @@ private:
 	void     TakeChanges();
 	ImageId  CurrentImage(const Image::HeapChange& change);
 	uint32_t Allocate(bool may_fail);
+	size_t   FreeSlots(bool table) const;
+	size_t   ReclaimSlots(bool table);
+	void     ReclaimCompleted(uint64_t tick);
+	bool     CouldFit(const SlotDemand& demand, size_t available) const;
+	bool     FitsFreeSlots(View& view);
 	void     Resize(Memory& memory, uint64_t base, uint64_t size);
 	void     WriteDescriptors();
 	void     Drop(Memory& memory);
@@ -298,6 +308,9 @@ private:
 	std::vector<uint32_t>                                               m_marked;
 	std::vector<Use>                                                    m_visits;
 	std::unordered_map<Key, uint32_t, KeyHash>                          m_index;
+	uint64_t                                                            m_insertions   = 0;
+	uint64_t                                                            m_reclaim_tick = 0;
+	std::vector<ImageHeapSlots::KeyWordArray>                           m_absent;
 	std::vector<uint32_t>                                               m_free;
 	std::vector<uint32_t>                                               m_pending;
 	std::vector<uint32_t>                                               m_released;

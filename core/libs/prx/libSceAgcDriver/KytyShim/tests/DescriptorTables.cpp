@@ -62,26 +62,30 @@ struct ImageHeapTestAccess {
 		return count;
 	}
 
-	static bool Matches(const ImageHeap& heap, const ShaderRecompiler::IR::ImageHeapRequest& request,
-	                    const ShaderRecompiler::IR::ImageTableSnapshot& table, const std::array<ImageId, 4>& images) {
+	static const Buffer* ViewBuffer(const ImageHeap& heap, const ShaderRecompiler::IR::ImageHeapRequest& request) {
 		const auto memory = std::ranges::find_if(heap.m_memories, [&](const auto& item) { return item->base == request.base; });
-		if (memory == heap.m_memories.end()) return false;
+		if (memory == heap.m_memories.end()) return nullptr;
 		const auto view = std::ranges::find_if((*memory)->views, [&](const auto& item) {
-			return item->first == request.first && item->step == request.step && heap.m_profiles[item->profile] == *request.root;
+			return item->shape.first == request.first && item->shape.step == request.step &&
+			       heap.m_profiles[item->shape.profile] == *request.root;
 		});
-		if (view == (*memory)->views.end()) return false;
+		return view == (*memory)->views.end() ? nullptr : (*view)->buffer.get();
+	}
+
+	static bool Matches(const ImageHeap& heap, const ShaderRecompiler::IR::ImageHeapRequest& request,
+	                    const ShaderRecompiler::IR::ImageTableSnapshot& table, const std::array<ImageId, 4>& images,
+	                    std::span<const uint32_t> slots) {
 		for (size_t i = 1; i < table.mapping.size(); ++i) {
 			const auto offset = (request.first + (i - 1u) * request.step) / 4u;
-			if (offset >= (*view)->slots.size()) return false;
-			const auto entry = (*view)->slots[offset];
-			const auto slot = entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u);
+			if (offset >= slots.size()) return false;
+			const auto slot = slots[offset] & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u);
 			const auto ordinal = table.mapping[i];
 			if (ordinal == 0u) {
 				if (slot != 0u) return false;
 				continue;
 			}
-			if (slot == 0u || heap.m_elements[slot].key.value != table.slots[ordinal] ||
-				heap.m_elements[slot].image != images[ordinal]) return false;
+			if (slot == 0u || slot >= heap.m_elements.size() || heap.m_elements[slot].key.value != table.slots[ordinal] ||
+			    heap.m_elements[slot].image != images[ordinal]) return false;
 		}
 		return true;
 	}
@@ -142,6 +146,7 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	auto& scheduler = renderer.GetCommandScheduler();
 	scheduler.Begin(processor.GetCtx(), processor.GetUcfg(), processor.GetShCtx());
 	auto& heap = renderer.GetImageHeap();
+	auto& buffers = renderer.GetBufferCache();
 	IR::ImageResource root;
 	root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
 	const auto profile = IR::ImageTableHeapProfile(root, false);
@@ -150,7 +155,7 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	const auto texture_c = HeapTexture(address + 0xc000u);
 	const auto write = [&](uint64_t target, const IR::DescriptorValue& value) {
 		Libs::LibKernel::Memory::WriteBacking(target, value.dwords.data(), sizeof(value.dwords));
-		(void)heap.InvalidateMemory(target, sizeof(value.dwords));
+		buffers.InvalidateMemory(target, sizeof(value.dwords));
 	};
 	write(address, texture_a);
 	const IR::ImageHeapRequest resident {.base = address, .size = 32u, .step = 32u, .count = 1u, .root = &profile, .table = true};
@@ -228,7 +233,7 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	module.info.bindings.descriptor_counts[static_cast<size_t>(kind)] = fallback_descriptors;
 	module.info.bindings.descriptor_mask = uint64_t {1} << static_cast<size_t>(kind);
 	const IR::ResourceSnapshot fallback {.images = {{.dword_count = 8u}},
-	                                     .image_tables = {std::make_shared<IR::ImageTableSnapshot>(table)}};
+	                                     .image_tables = {std::make_shared<const IR::ImageTableSnapshot>(table)}};
 	const ShaderStageRuntime runtime {&module, &fallback};
 	const vk::DescriptorSetLayoutBinding binding {
 	    IR::NativeBinding(ShaderType::Compute, kind), vk::DescriptorType::eSampledImage,
@@ -258,6 +263,19 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	                                       .push_stages = vk::ShaderStageFlagBits::eCompute};
 	PreparedBindings prepared;
 	auto& executor = renderer.GetRenderExecutor();
+	const auto matches = [&](const IR::ImageHeapRequest& target, const IR::ImageTableSnapshot& expected,
+	                         const std::array<ImageId, 4>& images) {
+		const auto* slots_buffer = ImageHeapTestAccess::ViewBuffer(heap, target);
+		if (slots_buffer == nullptr) return false;
+		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, heap_layout.value);
+		const auto slot_bytes = std::min<uint64_t>(target.size & ~uint64_t {3}, slots_buffer->Size());
+		Buffer readback(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, slot_bytes);
+		readback.CopyFrom(scheduler.Current(), *slots_buffer, 0, 0, slot_bytes);
+		scheduler.Finish();
+		std::vector<uint32_t> slots(slot_bytes / sizeof(uint32_t));
+		std::memcpy(slots.data(), readback.Mapped().data(), slot_bytes);
+		return ImageHeapTestAccess::Matches(heap, target, expected, images, slots);
+	};
 	const auto bind_fallback = [&] {
 		RenderExecutorTestAccess::Reset(executor);
 		executor.PrepareBindings(runtime, prepared);
@@ -337,17 +355,12 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	Check(recovered, "two completed slots recover the alias-heavy direct binding");
 	heap.Rebind(executor);
 	sample_memory();
-	if (recovered) {
-		Check(ImageHeapTestAccess::Matches(heap, request, table, fallback_images),
-		      "recovered heap preserves the fallback descriptor at every ordinal");
-		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, heap_layout.value);
-	}
 	Check(device.signalSemaphore({.semaphore = gate.value, .value = 1u}) == vk::Result::eSuccess, "release the fallback submission");
 	scheduler.Finish();
 	device.destroySemaphore(gate.value);
-	device.destroyPipelineLayout(heap_layout.value);
-	device.destroyPipelineLayout(layout.value);
-	device.destroyDescriptorSetLayout(set_layout.value);
+	if (recovered) {
+		Check(matches(request, table, fallback_images), "recovered heap preserves the fallback descriptor at every ordinal");
+	}
 
 	const auto full = ImageHeapTestAccess::Pending(heap);
 	IR::ImageTableSnapshot unique {.slots = {{}, texture_a, texture_b, texture_c}, .mapping = {260, 1, 2, 3},
@@ -375,7 +388,7 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	heap.BeginDraw();
 	Check(!heap.Acquire(mapped, result), "memory-backed view starts on fallback");
 	std::thread invalidator([&] {
-		for (uint32_t i = 0; i < 128; ++i) (void)heap.InvalidateMemory(address, 96u);
+		for (uint32_t i = 0; i < 128; ++i) buffers.InvalidateMemory(address, 96u);
 	});
 	bool exhausted = true;
 	for (uint32_t i = 0; i < 128; ++i) {
@@ -389,14 +402,14 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	Check(heap.Acquire(mapped, result), "memory-backed descriptor mutation invalidates a failed request");
 	IR::ImageTableSnapshot expected {.slots = {{}, texture_a, texture_b, texture_c}, .mapping = {3, 1, 2, 3}};
 	heap.Rebind(executor);
-	Check(ImageHeapTestAccess::Matches(heap, mapped, expected, fallback_images), "changed descriptors select the current images");
+	Check(matches(mapped, expected, fallback_images), "changed descriptors select the current images");
 	auto truncated = mapped;
 	truncated.size = 76u;
-	Check(!heap.Acquire(truncated, result) && ImageHeapTestAccess::Matches(heap, mapped, expected, fallback_images),
+	Check(!heap.Acquire(truncated, result) && matches(mapped, expected, fallback_images),
 	      "a different extent in the same draw preserves the active view and uses fallback");
 	expected.mapping.back() = 0u;
 	heap.BeginDraw();
-	Check(heap.Acquire(truncated, result) && ImageHeapTestAccess::Matches(heap, truncated, expected, fallback_images),
+	Check(heap.Acquire(truncated, result) && matches(truncated, expected, fallback_images),
 	      "truncating a descriptor clears its previous image");
 	renderer.UnmapMemory(address, 0x4000u);
 	renderer.MapMemory(address, 0x4000u);
@@ -405,7 +418,7 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	Check(heap.Acquire(mapped, result), "a view remapped at the same guest address uses the new table");
 	expected.mapping.back() = 1u;
 	heap.Rebind(executor);
-	Check(ImageHeapTestAccess::Matches(heap, mapped, expected, fallback_images), "remapped slots resolve to the current images");
+	Check(matches(mapped, expected, fallback_images), "remapped slots resolve to the current images");
 
 	const IR::ImageTableSnapshot keep {.slots = {{}, texture_a, texture_c}, .mapping = {2, 1, 2}};
 	changed.size = 64u;
@@ -418,19 +431,28 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	write(address + 32u, next);
 	heap.BeginDraw();
 	Check(!heap.Acquire(mapped, result), "the retired image slot cannot be overwritten on the recording tick");
-	heap.RunGarbageCollector();
-	scheduler.Wait(scheduler.CurrentTick());
-	heap.BeginDraw();
-	Check(heap.Acquire(mapped, result), "a completed image slot accepts a different descriptor");
+	bool recycled = false;
+	for (uint32_t frame = 0; frame < 256u && !recycled; ++frame) {
+		heap.RunGarbageCollector();
+		scheduler.Finish();
+		heap.BeginDraw();
+		Check(heap.Acquire(changed, result), "keep the two unchanged images resident while the replaced slot ages");
+		recycled = heap.Acquire(mapped, result);
+		heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, heap_layout.value);
+	}
+	Check(recycled, "a completed image slot accepts a different descriptor");
 	heap.Rebind(executor);
 	const auto next_image = executor.ResolveTexture(IR::ImageTableHeapResource(profile, next), next, true).image_id;
 	expected.slots[2] = next;
 	auto next_images = fallback_images;
 	next_images[2] = next_image;
 	Check(old_slot != 0u && old_slot == ImageHeapTestAccess::LiveSlot(heap, next) &&
-	      next_image && next_image != fallback_images[2] && ImageHeapTestAccess::Matches(heap, mapped, expected, next_images),
+	      next_image && next_image != fallback_images[2] && matches(mapped, expected, next_images),
 	      "a recycled slot resolves the replacement image at every ordinal");
 	scheduler.Finish();
+	device.destroyPipelineLayout(heap_layout.value);
+	device.destroyPipelineLayout(layout.value);
+	device.destroyDescriptorSetLayout(set_layout.value);
 	renderer.UnmapMemory(address, bytes);
 	if (memory_budget) {
 		std::printf("%s: sampled peak device-local bytes=%llu\n", g_name,
@@ -444,7 +466,7 @@ int HeapExhaustion() {
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* unavailable = gpu.Initialize(true)) {
+	if (const auto* unavailable = gpu.Initialize(true, true)) {
 		std::fprintf(stderr, "%s: %s\n", g_name, unavailable);
 		return std::getenv("ANYPS5_REQUIRE_VULKAN") ? 1 : 77;
 	}
