@@ -1343,10 +1343,12 @@ void BufferCache::UploadHeapTable(uint64_t vaddr, uint64_t size, const HeapTable
 	    },
 	    [&]() noexcept {
 		    if (copies.empty()) return;
+		    TakeOrderedCopies(copies, total_size);
+		    if (copies.empty()) return;
 		    FinishHostCopies();
 		    m_heap_bytes.resize(total_size);
 		    for (const auto& copy: copies) {
-			    const auto address = m_storage->HandleOrigin() + copy.dstOffset;
+			    const auto address = m_storage->GuestAddress(copy.dstOffset);
 			    if (!LibKernel::Memory::CopySparseMemory(address, m_heap_bytes.data() + copy.srcOffset, copy.size)) {
 				    EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			    }

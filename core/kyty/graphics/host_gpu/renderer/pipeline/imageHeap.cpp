@@ -938,9 +938,10 @@ void ImageHeap::SyncMemory(Memory& memory) {
 	m_runs.clear();
 	m_unread.ForEach([&](uint64_t begin, uint64_t end) { m_runs.emplace_back(begin, end); });
 	for (const auto& [begin, end]: m_runs) {
-		if (!memory.fresh && owned && Unchanged(memory, begin, end)) {
+		if (!memory.fresh && owned && cache.IsRegionCpuModified(begin, end - begin) && Unchanged(memory, begin, end)) {
 			++m_stats.unchanged;
 			m_unread.Subtract(begin, end - begin);
+			memory.unread.emplace_back(begin, end);
 		} else {
 			Upload(begin, end);
 		}
