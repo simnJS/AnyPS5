@@ -13,12 +13,15 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
-#include <deque>
 #include <queue>
 #include <source_location>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(ANYPS5_KYTY)
+#include <deque>
+#endif
 
 namespace Libs::Graphics {
 
@@ -132,7 +135,6 @@ private:
 	void SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_index,
 	                    const RecordedSubmit& recorded);
 	void QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick, const std::source_location& where);
-	void NoteSubmittedFrames(uint64_t tick);
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 #if defined(ANYPS5_KYTY)
@@ -175,8 +177,6 @@ private:
 	std::unique_ptr<HostCopyQueue> m_host_copies;
 	SubmitHook                     m_submit_hook      = nullptr;
 	void*                          m_submit_hook_data = nullptr;
-	Common::AnnotatedMutex         m_stats_mutex;
-	std::deque<uint64_t>           m_stats_flip_ticks KYTY_GUARDED_BY(m_stats_mutex);
 #if defined(ANYPS5_KYTY)
 	Common::AnnotatedMutex      m_flip_mutex;
 	std::condition_variable_any m_flip_changed;

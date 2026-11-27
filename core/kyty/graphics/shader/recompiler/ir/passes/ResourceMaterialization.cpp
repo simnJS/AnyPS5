@@ -1641,10 +1641,51 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+		enum class ImageUse { Atomic, Storage, Sampled };
+		const auto unsupported_format = [&](ImageUse use) {
+			static constexpr std::array kinds = {"atomic", "storage", "sampled"};
+			static std::atomic_flag reported[kinds.size()][1u << 9u] {};
+			const auto kind = static_cast<size_t>(use);
+			if (reported[kind][static_cast<uint32_t>(format)].test_and_set(std::memory_order_relaxed))
+				return false;
+			auto message = fmt::format(
+			    "{} image descriptor {} uses unsupported format {}: root={} source={} "
+			    "first_use_pc={:#x} r128={} words={:08x},{:08x},{:08x},{:08x},"
+			    "{:08x},{:08x},{:08x},{:08x}",
+			    kinds[kind], i, static_cast<uint32_t>(format), base_index, base.source, base.first_use_pc,
+			    base.r128, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
+			    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
+			    descriptor.dwords[6], descriptor.dwords[7]);
+			const auto* source = Source(program, base.source);
+			if (i >= program.info.images.size() && source != nullptr &&
+			    source->indirect_descriptor &&
+			    IsBoundedDescriptorTable(program, *source->indirect_descriptor) &&
+			    !specialization.images[base_index].heap &&
+			    specialization.images[base_index].indirect_search_iterations == 0u &&
+			    !source->indirect_descriptor->pointer_table) {
+				const auto& indirect = *source->indirect_descriptor;
+				const size_t mapping = specialization.images[base_index].indirect_mapping_offset;
+				const auto& flat = snapshot.flattened_srt;
+				if (mapping < flat.size() && flat[mapping] <= flat.size() - mapping - 1u) {
+					uint32_t ordinal = 0;
+					for (size_t child = program.info.images.size(); child <= i; ++child)
+						ordinal += specialization.images[child].indirect_root == base_index;
+					uint32_t matches = 0;
+					uint64_t first_offset = 0;
+					for (uint32_t probe = 0; probe < flat[mapping]; ++probe) {
+						if (flat[mapping + 1u + probe] != ordinal) continue;
+						if (matches++ == 0u) first_offset = uint64_t {probe} * 4u;
+					}
+					message += fmt::format(" table_source={} ordinal={} dense_matches={}",
+					                       indirect.table_source, ordinal, matches);
+					if (matches != 0u)
+						message += fmt::format(" first_candidate_offset={:#x}", first_offset);
+				}
+			}
+			return SpecializationFail(message);
+		};
 		if (base.atomic && !Prospero::IsSupportedAtomicImageFormat(format, base.atomic64)) {
-			return SpecializationFail(
-			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
-			                static_cast<uint32_t>(format)));
+			return unsupported_format(ImageUse::Atomic);
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
 		image.fmask             = Prospero::IsFmaskTextureFormat(format);
@@ -1693,9 +1734,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (!base.atomic &&
 			    ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			     image.numeric_class == Prospero::TextureNumericClass::Unsupported)) {
-				return SpecializationFail(
-				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
-				                static_cast<uint32_t>(format)));
+				return unsupported_format(ImageUse::Storage);
 			}
 			if (raw_sint_storage || base.atomic) {
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
@@ -1703,39 +1742,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
-			auto message = fmt::format(
-			    "sampled image descriptor {} uses unsupported format {}: root={} source={} "
-			    "first_use_pc={:#x} r128={} words={:08x},{:08x},{:08x},{:08x},"
-			    "{:08x},{:08x},{:08x},{:08x}",
-			    i, static_cast<uint32_t>(format), base_index, base.source, base.first_use_pc,
-			    base.r128, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
-			    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
-			    descriptor.dwords[6], descriptor.dwords[7]);
-			const auto* source = Source(program, base.source);
-			if (i >= program.info.images.size() && source != nullptr &&
-			    source->indirect_descriptor &&
-			    IsBoundedDescriptorTable(program, *source->indirect_descriptor) &&
-			    specialization.images[base_index].indirect_search_iterations == 0u &&
-			    !source->indirect_descriptor->pointer_table) {
-				const auto& indirect = *source->indirect_descriptor;
-				const size_t mapping = specialization.images[base_index].indirect_mapping_offset;
-				const auto& flat = snapshot.flattened_srt;
-				if (mapping < flat.size() && flat[mapping] <= flat.size() - mapping - 1u) {
-					uint32_t ordinal = 0;
-					for (size_t child = program.info.images.size(); child <= i; ++child)
-						ordinal += specialization.images[child].indirect_root == base_index;
-					uint32_t matches = 0;
-					uint64_t first_offset = 0;
-					for (uint32_t probe = 0; probe < flat[mapping]; ++probe) {
-						if (flat[mapping + 1u + probe] != ordinal) continue;
-						if (matches++ == 0u) first_offset = uint64_t {probe} * 4u;
-					}
-					message += fmt::format(" table_source={} ordinal={} dense_matches={} "
-					                       "first_candidate_offset={:#x}",
-					                       indirect.table_source, ordinal, matches, first_offset);
-				}
-			}
-			return SpecializationFail(message);
+			return unsupported_format(ImageUse::Sampled);
 		}
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {

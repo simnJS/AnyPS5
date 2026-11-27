@@ -3288,7 +3288,15 @@ RenderExecutor::TableBindingState::RingSet* RenderExecutor::AcquireTableRingSet(
 		}
 	}
 	if (state.ring.size() >= MaxRingSets) {
-		return nullptr;
+		const auto evict = std::find_if(state.ring.begin(), state.ring.end(), [&](const auto& entry) {
+			return semaphore.IsFree(entry.tick);
+		});
+		if (evict == state.ring.end()) {
+			return nullptr;
+		}
+		m_context.GetDescriptorHeap().RetirePersistent(evict->set, evict->tick);
+		*evict = state.ring.back();
+		state.ring.pop_back();
 	}
 	auto& entry  = state.ring.emplace_back();
 	entry.set    = m_context.GetDescriptorHeap().CommitPersistent(layout);

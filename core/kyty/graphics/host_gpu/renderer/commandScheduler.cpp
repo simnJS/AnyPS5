@@ -328,10 +328,6 @@ static bool EarlyFlipEnabled() {
 void CommandScheduler::DeferFlipCompletion(Common::UniqueFunction<void>&& complete) {
 	CheckActive();
 	EXIT_IF(!complete);
-	if (SubmitStats::Enabled()) {
-		Common::ScopedLock lock(m_stats_mutex);
-		m_stats_flip_ticks.push_back(CurrentTick());
-	}
 	const uint64_t previous = std::exchange(m_last_flip_tick, CurrentTick());
 	if (!m_flips_in_place && InPlaceMemory::Live() && previous < CurrentTick()) {
 		if (EarlyFlipEnabled()) {
@@ -666,18 +662,6 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 	m_submitted_tick.store(tick, std::memory_order_release);
-	if (stats) {
-		SubmitStats::Record({.queue           = SubmitStats::Queue::Graphics,
-		                     .batches         = 1,
-		                     .command_buffers = submit_info.commandBufferCount,
-		                     .signal_only     = submit_info.commandBufferCount == 0 ? 1u : 0u,
-		                     .waits           = submit_info.waitSemaphoreCount,
-		                     .lock_ns         = call_start - lock_start,
-		                     .call_ns         = call_end - call_start,
-		                     .tick            = tick,
-		                     .where           = where});
-		NoteSubmittedFrames(tick);
-	}
 #if defined(ANYPS5_KYTY)
 	if (m_flips_pending.load(std::memory_order_acquire)) {
 		{
@@ -686,19 +670,17 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		m_flip_changed.notify_all();
 	}
 #endif
-}
-
-void CommandScheduler::NoteSubmittedFrames(uint64_t tick) {
-	uint32_t ended = 0;
-	{
-		Common::ScopedLock lock(m_stats_mutex);
-		while (!m_stats_flip_ticks.empty() && m_stats_flip_ticks.front() <= tick) {
-			m_stats_flip_ticks.pop_front();
-			ended++;
-		}
-	}
-	for (; ended > 0; ended--) {
-		SubmitStats::EndFrame();
+	if (stats) {
+		const bool signal_only = submit_info.commandBufferCount == 0 && submit_info.waitSemaphoreCount == 0;
+		SubmitStats::Record({.queue           = SubmitStats::Queue::Graphics,
+		                     .batches         = 1,
+		                     .command_buffers = submit_info.commandBufferCount,
+		                     .signal_only     = signal_only ? 1u : 0u,
+		                     .waits           = submit_info.waitSemaphoreCount,
+		                     .lock_ns         = call_start - lock_start,
+		                     .call_ns         = call_end - call_start,
+		                     .tick            = tick,
+		                     .where           = where}, submit.ends_frame);
 	}
 }
 

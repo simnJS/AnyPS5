@@ -90,6 +90,16 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_image_atomic_formats kyty_shim_image_atomic_bindings PROPERTIES TIMEOUT 20)
 endif()
 
+add_test_executable(kyty_shim_image_format_diagnostics_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageFormatDiagnostics.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_image_format_diagnostics_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_image_format_diagnostics_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_image_format_diagnostics_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_image_format_diagnostics_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_image_format_diagnostics COMMAND kyty_shim_image_format_diagnostics_tests)
+set_tests_properties(kyty_shim_image_format_diagnostics PROPERTIES TIMEOUT 20)
+
 add_test_executable(kyty_shim_replay_sampling_tests ${CMAKE_CURRENT_SOURCE_DIR}/ReplaySampling.cpp)
 configure_host_test_executable(kyty_shim_replay_sampling_tests)
 target_include_directories(kyty_shim_replay_sampling_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools)
@@ -270,6 +280,11 @@ target_include_directories(kyty_shim_compare_write_back_tests PRIVATE ${CMAKE_SO
 add_test(NAME kyty_shim_compare_write_back COMMAND kyty_shim_compare_write_back_tests)
 set_tests_properties(kyty_shim_compare_write_back PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_compare_write_back: ok")
 
+add_test_executable(kyty_shim_cache_gc_history_tests ${CMAKE_CURRENT_SOURCE_DIR}/CacheGcHistory.cpp)
+configure_host_test_executable(kyty_shim_cache_gc_history_tests)
+target_include_directories(kyty_shim_cache_gc_history_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty)
+add_test(NAME kyty_shim_cache_gc_history COMMAND kyty_shim_cache_gc_history_tests)
+
 if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ImageWriteBackAlias.cpp)
     add_test_executable(kyty_shim_image_write_back_alias_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageWriteBackAliasMain.cpp)
@@ -295,6 +310,14 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     add_test(NAME kyty_shim_vram_budget_guest_eviction COMMAND kyty_shim_vram_budget_tests guest-eviction)
     set_tests_properties(kyty_shim_vram_budget kyty_shim_vram_budget_guest_eviction
             PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77 ENVIRONMENT "KYTY_GPU_PIPELINE=0")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/VramTimeAging.cpp)
+    add_test_executable(kyty_shim_vram_time_aging_tests ${CMAKE_CURRENT_SOURCE_DIR}/VramTimeAgingMain.cpp)
+    configure_host_test_executable(kyty_shim_vram_time_aging_tests)
+    target_link_libraries(kyty_shim_vram_time_aging_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_vram_time_aging COMMAND kyty_shim_vram_time_aging_tests)
+    set_tests_properties(kyty_shim_vram_time_aging PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
+            FAIL_REGULAR_EXPRESSION "FAILED")
     if(NOT ANYPS5_ENABLE_ASAN)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/MaskedMaterialStore.cpp)
@@ -1100,4 +1123,16 @@ target_link_libraries(kyty_shim_descriptor_pool_oversize_tests PRIVATE
         Kyty::gpu libkernel libc)
 add_test(NAME kyty_shim_descriptor_pool_oversize COMMAND kyty_shim_descriptor_pool_oversize_tests)
 set_tests_properties(kyty_shim_descriptor_pool_oversize PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+
+add_test_executable(kyty_shim_persistent_descriptor_reclaim_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/PersistentDescriptorReclaim.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_persistent_descriptor_reclaim_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_persistent_descriptor_reclaim_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_persistent_descriptor_reclaim_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_persistent_descriptor_reclaim_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_persistent_descriptor_reclaim COMMAND kyty_shim_persistent_descriptor_reclaim_tests)
+set_tests_properties(kyty_shim_persistent_descriptor_reclaim PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endif()

@@ -198,19 +198,15 @@ void Buffer::Commit(uint64_t offset, uint64_t size) {
 	bind_info.pWaitSemaphores    = &zeroed;
 	bind_info.bufferBindCount    = 1;
 	bind_info.pBufferBinds       = &buffer_bind;
+	const bool stats      = SubmitStats::Enabled();
+	const auto lock_start = stats ? Common::SteadyNs() : 0;
+	uint64_t   call_start = 0;
+	uint64_t   call_end   = 0;
 	{
-		const bool stats      = SubmitStats::Enabled();
-		const auto lock_start = stats ? Common::SteadyNs() : 0;
 		Common::LockGuard lock {graphics.queue_mutex};
-		const auto call_start = stats ? Common::SteadyNs() : 0;
+		call_start = stats ? Common::SteadyNs() : 0;
 		EXIT_IF(graphics.queue.submit(1, &submit, nullptr) != vk::Result::eSuccess);
-		if (stats) {
-			SubmitStats::Record({.queue           = SubmitStats::Queue::Sparse,
-			                     .batches         = 1,
-			                     .command_buffers = submit.commandBufferCount,
-			                     .lock_ns         = call_start - lock_start,
-			                     .call_ns         = Common::SteadyNs() - call_start});
-		}
+		call_end = stats ? Common::SteadyNs() : 0;
 		const auto result = graphics.queue.bindSparse(1, &bind_info, fence);
 		if (result != vk::Result::eSuccess) {
 			EXIT("Buffer: sparse bind of %zu blocks at 0x%" PRIx64 " failed: %s (block %" PRIu64
@@ -218,6 +214,13 @@ void Buffer::Commit(uint64_t offset, uint64_t size) {
 			     binds.size(), binds.front().resourceOffset, vk::to_string(result).c_str(), m_sparse_block,
 			     m_sparse_size, m_size);
 		}
+	}
+	if (stats) {
+		SubmitStats::Record({.queue           = SubmitStats::Queue::Sparse,
+		                     .command_buffers = submit.commandBufferCount,
+		                     .lock_ns         = call_start - lock_start,
+		                     .call_ns         = call_end - call_start,
+		                     .where           = std::source_location::current()});
 	}
 	EXIT_IF(graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
 	graphics.device.destroyFence(fence, nullptr);
