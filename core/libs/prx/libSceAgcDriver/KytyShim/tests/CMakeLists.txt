@@ -163,6 +163,13 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_cross_queue_label_order PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0;KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_label_order: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/QueueSubmitBatching.cpp)
+    add_test_executable(kyty_shim_queue_submit_batching_tests ${CMAKE_CURRENT_SOURCE_DIR}/QueueSubmitBatchingMain.cpp)
+    configure_host_test_executable(kyty_shim_queue_submit_batching_tests)
+    target_link_libraries(kyty_shim_queue_submit_batching_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_queue_submit_batching COMMAND kyty_shim_queue_submit_batching_tests)
+    set_tests_properties(kyty_shim_queue_submit_batching PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77)
     add_test(NAME kyty_shim_buffer_write_coverage COMMAND kyty_shim_cross_queue_label_order_tests buffer-write-coverage)
     set_tests_properties(kyty_shim_buffer_write_coverage PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_COMMAND_MEMORY_IN_PLACE=0"

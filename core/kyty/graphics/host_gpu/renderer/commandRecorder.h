@@ -163,6 +163,10 @@ public:
 		auto chunk = m_chunks.Pop();
 		return chunk ? std::move(*chunk) : nullptr;
 	}
+	[[nodiscard]] ChunkPtr TryPop() {
+		auto chunk = m_chunks.TryPop();
+		return chunk ? std::move(*chunk) : nullptr;
+	}
 	void Recycle(ChunkPtr chunk);
 
 	void Stop() { m_chunks.Stop(); }

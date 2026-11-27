@@ -665,9 +665,12 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 void CommandScheduler::RecordingThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuRecord");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Recording);
-	vk::CommandBuffer buffer       = nullptr;
-	size_t            buffer_index = 0;
-	const auto        acquire      = [this, &buffer, &buffer_index] {
+	constexpr size_t      MaxBatchedSubmits = 32;
+	vk::CommandBuffer     buffer            = nullptr;
+	size_t                buffer_index      = 0;
+	std::optional<uint64_t> pending_tick;
+	size_t                batched = 0;
+	const auto            acquire = [this, &buffer, &buffer_index] {
 		if (buffer == nullptr) {
 			std::tie(buffer, buffer_index) = m_command_pool.CommitDeferred();
 			vk::CommandBufferBeginInfo begin_info {};
@@ -676,18 +679,51 @@ void CommandScheduler::RecordingThread() {
 		}
 		return buffer;
 	};
+	const auto flush_pending = [&] {
+		if (!pending_tick.has_value()) {
+			return;
+		}
+		const RecordedSubmit pending {.tick = *pending_tick};
+		pending_tick.reset();
+		batched = 0;
+		SubmitRecorded(buffer, buffer_index, pending);
+	};
 	for (;;) {
 		auto chunk = m_chunk_queue.Pop();
 		if (chunk == nullptr) {
 			break;
 		}
-		CommandStream::Replay(*chunk, acquire, [&](const CommandStream::Entry& entry) {
-			EXIT_IF(entry.kind != CommandStream::RecordKind::Submit);
-			SubmitRecorded(buffer, buffer_index,
-			               *static_cast<const RecordedSubmit*>(entry.Payload()));
-		});
-		m_chunk_queue.Recycle(std::move(chunk));
+		while (chunk != nullptr) {
+			CommandStream::Replay(*chunk, acquire, [&](const CommandStream::Entry& entry) {
+				EXIT_IF(entry.kind != CommandStream::RecordKind::Submit);
+				const auto& recorded       = *static_cast<const RecordedSubmit*>(entry.Payload());
+				const bool  has_host_copy  = m_host_copies != nullptr && recorded.host_copies != 0;
+				const bool  has_waits      = recorded.info.num_wait_semaphores != 0 || has_host_copy;
+				const bool  has_signals    = recorded.info.num_signal_semaphores != 0;
+				if (!has_waits && !has_signals && batched < MaxBatchedSubmits) {
+					pending_tick = recorded.tick;
+					++batched;
+					return;
+				}
+				if (has_waits) {
+					flush_pending();
+				} else {
+					pending_tick.reset();
+					batched = 0;
+				}
+				SubmitRecorded(buffer, buffer_index, recorded);
+			});
+			m_chunk_queue.Recycle(std::move(chunk));
+			if (!pending_tick.has_value()) {
+				break;
+			}
+			chunk = m_chunk_queue.TryPop();
+			if (chunk == nullptr) {
+				flush_pending();
+			}
+		}
 	}
+	flush_pending();
 	EXIT_IF(buffer != nullptr);
 }
 
