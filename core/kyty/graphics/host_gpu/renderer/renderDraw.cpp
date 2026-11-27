@@ -1195,9 +1195,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 					    depth.image_id,
 					    {info.base_level, info.level_count, info.base_layer, info.layer_count},
 					    info.aspect);
-					auto& copy         = cache.GetImage(copy_id);
-					binding.image_id   = copy_id;
-					binding.image_view = copy.FindView(info);
+					auto& copy           = cache.GetImage(copy_id);
+					binding.image_id     = copy_id;
+					binding.image_serial = copy.serial;
+					binding.image_view   = copy.FindView(info);
 					for (size_t i = 0; i < mip_infos.size(); i++) {
 						binding.mip_views[i] = copy.FindView(mip_infos[i]);
 					}

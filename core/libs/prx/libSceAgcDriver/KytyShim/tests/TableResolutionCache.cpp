@@ -313,7 +313,7 @@ void RecycledImageSlot() {
 	const auto id = images.insert(Owner {1, 5});
 	TextureBinding binding;
 	binding.image_id = id;
-	binding.table_serial = images[id].serial;
+	binding.image_serial = images[id].serial;
 	binding.desc.view_info.base_level = 1;
 	binding.desc.view_info.level_count = 4;
 	const auto end = binding.desc.view_info.base_level + binding.desc.view_info.level_count;
@@ -327,7 +327,7 @@ void RecycledImageSlot() {
 	      "replacement reuses the slot with a shorter mip chain");
 	Check(original.Get(images) == nullptr, "recycled slot cannot serve the original image");
 	binding.image_id = replacement;
-	binding.table_serial = images[replacement].serial;
+	binding.image_serial = images[replacement].serial;
 	Check(binding.TableImage() != original && binding.TableImage().Get(images) == &images[replacement],
 	      "new resolution identifies the replacement owner");
 }

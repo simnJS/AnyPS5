@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "RenderExecutorTestAccess.h"
 #include "TestVulkanDevice.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
@@ -88,13 +89,6 @@ struct ImageHeapTestAccess {
 			    heap.m_elements[slot].image != images[ordinal]) return false;
 		}
 		return true;
-	}
-};
-
-struct RenderExecutorTestAccess {
-	static void Reset(RenderExecutor& executor) { executor.ResetBindings(); }
-	static size_t RingSets(const RenderExecutor& executor, const ShaderModule& module) {
-		return executor.m_table_states.at(&module.info).ring.size();
 	}
 };
 

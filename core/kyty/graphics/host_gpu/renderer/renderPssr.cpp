@@ -257,9 +257,11 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		}
 	}
 	const auto acquire = [&](TextureBinding& binding, const uint32_t* words, bool storage) {
-		auto& previous = cache.GetImage(binding.image_id);
-		if (!previous.registered || previous.binding.needs_rebind) {
-			previous.binding = {};
+		auto* previous = binding.TableImage().Get(cache.m_slot_images);
+		if (previous == nullptr || !previous->registered || previous->binding.needs_rebind) {
+			if (previous != nullptr) {
+				previous->binding = {};
+			}
 			binding = resolve(words, storage);
 			BindImage(binding.image_id, storage);
 		}

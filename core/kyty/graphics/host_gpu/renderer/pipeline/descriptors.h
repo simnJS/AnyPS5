@@ -62,9 +62,9 @@ struct TextureBinding {
 	TextureDescDerivation* lookup = nullptr;
 	bool                   reused   = false;
 	bool                   declined = false;
-	uint64_t               table_serial = 0;
+	uint64_t               image_serial = 0;
 
-	[[nodiscard]] TableImageRef TableImage() const { return {image_id, table_serial}; }
+	[[nodiscard]] TableImageRef TableImage() const { return {image_id, image_serial}; }
 };
 
 struct PreparedBindings {
