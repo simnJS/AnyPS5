@@ -513,7 +513,8 @@ void RenderContext::CacheIndexedBufferReads(const ShaderStageRuntime& runtime) {
 	if (pending_page) return;
 	std::vector<std::pair<uint64_t, uint64_t>> spans;
 	children.ForEach([&](uint64_t first, uint64_t last) {
-		if (m_buffer_cache.FindBuffer(first, last - first)) spans.emplace_back(first, last);
+		m_buffer_cache.RequestDeviceRange(first, last - first);
+		spans.emplace_back(first, last);
 	});
 	if (!spans.empty()) m_buffer_cache.SynchronizeBuffersInSpans(spans);
 }
