@@ -192,7 +192,7 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     target_link_libraries(kyty_shim_cross_queue_label_order_tests PRIVATE libSceAgcDriver libkernel libc)
     add_test(NAME kyty_shim_cross_queue_label_order COMMAND kyty_shim_cross_queue_label_order_tests)
     set_tests_properties(kyty_shim_cross_queue_label_order PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
-            ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0;KYTY_GPU_PIPELINE=0"
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_label_order: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     add_test(NAME kyty_shim_buffer_write_coverage COMMAND kyty_shim_cross_queue_label_order_tests buffer-write-coverage)
     set_tests_properties(kyty_shim_buffer_write_coverage PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
@@ -1080,23 +1080,16 @@ set_target_properties(kyty_shim_cross_queue_order_tests PROPERTIES CXX_EXTENSION
 configure_host_test_executable(kyty_shim_cross_queue_order_tests)
 add_dependencies(kyty_shim_cross_queue_order_tests agc_frame_replay)
 foreach(scenario compute_waits_graphics_data graphics_waits_compute_data dma_wait generated_command_buffer
-        compute_waits_graphics_clock recycled_label)
+        compute_waits_graphics_clock graphics_waits_compute_clock recycled_label early_label)
     add_test(NAME kyty_shim_cross_queue_${scenario}
             COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> ${scenario})
     set_tests_properties(kyty_shim_cross_queue_${scenario} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
             LABELS "cross_queue_order" PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_${scenario}: ok")
 endforeach()
-foreach(scenario graphics_waits_compute_clock early_label)
-    add_test(NAME kyty_shim_cross_queue_${scenario}
-            COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> ${scenario})
-    set_tests_properties(kyty_shim_cross_queue_${scenario} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
-            LABELS "cross_queue_order;expected_failure"
-            PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_${scenario}: order broken: ")
-endforeach()
-add_test(NAME kyty_shim_cross_queue_recycled_label_own_tick
+add_test(NAME kyty_shim_cross_queue_recycled_label_serial
         COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> recycled_label)
-set_tests_properties(kyty_shim_cross_queue_recycled_label_own_tick PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
-        LABELS "cross_queue_order" ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0"
+set_tests_properties(kyty_shim_cross_queue_recycled_label_serial PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+        LABELS "cross_queue_order" ENVIRONMENT "KYTY_GPU_PIPELINE=0"
         PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_recycled_label: ok")
 if(WIN32)
     set_property(TEST kyty_shim_buffer_null_range kyty_shim_uniform_scalar_replay kyty_shim_empty_buffer_replay
@@ -1106,7 +1099,7 @@ if(WIN32)
             kyty_shim_cross_queue_compute_waits_graphics_data kyty_shim_cross_queue_graphics_waits_compute_data
             kyty_shim_cross_queue_dma_wait kyty_shim_cross_queue_generated_command_buffer kyty_shim_cross_queue_compute_waits_graphics_clock
             kyty_shim_cross_queue_graphics_waits_compute_clock kyty_shim_cross_queue_recycled_label
-            kyty_shim_cross_queue_early_label kyty_shim_cross_queue_recycled_label_own_tick
+            kyty_shim_cross_queue_early_label kyty_shim_cross_queue_recycled_label_serial
             APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
     if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
         set_property(TEST kyty_shim_prepared_variant_first_use kyty_shim_rt_stats_cache_isolation

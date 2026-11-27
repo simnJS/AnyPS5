@@ -12,7 +12,6 @@ struct Facts {
 	bool tracked_bytes  = false;
 	bool around_enabled = false;
 	bool backing        = false;
-	bool label_pending  = false;
 };
 
 enum class Route : uint8_t { Defer, DeferAround, Drain };
@@ -22,7 +21,6 @@ enum class Reason : uint8_t {
 	CacheBytes,
 	AroundOff,
 	NoBacking,
-	NoLabelPending,
 	Other,
 	Count
 };
@@ -36,8 +34,7 @@ inline constexpr size_t ReasonCount = static_cast<size_t>(Reason::Count);
 	if (!facts.tracked_page) {
 		return Route::Defer;
 	}
-	const bool around = facts.around_enabled && facts.label_pending && !facts.tracked_bytes && facts.backing;
-	return around ? Route::DeferAround : Route::Drain;
+	return facts.around_enabled && !facts.tracked_bytes && facts.backing ? Route::DeferAround : Route::Drain;
 }
 
 [[nodiscard]] constexpr Reason DrainReason(const Facts& facts) noexcept {
@@ -53,10 +50,7 @@ inline constexpr size_t ReasonCount = static_cast<size_t>(Reason::Count);
 	if (!facts.around_enabled) {
 		return Reason::AroundOff;
 	}
-	if (!facts.backing) {
-		return Reason::NoBacking;
-	}
-	return facts.label_pending ? Reason::Other : Reason::NoLabelPending;
+	return facts.backing ? Reason::Other : Reason::NoBacking;
 }
 
 }
