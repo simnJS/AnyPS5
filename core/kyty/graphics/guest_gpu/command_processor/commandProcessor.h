@@ -91,6 +91,11 @@ public:
 		return m_sh_ctx;
 	}
 
+	void ObserveIndirectRegister(uint32_t space, uint32_t offset, uint32_t value) {
+		if (m_draw_observer != nullptr && offset != UINT32_MAX) {
+			m_draw_observer->WriteRegister(space, offset, value);
+		}
+	}
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);
 	void SetIndexBufferSize(uint32_t index_buffer_size);

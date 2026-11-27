@@ -1032,6 +1032,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = registers.Value(i);
+		cp.ObserveIndirectRegister(0, raw_cmd_offset, value);
 
 		if (cmd_offset == Pm4::CX_NOP) {
 			continue;
@@ -1101,6 +1102,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = registers.Value(i);
+		cp.ObserveIndirectRegister(1, raw_cmd_offset, value);
 
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;
@@ -1152,6 +1154,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = registers.Value(i);
+		cp.ObserveIndirectRegister(2, raw_cmd_offset, value);
 
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
