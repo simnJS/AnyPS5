@@ -249,10 +249,15 @@ def excluded_device(policy_path, cache):
 
 def driver(args, binary):
     root = args.work.resolve(strict=True)
-    if root.parent != binary.parent or not root.name.startswith('compute-'):
-        raise ValueError('expected a private compute preparation directory')
-    manifest, = (root / '_PipelineCache').glob('*.compute.kpm')
-    title, version = manifest.name.removesuffix('.compute.kpm').rsplit('_', 1)
+    if root.parent != binary.parent or not root.name.startswith(('compute-', 'graphics-')):
+        raise ValueError('expected a private preparation directory')
+    if root.name.startswith('graphics-'):
+        if not (root / '_PipelineCache/offline_1.kpm').is_file():
+            raise ValueError('missing graphics signature manifest')
+        title, version = 'offline', '1'
+    else:
+        manifest, = (root / '_PipelineCache').glob('*.compute.kpm')
+        title, version = manifest.name.removesuffix('.compute.kpm').rsplit('_', 1)
     cache = root / 'driver-cache'
     cache.mkdir(exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('KYTY_', '__GL_SHADER_DISK_CACHE', 'MESA_SHADER_CACHE'))}
@@ -306,6 +311,10 @@ def main():
     prep.add_argument('recipes', type=Path)
     prep.add_argument('--select', type=Path)
     prep.add_argument('--signatures', type=Path)
+    graphics = commands.add_parser('prepare-graphics', help='prepare generic graphics modules and pipeline signatures')
+    graphics.add_argument('store', type=Path)
+    graphics.add_argument('signatures', type=Path)
+    graphics.add_argument('output', type=Path, help='new graphics-* directory beside the driver tool')
     gpu = commands.add_parser('driver')
     gpu.add_argument('work', type=Path)
     gpu.add_argument('--modules-only', action='store_true')
@@ -322,6 +331,9 @@ def main():
             return select_compute_programs(args)
         except (KeyError, OSError, ValueError) as error:
             select.error(str(error))
+    if args.command == 'prepare-graphics':
+        script = Path(__file__).resolve().parents[1] / 'graphics-precache/generic.py'
+        return subprocess.run([sys.executable, script, args.store, args.signatures, args.output]).returncode
     binary = args.binary.resolve(strict=True)
     if args.command == 'inventory':
         return inventory(args, binary)
