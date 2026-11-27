@@ -564,7 +564,7 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 	}
 	m_scratch.assign(slots, 0u);
 	for (size_t index = 0; index < count; ++index) {
-		const auto value = table != nullptr ? table->slots[table->mapping[index + 1u]] : list.values[index];
+		auto       value = table != nullptr ? table->slots[table->mapping[index + 1u]] : list.values[index];
 		const auto kind  = table != nullptr ? IR::ImageTableHeapKind(m_profiles[profile], value)
 		                                    : IR::ImageHeapKind(m_profiles[profile], value);
 		if (kind == 0u) continue;
