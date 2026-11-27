@@ -9,9 +9,11 @@
 #include "kernel/memory.h"
 #include "prx/libkernel/include/Api.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -175,7 +177,10 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	if (!graphics.CreateImage(recycle_info, recycled_image) || texture_bytes() != baseline + bytes) {
 		return "reusing a recycled image changed its charge";
 	}
+	const auto start = std::chrono::steady_clock::now();
 	graphics.LogMemoryMinute("sample", 0);
+	const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start);
+	std::printf("memory sample including log write: %.1f us\n", elapsed.count());
 	graphics.DeleteImage(recycled_image);
 	graphics.TrimRecycledImages();
 	if (texture_bytes() != baseline) return "trim left a dead image charge";
@@ -238,7 +243,7 @@ const char* CheckVramCase(GraphicContext& graphics, uint64_t address) {
 
 }
 
-extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
+extern "C" int RunKytyVramBudgetTest(bool guest_eviction, bool wait_for_minute) {
 	const char* name = guest_eviction ? "kyty_shim_vram_budget_guest_eviction" : "kyty_shim_vram_budget";
 	Common::InitializeThreads();
 	Config::Initialize();
@@ -265,7 +270,23 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
 		address = reinterpret_cast<uint64_t>(guest);
 	}
 	const bool invalid_range = guest_eviction && !GuestRange {address, GuestBytes}.Valid();
+	gpu.graphics.StartMemoryMinutes();
 	const char* failure = invalid_range ? nullptr : CheckVramCase(gpu.graphics, address);
+	gpu.graphics.TrimRecycledImages();
+	if (wait_for_minute) std::this_thread::sleep_for(std::chrono::seconds(61));
+	gpu.graphics.StopMemoryMinutes();
+	if (!failure) {
+		for (const auto& heaps: MemoryTelemetry::totals) {
+			for (const auto& total: heaps) {
+				if (total.bytes != 0 || total.count != 0) failure = "destroyed renderer retained an allocation charge";
+			}
+		}
+		if (MemoryTelemetry::resident != 0 || MemoryTelemetry::imported != 0 || MemoryTelemetry::pipeline_ram != 0 ||
+		    MemoryTelemetry::live_objects<vk::Pipeline> != 0 || MemoryTelemetry::live_objects<vk::PipelineCache> != 0 ||
+		    MemoryTelemetry::live_objects<vk::DescriptorPool> != 0 || MemoryTelemetry::live_objects<vk::CommandPool> != 0) {
+			failure = "destroyed renderer retained a memory or object charge";
+		}
+	}
 	if (guest_eviction && sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", name);
 		return 1;

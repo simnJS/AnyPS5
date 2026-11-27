@@ -83,6 +83,22 @@ void MeasureCounters() {
 	}
 	const auto elapsed = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
 	std::printf("allocation/free pairs=%zu ns/pair=%.2f\n", pairs, elapsed / pairs);
+
+	auto report = std::make_unique<DriverMemoryReport>(1);
+	VkDeviceMemoryReportCallbackDataEXT event {};
+	event.objectType = VK_OBJECT_TYPE_PIPELINE;
+	event.size = 4096;
+	const auto driver_start = Clock::now();
+	for (size_t i = 0; i < pairs; ++i) {
+		event.memoryObjectId = i;
+		event.type = VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATE_EXT;
+		report->Observe(event);
+		event.type = VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT;
+		report->Observe(event);
+	}
+	const auto driver_elapsed = std::chrono::duration<double, std::nano>(Clock::now() - driver_start).count();
+	Require(report->Bytes(DriverMemoryReport::Pipeline) == 0, "driver report retained bytes");
+	std::printf("driver report pairs=%zu ns/pair=%.2f\n", pairs, driver_elapsed / pairs);
 }
 
 }
