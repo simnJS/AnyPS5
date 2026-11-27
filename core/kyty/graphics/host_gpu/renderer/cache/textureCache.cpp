@@ -650,10 +650,7 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 	        range.base_layer + range.layer_count > depth.backing.layers);
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
-	depth.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range,
-	              command);
-	copy.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, range,
-	             command);
+	copy.PrepareTransfer(command, depth, range, range, vk::PipelineStageFlagBits2::eCopy);
 	std::vector<vk::ImageCopy> copies;
 	for (const auto aspect: {vk::ImageAspectFlagBits::eDepth, vk::ImageAspectFlagBits::eStencil}) {
 		if (!(aspects & aspect)) {
@@ -3155,8 +3152,22 @@ void TextureCache::ClearImageLayers(CommandBuffer& command, ImageId id, vk::Form
 			offset += count;
 		}
 	} else {
-		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-		              command.Handle());
+		Image::Barriers barriers;
+		for (const auto& run: runs) {
+			const ImageSubresourceRange cleared {range.baseMipLevel, range.levelCount, run.first, run.count};
+			const auto run_barriers =
+			    image.GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+			                      vk::PipelineStageFlagBits2::eTransfer, cleared);
+			barriers.insert(barriers.end(), run_barriers.begin(), run_barriers.end());
+			if (image.info.IsVolume()) {
+				break;
+			}
+		}
+		if (!barriers.empty()) {
+			vk::DependencyInfo dependency {};
+			dependency.setImageMemoryBarriers(barriers);
+			command.Handle().pipelineBarrier2(dependency);
+		}
 		for (const auto& run: runs) {
 			auto native_range = range;
 			native_range.baseArrayLayer = image.info.IsVolume() ? 0 : run.first;
