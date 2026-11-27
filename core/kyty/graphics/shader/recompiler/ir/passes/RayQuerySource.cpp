@@ -23,6 +23,7 @@ constexpr size_t   MaxHypotheses = 8;
 constexpr uint64_t Literal       = 1ull << 63;
 constexpr uint64_t Zext          = 0x10000;
 constexpr uint64_t Base48        = 0x10001;
+constexpr uint64_t DwordBase     = 0x10002;
 constexpr uint32_t None          = 0xffffffffu;
 constexpr uint32_t One           = 0xfffffffeu;
 
@@ -356,7 +357,7 @@ public:
 			form.constant &= ~uint64_t {3};
 			return m_store.Make(std::move(form));
 		}
-		return m_store.Join(AlignDword(m_store.Lo(value)), m_store.Hi(value));
+		return m_store.Op(64, {DwordBase, value});
 	}
 
 	Choices Word(Value value) {
@@ -1267,6 +1268,13 @@ struct Source {
 	bool operator==(const Source&) const = default;
 };
 
+const Atom* UserTablePointer(const Store& store, const Atom& base) {
+	if (base.kind == Kind::Pointer) return &base;
+	if (base.kind != Kind::Op || base.args.size() != 2 || base.args[0] != DwordBase) return nullptr;
+	const auto atom = store.AtomOf(static_cast<uint32_t>(base.args[1]));
+	return atom && store.A(*atom).kind == Kind::Pointer ? &store.A(*atom) : nullptr;
+}
+
 std::optional<Source> SourceOf(const Store& store, uint32_t form) {
 	const auto atom = store.AtomOf(form);
 	if (!atom) return std::nullopt;
@@ -1277,7 +1285,9 @@ std::optional<Source> SourceOf(const Store& store, uint32_t form) {
 	if (address.terms.size() != 1 || address.terms[0].second != 1 || address.constant > 0xffffu) return std::nullopt;
 	const auto& base = store.A(address.terms[0].first);
 	const auto  at   = static_cast<uint32_t>(address.constant);
-	if (base.kind == Kind::Pointer) return Source {static_cast<uint32_t>(base.args[0]), at};
+	if (const auto* user = UserTablePointer(store, base)) {
+		return Source {static_cast<uint32_t>(user->args[0]), at, user == &base ? ShaderInfo::NoRayQuerySlot : ScalarRayQueryTable};
+	}
 	if (base.kind != Kind::Op || base.args.size() != 2 || base.args[0] != Base48) return std::nullopt;
 	const auto inner = store.AtomOf(static_cast<uint32_t>(base.args[1]));
 	if (!inner) return std::nullopt;
@@ -1289,8 +1299,10 @@ std::optional<Source> SourceOf(const Store& store, uint32_t form) {
 	const auto& table = store.F(static_cast<uint32_t>(vsharp.args[0]));
 	if (table.terms.size() != 1 || table.terms[0].second != 1 || table.constant > 0xffffu) return std::nullopt;
 	const auto& user = store.A(table.terms[0].first);
-	if (user.kind != Kind::Pointer) return std::nullopt;
-	return Source {static_cast<uint32_t>(user.args[0]), at, static_cast<uint32_t>(table.constant)};
+	const auto* pointer = UserTablePointer(store, user);
+	if (pointer == nullptr) return std::nullopt;
+	const auto offset = static_cast<uint32_t>(table.constant);
+	return Source {static_cast<uint32_t>(pointer->args[0]), at, pointer == &user ? offset : ScalarRayQueryVsharpAt(offset)};
 }
 
 struct Record {
@@ -1302,7 +1314,17 @@ struct Record {
 	uint32_t node    = 0;
 };
 
+uint32_t RecordAddress(Store& store, uint32_t address) {
+	const auto offset = store.F(address).constant;
+	const auto* aligned = store.OpOf(store.Strip(address), DwordBase);
+	if (aligned == nullptr) return address;
+	auto record = store.F(static_cast<uint32_t>(aligned->args[1]));
+	record.constant = (record.constant & ~uint64_t {3}) + offset;
+	return store.Make(std::move(record));
+}
+
 std::optional<Record> RecordOf(Store& store, uint32_t address, uint32_t header) {
+	address = RecordAddress(store, address);
 	const auto form   = store.F(address);
 	const auto top    = store.F(header);
 	Record     record {.key = store.Strip(address), .offset = form.constant};
@@ -1318,9 +1340,10 @@ std::optional<Record> RecordOf(Store& store, uint32_t address, uint32_t header) 
 	for (const auto& [atom, scale]: rest) {
 		const auto& a = store.A(atom);
 		if (a.kind == Kind::Load && a.args[1] == 8 && scale == 1) {
-			const auto& at = store.F(static_cast<uint32_t>(a.args[0]));
-			if (store.Strip(static_cast<uint32_t>(a.args[0])) != store.Strip(header) || at.constant < top.constant) return std::nullopt;
-			record.base = static_cast<uint32_t>(at.constant - top.constant);
+			const auto at = RecordAddress(store, static_cast<uint32_t>(a.args[0]));
+			const auto offset = store.F(at).constant;
+			if (store.Strip(at) != header || offset < top.constant) return std::nullopt;
+			record.base = static_cast<uint32_t>(offset - top.constant);
 			continue;
 		}
 		if (a.kind == Kind::Op && a.args.size() == 3 && a.args[0] == static_cast<uint64_t>(ValueOpcode::ShiftRightLogical32) &&
@@ -1595,6 +1618,7 @@ struct Fields {
 	uint64_t                inline_offset = 0;
 
 	std::optional<uint32_t> Dword(Store& store, uint32_t address) const {
+		address = RecordAddress(store, address);
 		const auto key    = store.Strip(address);
 		const auto offset = store.F(address).constant;
 		if (std::ranges::find(indexed_keys, key) != indexed_keys.end() && offset % 4u == 0 && offset < 256u) {
@@ -1939,8 +1963,8 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		if (rest.size() != 1 || rest[0].second != 1) return false;
 		const auto& offset = store.A(rest[0].first);
 		if (offset.kind != Kind::Load || offset.args[1] != 8) return false;
-		const auto address = static_cast<uint32_t>(offset.args[0]);
-		return store.Strip(address) == store.Strip(named) && indexed && store.F(address).constant == top.constant + indexed->base;
+		const auto address = RecordAddress(store, static_cast<uint32_t>(offset.args[0]));
+		return store.Strip(address) == named && indexed && store.F(address).constant == top.constant + indexed->base;
 	};
 	const auto bounded = [&](uint32_t base) {
 		auto form = store.F(base);
@@ -2138,7 +2162,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 				if (inline_record ? word == start : std::ranges::find(starts, word) != starts.end()) return true;
 				const auto atom = store.AtomOf(word);
 				if (!atom || store.A(*atom).kind != Kind::Load) return false;
-				const auto key = store.Strip(static_cast<uint32_t>(store.A(*atom).args[0]));
+				const auto key = store.Strip(RecordAddress(store, static_cast<uint32_t>(store.A(*atom).args[0])));
 				return inline_record ? key == fields.inline_key : std::ranges::find(keys, key) != keys.end();
 			});
 		};

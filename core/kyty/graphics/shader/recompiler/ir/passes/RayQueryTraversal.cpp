@@ -1546,6 +1546,7 @@ struct AddressLoad {
 	Value    low;
 	Value    high;
 	uint32_t offset = 0;
+	bool     scalar = false;
 };
 
 std::optional<AddressLoad> LoadOf(const Program& program, Value value) {
@@ -1554,8 +1555,9 @@ std::optional<AddressLoad> LoadOf(const Program& program, Value value) {
 		return std::nullopt;
 	const auto* handle = Producer(load->Arg(0), ValueOpcode::GetAddressResource);
 	if (handle == nullptr) return std::nullopt;
-	return AddressLoad {handle->Arg(0).Resolve(), handle->Arg(1).Resolve(),
-	                    MemoryOf(program, *load).offset};
+	const auto& memory = MemoryOf(program, *load);
+	const bool scalar = memory.kind == ResourceKind::ScalarAddress;
+	return AddressLoad {handle->Arg(0).Resolve(), handle->Arg(1).Resolve(), scalar ? memory.offset & ~3u : memory.offset, scalar};
 }
 
 const Inst* DescriptorAddress(Value word) {
@@ -2261,13 +2263,13 @@ bool DeriveHeaderSource(const Program& program, LaneMaskWalk& w) {
 		    direct && UserRegister(buffer->Arg(1)) == *direct + 1u) {
 			source.user_sgpr     = *direct;
 			source.header_vsharp = ShaderInfo::UserDataRayQueryVsharp;
-			source.header_offset = MemoryOf(program, *read).offset;
+			source.header_offset = MemoryOf(program, *read).offset & ~3u;
 			return true;
 		}
 		if (!user || UserRegister(base->high) != *user + 1u) return false;
 		source.user_sgpr     = *user;
-		source.header_vsharp = base->offset;
-		source.header_offset = MemoryOf(program, *read).offset;
+		source.header_vsharp = base->scalar ? ScalarRayQueryVsharpAt(base->offset) : base->offset;
+		source.header_offset = MemoryOf(program, *read).offset & ~3u;
 		return true;
 	}
 	if (const auto low = UserRegister(value); low) {
@@ -2292,6 +2294,7 @@ bool DeriveHeaderSource(const Program& program, LaneMaskWalk& w) {
 	if (!user || load->high.IsEmpty() || UserRegister(load->high) != *user + 1u) return false;
 	source.user_sgpr     = *user;
 	source.header_offset = load->offset;
+	source.header_vsharp = load->scalar ? ScalarRayQueryTable : ShaderInfo::NoRayQuerySlot;
 	return true;
 }
 

@@ -16,6 +16,18 @@ constexpr uint32_t BvhIntersectEmpty = 1u << 11;
 constexpr uint32_t BvhIntersectStrict = 1u << 12;
 constexpr uint32_t BvhIntersectOracleMulti = 1u << 13;
 constexpr uint32_t RayQueryListSize = 32;
+constexpr uint32_t ScalarRayQueryVsharp = 0x80000000u;
+constexpr uint32_t ScalarRayQueryTable  = 0xc0000000u;
+
+constexpr uint32_t ScalarRayQueryVsharpAt(uint32_t byte_offset) {
+	return ScalarRayQueryVsharp | (byte_offset >> 2u);
+}
+
+constexpr uint32_t ResolveRayQueryUserTable(uint64_t& pointer, uint32_t vsharp) {
+	if (vsharp < ScalarRayQueryVsharp || vsharp > ScalarRayQueryTable) return vsharp;
+	pointer &= ~uint64_t {3};
+	return vsharp == ScalarRayQueryTable ? UINT32_MAX : (vsharp - ScalarRayQueryVsharp) << 2u;
+}
 
 enum class RayQueryResultKind : uint32_t {
 	Has        = 0,

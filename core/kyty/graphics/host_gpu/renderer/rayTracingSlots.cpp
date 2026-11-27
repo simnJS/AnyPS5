@@ -514,17 +514,18 @@ bool RayTracing::HeaderInUserData(const TlasSource& source) noexcept {
 
 uint64_t RayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
                                        const std::function<bool(uint64_t, uint64_t)>& readable) {
-	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
+	const auto offset = ShaderRecompiler::IR::ResolveRayQueryUserTable(pointer, source.header_vsharp);
+	if (offset == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
 		return pointer;
 	}
-	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::UserDataRayQueryVsharp) {
+	if (offset == ShaderRecompiler::IR::ShaderInfo::UserDataRayQueryVsharp) {
 		return pointer & ((uint64_t {1} << 48u) - 1u);
 	}
 	std::array<uint32_t, 2> vsharp {};
-	if (pointer > UINT64_MAX - source.header_vsharp || !readable(pointer + source.header_vsharp, sizeof(vsharp))) {
+	if (pointer > UINT64_MAX - offset || !readable(pointer + offset, sizeof(vsharp))) {
 		return 0;
 	}
-	std::memcpy(vsharp.data(), reinterpret_cast<const void*>(pointer + source.header_vsharp), sizeof(vsharp));
+	std::memcpy(vsharp.data(), reinterpret_cast<const void*>(pointer + offset), sizeof(vsharp));
 	return uint64_t {vsharp[0]} | (uint64_t {vsharp[1] & 0xffffu} << 32u);
 }
 
@@ -591,7 +592,7 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 	const uint32_t node_limit = node_limit_at(header, TlasNodeCountBit);
 	uint64_t       instance_offset = 0;
 	load(header + ((layout[1] >> 16u) & 15u) * 8u, instance_offset);
-	if (node_limit >= QueueCapacity || instance_offset >= MaxExtent) {
+	if (node_limit >= QueueCapacity || instance_offset >= MaxExtent || (instance_offset & 3u) != 0) {
 		return {};
 	}
 	const auto nodes_end = header + (uint64_t {node_limit} + 1) * 64;

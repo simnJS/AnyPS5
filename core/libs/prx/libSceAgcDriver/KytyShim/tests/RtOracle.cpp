@@ -231,6 +231,7 @@ struct SourceWalk {
     IR::Block              entry, header, body, latch, merge, second_header, second_body, second_latch, second_merge;
     IR::Program            program;
     IR::Block*             block = &entry;
+    IR::ResourceKind       address_kind = IR::ResourceKind::None;
     std::vector<IR::Inst*> sites;
 
     IR::Value Add(IR::ValueOpcode opcode, std::initializer_list<IR::Value> args, uint64_t flags = 0) {
@@ -246,8 +247,10 @@ struct SourceWalk {
         return Add(opcode, args, std::bit_cast<uint64_t>(flags));
     }
 
-    IR::Value LoadAddress(IR::Value resource, uint32_t offset) {
-        return Load(IR::ValueOpcode::LoadAddressU32, {resource, IR::Value(uint32_t {0}), IR::Value(uint32_t {0}), IR::Value(true)}, offset, false);
+    IR::Value LoadAddress(IR::Value resource, uint32_t offset, uint32_t displacement = 0) {
+        const auto word = Load(IR::ValueOpcode::LoadAddressU32, {resource, IR::Value(displacement), IR::Value(uint32_t {0}), IR::Value(true)}, offset, false);
+        program.memory_info.back().kind = address_kind;
+        return word;
     }
 
     std::array<IR::Value, 2> Offset(IR::Value low, IR::Value high, IR::Value node) {
@@ -293,12 +296,12 @@ void Number(SourceWalk& walk) {
     }
 }
 
-std::array<IR::Value, 2> UserHeader(SourceWalk& walk, uint32_t offset) {
+std::array<IR::Value, 2> UserHeader(SourceWalk& walk, uint32_t offset, uint32_t displacement = 0) {
     using Op           = IR::ValueOpcode;
     walk.block         = &walk.entry;
     const auto user    = [&](uint32_t reg) { return walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {reg})}); };
     const auto pointer = walk.Add(Op::GetAddressResource, {user(4), user(5)});
-    return {walk.LoadAddress(pointer, offset), walk.LoadAddress(pointer, offset + 4)};
+    return {walk.LoadAddress(pointer, offset, displacement), walk.LoadAddress(pointer, offset + 4, displacement)};
 }
 
 std::array<IR::Value, 6> UserRay(SourceWalk& walk) {
@@ -308,7 +311,7 @@ std::array<IR::Value, 6> UserRay(SourceWalk& walk) {
     return ray;
 }
 
-void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> header, const std::array<IR::Value, 6>& ray, HighWord kind) {
+void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> header, const std::array<IR::Value, 6>& ray, HighWord kind, bool scalar_blas = false) {
     using Op               = IR::ValueOpcode;
     const auto u32         = [](uint32_t value) { return IR::Value(value); };
     const auto word        = static_cast<uint64_t>(IR::Type::U32);
@@ -355,7 +358,15 @@ void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> head
     if (kind == HighWord::Masked) high = walk.Add(Op::BitwiseAnd32, {high, u32(0xffffu)});
     const auto buffer = walk.Add(Op::GetBufferResource, {low, walk.Add(Op::BitwiseOr32, {high, u32(0x00800000u)}), u32(0xffffffffu), u32(0x00027000u)});
     const auto index  = walk.Add(Op::ShiftRightLogical32, {child, u32(3)});
+    IR::Value scalar_record;
+    if (scalar_blas) {
+        const auto array = walk.Add(Op::CompositeConstructU64, {low, high});
+        const auto element = walk.Add(Op::ShiftLeftLogical64, {walk.Add(Op::CompositeConstructU64, {index, u32(0)}), u32(7)});
+        const auto record = walk.Add(Op::IAdd64, {array, element});
+        scalar_record = walk.Add(Op::GetAddressResource, {walk.Add(Op::CompositeExtractU64, {record, u32(0)}), walk.Add(Op::CompositeExtractU64, {record, u32(1)})});
+    }
     const auto record = [&](uint32_t dword) {
+        if (scalar_blas && dword >= 12) return walk.LoadAddress(scalar_record, dword * 4u);
         return walk.Load(Op::LoadBufferU32, {buffer, index, u32(0), u32(0), IR::Value(true)}, dword * 4u, true);
     };
     const auto number = [&](IR::Value value) { return walk.Add(Op::BitCastF32U32, {value}); };
@@ -397,6 +408,33 @@ IR::OracleWalks DeriveWithHighWord(HighWord kind) {
     const auto header = UserHeader(walk, 0x20);
     BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, header, ray, kind);
     return IR::DeriveOracleWalks(walk.program, walk.sites);
+}
+
+void ScalarHeaderWalk() {
+    SourceWalk walk;
+    walk.program.blocks = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge};
+    Number(walk);
+    walk.address_kind = IR::ResourceKind::ScalarAddress;
+    const auto ray    = UserRay(walk);
+    const auto header = UserHeader(walk, 0x23, 7);
+    BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, header, ray, HighWord::Exact, true);
+    const auto traced = IR::TraceNativeTraversals(walk.program, {.wave_size = 32, .rewrite = true, .oracle = IR::OracleRemaining | IR::OracleOnly});
+    const auto flags = walk.sites.front()->Flags<uint32_t>();
+    Expect(traced.source_valid && traced.user_sgpr == 4 && traced.header_offset == 0x24,
+           "a scalar header load rounds down its dynamic and immediate offsets independently");
+    uint64_t pointer = 0x1003;
+    const auto vsharp = IR::ResolveRayQueryUserTable(pointer, traced.header_vsharp);
+    Expect(vsharp == IR::ShaderInfo::NoRayQuerySlot && pointer + traced.header_offset == 0x1024,
+           "the host reads the same dword as the scalar load with an unaligned user pointer");
+    pointer = 0x1003;
+    const auto descriptor = IR::ResolveRayQueryUserTable(pointer, IR::ScalarRayQueryVsharpAt(0x10027));
+    Expect(pointer == 0x1000 && descriptor == 0x10024, "a scalar descriptor load keeps the aligned table base and descriptor offset");
+    pointer = 0x1003;
+    Expect(IR::ResolveRayQueryUserTable(pointer, IR::ShaderInfo::UserDataRayQueryVsharp) == IR::ShaderInfo::UserDataRayQueryVsharp &&
+               pointer == 0x1003,
+           "a buffer descriptor supplied directly by the user retains its byte address");
+    Expect((flags & IR::BvhIntersectOracle) != 0 && (flags & IR::BvhIntersectEmpty) == 0,
+           "a walk reading its header and instance offset with scalar loads is served by a host query");
 }
 
 struct TwoWalks {
@@ -577,6 +615,7 @@ void EntryLanes() {
 int main() {
     EntryLanes();
     PrologueFlag();
+    ScalarHeaderWalk();
     TwoTlasWalks();
     RecordLayouts();
     UntracedWalk();

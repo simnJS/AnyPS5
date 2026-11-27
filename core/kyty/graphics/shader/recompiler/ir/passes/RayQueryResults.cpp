@@ -1537,14 +1537,15 @@ void Analysis::Begin(uint64_t seed) {
 	const auto table   = 0x0000080000000000ull + ((Mix(seed + 77u) & 0xffffffu) << 12u);
 	const auto sgpr    = m_result.user_sgpr;
 	auto       pointer = static_cast<uint64_t>(m_machine.UserData(sgpr)) | static_cast<uint64_t>(m_machine.UserData(sgpr + 1u)) << 32u;
-	if (m_result.header_vsharp == 0xfffffffeu) {
+	const auto vsharp = ResolveRayQueryUserTable(pointer, m_result.header_vsharp);
+	if (vsharp == ShaderInfo::UserDataRayQueryVsharp) {
 		pointer = m_result.header_offset == 0xffffffffu ? header : table;
 		m_machine.SetUserData(sgpr, static_cast<uint32_t>(pointer));
 		m_machine.SetUserData(sgpr + 1u, static_cast<uint32_t>(pointer >> 32u));
-	} else if (m_result.header_vsharp != 0xffffffffu) {
+	} else if (vsharp != ShaderInfo::NoRayQuerySlot) {
 		const auto loaded = m_result.header_offset == 0xffffffffu ? header : table;
-		m_machine.Preset(pointer + m_result.header_vsharp, static_cast<uint32_t>(loaded));
-		m_machine.Preset(pointer + m_result.header_vsharp + 4u, static_cast<uint32_t>(loaded >> 32u) & 0xffffu);
+		m_machine.Preset(pointer + vsharp, static_cast<uint32_t>(loaded));
+		m_machine.Preset(pointer + vsharp + 4u, static_cast<uint32_t>(loaded >> 32u) & 0xffffu);
 		pointer = loaded;
 	} else if (m_result.header_offset == 0xffffffffu) {
 		m_machine.SetUserData(sgpr, static_cast<uint32_t>(header));

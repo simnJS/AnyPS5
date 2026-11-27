@@ -194,6 +194,7 @@ void main() {
 			}
 		} else if (cached) {
 			state.instance_base = header + LoadGuestU64(header + LayoutInstanceOffset(pc.instance_layout));
+			if ((state.instance_base & 3u) != 0) s_valid = 0u;
 			state.node_limit    = LayoutNodeCountAt80(pc.instance_layout) ? LoadGuestU32(header + 80) - 1u
 			                                                              : LoadGuestU32(header + 88);
 		} else if (s_valid != 0) {

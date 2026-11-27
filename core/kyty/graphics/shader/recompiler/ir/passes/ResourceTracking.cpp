@@ -5066,11 +5066,13 @@ private:
 		const auto& source = m_decoded.ray_tracing_source;
 		const auto* handle = read.Arg(0).Resolve().TryInstruction();
 		uint32_t    reg    = 0;
-		return source.header_vsharp == 0xffffffffu && source.header_offset != ShaderInfo::UserDataRayQueryHeader &&
-		       memory.kind == ResourceKind::ScalarAddress &&
-		       !memory.address_is_full && handle != nullptr && UserDataBasePair(*handle, reg) &&
-		       reg == source.user_sgpr &&
-		       (memory.offset == source.header_offset || memory.offset == source.header_offset + 4u);
+		if ((source.header_vsharp != ShaderInfo::NoRayQuerySlot && source.header_vsharp != ScalarRayQueryTable) ||
+		    source.header_offset == ShaderInfo::UserDataRayQueryHeader || memory.kind != ResourceKind::ScalarAddress ||
+		    memory.address_is_full || handle == nullptr || !UserDataBasePair(*handle, reg) || reg != source.user_sgpr) return false;
+		const auto dynamic = read.Arg(1).Resolve();
+		if (!dynamic.IsImmediate() || dynamic.GetType() != Type::U32) return false;
+		const auto at = int64_t {dynamic.U32() & ~3u} + static_cast<int32_t>(memory.offset & ~3u);
+		return at == source.header_offset || at == int64_t {source.header_offset} + 4;
 	}
 
 	Roots RootsOf(const Value& value) const {
