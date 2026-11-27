@@ -3,18 +3,17 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/lruCache.h"
-#include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
-#include "graphics/host_gpu/renderer/cache/inPlaceMemory.h"
-#include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/guestHostView.h"
+#include "graphics/host_gpu/renderer/cache/guestMirror.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,33 +30,52 @@ class CommandScheduler;
 class CommandRecorder;
 class TextureCache;
 class RenderContext;
-
-using BufferId = Common::SlotId;
-inline constexpr BufferId NULL_BUFFER_ID {0};
+class GuestMirror;
+struct SubmitInfo;
 
 enum class HackMark : uint32_t {
 	LoopGuard,
 	Count,
 };
 
+enum class ObtainFrom : uint8_t {
+	Any,
+	Mirror,
+};
+
+enum class BdaWriteTracking : uint8_t { Unknown, PageBitmap, ExplicitRanges };
+
+enum class HeapProducer : uint8_t { Image, Occlusion };
+
+enum class HeapWriteSource : uint8_t { Immediate, Shader, Collected };
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
-	static constexpr uint64_t NATIVE_RT_CONTEXT_PAGE = CACHING_NUMPAGES;
-	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    (CACHING_NUMPAGES + 1) * sizeof(vk::DeviceAddress);
-	static constexpr uint64_t WRITE_BITMAP_OFFSET = CACHING_NUMPAGES / 8;
-	static constexpr uint64_t USE_BITMAP_OFFSET   = 2 * WRITE_BITMAP_OFFSET;
-	static constexpr uint64_t HACK_MARKS_OFFSET   = 3 * WRITE_BITMAP_OFFSET;
+	static constexpr uint32_t MIRROR_BLOCK_BITS = GuestMirror::MinBlockBits;
+	static constexpr uint64_t MIRROR_BLOCK_SIZE = uint64_t {1} << MIRROR_BLOCK_BITS;
+	static constexpr uint64_t MIRROR_BITMAP_SIZE = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) / MIRROR_BLOCK_SIZE / 8;
+	static constexpr uint64_t RT_CONTEXT_OFFSET = 3 * sizeof(uint64_t);
+	static constexpr uint64_t HOST_TABLE_OFFSET = 8 * sizeof(uint64_t);
+	static constexpr uint64_t HOST_ACCESS_OFFSET = HOST_TABLE_OFFSET + sizeof(uint64_t);
+	static constexpr uint64_t RESIDENCY_OFFSET = 256;
+	static constexpr uint32_t RESIDENCY_BLOCKS = 16;
+	static constexpr uint64_t RESIDENCY_SIZE = MIRROR_BITMAP_SIZE * 8 / RESIDENCY_BLOCKS * sizeof(uint32_t);
+	static_assert(GuestMirror::LargestSize / GuestMirror::WindowSize <= (UINT32_MAX >> RESIDENCY_BLOCKS));
+	static constexpr uint64_t FAULT_BITMAP_OFFSET = RESIDENCY_OFFSET + RESIDENCY_SIZE;
+	static constexpr uint64_t USE_BITMAP_OFFSET = FAULT_BITMAP_OFFSET + MIRROR_BITMAP_SIZE;
+	static constexpr uint64_t WRITE_BITMAP_OFFSET = USE_BITMAP_OFFSET + MIRROR_BITMAP_SIZE;
+	static constexpr uint64_t HACK_MARKS_OFFSET = WRITE_BITMAP_OFFSET + CACHING_NUMPAGES / 8;
 	static constexpr uint32_t HACK_MARK_ENTRIES   = 256;
 	static constexpr uint32_t HACK_MARK_DWORDS    = 16;
 	static constexpr uint32_t HACK_MARK_COUNTS    = 4;
 	static constexpr uint32_t HACK_MARK_GUEST_RAYS = HACK_MARK_COUNTS + static_cast<uint32_t>(HackMark::Count);
 	static constexpr uint64_t HACK_MARKS_SIZE     = uint64_t {HACK_MARK_ENTRIES} * HACK_MARK_DWORDS * 4;
 	static constexpr uint64_t RT_STATS_OFFSET     = HACK_MARKS_OFFSET + HACK_MARKS_SIZE;
-	static constexpr uint64_t FAULT_BUFFER_SIZE   = RT_STATS_OFFSET + sizeof(uint32_t);
+	static constexpr uint64_t FAULT_BUFFER_SIZE = RT_STATS_OFFSET + sizeof(uint32_t);
+	static constexpr uint64_t GUEST_END = LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
 	static constexpr uint32_t HACK_MARK_ORACLE_RETURNED   = HACK_MARK_GUEST_RAYS + 1;
 	static constexpr uint32_t HACK_MARK_ORACLE_RAYS       = HACK_MARK_GUEST_RAYS + 2;
 	static constexpr uint32_t HACK_MARK_ORACLE_CANDIDATES = HACK_MARK_GUEST_RAYS + 3;
@@ -72,12 +90,10 @@ public:
 		       HACK_MARK_ENTRIES;
 	}
 
-	static constexpr uint64_t PageIndex(uint64_t address) {
-		return (address < LOWER_ADDRESS_SIZE
-		            ? address
-		            : address - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE) >>
-		       CACHING_PAGEBITS;
+	static constexpr uint64_t GuestOffset(uint64_t address) {
+		return address < LibKernel::Memory::kExtendedMemoryBase ? address : address - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE;
 	}
+
 	static constexpr uint64_t GuestAddress(uint64_t offset) {
 		return offset < LOWER_ADDRESS_SIZE
 		           ? offset
@@ -89,6 +105,7 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
+	void                   ReleaseWindowBlocks(std::span<const uint64_t> windows);
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_fault = false);
 	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
@@ -101,15 +118,6 @@ public:
 	enum class WriteFaultOwner : uint8_t { CommandBuffer, CommandSegment, GpuNeighbor, Buffer, Other };
 	WriteFaultOwner        InvalidateFaultedPage(uint64_t vaddr);
 	static void            CountWriteFault(WriteFaultOwner owner, bool image);
-	[[nodiscard]] static bool CommandMemoryInPlaceRequested() noexcept { return InPlaceMemory::Requested(); }
-	[[nodiscard]] bool        ServesInPlace(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] uint64_t    InPlaceGpuWriteTick(uint64_t vaddr, uint64_t size) const;
-	[[nodiscard]] uint64_t    InPlaceGpuWriteBytesTick(uint64_t vaddr, uint64_t size) const;
-	[[nodiscard]] bool        DeferredLabelPending(uint64_t vaddr, uint64_t size) const;
-	void                      NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size);
-	void                      NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size, InPlaceMemory::WriteKind kind);
-	[[nodiscard]] InPlaceMemory::WriteCover InPlaceGpuWriteCover(uint64_t vaddr, uint64_t size) const;
-	void                      ServeInPlaceConversions();
 	void NoteCommandBuffer(uint64_t vaddr, uint64_t size) {
 		if (size != 0 && GuestRange {vaddr, size}.Valid()) {
 			m_memory_tracker.MarkCommandBlocks(vaddr, size);
@@ -125,31 +133,30 @@ public:
 			m_memory_tracker.ForgetCommandBlocks(vaddr, size);
 		}
 	}
-	uint64_t               DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
-	using FreeBlocksQuery = bool (*)(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* blocks);
-	struct FreeBlockSplits {
-		uint64_t lists = 0, cut = 0;
-	};
-	uint64_t               SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks = nullptr,
-	                                            FreeBlockSplits* splits = nullptr);
-	uint64_t               DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks,
-	                                      FreeBlockSplits* splits);
+	bool                   DropFreedRange(uint64_t vaddr, uint64_t size);
 	void                   InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept;
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
 	                                  bool guest_fault = false);
 	static void            LogReadbackSummary();
 	static void            LogWriteBlockSummary();
 	static void            NoteStagedCommandProcessorRead();
-	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
-	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
-	                                                        bool     is_written,
-	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
-	[[nodiscard]] std::pair<Buffer*, uint64_t>
-	ObtainBufferWithProvenWrites(uint64_t vaddr, uint64_t size, std::span<const GuestRange> writes,
-	                           BufferId id);
+	void RequestDeviceRange(uint64_t vaddr, uint64_t size);
+	void RequestUnimportedRanges(const RangeSet& mapped, uint64_t mapping_epoch);
+	void RequestUnimportedRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t ImportGeneration();
+	void ImportGuestMemory(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool GuestMemoryImported(uint64_t vaddr, uint64_t size) const { return m_host_view->Overlaps(vaddr, size); }
+	void ForgetGuestMemory(uint64_t vaddr, uint64_t size);
+	void EnsureRangeContents(uint64_t vaddr, uint64_t size, RangeSet* uploaded = nullptr);
+	[[nodiscard]] bool InMirror(const Buffer* buffer) const noexcept { return buffer != nullptr && buffer == m_storage.get(); }
+	[[nodiscard]] std::pair<uint64_t, uint64_t> OwnedRun(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high) const;
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainRange(uint64_t vaddr, uint64_t size, bool is_written,
+	                                                       bool       is_texel_buffer = false,
+	                                                       ObtainFrom from            = ObtainFrom::Any,
+	                                                       HeapWriteSource writer = HeapWriteSource::Immediate);
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainRangeWithProvenWrites(uint64_t vaddr, uint64_t size,
+	                                                                       std::span<const GuestRange> writes);
 	bool PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
@@ -161,14 +168,16 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] const Buffer& GetNullBuffer() const noexcept { return m_null_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainRangeForImage(uint64_t vaddr, uint64_t size);
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::optional<uint64_t> StreamGuestRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::optional<uint64_t> FindStreamCopy(uint64_t vaddr, uint64_t size);
 	void NoteStreamCopy(uint64_t vaddr, uint64_t size, uint64_t offset);
 	void SetStreamInPlace(bool in_place) noexcept { m_stream_in_place = in_place; }
+	[[nodiscard]] std::pair<Buffer*, uint64_t> UploadHeapData(
+	    uint64_t size, const std::function<void(uint8_t*, uint64_t)>& write);
 	[[nodiscard]] uint64_t StreamUpload(const void* data, uint64_t size, uint64_t alignment);
 	[[nodiscard]] vk::DeviceAddress TableUpload(const void* data, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
@@ -190,27 +199,24 @@ public:
 	void        WaitReadbackRelease();
 	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
-		return m_memory_tracker.MayBeGpuModified(vaddr, size) || InPlaceGpuWriteTick(vaddr, size) != 0;
+		return m_memory_tracker.MayBeGpuModified(vaddr, size);
 	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
-	[[nodiscard]] Buffer* GetBufferIfLive(BufferId id) {
-		return IsBufferInvalid(id) ? nullptr : &m_slot_buffers[id];
-	}
-	[[nodiscard]] bool TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr, uint64_t size);
-	void EnsureBufferContents(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] static uint64_t BdaTableGeneration() noexcept { return 0; }
 	[[nodiscard]] StreamBuffer& GetTableUploadBuffer();
-	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
+	void               PrepareFaultBuffer(bool may_write = false);
 	void               ProcessFaultBuffer();
 	bool               ProcessHackMarks() { return m_fault_manager.ProcessHackMarkBuffer(); }
 	void               ProcessUseBuffer();
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
+		BeginHeapDraw();
+		m_heap_bitmap_ready.ForEach([&](uint64_t begin, uint64_t end) { m_heap_table_writes.Add(begin, end - begin); });
+		m_heap_bitmap_ready.Clear();
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
-	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
+	void NoteGpuWrites(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate);
 	template <typename Func>
 	void ConsumeCpuWrites(CpuWriteConsumer consumer, uint64_t vaddr, uint64_t size, Func&& func) {
 		m_memory_tracker.ConsumeCpuWrites(consumer, vaddr, size, std::forward<Func>(func));
@@ -220,6 +226,54 @@ public:
 		m_released_ranges.ForEach(func);
 		m_released_ranges.Clear();
 		m_record_released = true;
+	}
+	void WatchHeapTables(std::span<const std::pair<uint64_t, uint64_t>> tables) {
+		m_heap_tables.Clear();
+		if (tables.empty()) {
+			m_heap_bitmap_pending.Clear();
+			m_heap_bitmap_ready.Clear();
+			m_heap_shader_writes.Clear();
+		}
+		for (const auto& [base, size]: tables) {
+			if (size != 0) m_heap_tables.Add(base, size);
+		}
+	}
+	void NoteHeapTransfer(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate) {
+		if (!m_heap_tables.Empty() && size != 0) {
+			m_heap_tables.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
+				auto& ranges = writer == HeapWriteSource::Shader ? m_heap_shader_writes : m_heap_table_writes;
+				ranges.Add(begin, end - begin);
+			});
+		}
+	}
+	void NoteHeapShaderWrites() {
+		m_heap_tables.ForEach([&](uint64_t begin, uint64_t end) { m_heap_bitmap_pending.Add(begin, end - begin); });
+	}
+	void NoteHeapShaderWrites(uint64_t vaddr, uint64_t size) {
+		if (!m_heap_tables.Empty() && size != 0) {
+			m_heap_tables.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
+				m_heap_bitmap_pending.Add(begin, end - begin);
+			});
+		}
+	}
+	[[nodiscard]] bool HeapBitmapReady(uint64_t vaddr, uint64_t size) const {
+		return !m_heap_bitmap_ready.Empty() && m_heap_bitmap_ready.Intersects(vaddr, size);
+	}
+	void CopyHeapTable(Buffer& destination, uint64_t offset, uint64_t address, uint64_t size);
+	void BeginHeapDraw(bool replay = false);
+	bool PrepareHeapPublication(HeapProducer producer, uint64_t serial, uint64_t version, uint64_t address, uint64_t size);
+	void CollectHeapWritePages(RangeSet& written);
+	uint64_t HeapBitmapBytes() const noexcept { return m_heap_bitmap_bytes; }
+	uint64_t HeapBitmapWaits() const noexcept { return m_heap_bitmap_waits; }
+	template <typename Func>
+	void TakeHeapTableWrites(Func&& func) {
+		if (std::exchange(m_heap_writes_unbounded, false)) {
+			m_heap_tables.ForEach(func);
+		} else {
+			if (m_heap_table_writes.Empty()) return;
+			m_heap_table_writes.ForEach(func);
+		}
+		m_heap_table_writes.Clear();
 	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void SynchronizeBuffersInRanges(const RangeSet& ranges, bool all);
@@ -265,16 +319,11 @@ public:
 	}
 	void NoteHostWrite(uint64_t vaddr, uint64_t size) { m_memory_tracker.NoteHostWrite(vaddr, size); }
 	[[nodiscard]] bool IsRegionCpuDirty(uint64_t vaddr, uint64_t size) { return m_memory_tracker.IsRegionCpuModified(vaddr, size); }
-	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size) const {
-		if (vaddr == 0 || !GuestRange {vaddr, size}.Valid()) return {};
-		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-		if (owner == nullptr || !*owner) return {};
-		const auto* buffer = m_slot_buffers.try_get(*owner);
-		return buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(vaddr, size) ? *owner : BufferId {};
-	}
 	void               RunGarbageCollector();
 	[[nodiscard]] bool CommitWriteTicks();
 	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
+	[[nodiscard]] GuestMirror* GetGuestMirror() noexcept { return m_guest_mirror.get(); }
+	[[nodiscard]] const GuestHostView* GetGuestHostView() const noexcept { return m_host_view.get(); }
 	void RequestFlushForReadbacks() noexcept {
 		if ((m_device_address_hot != 0 &&
 		     m_readback_count - m_device_address_hot < HotReadbackLifetime) ||
@@ -284,7 +333,12 @@ public:
 	}
 	void BeginIndirectWrites() noexcept { m_indirect_writes_pending.fetch_add(1, std::memory_order_acq_rel); }
 	void EndIndirectWrites() noexcept { m_indirect_writes_pending.fetch_sub(1, std::memory_order_acq_rel); }
-	void NoteDeviceAddressUse() noexcept {
+	void NoteDeviceAddressUse(BdaWriteTracking tracking = BdaWriteTracking::Unknown) noexcept {
+		if (tracking == BdaWriteTracking::PageBitmap) {
+			NoteHeapShaderWrites();
+		} else if (tracking == BdaWriteTracking::Unknown) {
+			m_heap_writes_unbounded = !m_heap_tables.Empty();
+		}
 		m_device_address_pending = true;
 		if (m_device_address_hot != 0 &&
 		    m_readback_count - m_device_address_hot < HotReadbackLifetime) {
@@ -294,78 +348,59 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
-	friend struct BufferCacheGcTestAccess;
+	friend struct MirrorWindowsTestAccess;
 	friend struct VramBudgetTestAccess;
 	friend struct IndirectDispatchTestAccess;
-	friend struct BufferCacheBdaTestAccess;
 	friend class TextureCache;
 
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedBuffer(
-	    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id = {});
-
-	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedRange(uint64_t vaddr, uint64_t size, bool is_written,
+	                                                                   bool       is_texel_buffer,
+	                                                                   ObtainFrom from = ObtainFrom::Any,
+	                                                                   HeapWriteSource writer = HeapWriteSource::Immediate);
+	void                   RequestRange(uint64_t vaddr, uint64_t size);
+	void                   SetResident(uint64_t begin, uint64_t end, bool resident);
+	void                   NoteBlockRegions(uint64_t begin, uint64_t end, bool insert);
+	[[nodiscard]] bool     Holds(uint64_t vaddr, uint64_t size) const noexcept { return m_guest_mirror->Owned(vaddr, size); }
+	[[nodiscard]] uint64_t Frame() const noexcept;
+	void                   EvictOldBlocks();
+	void                   EvictBlocks(const GuestMirror::Runs& runs);
+	void                   CheckMirrorRange(uint64_t vaddr, uint64_t size) noexcept;
+	void                   CheckMirrorCopies(std::span<const vk::BufferCopy> copies) noexcept;
 	WriteFaultOwner InvalidateGuestWriteFault(uint64_t vaddr);
 	[[nodiscard]] bool MayMarkAhead() const noexcept;
 
-	using BufferMap = std::map<uint64_t, BufferId>;
-	struct OverlapResult {
-		BufferMap::iterator first;
-		BufferMap::iterator last;
-		uint64_t            begin;
-		uint64_t            end;
-		bool                has_stream_leap;
-	};
-
-	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
-	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
-	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
-	void TouchBuffer(const Buffer& buffer);
-	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
-	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
-	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
-	void                   Register(BufferId id);
-	void Unregister(BufferId id);
-	template <bool insert>
-	void ChangeRegister(BufferId id);
-	void DeleteBuffer(BufferId id);
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
-	void CollectStaleBuffers(uint64_t tick);
 	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
-	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
-	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
-	void RecordBufferUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies,
-	                        vk::Buffer source);
-	void               SynchronizeBuffers(std::span<Buffer* const>                       buffers,
-	                                      std::span<const std::pair<uint64_t, uint64_t>> ranges);
-	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool SynchronizeRange(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, RangeSet* uploaded = nullptr);
+	[[nodiscard]] vk::Buffer UploadCopies(std::vector<vk::BufferCopy>& copies, uint64_t total_size);
+	void                     TakeOrderedCopies(std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
+	void                     NotePromotion(uint64_t begin, uint64_t end);
+	[[nodiscard]] bool       IsResident(uint64_t vaddr) const noexcept;
+	void RecordUpload(std::span<const vk::BufferCopy> copies, vk::Buffer source);
+	void SynchronizeRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+	[[nodiscard]] bool SynchronizeRangeFromImage(uint64_t vaddr, uint64_t size);
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadMemory(uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] uint64_t ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] uint64_t ReadAheadSize(uint64_t vaddr, uint64_t size) const;
 	void ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault);
 	void ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault, bool command_processor);
 	[[nodiscard]] uint64_t InFlightReadbackTick(uint64_t begin, uint64_t end) const;
 	void ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_begin, uint64_t pages_end,
 	                     uint64_t tick, bool is_write);
-	std::unique_ptr<InPlaceMemory> m_in_place;
-	InPlaceMemory::WriteKind       m_in_place_write = InPlaceMemory::WriteKind::Binding;
 	struct CopyFeedback;
 	std::unique_ptr<CopyFeedback> m_copy_feedback;
 	size_t                        m_copy_feedback_entries = 0;
 	void                          InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) noexcept;
-	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool TryReadCopyFeedback(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write);
 	uint64_t m_protect_jobs = 0;
-	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
-	                                           uint64_t total_size);
-	void CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                           std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
+	[[nodiscard]] bool DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies, uint64_t total_size);
+	void CollectDownloadCopies(uint64_t vaddr, uint64_t size, std::vector<vk::BufferCopy>& copies,
+	                           uint64_t& total_size);
 	struct ReadbackQueueRead;
-	[[nodiscard]] bool StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                          uint64_t pages_begin, uint64_t pages_end,
-	                                          ReadbackQueueRead& read, bool followers);
+	[[nodiscard]] bool StartReadbackQueueRead(uint64_t vaddr, uint64_t size, uint64_t pages_begin,
+	                                          uint64_t pages_end, ReadbackQueueRead& read, bool followers);
 	struct GuestReadPage {
 		uint64_t page = 0;
 		uint64_t read = 0;
@@ -376,10 +411,11 @@ private:
 	uint64_t                   m_guest_reads = 0;
 	void                       NoteGuestReadPages(uint64_t pages_begin, uint64_t pages_end);
 	void FinishReadbackQueueRead(ReadbackQueueRead& read);
-	void WaitReadbackQueueCopies(vk::Buffer buffer);
+	void WaitReadbackQueueCopies();
 	void DrainHostCopies();
-	void NoteWrite(uint64_t vaddr, uint64_t size) {
+	void NoteWrite(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate) {
 		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);
+		if (writer != HeapWriteSource::Collected) NoteHeapTransfer(vaddr, size, writer);
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
 			m_pending_writes.emplace_back(vaddr, size);
 			for (const auto& hot: m_readback_hot) {
@@ -419,11 +455,8 @@ private:
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
-	Common::SlotVector<Buffer>                        m_slot_buffers;
-	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	BufferMap                                         m_buffers;
-	PageTable                                         m_page_table;
+	std::vector<uint32_t>                             m_residency_words;
+	Buffer                                            m_null_buffer;
 	RangeSet                                          m_gpu_modified_ranges;
 	struct DirtyPageMask {
 		uint64_t                 page = UINT64_MAX;
@@ -459,6 +492,20 @@ private:
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
+	RangeSet                                          m_heap_tables;
+	RangeSet                                          m_heap_table_writes;
+	RangeSet                                          m_heap_shader_writes;
+	RangeSet                                          m_heap_bitmap_pending;
+	RangeSet                                          m_heap_bitmap_ready;
+	uint64_t                                          m_heap_bitmap_bytes = 0;
+	uint64_t                                          m_heap_bitmap_waits = 0;
+	struct Publication {
+		HeapProducer producer;
+		uint64_t serial, version, address, size;
+		bool operator==(const Publication&) const = default;
+	};
+	std::vector<Publication>                          m_heap_publications;
+	bool                                              m_heap_writes_unbounded = false;
 	static constexpr size_t                           StaleRingSize = 32;
 	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};
 	std::atomic<uint32_t>                             m_stale_ring_next {0};
@@ -497,23 +544,18 @@ private:
 	ReadbackQueue m_readback;
 	struct ReadbackQueueSlot {
 		ReadbackQueue     queue;
-		vk::Buffer        source = nullptr;
-		bool              many = false;
 		std::atomic<bool> busy {false};
 	};
 	std::array<ReadbackQueueSlot, 4> m_readback_slots;
 	struct ReadbackQueueRead {
 		ReadbackQueueSlot*                 slot = nullptr;
 		std::vector<vk::BufferCopy>        copies;
-		uint64_t                           buffer_address = 0;
 		uint64_t                           total_size     = 0;
 		uint64_t                           needed   = 0;
 		uint64_t                           recorded = 0;
 		std::shared_ptr<std::atomic<bool>> published;
 		struct Follower {
-			uint64_t                    page           = 0;
-			uint64_t                    buffer_address = 0;
-			vk::Buffer                  source         = nullptr;
+			uint64_t                    page = 0;
 			std::vector<vk::BufferCopy> copies;
 		};
 		std::vector<Follower> followers;
@@ -528,6 +570,32 @@ private:
 	static constexpr uint64_t MirrorMaxRead       = 256;
 	static constexpr uint32_t MaxMirrorLines      = 8192;
 	static constexpr uint64_t MirrorFlushLifetime = 4096;
+	void                      SubmitGuestMirror(SubmitInfo& submit);
+	void                      TickGuestMirror();
+	std::unique_ptr<GuestMirror> m_guest_mirror;
+	std::unique_ptr<GuestHostView> m_host_view;
+	std::unique_ptr<Buffer>      m_storage;
+	struct Promoted {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	std::vector<Promoted>                             m_promoted;
+	std::vector<vk::BufferCopy>                       m_ordered_staged;
+	std::vector<std::pair<vk::Buffer, vk::BufferCopy>> m_ordered_direct;
+	bool                                              m_guest_stores = false;
+	std::array<uint64_t, 3>                           m_unimported_layout {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+	uint64_t                                          m_unimported_bytes = 0;
+	std::unique_ptr<Buffer>                           m_host_access_download;
+	uint64_t                                          m_host_accesses     = 0;
+	uint32_t                                          m_host_access_seen  = 0;
+	bool                                              m_host_access_read  = false;
+	GuestMirror::Runs            m_fresh;
+	GuestMirror::Runs            m_victims;
+	int64_t                      m_evict_check         = 0;
+	uint64_t                     m_guest_mirror_line   = 0;
+	uint64_t                     m_guest_mirror_frames = 0;
+	uint64_t                     m_guest_mirror_evictions = 0;
 	void                      MarkMirrorLinesWritten(uint64_t vaddr, uint64_t size, uint64_t tick);
 	void                      AddMirrorLine(uint64_t line);
 	void                      RecordMirrorCopies(CommandBuffer& command);
@@ -541,12 +609,7 @@ private:
 	struct UploadBatch;
 	bool                                              m_upload_batching   = false;
 	uint64_t                                          m_upload_batch_tick = 0;
-	struct UploadBatchBuffer {
-		vk::Buffer        buffer;
-		vk::DeviceAddress address = 0;
-		uint32_t          count   = 0;
-	};
-	std::vector<UploadBatchBuffer>                    m_upload_batch_buffers;
+	std::vector<uint32_t>                             m_upload_batch_counts;
 	std::vector<vk::BufferCopy>                       m_upload_batch_copies;
 	vk::PipelineLayout                                m_scatter_layout   = nullptr;
 	vk::Pipeline                                      m_scatter_pipeline = nullptr;
@@ -554,36 +617,8 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
-	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_register_epoch     = 0;
-	uint64_t m_buffer_set_epoch = 0;
 	std::unique_ptr<StreamBuffer> m_table_upload;
-	struct ObtainMemo {
-		uint64_t vaddr        = 0;
-		uint64_t size         = 0;
-		uint64_t buffer_epoch = 0;
-		uint64_t cpu_epoch    = 0;
-		uint64_t offset       = 0;
-		BufferId id;
-		bool texel = false;
-	};
-	struct PageMemo {
-		uint64_t page           = UINT64_MAX;
-		uint64_t buffer_epoch   = 0;
-		uint64_t cpu_epoch      = 0;
-		uint64_t buffer_address = 0;
-		BufferId id;
-		uint32_t clean = 0;
-	};
-	static constexpr uint32_t AllPageBits = (1u << (CACHING_PAGESIZE / TRACKER_PAGE_SIZE)) - 1u;
-	struct WrittenMemo {
-		uint64_t vaddr        = 0;
-		uint64_t size         = 0;
-		uint64_t buffer_epoch = 0;
-		uint64_t cpu_epoch    = 0;
-		uint64_t gpu_epoch    = 0;
-		BufferId id;
-	};
 	struct StreamMemo {
 		uint64_t vaddr            = 0;
 		uint64_t size             = 0;
@@ -596,21 +631,26 @@ private:
 	bool                                                     m_stream_in_place = false;
 	std::unique_ptr<std::array<StreamMemo, StreamMemoSlots>> m_stream_memo =
 	    std::make_unique<std::array<StreamMemo, StreamMemoSlots>>();
-	static constexpr size_t                                  ObtainMemoSlots = 4096;
-	std::unique_ptr<std::array<ObtainMemo, ObtainMemoSlots>> m_obtain_memo =
-	    std::make_unique<std::array<ObtainMemo, ObtainMemoSlots>>();
-	static constexpr size_t                              PageMemoSlots = 4096;
-	std::unique_ptr<std::array<PageMemo, PageMemoSlots>> m_page_memo =
-	    std::make_unique<std::array<PageMemo, PageMemoSlots>>();
+	struct WrittenMemo {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t cpu_epoch    = 0;
+		uint64_t gpu_epoch    = 0;
+		uint64_t region_epoch = 0;
+		uint64_t registration = 0;
+		[[nodiscard]] bool Covers(const WrittenMemo& now) const noexcept {
+			return size != 0 && vaddr == now.vaddr && size == now.size && registration == now.registration &&
+			       ((cpu_epoch == now.cpu_epoch && gpu_epoch == now.gpu_epoch) ||
+			        (region_epoch != 0 && region_epoch == now.region_epoch));
+		}
+	};
 	static constexpr size_t                                    WrittenMemoSlots = 1024;
 	std::unique_ptr<std::array<WrittenMemo, WrittenMemoSlots>> m_written_memo =
 	    std::make_unique<std::array<WrittenMemo, WrittenMemoSlots>>();
-	uint64_t m_memory_budget      = 0;
-	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
-	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
-	uint64_t m_gc_tick            = 0;
-	void     UpdateMemoryThresholds(uint64_t budget_bytes);
-	void                                       NoteBufferRegions(const Buffer& buffer, bool insert);
+	static constexpr uint64_t StreamLeap = CACHING_PAGESIZE * 128;
+	std::array<uint64_t, 16>  m_growth_ends {};
+	uint32_t                  m_growth_next = 0;
+	uint64_t m_gc_tick = 0;
 	void                                       GrowRegionTables(uint64_t region);
 	std::vector<uint32_t>                      m_region_buffer_count;
 	std::vector<uint64_t>                      m_buffer_region_bits;
@@ -621,19 +661,13 @@ private:
 	}
 	std::vector<uint64_t>                      m_synced_region_epochs;
 	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
-	void CollectSpanBuffers(uint64_t span, uint64_t bytes, std::vector<Buffer*>& buffers,
-	                        std::vector<std::pair<uint64_t, uint64_t>>& ranges);
-	std::vector<Buffer*>                       m_span_buffers;
+	void CollectSpanRanges(uint64_t span, uint64_t bytes, std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 	std::vector<std::pair<uint64_t, uint64_t>> m_span_ranges;
 	std::vector<std::vector<vk::BufferCopy>>   m_span_copies;
 	std::vector<uint64_t>                      m_span_sizes;
 	std::vector<std::pair<uint64_t, uint64_t>> m_sync_spans;
-	struct SetChunk {
-		std::vector<Buffer*>                       buffers;
-		std::vector<std::pair<uint64_t, uint64_t>> ranges;
-	};
-	std::vector<std::pair<uint64_t, size_t>> m_set_visits;
-	std::vector<SetChunk>                    m_set_chunks;
+	std::vector<std::pair<uint64_t, size_t>>                m_set_visits;
+	std::vector<std::vector<std::pair<uint64_t, uint64_t>>> m_set_chunks;
 	uint32_t m_device_syncs     = 0;
 	uint32_t m_device_sync_pass = 0;
 	uint32_t m_device_full_pass = 0;

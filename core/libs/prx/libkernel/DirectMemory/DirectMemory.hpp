@@ -72,6 +72,10 @@ inline constexpr std::uint64_t DirectMemoryViewPrivate = ~std::uint64_t{0} - 1;
 inline constexpr std::uint64_t DirectMemoryViewReplacing = ~std::uint64_t{0} - 2;
 
 extern "C" {
+using DirectMemoryMapAdmission = bool (*)(std::uintptr_t address, std::size_t bytes);
+void DirectMemorySetMapAdmission_nid_no_patch(DirectMemoryMapAdmission admit);
+using DirectMemoryMapCancellation = void (*)(std::uintptr_t address, std::size_t bytes);
+void DirectMemorySetMapCancellation_nid_no_patch(DirectMemoryMapCancellation cancel);
 using DirectMemoryViewObserver = void (*)(std::uintptr_t address, std::size_t bytes, std::uint64_t viewOffset);
 bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std::uint8_t** view, std::size_t* guestBytes, std::size_t* viewBytes);
 bool DirectMemoryViewFiles_nid_no_patch(int* guestFile, int* directFile);

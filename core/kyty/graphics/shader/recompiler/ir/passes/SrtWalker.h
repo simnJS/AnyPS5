@@ -56,6 +56,7 @@ struct ImageHeapList {
 
 class ImageHeapSource {
 public:
+	virtual bool ReadFallback(uint64_t, std::span<uint32_t>) const { return false; }
 	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
 	virtual bool AcquireList(const ImageHeapList& , ImageHeapView& ) {
 		return false;

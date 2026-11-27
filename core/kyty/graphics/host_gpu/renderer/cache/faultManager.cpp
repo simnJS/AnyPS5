@@ -100,11 +100,16 @@ void FaultManager::PrepareFaultBuffer() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
-	Process(m_faults, 0, [this](std::span<const uint64_t> pages) {
+	Process(m_faults, BufferCache::FAULT_BITMAP_OFFSET, [this](std::span<const uint64_t> blocks) {
 		RangeSet fault_ranges;
-		for (const auto address: pages) {
-			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+		for (const auto block: blocks) {
+			m_buffer_cache.GetGuestMirror()->NoteUnboundRead();
+			for (uint64_t offset = 0; offset < BufferCache::MIRROR_BLOCK_SIZE; offset += BufferCache::CACHING_PAGESIZE) {
+				const auto page = block + offset;
+				if (m_scheduler.Context().IsMapped(page, BufferCache::CACHING_PAGESIZE)) {
+					fault_ranges.Add(page, BufferCache::CACHING_PAGESIZE);
+				}
+			}
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
@@ -212,7 +217,8 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 	std::memset(mapped, 0, sizeof(uint64_t));
 	reader.download.Flush(offset, sizeof(uint64_t));
 
-	constexpr auto bitmap_size = BufferCache::CACHING_NUMPAGES / 8;
+	const bool page_writes = bitmap_offset == BufferCache::WRITE_BITMAP_OFFSET;
+	const auto bitmap_size = page_writes ? BufferCache::CACHING_NUMPAGES / 8 : BufferCache::MIRROR_BITMAP_SIZE;
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
@@ -225,7 +231,7 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
 	    {m_fault_buffer.Handle(), bitmap_offset, bitmap_size},
@@ -249,14 +255,14 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 128;
+	const auto num_threads    = bitmap_size / 16;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 
 	const auto area = reader.current;
-	Common::UniqueFunction<void> scan = [&reader, mapped, offset, area, area_size,
+	Common::UniqueFunction<void> scan = [&reader, mapped, offset, area, area_size, page_writes,
 	                                     handler = std::move(handler)] {
 		reader.download.Invalidate(offset, area_size);
 		const auto* entries = std::bit_cast<const uint64_t*>(mapped);
@@ -265,7 +271,8 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 		std::vector<uint64_t> pages;
 		pages.reserve(count);
 		for (uint64_t index = 1; index <= count; ++index) {
-			pages.push_back(BufferCache::GuestAddress(entries[index]));
+			const auto shift = page_writes ? BufferCache::CACHING_PAGEBITS : BufferCache::MIRROR_BLOCK_BITS;
+			pages.push_back(BufferCache::GuestAddress(entries[index] << shift));
 		}
 		if (!pages.empty()) {
 			handler(pages);

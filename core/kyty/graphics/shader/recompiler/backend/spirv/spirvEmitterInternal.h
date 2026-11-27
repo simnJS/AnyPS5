@@ -169,7 +169,6 @@ struct EmitterState {
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	std::vector<uint32_t>                           memory_strides;
-	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	bool                                             converged_calls         = false;
@@ -669,6 +668,9 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
+uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent, bool in_page = false);
+uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset);
+uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t size, uint32_t extent, bool in_page);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBdaLoads(EmitterState& state);
 uint32_t RayStatsEnabled(EmitterState& state);
@@ -689,8 +691,8 @@ bool ProgramUsesOracle(const IR::Program& program);
 void DeclareOracleVariables(EmitterState& state);
 void InitializeOracleVariables(EmitterState& state);
 void FlushOracleCounts(EmitterState& state);
-uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
-uint32_t GetBdaPointerMasked(EmitterState& state, uint32_t address, uint32_t active);
+uint32_t GetBdaPointer(EmitterState& state, uint32_t address, uint32_t extent = sizeof(uint32_t));
+uint32_t GetBdaPointerMasked(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent = sizeof(uint32_t));
 uint32_t EmitGuestDwordLoad(ValueEmitContext& ctx, uint32_t address);
 uint32_t EmitScalarBufferDwordLoad(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
                                    uint32_t offset);

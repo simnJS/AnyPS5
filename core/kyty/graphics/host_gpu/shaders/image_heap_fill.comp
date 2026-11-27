@@ -1,0 +1,179 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+const uint KeyWords     = 8u;
+const uint EmptyProfile = 0xffffffffu;
+const uint BucketMask   = (1u << 18) - 1u;
+const uint MaxDistance  = 64u;
+const uint MaxArms      = 8u;
+const uint KindShift    = 16u;
+const uint IndexMask    = (1u << KindShift) - 1u;
+const uint ArmShift     = 20u;
+const uint GroupProbes  = 64u;
+
+struct Job {
+	uint64_t table;
+	uint64_t slots;
+	uint64_t guest;
+	uint     table_words;
+	uint     first_word;
+	uint     step_words;
+	uint     count;
+	uint     begin;
+	uint     end;
+	uint     first_group;
+	uint     profile;
+	uint     key_words;
+	uint     view;
+	uint     arm_count;
+	uint     shape;
+	uint     kinds[MaxArms];
+};
+
+struct Bucket {
+	uint words[KeyWords];
+	uint profile;
+	uint value;
+	uint flags;
+	uint pad;
+};
+
+struct Miss {
+	uint     words[KeyWords];
+	uint     profile;
+	uint     view;
+	uint     slot;
+	uint     shape;
+	uint64_t guest;
+	uint64_t pad;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Jobs {
+	Job v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Groups {
+	uint v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Buckets {
+	Bucket v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words {
+	uint v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Slots {
+	uint v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Used {
+	uint v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Ring {
+	uint count;
+	uint pad0;
+	uint pad1;
+	uint pad2;
+	Miss v[];
+};
+
+layout(push_constant, std430) uniform Push {
+	uint64_t jobs;
+	uint64_t groups;
+	uint64_t buckets;
+	uint64_t ring;
+	uint64_t used;
+	uint     group_offset;
+	uint     frame;
+	uint     ring_capacity;
+	uint     pad;
+} pc;
+
+uint Mix(uint value) {
+	value ^= value >> 16;
+	value *= 0x7feb352du;
+	value ^= value >> 15;
+	value *= 0x846ca68bu;
+	value ^= value >> 16;
+	return value;
+}
+
+void main() {
+	const uint group = gl_WorkGroupID.x + pc.group_offset;
+	const uint index = Groups(pc.groups).v[group];
+	Jobs       jobs  = Jobs(pc.jobs);
+	const uint probe = jobs.v[index].begin + (group - jobs.v[index].first_group) * GroupProbes +
+	                   gl_LocalInvocationID.x;
+	if (probe >= jobs.v[index].end) {
+		return;
+	}
+	const uint slot  = jobs.v[index].first_word + probe * jobs.v[index].step_words;
+	uint       value = 0u;
+	if (probe < jobs.v[index].count) {
+		const uint profile   = jobs.v[index].profile;
+		const uint key_words = jobs.v[index].key_words;
+		const uint limit     = jobs.v[index].table_words;
+		Words      table     = Words(jobs.v[index].table);
+		uint       words[KeyWords];
+		uint       hash = Mix(profile ^ 0x9e3779b9u);
+		for (uint word = 0u; word < KeyWords; word++) {
+			words[word] = word < key_words && slot + word < limit ? table.v[slot + word] : 0u;
+			hash        = Mix(hash ^ words[word]);
+		}
+		Buckets buckets = Buckets(pc.buckets);
+		bool    found   = false;
+		uint    entry   = 0u;
+		for (uint distance = 0u; distance < MaxDistance; distance++) {
+			const uint at = (hash + distance) & BucketMask;
+			const uint owner = buckets.v[at].profile;
+			if (owner == EmptyProfile) {
+				break;
+			}
+			if (owner != profile) {
+				continue;
+			}
+			bool same = true;
+			for (uint word = 0u; word < KeyWords; word++) {
+				same = same && buckets.v[at].words[word] == words[word];
+			}
+			if (same) {
+				found = true;
+				entry = buckets.v[at].value;
+				break;
+			}
+		}
+		bool miss = !found;
+		if (found && entry != 0u) {
+			const uint kind = entry >> KindShift;
+			const uint arms = min(jobs.v[index].arm_count, MaxArms);
+			uint       arm  = arms;
+			for (uint candidate = 0u; candidate < arms; candidate++) {
+				if (arm == arms && jobs.v[index].kinds[candidate] == kind) {
+					arm = candidate;
+				}
+			}
+			if (arm < arms) {
+				value = (arm << ArmShift) | (entry & IndexMask);
+				atomicExchange(Used(pc.used).v[entry & IndexMask], pc.frame);
+			} else {
+				miss = true;
+			}
+		}
+		if (miss && pc.ring_capacity != 0u) {
+			Ring       ring = Ring(pc.ring);
+			const uint at   = atomicAdd(ring.count, 1u);
+			if (at < pc.ring_capacity) {
+				for (uint word = 0u; word < KeyWords; word++) {
+					ring.v[at].words[word] = words[word];
+				}
+				ring.v[at].profile = profile;
+				ring.v[at].view    = jobs.v[index].view;
+				ring.v[at].slot    = slot;
+				ring.v[at].shape   = jobs.v[index].shape;
+				ring.v[at].guest   = jobs.v[index].guest + uint64_t(slot) * 4ul;
+				ring.v[at].pad     = 0ul;
+			}
+		}
+	}
+	Slots(jobs.v[index].slots).v[slot] = value;
+}

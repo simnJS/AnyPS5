@@ -227,8 +227,7 @@ bool ReadFrameCaptureMemory(std::uint64_t address, std::span<std::byte> destinat
             renderer.GetGpu().SendCommandSync([&] {
                 try {
                     const auto size = destination.size();
-                    if (renderer.GetTextureCache().IsRegionGpuModified(address, size, true) ||
-                        buffers.DeferredLabelPending(address, size)) return;
+                    if (renderer.GetTextureCache().IsRegionGpuModified(address, size, true)) return;
                     if (!buffers.HasGpuDirtyBytes(address, size)) {
                         needsGpu = false;
                         return;

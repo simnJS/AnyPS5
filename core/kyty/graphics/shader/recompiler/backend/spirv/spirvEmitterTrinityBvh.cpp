@@ -352,13 +352,13 @@ void Bvh8Emitter::DefineIntersect() {
 		const auto in_bounds = Both(Binary(s, spv::OpULessThanEqual, b, end, limit),
 		    Binary(s, spv::OpULessThanEqual, b, end, ConstantU64(s, (uint64_t{1} << 48) - 1)));
 		return EmitValueOrDefaultIfCondition(s, Both(Both(valid, enabled), in_bounds), w,
-		    ConstantU64(s, 0), [&] { return GetBdaPointer(s, at); });
+		    ConstantU64(s, 0), [&] { return GetBdaPointer(s, at, 64); });
 	};
 	const auto first = fetch(address, ConstantBool(s, true));
 	const auto present = [&](uint32_t pointer) { return Ne(pointer, ConstantU64(s, 0)); };
 	const auto tail = [&](uint32_t at, uint32_t pointer) {
 		return EmitValueOrDefaultIfCondition(s, Both(full, present(pointer)), w, ConstantU64(s, 0), [&] {
-			return GetBdaPointer(s, Binary(s, spv::OpIAdd, w, at, ConstantU64(s, 64)));
+			return GetBdaPointer(s, Binary(s, spv::OpIAdd, w, at, ConstantU64(s, 64)), 64);
 		});
 	};
 	const auto second = tail(address, first);

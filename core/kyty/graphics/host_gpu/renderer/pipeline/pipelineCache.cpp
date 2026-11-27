@@ -417,7 +417,9 @@ thread_local bool t_execute_unlocked = false;
 thread_local bool t_ahead_missing    = false;
 #endif
 
-bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const auto* heap = static_cast<const ShaderRecompiler::IR::ImageHeapSource*>(userdata);
+	if (heap != nullptr && heap->ReadFallback(address, values)) return true;
 #if defined(ANYPS5_KYTY)
 	if (ProgramLock::Enabled()) {
 		return !values.empty() && ProgramLock::TimedGuestRead(address, values);
@@ -1529,6 +1531,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
 	    .shader_base                = params.Base(),
+	    .userdata                   = m_image_heap,
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
 	};

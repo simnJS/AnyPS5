@@ -1,7 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-#define RT_RECORD_PAGES
 #include "rt_common.inc"
 
 layout(local_size_x = 256) in;

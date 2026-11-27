@@ -30,9 +30,8 @@ struct GraphicContext {
 	VmaAllocator                       allocator                             = nullptr;
 	VmaAllocator                       spill_allocator                       = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
-	bool                               partial_buffers_enabled               = false;
-	bool                               host_import_enabled                   = false;
-	uint64_t                           host_import_alignment                 = 0;
+	bool                               external_memory_host_enabled          = false;
+	uint64_t                           host_pointer_alignment                = 0;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
@@ -78,6 +77,12 @@ struct GraphicContext {
 	vk::Queue                          queue        = nullptr;
 	vk::Queue                          readback_queue  = nullptr;
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
+	bool                               sparse_buffers_enabled = false;
+	vk::Queue                          sparse_queue           = nullptr;
+	uint32_t                           sparse_family          = static_cast<uint32_t>(-1);
+	uint32_t                           sparse_queue_index     = 0;
+	uint64_t                           mirror_base            = 0;
+	uint64_t                           mirror_size            = 0;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

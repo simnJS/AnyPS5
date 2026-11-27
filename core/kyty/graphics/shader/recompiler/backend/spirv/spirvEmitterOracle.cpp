@@ -163,11 +163,8 @@ void DeclareOracleVariables(EmitterState& s) {
 
 void InitializeOracleVariables(EmitterState& s) {
 	if (s.oracle.valid == 0) return;
-	const auto u = TypeU32(s), b = TypeBool(s), wide = TypeU64(s);
-	const auto entry = s.builder.AllocateId();
-	s.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(s, 64), entry, s.bda_pagetable_variable,
-	                      U32(s, 0), U32(s, static_cast<uint32_t>(BufferCache::NATIVE_RT_CONTEXT_PAGE)));
-	const auto context = Load(s, wide, entry);
+	const auto u = TypeU32(s), b = TypeBool(s);
+	const auto context = LoadMirrorMetadata64(s, BufferCache::RT_CONTEXT_OFFSET);
 	const auto present = Binary(s, spv::OpINotEqual, b, context, ConstantU64(s, 0));
 	const auto valid   = EmitValueOrDefaultIfCondition(s, present, b, ConstantBool(s, false), [&] {
 		return Binary(s, spv::OpINotEqual, b, LoadAddressU32(s, AddressPlus(s, context, ContextValid)), U32(s, 0));

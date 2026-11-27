@@ -113,7 +113,6 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::Samplers: return vk::DescriptorType::eSampler;
 		case BindingKind::Buffers:
 		case BindingKind::Gds:
-		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
@@ -351,7 +350,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     uint64_t invocations_x) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto& [address, size] = source;
 	if (address == 0 || size == 0) {
 		return {nullptr, 0, vk::WholeSize};
 	}
@@ -372,10 +371,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		if (!resource.proven_writes.empty()) {
 			const auto writes = BoundBufferWrites(resource, address, size, invocations_x);
 			if (!writes.empty()) {
-				return cache.ObtainBufferWithProvenWrites(address, size, writes, id);
+				return cache.ObtainRangeWithProvenWrites(address, size, writes);
 			}
 		}
-		return cache.ObtainBuffer(address, size, resource.written, resource.formatted, id);
+		return cache.ObtainRange(address, size, resource.written, resource.formatted, ObtainFrom::Any, HeapWriteSource::Shader);
 	}();
 	if (counters) {
 		queries.NoteReadTarget(address, size, *buffer, offset);
@@ -1528,7 +1527,7 @@ static void CopyGpuFlatLoads(RenderContext& context, const vk::DescriptorBufferI
 	copies.reserve(loads.size());
 	for (const auto& load: loads) {
 		const auto bytes            = uint64_t {load.count} * sizeof(uint32_t);
-		const auto [buffer, offset] = cache.ObtainBuffer(load.address, bytes, false);
+		const auto [buffer, offset] = cache.ObtainRange(load.address, bytes, false);
 		copies.push_back({buffer->Handle(),
 		                  vk::BufferCopy {offset, target.offset + uint64_t {load.slot} * sizeof(uint32_t),
 		                                  bytes}});
@@ -2798,13 +2797,10 @@ void RenderExecutor::CommitTemplateBindings(CommandBuffer& buffer, const Pipelin
 			case BindingKind::UniformBuffers:
 				put(descriptors.uniform_buffers.data(), descriptors.uniform_buffers.size());
 				break;
-			case BindingKind::BdaPagetable:
 			case BindingKind::FaultBuffer: {
 				auto&       cache      = m_context.GetBufferCache();
-				const auto* bda_buffer = static_cast<BindingKind>(slot.kind) == BindingKind::BdaPagetable
-				                             ? cache.GetBdaPageTableBuffer()
-				                             : cache.GetFaultBuffer();
-				const vk::DescriptorBufferInfo view {bda_buffer->Handle(), 0, bda_buffer->Size()};
+				const auto* fault = cache.GetFaultBuffer();
+				const vk::DescriptorBufferInfo view {fault->Handle(), 0, fault->Size()};
 				put(&view, 1);
 				break;
 			}
@@ -2830,14 +2826,13 @@ void RenderExecutor::CommitTemplateBindings(CommandBuffer& buffer, const Pipelin
 	                                   "RenderExecutor::FindBuffers", shader_hash, 0);
 }
 
-void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers) {
+void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	for (const auto* stage: stages) {
 		if (!stage->runtime->module->info.info.indexed_buffer_reads.empty()) {
 			m_context.CacheIndexedBufferReads(*stage->runtime);
 		}
 	}
-	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
@@ -2901,7 +2896,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 #endif
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
-			source = {address, size, find_buffers ? cache.FindBuffer(address, size) : NULL_BUFFER_ID};
+			if (program.stage == ShaderType::Compute && program.info.uses_dma) {
+				const auto* mirror = m_context.GetBufferCache().GetGuestMirror();
+				if (mirror->Holds(address, size) && !mirror->Requested(address, size)) {
+					m_context.GetBufferCache().RequestDeviceRange(address, size);
+				}
+			}
+			source = {address, size};
 		}
 	}
 }
@@ -3131,9 +3132,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	std::array<const ShaderStageRuntime*, 4> dma_stages {};
 	uint32_t                                 dma_stage_count = 0;
 	bool                                     uses_image_heap = false;
-	FindBuffers(stages, std::ranges::any_of(stages, [](const auto* stage) {
-		            return stage->runtime->module->info.info.uses_dma;
-	            }));
+	FindBuffers(stages);
 	for (auto* stage: stages) {
 		if (stage->runtime->module->info.info.uses_dma) {
 			m_context.CacheDmaBases(*stage->runtime);
@@ -3144,9 +3143,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
 	if (dma_stage_count != 0) {
-		const bool reach_synchronized =
-		    m_context.SynchronizeDmaFootprint(std::span {dma_stages.data(), dma_stage_count});
-		m_context.PrepareBda(dma_write, !reach_synchronized);
+		m_context.PrepareShaderBda(std::span {dma_stages.data(), dma_stage_count}, dma_write);
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
@@ -3347,7 +3344,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_commit_capture_ok = m_commit_capture != nullptr && pipeline.uses_push_descriptors;
 	m_commit_capture_kinds.clear();
 	size_t image_cursor = 0;
-	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
+	vk::DescriptorBufferInfo address_buffer {};
 	vk::DescriptorBufferInfo                mip_stats_view;
 	struct TableRange {
 		TableBindingState* state;
@@ -3505,15 +3502,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						}
 						write.pBufferInfo = descriptors.uniform_buffers.data();
 						break;
-					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
 						auto& cache = m_context.GetBufferCache();
-						const auto* bda_buffer = kind == BindingKind::BdaPagetable
-						                             ? cache.GetBdaPageTableBuffer()
-						                             : cache.GetFaultBuffer();
-						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
-						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
-						write.pBufferInfo = &view;
+						const auto* fault = cache.GetFaultBuffer();
+						address_buffer = {fault->Handle(), 0, fault->Size()};
+						write.pBufferInfo = &address_buffer;
 						break;
 					}
 					case BindingKind::MipStats: {

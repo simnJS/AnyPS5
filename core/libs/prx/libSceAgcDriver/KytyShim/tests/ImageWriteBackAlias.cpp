@@ -139,7 +139,7 @@ const char* CheckFilledMetaClearReachesBind(GraphicContext& graphics, uint64_t b
 		buffers.FillBuffer(address, size, value, false);
 	};
 	const auto gpu_write = [&](uint64_t address, uint64_t size) {
-		(void)buffers.ObtainBuffer(address, size, true, false);
+		(void)buffers.ObtainRange(address, size, true, false);
 	};
 	const std::array<uint32_t, 4> overwrite {1, 2, 3, 4};
 	const auto none = std::array<bool, 2> {false, false};
@@ -356,7 +356,7 @@ const char* CheckFilledMetaClearReachesBind(GraphicContext& graphics, uint64_t b
 	scheduler.Wait(tick);
 	scheduler.WaitPriorityOperations(tick);
 	BufferCacheTestAccess::DiscardGpuWrites(buffers, base, DepthGuestBytes);
-	(void)buffers.DropFreedRange(base, DepthGuestBytes, nullptr, nullptr);
+	(void)buffers.DropFreedRange(base, DepthGuestBytes);
 	return failure;
 }
 
@@ -467,9 +467,9 @@ const char* CheckWriteBackOrder(GraphicContext& graphics, uint64_t address) {
 	const auto source = address + GuestBytes / 2;
 	const auto destination = address + CopyWord * sizeof(uint32_t);
 	const auto fill_address = address + FillWord * sizeof(uint32_t);
-	auto [source_buffer, source_offset] = buffers.ObtainBuffer(source, Bytes, true, false);
+	auto [source_buffer, source_offset] = buffers.ObtainRange(source, Bytes, true, false);
 	source_buffer->Fill(source_offset, Bytes, CopyValue);
-	auto [fill_buffer, fill_offset] = buffers.ObtainBuffer(fill_address, Bytes, true, false);
+	auto [fill_buffer, fill_offset] = buffers.ObtainRange(fill_address, Bytes, true, false);
 	fill_buffer->Fill(fill_offset, Bytes, 0);
 
 	ImageInfo info;
@@ -494,7 +494,7 @@ const char* CheckWriteBackOrder(GraphicContext& graphics, uint64_t address) {
 	buffers.FillBuffer(fill_address, Bytes, FillValue, false);
 	const bool same_tick = scheduler.CurrentTick() == tick;
 
-	const auto [target_buffer, target_offset] = buffers.ObtainBuffer(destination, Bytes, false, false);
+	const auto [target_buffer, target_offset] = buffers.ObtainRange(destination, Bytes, false, false);
 	Buffer copied(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst,
 	              2 * Bytes);
 	copied.CopyFrom(scheduler.Current(), *target_buffer, target_offset, 0, Bytes);
@@ -503,7 +503,7 @@ const char* CheckWriteBackOrder(GraphicContext& graphics, uint64_t address) {
 	scheduler.Wait(last);
 	scheduler.WaitPriorityOperations(last);
 	BufferCacheTestAccess::DiscardGpuWrites(buffers, address, GuestBytes);
-	(void)buffers.DropFreedRange(address, GuestBytes, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, GuestBytes);
 	if (!queued) return "the image write-back was not pending before the buffer writes";
 	if (!same_tick) return "the image download and buffer transfers did not share a tick";
 	copied.Invalidate(0, 2 * Bytes);
@@ -541,7 +541,7 @@ const char* CheckWriteBackRefreshesBufferCopy(GraphicContext& graphics, uint64_t
 
 	constexpr uint64_t Bytes = ImageWords * sizeof(uint32_t);
 	constexpr uint64_t CoverBytes = GuestBytes / 4;
-	(void)buffers.ObtainBuffer(address, CoverBytes, false);
+	(void)buffers.ObtainRange(address, CoverBytes, false);
 	const bool clean = !buffers.IsRegionCpuDirty(address, CoverBytes);
 
 	ImageInfo info;
@@ -565,13 +565,13 @@ const char* CheckWriteBackRefreshesBufferCopy(GraphicContext& graphics, uint64_t
 	scheduler.WaitPriorityOperations(tick);
 	const bool invalidated = buffers.IsRegionCpuDirty(address, Bytes);
 
-	const auto [buffer, offset] = buffers.ObtainBuffer(address, CoverBytes, false);
+	const auto [buffer, offset] = buffers.ObtainRange(address, CoverBytes, false);
 	Buffer copied(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, Bytes);
 	copied.CopyFrom(scheduler.Current(), *buffer, offset, 0, Bytes);
 	const auto last = scheduler.CurrentTick();
 	scheduler.Wait(last);
 	scheduler.WaitPriorityOperations(last);
-	(void)buffers.DropFreedRange(address, CoverBytes, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, CoverBytes);
 	if (!clean) return "the buffer read did not leave the image pages clean";
 	if (!queued) return "the second image write-back was not queued";
 	if (!invalidated) return "the image write-back left the pages of an older buffer copy clean";
@@ -625,11 +625,11 @@ const char* CheckPartialBufferWrite(GraphicContext& graphics, uint64_t address,
 	const uint64_t offset = info.IsTiled() ? block.block_size - 2 * TexelBytes
 	                                      : (Width + 5) * TexelBytes;
 	if (fill) {
-		(void)buffers.ObtainBuffer(address + offset, CopyBytes, true, false);
+		(void)buffers.ObtainRange(address + offset, CopyBytes, true, false);
 		buffers.FillBuffer(address + offset, CopyBytes, CopyValue, false);
 	} else {
 		const auto source = address + GuestBytes / 4;
-		const auto [source_buffer, source_offset] = buffers.ObtainBuffer(source, CopyBytes, true, false);
+		const auto [source_buffer, source_offset] = buffers.ObtainRange(source, CopyBytes, true, false);
 		source_buffer->Fill(source_offset, CopyBytes, CopyValue);
 		buffers.CopyBuffer(address + offset, source, CopyBytes, false, false);
 	}
@@ -647,7 +647,7 @@ const char* CheckPartialBufferWrite(GraphicContext& graphics, uint64_t address,
 	std::array<uint32_t, Width * Height> actual {};
 	std::memcpy(actual.data(), readback.Mapped().data(), sizeof(actual));
 	BufferCacheTestAccess::DiscardGpuWrites(buffers, address, GuestBytes / 2);
-	(void)buffers.DropFreedRange(address, GuestBytes / 2, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, GuestBytes / 2);
 	if (!view) return "could not rebind the resident image after the partial buffer write";
 
 	uint32_t covered = 0;
@@ -816,7 +816,7 @@ const char* CheckLargerRequestOverGpuWrites(GraphicContext& graphics, uint64_t a
 	const auto tick = scheduler.CurrentTick();
 	scheduler.Wait(tick);
 	scheduler.WaitPriorityOperations(tick);
-	(void)buffers.DropFreedRange(address, requested_info.data.size, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, requested_info.data.size);
 	if (found_layers != RequestedLayers) return "the larger request found no image with its layers";
 	readback.Invalidate(0, RequestedWords * sizeof(uint32_t));
 	std::vector<uint32_t> actual(RequestedWords);
@@ -912,7 +912,7 @@ const char* CheckLargerRequestOverInvalidatedWrites(GraphicContext& graphics, ui
 	const auto tick = scheduler.CurrentTick();
 	scheduler.Wait(tick);
 	scheduler.WaitPriorityOperations(tick);
-	(void)buffers.DropFreedRange(address, requested_info.data.size, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, requested_info.data.size);
 	if (!stale) return "the guest write did not invalidate the GPU-written image";
 	if (found_layers != RequestedLayers) return "the larger request found no image with its layers";
 	if (samples != 1) return nullptr;
@@ -936,7 +936,7 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
 	auto& graphics = gpu.graphics;
-	if (const auto* unavailable = gpu.Initialize(true)) {
+	if (const auto* unavailable = gpu.Initialize(true, true)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "kyty_shim_image_write_back_alias: %s, no usable Vulkan device (%s)\n",
 		             required ? "FAILED" : "skipped", unavailable);

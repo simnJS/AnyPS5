@@ -21,12 +21,13 @@ public:
 
 	bool Prepare(uint64_t address, uint64_t size);
 	void NotePendingWrites() noexcept;
+	void TrackWriteBitmap() noexcept;
 	[[nodiscard]] bool TakePendingWrites() noexcept {
 		const bool pending = m_pending_writes;
 		m_pending_writes   = false;
 		return pending;
 	}
-	void NoteWrites(std::span<const uint64_t> pages);
+	void NoteWrites(std::span<const uint64_t> pages, bool heap_collected = false);
 
 	[[nodiscard]] static GuestRange TargetRange(const ShaderBufferResource& target);
 	[[nodiscard]] static std::vector<GuestRange> CoalesceTargets(std::vector<GuestRange> ranges);

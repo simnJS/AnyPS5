@@ -86,7 +86,7 @@ static bool PrepareSelfSizedBuffers(RenderContext& context, const ShaderStageRun
 	if (stage.module->info.info.self_sized_buffers.empty() || !context.CacheSelfSizedBuffers(stage)) {
 		return false;
 	}
-	context.GetIndirectWriteTables().NotePendingWrites();
+	context.GetIndirectWriteTables().TrackWriteBitmap();
 	return true;
 }
 
@@ -374,7 +374,7 @@ static void CacheDmaBases(RenderContext& context, const ShaderStageRuntime& stag
 		const auto base = low | uint64_t {high} << 32u;
 		for (uint64_t index = 0; index <= 2; ++index) {
 			const auto page = base + index * BufferCache::CACHING_PAGESIZE;
-			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+			if (context.IsMapped(page, 1)) context.GetBufferCache().RequestDeviceRange(page, 1);
 		}
 	};
 	const auto& info = stage.module->info.info;
@@ -477,6 +477,15 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
 	m_context.GetCommandScheduler().PopPendingOperations();
+	Common::LockGuard lock(m_context.GetMutex());
+	do {
+		DispatchDirectOnce(buffer, thread_group_x, thread_group_y, thread_group_z, mode, async_compute);
+	} while (m_context.GetImageHeap().TakeReplay());
+}
+
+void RenderExecutor::DispatchDirectOnce(CommandBuffer& buffer, uint32_t thread_group_x,
+                                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+                                    bool async_compute) {
 	auto& sh_ctx = buffer.GetShaders();
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
@@ -490,7 +499,6 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		return;
 	}
 
-	Common::LockGuard lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -620,8 +628,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		if (program.info.uses_dma) {
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
-			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+			const bool address_writes = MayWriteThroughDeviceAddresses(program);
+			m_context.PrepareShaderBda(std::span {&dma_stage, 1}, address_writes);
 			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}
@@ -637,6 +645,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		RebindBuffers(bindings, invocations_x);
 		m_context.GetOcclusionQueries().WriteForReaders();
 
+		if (m_context.GetImageHeap().CheckTableWrites()) {
+			ResetBindings();
+			return;
+		}
 		const auto vk_buffer = buffer.Handle();
 		const bool counted =
 		    PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings, rt_pass == 1, rt_pass != 2 && !fell_back);
@@ -790,7 +802,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			RtCheck().Defer(hash, queued);
 		} else if (RtCheck().Begin(hash)) {
 			record(input_info, 1);
-			if (RtCheck().Active()) {
+			if (!m_context.GetImageHeap().ReplayPending() && RtCheck().Active()) {
 				record(guest, 2);
 			}
 			return;
@@ -806,7 +818,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			SplitCheck().Defer(compute_module->info.shader_hash, queued);
 		} else if (SplitCheck().Begin(*compute_module, *pairs_module)) {
 			record(SplitCheck().Witness() ? pairs : input_info, 3);
-			if (SplitCheck().Active()) {
+			if (!m_context.GetImageHeap().ReplayPending() && SplitCheck().Active()) {
 				record(pairs, 4);
 			}
 			return;
@@ -974,10 +986,17 @@ static IndirectThreadPass& ThreadPass(
 
 void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t args_addr,
                                              uint32_t mode, bool async_compute) {
-	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
+	do {
+		DispatchIndirectThreadsOnce(buffer, args_addr, mode, async_compute);
+	} while (m_context.GetImageHeap().TakeReplay());
+}
+
+void RenderExecutor::DispatchIndirectThreadsOnce(CommandBuffer& buffer, uint64_t args_addr,
+                                             uint32_t mode, bool async_compute) {
+	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
+	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0);
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
@@ -1013,8 +1032,8 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+		const bool address_writes = MayWriteThroughDeviceAddresses(program);
+		m_context.PrepareShaderBda(std::span {&dma_stage, 1}, address_writes);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			m_context.GetBufferCache().RequestFlushForReadbacks();
 		}
@@ -1039,10 +1058,14 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		BindSharedMemory(m_context, input_info, bindings);
 	}
 	const auto [args_buffer, args_offset] =
-	    m_context.GetBufferCache().ObtainBuffer(args_addr, ArgsSize, false);
+	    m_context.GetBufferCache().ObtainRange(args_addr, ArgsSize, false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	m_context.GetOcclusionQueries().WriteForReaders();
+	if (m_context.GetImageHeap().CheckTableWrites()) {
+		ResetBindings();
+		return;
+	}
 	PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
 	const auto& shader_data = bindings.shader_data_buffer;
 	const bool  thread_limit =
@@ -1099,10 +1122,17 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 
 void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
                                       bool async_compute) {
-	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
+	do {
+		DispatchIndirectOnce(buffer, args_addr, mode, async_compute);
+	} while (m_context.GetImageHeap().TakeReplay());
+}
+
+void RenderExecutor::DispatchIndirectOnce(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
+                                      bool async_compute) {
+	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
+	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	vk::DispatchIndirectCommand args {};
 	const bool cpu_args = !m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
 	                      LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args));
@@ -1147,8 +1177,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		if (program.info.uses_dma) {
 			m_context.CacheDmaBases(input_info.stage);
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
-			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+			const bool address_writes = MayWriteThroughDeviceAddresses(program);
+			m_context.PrepareShaderBda(std::span {&dma_stage, 1}, address_writes);
 			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}
@@ -1159,11 +1189,15 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			m_context.GetImageHeap().Rebind(*this);
 		}
 		RebindImages(bindings);
-		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainRange(
 		    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 		EXIT_IF((args_offset & 3u) != 0);
 		RebindBuffers(bindings);
 		m_context.GetOcclusionQueries().WriteForReaders();
+		if (m_context.GetImageHeap().CheckTableWrites()) {
+			ResetBindings();
+			return;
+		}
 		const bool counted = PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings, rt_pass == 1,
 		                                             rt_pass != 2 && !fell_back);
 		if (rt_pass == 1) {
@@ -1267,7 +1301,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			RtCheck().Defer(hash, queued);
 		} else if (RtCheck().Begin(hash)) {
 			record(input_info, 1);
-			if (RtCheck().Active()) {
+			if (!m_context.GetImageHeap().ReplayPending() && RtCheck().Active()) {
 				record(guest, 2);
 			}
 			return;

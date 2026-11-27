@@ -1455,7 +1455,7 @@ bool Publish(TextureCache& cache, Image& image) {
 		return false;
 	}
 	auto [buffer, offset] =
-	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
+	    cache.m_buffer_cache.ObtainRange(image.info.data.address, image.info.data.size, true);
 	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
 	image.MarkBufferModified();
@@ -1756,7 +1756,7 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	if (upload) {
 		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		    m_buffer_cache.ObtainRangeForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
@@ -1803,7 +1803,7 @@ bool TextureCache::UploadImageLayers(Image& image) {
 			count++;
 		}
 		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(base + slice * layer, slice * count);
+		    m_buffer_cache.ObtainRangeForImage(base + slice * layer, slice * count);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
@@ -1898,7 +1898,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				InitializeImage(id);
 				const bool expand = desc.type != BindingType::VideoOut;
 				const auto [buffer, offset] =
-				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
+				    m_buffer_cache.ObtainRange(viewed.address, viewed.size, expand);
 				const auto predicates = m_tiler.CheckColorClear(
 				    {buffer->Handle(), offset, viewed.size}, slice_size, count, keys, expand);
 				for (uint32_t slice = 0; slice < count && expand; slice++) {
@@ -2320,7 +2320,7 @@ void TextureCache::RetileStencilCopy(Image& copy, const Image& association, Imag
 	auto        view  = copy.info;
 	view.data         = plane.data;
 	const auto [backing, backing_offset] =
-	    m_buffer_cache.ObtainSynchronizedBuffer(plane.data.address, plane.data.size, true, false);
+	    m_buffer_cache.ObtainSynchronizedRange(plane.data.address, plane.data.size, true, false);
 
 	const auto tile_image = [&](Image& image, const ImageInfo& layout, uint32_t base_layer) {
 		auto regions = layout.BufferCopies();
@@ -3134,7 +3134,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	const bool tiled        = info.IsTiled();
 	auto guest_linear = tiled ? m_tiler.GetScratchBuffer(info.LinearSize(), host_linear.buffer)
 	                          : TileManager::Result {destination.Handle(), destination_offset,
-	                                                 destination.Size() - destination_offset};
+	                                                 destination.Capacity(destination_offset)};
 	m_tiler.ConvertD16(host_linear, guest_linear, TileManager::D16Direction::Demote,
 	                   DepthAspectTransferFormat(info.pixel_format) == vk::Format::eD32Sfloat,
 	                   {.width               = info.extent.width,
@@ -3185,7 +3185,7 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
-bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::SynchronizeRangeFromImage(uint64_t vaddr, uint64_t size) {
 	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
 	if (!selected) {
 		return false;
@@ -3196,14 +3196,20 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (!image.SafeToDownload()) {
 		return false;
 	}
-	if (!buffer.IsInBounds(image.info.data.address, 1)) {
+	auto&      buffer  = *m_storage;
+	const auto address = image.info.data.address;
+	uint64_t   available = 0;
+	m_guest_mirror->ForEachOwned(address, image.info.data.size, [&](uint64_t begin, uint64_t end) {
+		if (begin == address + available) available = end - address;
+	});
+	available = m_guest_mirror->ContiguousSize(address, available);
+	if (available == 0) {
 		return false;
 	}
-	const auto buf_offset = buffer.Offset(image.info.data.address);
-	const auto available  = buffer.Size() - buf_offset;
+	const auto buf_offset = buffer.Offset(address);
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
-	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+	if (available >= image.info.data.size) {
 		levels    = image.info.resources.levels;
 		copy_size = image.info.data.size;
 	} else if (image.info.IsVolume() || image.info.resources.layers > 1) {
@@ -3225,9 +3231,11 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	     copy_size != image.info.data.size)) {
 		return false;
 	}
+	if (!PrepareHeapPublication(HeapProducer::Image, image.serial, image.gpu_write_sequence, address, copy_size)) return true;
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	InvalidateCopyFeedback(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	NoteHeapTransfer(address, copy_size);
 	return true;
 }
 
@@ -3587,7 +3595,7 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 		mip.linear_offset = Common::AlignUp<uint64_t>(linear, std::max(info.bytes_per_block, 4u));
 		linear            = mip.linear_offset + mip.linear_size;
 	}
-	const auto [buffer, source_offset] = m_buffer_cache.ObtainBuffer(source, size, false);
+	const auto [buffer, source_offset] = m_buffer_cache.ObtainRange(source, size, false);
 	const auto texels = m_tiler.Detile(buffer->Handle(), source_offset, part);
 	auto       copies = part.BufferCopies(texels.offset);
 	for (auto& copy: copies) {

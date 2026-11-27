@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/guestMirror.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -7,8 +8,6 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
-#include <array>
-#include <cinttypes>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -65,162 +64,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
-	Create(flags);
-}
-
-Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseResident,
-               vk::BufferUsageFlags flags, uint64_t size)
-    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_size(size) {
-	if (!graphics.partial_buffers_enabled || (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
-		Create(flags);
-		return;
-	}
-	vk::BufferCreateInfo buffer_info {};
-	buffer_info.flags = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
-	buffer_info.size  = size;
-	buffer_info.usage = flags;
-	const std::array<uint32_t, 2> families {graphics.queue_family, graphics.readback_family};
-	if (graphics.readback_family != static_cast<uint32_t>(-1)) {
-		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
-		buffer_info.queueFamilyIndexCount = 2;
-		buffer_info.pQueueFamilyIndices   = families.data();
-	}
-	if (graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) != vk::Result::eSuccess) {
-		m_buffer = nullptr;
-		Create(flags);
-		return;
-	}
-	const auto requirements = graphics.device.getBufferMemoryRequirements(m_buffer);
-	m_sparse_block          = requirements.alignment;
-	m_sparse_types          = requirements.memoryTypeBits;
-	m_sparse_size           = requirements.size;
-	m_sparse_blocks.assign((m_sparse_size + m_sparse_block - 1) / m_sparse_block, nullptr);
-#if defined(ANYPS5_KYTY)
-	m_device_local = true;
-#endif
-}
-
-void Buffer::Commit(uint64_t offset, uint64_t size) {
-	if (m_sparse_block == 0 || size == 0) {
-		return;
-	}
-	EXIT_IF(offset > m_size || size > m_size - offset);
-	auto&                 graphics = *m_graphics;
-	const auto            first    = offset / m_sparse_block;
-	const auto            last     = (offset + size - 1) / m_sparse_block;
-	std::vector<uint64_t> blocks;
-	for (auto block = first; block <= last; block++) {
-		if (m_sparse_blocks[block] == nullptr) {
-			blocks.push_back(block);
-		}
-	}
-	if (blocks.empty()) {
-		return;
-	}
-	vk::BufferCreateInfo zero_info {};
-	zero_info.size  = m_sparse_block;
-	zero_info.usage = vk::BufferUsageFlagBits::eTransferDst;
-	std::vector<vk::Buffer>           zero_buffers(blocks.size(), nullptr);
-	std::vector<vk::SparseMemoryBind> binds;
-	binds.reserve(blocks.size());
-	for (size_t i = 0; i < blocks.size(); i++) {
-		const auto block = blocks[i];
-		EXIT_IF(graphics.device.createBuffer(&zero_info, nullptr, &zero_buffers[i]) != vk::Result::eSuccess);
-		const auto           zero_requirements = graphics.device.getBufferMemoryRequirements(zero_buffers[i]);
-		VkMemoryRequirements memory {};
-		memory.size           = std::max(m_sparse_block, zero_requirements.size);
-		memory.alignment      = std::max(m_sparse_block, zero_requirements.alignment);
-		memory.memoryTypeBits = m_sparse_types & zero_requirements.memoryTypeBits;
-		VmaAllocationCreateInfo alloc_info {};
-		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		VmaAllocationInfo allocated {};
-		const auto        result =
-		    vmaAllocateMemory(graphics.allocator, &memory, &alloc_info, &m_sparse_blocks[block], &allocated);
-		if (result != VK_SUCCESS) {
-			std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS> heaps {};
-			const auto heap_count = graphics.GetHeapUsage(heaps);
-			for (uint32_t heap = 0; heap < heap_count; heap++) {
-				LOGF("Buffer: heap %u%s: %" PRIu64 " MiB used of a %" PRIu64 " MiB budget\n", heap,
-				     heaps[heap].device_local ? " (device local)" : "", heaps[heap].usage >> 20u,
-				     heaps[heap].budget >> 20u);
-			}
-			EXIT("Buffer: could not allocate sparse block %" PRIu64 " of %" PRIu64 " bytes: %s\n", block,
-			     m_sparse_block, vk::to_string(static_cast<vk::Result>(result)).c_str());
-		}
-		EXIT_IF(graphics.device.bindBufferMemory(zero_buffers[i], allocated.deviceMemory, allocated.offset) !=
-		        vk::Result::eSuccess);
-		vk::SparseMemoryBind bind {};
-		bind.resourceOffset = block * m_sparse_block;
-		bind.size           = std::min(m_sparse_block, m_sparse_size - block * m_sparse_block);
-		bind.memory         = allocated.deviceMemory;
-		bind.memoryOffset   = allocated.offset;
-		binds.push_back(bind);
-	}
-	vk::CommandPoolCreateInfo pool_info {};
-	pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient;
-	pool_info.queueFamilyIndex = graphics.queue_family;
-	vk::CommandPool pool       = nullptr;
-	EXIT_IF(graphics.device.createCommandPool(&pool_info, nullptr, &pool) != vk::Result::eSuccess);
-	vk::CommandBufferAllocateInfo allocate {};
-	allocate.commandPool        = pool;
-	allocate.level              = vk::CommandBufferLevel::ePrimary;
-	allocate.commandBufferCount = 1;
-	vk::CommandBuffer command   = nullptr;
-	EXIT_IF(graphics.device.allocateCommandBuffers(&allocate, &command) != vk::Result::eSuccess);
-	vk::CommandBufferBeginInfo begin_info {};
-	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-	EXIT_IF(command.begin(&begin_info) != vk::Result::eSuccess);
-	for (const auto zero_buffer: zero_buffers) {
-		command.fillBuffer(zero_buffer, 0, VK_WHOLE_SIZE, 0);
-	}
-	const vk::MemoryBarrier zero_visibility {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-	                                         .dstAccessMask = vk::AccessFlagBits::eMemoryRead};
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                        vk::PipelineStageFlagBits::eAllCommands, {},
-	                        1, &zero_visibility, 0, nullptr, 0, nullptr);
-	EXIT_IF(command.end() != vk::Result::eSuccess);
-	vk::SemaphoreCreateInfo semaphore_info {};
-	vk::Semaphore           zeroed = nullptr;
-	EXIT_IF(graphics.device.createSemaphore(&semaphore_info, nullptr, &zeroed) != vk::Result::eSuccess);
-	vk::FenceCreateInfo fence_info {};
-	vk::Fence           fence = nullptr;
-	EXIT_IF(graphics.device.createFence(&fence_info, nullptr, &fence) != vk::Result::eSuccess);
-	vk::SubmitInfo submit {};
-	submit.commandBufferCount   = 1;
-	submit.pCommandBuffers      = &command;
-	submit.signalSemaphoreCount = 1;
-	submit.pSignalSemaphores    = &zeroed;
-	vk::SparseBufferMemoryBindInfo buffer_bind {m_buffer, static_cast<uint32_t>(binds.size()), binds.data()};
-	vk::BindSparseInfo             bind_info {};
-	bind_info.waitSemaphoreCount = 1;
-	bind_info.pWaitSemaphores    = &zeroed;
-	bind_info.bufferBindCount    = 1;
-	bind_info.pBufferBinds       = &buffer_bind;
-	{
-		Common::LockGuard lock {graphics.queue_mutex};
-		EXIT_IF(graphics.queue.submit(1, &submit, nullptr) != vk::Result::eSuccess);
-		const auto result = graphics.queue.bindSparse(1, &bind_info, fence);
-		if (result != vk::Result::eSuccess) {
-			EXIT("Buffer: sparse bind of %zu blocks at 0x%" PRIx64 " failed: %s (block %" PRIu64
-			     ", memory size %" PRIu64 ", buffer size %" PRIu64 ")\n",
-			     binds.size(), binds.front().resourceOffset, vk::to_string(result).c_str(), m_sparse_block,
-			     m_sparse_size, m_size);
-		}
-	}
-	EXIT_IF(graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
-	graphics.device.destroyFence(fence, nullptr);
-	graphics.device.destroySemaphore(zeroed, nullptr);
-	graphics.device.destroyCommandPool(pool, nullptr);
-	for (const auto zero_buffer: zero_buffers) {
-		graphics.device.destroyBuffer(zero_buffer, nullptr);
-	}
-}
-
-void Buffer::Create(vk::BufferUsageFlags flags) {
 	KYTY_PROFILER_FUNCTION();
-	auto&      graphics = *m_graphics;
-	const auto usage    = m_usage;
-	const auto size     = m_size;
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
@@ -300,30 +144,34 @@ void Buffer::Create(vk::BufferUsageFlags flags) {
 }
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
-               vk::Buffer imported, vk::DeviceAddress device_address)
+               MirrorWindow mirror)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
-      m_device_address(device_address), m_buffer(imported), m_size(size), m_coherent(true), m_in_place(true) {
-	EXIT_IF(imported == nullptr || size == 0 || device_address == 0);
+      m_handle_offset(cpu_address - mirror.base), m_device_address(mirror.address), m_buffer(mirror.buffer), m_size(size),
+      m_mirror(mirror.mirror), m_window(true) {
+	EXIT_IF(mirror.buffer == nullptr || size == 0 || mirror.address == 0);
+#if defined(ANYPS5_KYTY)
+	m_device_local = true;
+#endif
+}
+
+uint64_t Buffer::Offset(uint64_t address) const noexcept {
+	return m_mirror != nullptr ? m_mirror->Offset(address) : address - m_cpu_address + m_handle_offset;
+}
+
+uint64_t Buffer::GuestAddress(uint64_t offset) const noexcept {
+	return m_mirror != nullptr ? m_mirror->Address(offset) : m_cpu_address - m_handle_offset + offset;
+}
+
+bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
+	if (m_mirror != nullptr) return size != 0 && m_mirror->ContiguousSize(address, size) == size;
+	return address >= m_cpu_address && size <= Size() && address - m_cpu_address <= Size() - size;
 }
 
 Buffer::~Buffer() {
-	if (m_buffer == nullptr) {
+	if (m_buffer == nullptr || m_window) {
 		return;
 	}
-	if (m_sparse_block != 0) {
-		m_graphics->device.destroyBuffer(m_buffer);
-		for (auto* block: m_sparse_blocks) {
-			if (block != nullptr) {
-				vmaFreeMemory(m_graphics->allocator, block);
-			}
-		}
-		return;
-	}
-	if (m_in_place) {
-		m_graphics->device.destroyBuffer(m_buffer);
-	} else {
-		vmaDestroyBuffer(m_allocator, m_buffer, m_allocation);
-	}
+	vmaDestroyBuffer(m_allocator, m_buffer, m_allocation);
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {
@@ -346,7 +194,7 @@ void Buffer::Invalidate(uint64_t offset, uint64_t size) {
 
 vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,
                                         vk::AccessFlags destination) const {
-	if (Handle() == nullptr || size == 0 || offset > Size() || size > Size() - offset) {
+	if (Handle() == nullptr || size == 0 || !HoldsOffsets(offset, size)) {
 		EXIT("Buffer: invalid DMA barrier, handle=%p offset=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " capacity=0x%016" PRIx64 "\n",
 		     static_cast<const void*>(Handle()), offset, size, Size());
@@ -364,8 +212,7 @@ vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::Acce
 
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
                       uint64_t destination_offset, uint64_t size) {
-	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
-	    destination_offset > Size() || size > Size() - destination_offset) {
+	if (size == 0 || !source.HoldsOffsets(source_offset, size) || !HoldsOffsets(destination_offset, size)) {
 		EXIT("Buffer: invalid copy range\n");
 	}
 	if (source.Handle() == Handle() && source_offset < destination_offset + size &&
@@ -384,12 +231,18 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	                       0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
+	vk::PipelineStageFlags stages = vk::PipelineStageFlagBits::eAllCommands;
+	vk::AccessFlags access = MEMORY_ACCESS;
+	if (Usage() == MemoryUsage::Download) {
+		stages |= vk::PipelineStageFlagBits::eHost;
+		access |= vk::AccessFlagBits::eHostRead;
+	}
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, MEMORY_ACCESS),
-	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS),
+	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, access),
 	};
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands,
+	                       stages,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 

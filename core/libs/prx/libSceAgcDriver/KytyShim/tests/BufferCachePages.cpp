@@ -14,17 +14,6 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace Libs::Graphics {
-
-struct BufferCacheGcTestAccess {
-	static void ForceCriticalPressure(BufferCache& cache) {
-		cache.m_trigger_gc_memory = 0;
-		cache.m_critical_gc_memory = 0;
-	}
-};
-
-}
-
 namespace {
 
 using namespace Libs::Graphics;
@@ -34,10 +23,6 @@ constexpr uint64_t Block = 0x10000;
 constexpr uint64_t GuestBytes = 3 * Block;
 constexpr int CpuReadWrite = 0x03;
 constexpr uint32_t GameValue = 0x600dcafe;
-constexpr uint64_t GcSlot = 2 * BufferCache::CACHING_PAGESIZE;
-constexpr uint32_t GcPinned = 64;
-constexpr uint64_t GcBytes = (GcPinned + 1) * GcSlot;
-constexpr uint64_t UseScanCalls = 257;
 
 uint64_t BlockAt(uint64_t address, uint32_t index) {
 	return (address + Block - 1) / Block * Block + uint64_t {index} * Block;
@@ -45,7 +30,7 @@ uint64_t BlockAt(uint64_t address, uint32_t index) {
 
 const char* CheckGpuPageLeftByWriteAround(BufferCache& buffers, uint64_t block) {
 	const auto page = block + 3 * Page;
-	(void)buffers.ObtainBuffer(page, sizeof(GameValue), true);
+	(void)buffers.ObtainRange(page, sizeof(GameValue), true);
 	if (!buffers.IsRegionGpuModified(page, Page)) {
 		return "a written buffer range did not make its page GPU-dirty";
 	}
@@ -63,7 +48,7 @@ const char* CheckGpuPageLeftByWriteAround(BufferCache& buffers, uint64_t block) 
 }
 
 const char* CheckMarkAheadWaitsForIndirectWrites(RenderContext& renderer, BufferCache& buffers, uint64_t block) {
-	(void)buffers.ObtainBuffer(block, Block, false, false);
+	(void)buffers.ObtainRange(block, Block, false, false);
 	buffers.InvalidateFaultedPage(block + Page);
 	auto& tables = renderer.GetIndirectWriteTables();
 	tables.NotePendingWrites();
@@ -97,54 +82,6 @@ const char* CheckMarkAheadStillMarks(BufferCache& buffers, uint64_t block) {
 	return nullptr;
 }
 
-const char* CheckMemoryGcKeepsPinnedBuffers(BufferCache& buffers, uint64_t address) {
-	const auto slot = [address](uint32_t index) { return address + uint64_t {index} * GcSlot; };
-	const auto live = [&](uint32_t first, uint32_t last) {
-		uint32_t count = 0;
-		for (auto index = first; index < last; index++) {
-			count += buffers.RegisteredBuffer(slot(index), Page) ? 1 : 0;
-		}
-		return count;
-	};
-	uint64_t calls = 0;
-	const auto collect = [&](uint64_t until) {
-		for (; calls < until; calls++) {
-			const auto read = buffers.RegisteredBuffer(slot(0), Page);
-			if (calls % UseScanCalls == 0 && read) {
-				(void)buffers.TouchLiveBuffer(read, buffers.GetBuffer(read).Handle(), slot(0), Page);
-			}
-			buffers.RunGarbageCollector();
-		}
-	};
-	for (uint32_t index = 0; index < GcPinned; index++) {
-		buffers.CacheFaultedMemory(slot(index), Page);
-	}
-	(void)buffers.FindBuffer(slot(GcPinned), Page);
-	if (live(0, GcPinned + 1) != GcPinned + 1) {
-		return "the buffers of the memory GC check were not registered";
-	}
-	BufferCacheGcTestAccess::ForceCriticalPressure(buffers);
-	collect(100);
-	if (live(0, GcPinned) != GcPinned) {
-		return "the memory GC retired a device-address pinned buffer before a use scan could touch it";
-	}
-	if (live(GcPinned, GcPinned + 1) != 0) {
-		return "pinned buffers kept by the memory GC stopped it from retiring the unpinned buffer behind them";
-	}
-	collect(400);
-	if (live(1, GcPinned) != GcPinned - 1) {
-		return "the memory GC retired an idle pinned buffer within one and a half use-scan intervals";
-	}
-	collect(1300);
-	if (live(1, GcPinned) != 0) {
-		return "the memory GC never retired an idle pinned buffer under memory pressure";
-	}
-	if (live(0, 1) != 1) {
-		return "the memory GC retired a pinned buffer that every use scan touched";
-	}
-	return nullptr;
-}
-
 int Report(const char* failure) {
 	if (failure == nullptr) {
 		return 0;
@@ -162,7 +99,7 @@ int CheckBufferCachePages(Libs::Graphics::GraphicContext& graphics, uint64_t add
 	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
 
 	const auto first = BlockAt(address, 0);
-	(void)buffers.ObtainBuffer(first, Block, false, false);
+	(void)buffers.ObtainRange(first, Block, false, false);
 	int failures = Report(buffers.IsRegionCpuDirty(first, Block) ? "a buffer read did not leave its pages clean" : nullptr);
 	if (failures == 0) {
 		failures += Report(CheckGpuPageLeftByWriteAround(buffers, first));
@@ -174,25 +111,10 @@ int CheckBufferCachePages(Libs::Graphics::GraphicContext& graphics, uint64_t add
 	const auto last = scheduler.CurrentTick();
 	scheduler.Wait(last);
 	scheduler.WaitPriorityOperations(last);
-	(void)buffers.DropFreedRange(address, GuestBytes, nullptr, nullptr);
+	(void)buffers.DropFreedRange(address, GuestBytes);
 	return failures;
 }
 
-int CheckMemoryGc(Libs::Graphics::GraphicContext& graphics, uint64_t address) {
-	RenderContext renderer(graphics);
-	CommandProcessor producer(renderer, 0);
-	producer.Reset();
-	auto& scheduler = renderer.GetCommandScheduler();
-	auto& buffers = renderer.GetBufferCache();
-	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
-
-	const int failures = Report(CheckMemoryGcKeepsPinnedBuffers(buffers, address));
-	const auto last = scheduler.CurrentTick();
-	scheduler.Wait(last);
-	scheduler.WaitPriorityOperations(last);
-	(void)buffers.DropFreedRange(address, GcBytes, nullptr, nullptr);
-	return failures;
-}
 
 }
 
@@ -201,7 +123,7 @@ extern "C" int RunKytyBufferCachePagesTest() {
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* unavailable = gpu.Initialize()) {
+	if (const auto* unavailable = gpu.Initialize(false, true)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "kyty_shim_buffer_cache_pages: %s, no usable Vulkan device (%s)\n",
 		             required ? "FAILED" : "skipped", unavailable);
@@ -212,14 +134,13 @@ extern "C" int RunKytyBufferCachePagesTest() {
 		return 1;
 	}
 	void* guest = nullptr;
-	constexpr uint64_t Mapped = GuestBytes + GcBytes + Block;
+	constexpr uint64_t Mapped = GuestBytes + Block;
 	if (sceKernelMapFlexibleMemory(&guest, Mapped, CpuReadWrite, 0) != 0 || guest == nullptr) {
 		std::fputs("kyty_shim_buffer_cache_pages: FAILED: could not map guest backing\n", stderr);
 		return 1;
 	}
 	const auto address = reinterpret_cast<uint64_t>(guest);
-	auto failures = CheckBufferCachePages(gpu.graphics, BlockAt(address, 0));
-	failures += CheckMemoryGc(gpu.graphics, BlockAt(address, 0) + GuestBytes);
+	const auto failures = CheckBufferCachePages(gpu.graphics, BlockAt(address, 0));
 	if (sceKernelMunmap(address, Mapped) != 0) {
 		std::fputs("kyty_shim_buffer_cache_pages: FAILED: could not unmap guest backing\n", stderr);
 		return 1;

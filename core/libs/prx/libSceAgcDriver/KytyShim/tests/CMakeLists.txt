@@ -175,7 +175,7 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
             PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_label_order: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     add_test(NAME kyty_shim_buffer_write_coverage COMMAND kyty_shim_cross_queue_label_order_tests buffer-write-coverage)
     set_tests_properties(kyty_shim_buffer_write_coverage PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
-            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_COMMAND_MEMORY_IN_PLACE=0"
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_buffer_write_coverage: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     add_test(NAME kyty_shim_renderer_shutdown COMMAND kyty_shim_cross_queue_label_order_tests renderer-shutdown)
     set_tests_properties(kyty_shim_renderer_shutdown PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
@@ -183,17 +183,12 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
 endif()
 
 if(NOT ANYPS5_KYTY_DLL)
-    add_test_executable(kyty_shim_in_place_labels_tests ${CMAKE_CURRENT_SOURCE_DIR}/InPlaceLabels.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
-    target_include_directories(kyty_shim_in_place_labels_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    configure_host_test_executable(kyty_shim_in_place_labels_tests)
-    if(MINGW)
-        target_link_libraries(kyty_shim_in_place_labels_tests PRIVATE stdc++ gcc_eh)
-    endif()
-    target_link_libraries(kyty_shim_in_place_labels_tests PRIVATE Kyty::gpu libkernel libc)
-    add_test(NAME kyty_shim_in_place_labels COMMAND kyty_shim_in_place_labels_tests)
-    set_tests_properties(kyty_shim_in_place_labels PROPERTIES TIMEOUT 20
-            PASS_REGULAR_EXPRESSION "kyty_shim_in_place_labels: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test_executable(kyty_shim_label_order_tests ${CMAKE_CURRENT_SOURCE_DIR}/LabelOrder.cpp)
+    configure_host_test_executable(kyty_shim_label_order_tests)
+    target_include_directories(kyty_shim_label_order_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty)
+    add_test(NAME kyty_shim_label_order COMMAND kyty_shim_label_order_tests)
+    set_tests_properties(kyty_shim_label_order PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_label_order: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
@@ -279,6 +274,34 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_image_write_back_alias PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_WRITE_BACK_IMAGES=1;KYTY_COMPARE_WRITE_BACK=1"
             PASS_REGULAR_EXPRESSION "kyty_shim_image_write_back_alias: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    add_test_executable(kyty_shim_mirror_admission_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/MirrorAdmission.cpp
+            ${CMAKE_SOURCE_DIR}/core/kyty/graphics/host_gpu/renderer/cache/mirrorWindowTable.cpp)
+    target_include_directories(kyty_shim_mirror_admission_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty ${LIBS_INCLUDE_DIR})
+    target_compile_definitions(kyty_shim_mirror_admission_tests PRIVATE ANYPS5_KYTY)
+    configure_host_test_executable(kyty_shim_mirror_admission_tests)
+    target_link_libraries(kyty_shim_mirror_admission_tests PRIVATE libkernel libc)
+    add_test(NAME kyty_shim_mirror_admission COMMAND kyty_shim_mirror_admission_tests)
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/MirrorWindows.cpp)
+    add_test_executable(kyty_shim_mirror_windows_tests ${CMAKE_CURRENT_SOURCE_DIR}/MirrorWindowsMain.cpp)
+    configure_host_test_executable(kyty_shim_mirror_windows_tests)
+    target_link_libraries(kyty_shim_mirror_windows_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_mirror_windows COMMAND kyty_shim_mirror_windows_tests)
+    set_tests_properties(kyty_shim_mirror_windows PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_mirror_windows: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    add_test(NAME kyty_shim_mirror_windows_checked COMMAND kyty_shim_mirror_windows_tests)
+    set_tests_properties(kyty_shim_mirror_windows_checked PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_MIRROR_CHECK=1"
+            PASS_REGULAR_EXPRESSION "kyty_shim_mirror_windows: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ImageHeapFill.cpp)
+    add_test_executable(kyty_shim_image_heap_fill_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageHeapFillMain.cpp)
+    configure_host_test_executable(kyty_shim_image_heap_fill_tests)
+    target_link_libraries(kyty_shim_image_heap_fill_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_image_heap_fill COMMAND kyty_shim_image_heap_fill_tests)
+    set_tests_properties(kyty_shim_image_heap_fill PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_fill: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePages.cpp)
     add_test_executable(kyty_shim_buffer_cache_pages_tests ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePagesMain.cpp)
     configure_host_test_executable(kyty_shim_buffer_cache_pages_tests)
@@ -315,16 +338,6 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
                 ENVIRONMENT "KYTY_GPU_PIPELINE=0"
                 PASS_REGULAR_EXPRESSION "kyty_shim_indirect_dispatch_dimensions: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     endif()
-    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/BdaPageTable.cpp)
-    add_test_executable(kyty_shim_bda_page_table_tests ${CMAKE_CURRENT_SOURCE_DIR}/BdaPageTableMain.cpp)
-    configure_host_test_executable(kyty_shim_bda_page_table_tests)
-    target_link_libraries(kyty_shim_bda_page_table_tests PRIVATE libSceAgcDriver libkernel libc)
-    foreach(mode sparse dense)
-        add_test(NAME kyty_shim_bda_page_table_${mode} COMMAND kyty_shim_bda_page_table_tests ${mode})
-        set_tests_properties(kyty_shim_bda_page_table_${mode} PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
-                ENVIRONMENT "KYTY_GPU_PIPELINE=0"
-                PASS_REGULAR_EXPRESSION "kyty_shim_bda_page_table_${mode}: ok" FAIL_REGULAR_EXPRESSION "FAILED")
-    endforeach()
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ImageHeapLayoutLimits.cpp)
     add_test_executable(kyty_shim_image_heap_layout_limits_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageHeapLayoutLimitsMain.cpp)
     configure_host_test_executable(kyty_shim_image_heap_layout_limits_tests)
@@ -618,6 +631,20 @@ add_test(NAME kyty_shim_compute_correlated_phi COMMAND kyty_shim_compute_executi
 set_tests_properties(kyty_shim_compute_correlated_phi PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "correlated phi execution: folded, all lane outputs checked"
         FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
+add_test_executable(kyty_shim_mirror_shadow_tests ${CMAKE_CURRENT_SOURCE_DIR}/MirrorShadow.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_mirror_shadow_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_mirror_shadow_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_mirror_shadow_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_mirror_shadow_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_mirror_shadow COMMAND kyty_shim_mirror_shadow_tests)
+set_tests_properties(kyty_shim_mirror_shadow PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_mirror_shadow: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_mirror_shadow_default_sizes COMMAND kyty_shim_mirror_shadow_tests default-sizes)
+set_tests_properties(kyty_shim_mirror_shadow_default_sizes PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_mirror_shadow: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
 add_test_executable(kyty_shim_pair_codegen_tests ${CMAKE_CURRENT_SOURCE_DIR}/PairCodegen.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_pair_codegen_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -965,6 +992,29 @@ add_dependencies(kyty_shim_bda_load_forms_tests agc_frame_replay)
 add_test(NAME kyty_shim_bda_load_forms COMMAND kyty_shim_bda_load_forms_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_bda_load_forms PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_bda_load_forms: ok")
+add_test_executable(kyty_shim_bda_pointer_chase_tests ${CMAKE_CURRENT_SOURCE_DIR}/BdaPointerChase.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_bda_pointer_chase_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_bda_pointer_chase_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_bda_pointer_chase_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_bda_pointer_chase_tests)
+add_dependencies(kyty_shim_bda_pointer_chase_tests agc_frame_replay)
+add_test(NAME kyty_shim_bda_pointer_chase COMMAND kyty_shim_bda_pointer_chase_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_bda_pointer_chase PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_bda_pointer_chase: ok")
+add_test_executable(kyty_shim_bda_guest_miss_tests ${CMAKE_CURRENT_SOURCE_DIR}/BdaGuestMiss.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_bda_guest_miss_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_bda_guest_miss_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_bda_guest_miss_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_bda_guest_miss_tests)
+add_dependencies(kyty_shim_bda_guest_miss_tests agc_frame_replay)
+foreach(scenario last_word store_then_read)
+    add_test(NAME kyty_shim_bda_guest_miss_${scenario}
+            COMMAND kyty_shim_bda_guest_miss_tests $<TARGET_FILE:agc_frame_replay> ${scenario})
+    set_tests_properties(kyty_shim_bda_guest_miss_${scenario} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "kyty_shim_bda_guest_miss_${scenario}: ok")
+endforeach()
 add_test_executable(kyty_shim_cross_queue_order_tests ${CMAKE_CURRENT_SOURCE_DIR}/CrossQueueOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
 target_include_directories(kyty_shim_cross_queue_order_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)

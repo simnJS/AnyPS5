@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace KytyShimTests {
 
@@ -15,7 +16,7 @@ struct TestVulkanDevice {
 	vk::detail::DynamicLoader loader;
 	Libs::Graphics::GraphicContext graphics;
 
-	const char* Initialize(bool require_tiling = false, bool sparse_buffers = false) {
+	const char* Initialize(bool require_tiling = false, bool sparse = false) {
 		if (!loader.success()) {
 			return "Vulkan loader unavailable";
 		}
@@ -36,11 +37,12 @@ struct TestVulkanDevice {
 			return "Vulkan device enumeration failed";
 		}
 		for (const auto device : devices.value) {
-			if (InitializeDevice(device, require_tiling, sparse_buffers)) {
+			if (InitializeDevice(device, require_tiling, sparse)) {
 				return nullptr;
 			}
 		}
-		return "no Vulkan device supports the scheduler fixture";
+		return sparse ? "no Vulkan device supports the scheduler fixture with sparse buffers"
+		              : "no Vulkan device supports the scheduler fixture";
 	}
 
 	~TestVulkanDevice() {
@@ -56,7 +58,7 @@ struct TestVulkanDevice {
 	}
 
 private:
-	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse_buffers) {
+	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse) {
 		vk::PhysicalDeviceVulkan12Properties limits {};
 		vk::PhysicalDeviceVulkan11Properties properties11 {.pNext = &limits};
 		vk::PhysicalDeviceProperties2 properties {.pNext = &properties11};
@@ -92,6 +94,9 @@ private:
 		vk::PhysicalDeviceVulkan13Features supported13 {.pNext = &supported11};
 		vk::PhysicalDeviceFeatures2 supported {.pNext = &supported13};
 		physical.getFeatures2(&supported);
+		if (sparse && (!supported.features.sparseBinding || !supported.features.sparseResidencyBuffer)) {
+			return false;
+		}
 		if (!supported.features.shaderInt64 || !supported.features.sampleRateShading ||
 		    !supported_robustness.nullDescriptor ||
 		    (require_tiling && (!supported11.storageBuffer16BitAccess ||
@@ -117,24 +122,60 @@ private:
 		    .pNext = &features12, .storageBuffer16BitAccess = require_tiling};
 		const vk::PhysicalDeviceVulkan13Features features13 {
 		    .pNext = &features11, .synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
-		const bool sparse = sparse_buffers && supported.features.sparseBinding &&
-		                    supported.features.sparseResidencyBuffer &&
-		                    properties.properties.sparseProperties.residencyNonResidentStrict &&
-		                    static_cast<bool>(family->queueFlags & vk::QueueFlagBits::eSparseBinding);
-		const vk::PhysicalDeviceFeatures core_features {
+		vk::PhysicalDeviceFeatures core_features {
 		    .sampleRateShading = VK_TRUE,
 		    .shaderStorageImageMultisample = supported.features.shaderStorageImageMultisample,
-		    .shaderInt64 = VK_TRUE,
-		    .sparseBinding = sparse ? VK_TRUE : VK_FALSE,
-		    .sparseResidencyBuffer = sparse ? VK_TRUE : VK_FALSE};
-		const float priority = 1.0f;
-		const vk::DeviceQueueCreateInfo queue_info {
-		    .queueFamilyIndex = static_cast<uint32_t>(family - families.begin()),
-		    .queueCount = 1, .pQueuePriorities = &priority};
+		    .shaderInt64 = VK_TRUE};
+		core_features.sparseBinding         = sparse ? VK_TRUE : VK_FALSE;
+		core_features.sparseResidencyBuffer = sparse ? VK_TRUE : VK_FALSE;
+		const std::array<float, 2> priorities {1.0f, 1.0f};
+		const auto main_family = static_cast<uint32_t>(family - families.begin());
+		std::array<vk::DeviceQueueCreateInfo, 3> queue_infos {};
+		queue_infos[0] = vk::DeviceQueueCreateInfo {.queueFamilyIndex = main_family, .queueCount = 1, .pQueuePriorities = priorities.data()};
+		uint32_t queue_count = 1;
+		uint32_t readback_family = static_cast<uint32_t>(-1);
+		uint32_t sparse_family = static_cast<uint32_t>(-1);
+		uint32_t sparse_index = 0;
+		if (sparse) {
+			for (uint32_t index = 0; index < families.size(); index++) {
+				const auto flags = families[index].queueFlags;
+				if (index != main_family && families[index].queueCount != 0 && (flags & vk::QueueFlagBits::eTransfer) &&
+				    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+					readback_family = index;
+					queue_infos[queue_count++] = vk::DeviceQueueCreateInfo {
+					    .queueFamilyIndex = index, .queueCount = 1, .pQueuePriorities = priorities.data()};
+					break;
+				}
+			}
+			for (uint32_t index = 0; index < families.size(); index++) {
+				if (index != main_family && index != readback_family && families[index].queueCount != 0 &&
+				    (families[index].queueFlags & vk::QueueFlagBits::eSparseBinding)) {
+					sparse_family = index;
+					queue_infos[queue_count++] = vk::DeviceQueueCreateInfo {
+					    .queueFamilyIndex = index, .queueCount = 1, .pQueuePriorities = priorities.data()};
+					break;
+				}
+			}
+			if (sparse_family == static_cast<uint32_t>(-1)) {
+				if (!(families[main_family].queueFlags & vk::QueueFlagBits::eSparseBinding)) {
+					return false;
+				}
+				sparse_family = main_family;
+				if (families[main_family].queueCount >= 2) {
+					queue_infos[0].queueCount = 2;
+					sparse_index = 1;
+				}
+			}
+		}
+		std::vector<const char*> enabled_extensions(required_extensions.begin(), required_extensions.end());
+		const bool host_memory = std::ranges::any_of(extensions.value, [](const auto& extension) {
+			return std::string_view(extension.extensionName.data()) == VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+		});
+		if (host_memory) enabled_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 		const vk::DeviceCreateInfo device_info {
-		    .pNext = &features13, .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info,
-		    .enabledExtensionCount = static_cast<uint32_t>(required_extensions.size()),
-		    .ppEnabledExtensionNames = required_extensions.data(),
+		    .pNext = &features13, .queueCreateInfoCount = queue_count, .pQueueCreateInfos = queue_infos.data(),
+		    .enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size()),
+		    .ppEnabledExtensionNames = enabled_extensions.data(),
 		    .pEnabledFeatures = &core_features};
 		if (physical.createDevice(&device_info, nullptr, &graphics.device) != vk::Result::eSuccess) {
 			return false;
@@ -148,10 +189,32 @@ private:
 			graphics.physical_device_properties.limits.storageImageSampleCounts = vk::SampleCountFlagBits::e1;
 		}
 		graphics.physical_device_memory_properties = physical.getMemoryProperties();
-		graphics.queue_family = queue_info.queueFamilyIndex;
+		if (host_memory) {
+			vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_properties {};
+			vk::PhysicalDeviceProperties2                     with_host {.pNext = &host_properties};
+			physical.getProperties2(&with_host);
+			graphics.external_memory_host_enabled = true;
+			graphics.host_pointer_alignment       = host_properties.minImportedHostPointerAlignment;
+		}
+		graphics.queue_family = main_family;
 		graphics.device.getQueue(graphics.queue_family, 0, &graphics.queue);
+		graphics.readback_family = readback_family;
+		if (readback_family != static_cast<uint32_t>(-1)) {
+			graphics.device.getQueue(readback_family, 0, &graphics.readback_queue);
+		}
+		graphics.sparse_buffers_enabled = sparse;
+		graphics.sparse_family = sparse_family;
+		graphics.sparse_queue_index = sparse_index;
+		if (sparse) {
+			graphics.device.getQueue(sparse_family, sparse_index, &graphics.sparse_queue);
+			constexpr uint64_t GiB   = uint64_t {1} << 30u;
+			const uint64_t     space = graphics.physical_device_properties.limits.sparseAddressSpaceSize;
+			if (space < 64 * GiB) {
+				graphics.mirror_base = 0x2'0000'0000;
+				graphics.mirror_size = std::min<uint64_t>(4 * GiB, space & ~(GiB - 1));
+			}
+		}
 		graphics.occlusion_queries_enabled = true;
-		graphics.partial_buffers_enabled = sparse;
 		return true;
 	}
 };

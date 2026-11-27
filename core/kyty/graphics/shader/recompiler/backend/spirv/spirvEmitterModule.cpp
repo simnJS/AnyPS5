@@ -380,7 +380,6 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
-	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma || state.program.loop_guards != 0;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && !table;
 	bindings.flattened_srt_uniform =
@@ -458,10 +457,6 @@ void DefineDescriptors(EmitterState& state) {
 				}
 				break;
 			}
-			case IR::DescriptorBindingKind::BdaPagetable:
-				state.bda_pagetable_variable =
-				    Define(StorageBufferType(state, state.storage_buffers[3], 64), "bda_pagetable");
-				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "fault_buffer");
