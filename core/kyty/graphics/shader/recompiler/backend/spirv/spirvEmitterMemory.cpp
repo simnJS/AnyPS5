@@ -2183,6 +2183,11 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address, uint32_t extent) {
 	const auto result = state.builder.AllocateId();
+	if (extent == sizeof(uint32_t)) {
+		if (state.bda_dword_function == 0u) state.bda_dword_function = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result, state.bda_dword_function, address);
+		return result;
+	}
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result,
 	                          state.bda_pointer_function, address, ConstantU32(state, extent));
 	return result;
@@ -2487,10 +2492,32 @@ void DefineGetBdaPointerMasked(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+void DefineBdaDwordPointers(EmitterState& state) {
+	const auto u64 = TypeU64(state), boolean = TypeBool(state);
+	const auto define = [&](uint32_t function, bool masked) {
+		if (function == 0u) return;
+		const auto function_type = masked ? state.builder.Type(spv::OpTypeFunction, u64, u64, boolean)
+		                                  : state.builder.Type(spv::OpTypeFunction, u64, u64);
+		state.builder.AddName(function, masked ? "get_bda_pointer_dword_masked" : "get_bda_pointer_dword");
+		state.builder.AddFunction(spv::OpFunction, u64, function, SharedHelperControl(state), function_type);
+		const auto address = state.builder.AllocateId();
+		const auto active  = masked ? state.builder.AllocateId() : ConstantBool(state, true);
+		state.builder.AddFunction(spv::OpFunctionParameter, u64, address);
+		if (masked) state.builder.AddFunction(spv::OpFunctionParameter, boolean, active);
+		EmitLabel(state, state.builder.AllocateId());
+		state.builder.AddFunction(spv::OpReturnValue, EmitMirrorDeviceAddress(state, address, active,
+		                                                                      ConstantU32(state, sizeof(uint32_t)), true));
+		state.builder.AddFunction(spv::OpFunctionEnd);
+	};
+	define(state.bda_dword_function, false);
+	define(state.bda_dword_masked_function, true);
+}
+
 void DefineBdaLoads(EmitterState& state) {
+	state.current_block = nullptr;
+	DefineBdaDwordPointers(state);
 	if (state.bda_load_functions.empty()) return;
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
-	state.current_block = nullptr;
 	for (const auto& [key, function]: state.bda_load_functions) {
 		const auto [coherent, guarded] = key;
 		{
@@ -2549,6 +2576,12 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 uint32_t GetBdaPointerMasked(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent) {
 	const auto result = state.builder.AllocateId();
+	if (extent == sizeof(uint32_t)) {
+		if (state.bda_dword_masked_function == 0u) state.bda_dword_masked_function = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result, state.bda_dword_masked_function, address,
+		                          active);
+		return result;
+	}
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result, state.bda_masked_function, address,
 	                          active, ConstantU32(state, extent));
 	return result;
