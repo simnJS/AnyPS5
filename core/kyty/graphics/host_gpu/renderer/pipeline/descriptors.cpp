@@ -1361,13 +1361,14 @@ void RenderExecutor::LogTableSummary(size_t binding_slots) {
 	    "a size mismatch); table cache of {} entries, one generation per entry: {} lookups, {} hits, {} new keys, "
 	    "{} keys made again after an eviction, {} evictions, {} cleared past {} elements, {} cleared for the element "
 	    "budget, {} generation bumps; {} entries in use, {} keys seen, {} elements; "
-	    "{} shader bindings retained with {} slots, {} bindings retired\n",
+	    "{} shader bindings retained with {} slots, {} bindings retired; {} reused tables rebound over {} elements, "
+	    "{} elements checked, {} full scans\n",
 	    seconds, taken.prepared, taken.bindings, taken.reused, taken.prepared - taken.reused, taken.unfinished,
 	    taken.renewed, taken.layout, taken.left_renewed + taken.left_size, taken.left_renewed, taken.left_size,
 	    m_table_resolutions.Capacity(), cache.lookups, cache.hits, cache.created, cache.recreated, cache.evicted,
 	    cache.overflowed, MaxTableElements, cache.trimmed, cache.generations, m_table_resolutions.Size(),
 	    m_table_resolutions.KnownKeys(), m_table_element_count, m_table_states.size(), binding_slots,
-	    taken.retired_bindings));
+	    taken.retired_bindings, taken.rebinds, taken.elements, taken.candidates, taken.full_scans));
 }
 
 RenderExecutor::TableResolution&
@@ -1758,6 +1759,17 @@ void RenderExecutor::UnpinTableBindings(TableBindingState& state) {
 		}
 	}
 	state.valid = false;
+	state.watch.Invalidate();
+}
+
+void RenderExecutor::TrackTableElement(TableBindingState& state, uint32_t element) {
+	using Checked       = TableBindingState::Checked;
+	const auto& checked = state.checked[element];
+	state.watch.Track(element, checked.image != Checked::None, checked.image < Checked::NullImage, checked.image,
+	                  checked.element, [&](uint32_t other, uint32_t slot) {
+		                  return other < state.checked.size() && state.checked[other].image != Checked::None &&
+		                         state.checked[other].element == slot;
+	                  });
 }
 
 void RenderExecutor::IndexTableSlots(TableBindingState& state) {
@@ -1888,6 +1900,7 @@ void RenderExecutor::DropUnusedTableElements(TableBindingState& state, PreparedB
 	state.infos.resize(kept);
 	state.marks.resize(kept);
 	state.checked.resize(kept);
+	state.watch.Invalidate();
 	for (auto& slot: state.slots) {
 		slot = remap[slot];
 	}
@@ -1945,7 +1958,8 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 	state.marks.assign(state.elements.size(), 0);
 	state.checked.assign(state.elements.size(), {});
 	state.mark_stamp = 0;
-	state.valid      = true;
+	state.watch.Invalidate();
+	state.valid = true;
 }
 
 bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -2082,20 +2096,52 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 	const auto element_count = static_cast<uint32_t>(state.elements.size());
 	EXIT_IF(state.checked.size() != element_count);
 	m_table_checks.clear();
-	m_table_element_flags.assign((size_t {element_count} + 7) & ~size_t {7}, 0);
-	GetExecHelpers().ParallelFor(element_count, 2048, [&](uint32_t begin, uint32_t end) {
-		for (uint32_t index = begin; index < end; index++) {
-			m_table_element_flags[index] =
-			    state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index]) ? 1 : 0;
-		}
-	});
-	for (uint32_t first = 0; first < element_count; first += 8) {
-		uint64_t word = 0;
-		std::memcpy(&word, m_table_element_flags.data() + first, sizeof(word));
-		for (; word != 0; word &= word - 1) {
-			m_table_checks.push_back(first + static_cast<uint32_t>(std::countr_zero(word)) / 8u);
+	auto& watch = state.watch;
+	watch.Begin(element_count);
+	const auto image_seq   = Image::change_journal.Head();
+	const auto element_seq = m_table_element_journal->Head();
+	uint64_t   considered  = 0;
+	m_bound_image_indices.clear();
+	for (const auto id: m_bound_images) {
+		if (id) {
+			m_bound_image_indices.push_back(id.index);
 		}
 	}
+	const bool full = !watch.Collect(Image::change_journal, image_seq, *m_table_element_journal, element_seq,
+	                                 m_bound_image_indices, [&](uint32_t index) {
+		                                 if (!watch.Consider(index)) {
+			                                 return;
+		                                 }
+		                                 considered++;
+		                                 if (state.marks[index] != state.mark_stamp &&
+		                                     !still_unchanged(state.checked[index])) {
+			                                 m_table_checks.push_back(index);
+		                                 }
+	                                 });
+	if (!full) {
+		std::ranges::sort(m_table_checks);
+	} else {
+		m_table_checks.clear();
+		considered = element_count;
+		m_table_element_flags.assign((size_t {element_count} + 7) & ~size_t {7}, 0);
+		GetExecHelpers().ParallelFor(element_count, 2048, [&](uint32_t begin, uint32_t end) {
+			for (uint32_t index = begin; index < end; index++) {
+				m_table_element_flags[index] =
+				    state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index]) ? 1 : 0;
+			}
+		});
+		for (uint32_t first = 0; first < element_count; first += 8) {
+			uint64_t word = 0;
+			std::memcpy(&word, m_table_element_flags.data() + first, sizeof(word));
+			for (; word != 0; word &= word - 1) {
+				m_table_checks.push_back(first + static_cast<uint32_t>(std::countr_zero(word)) / 8u);
+			}
+		}
+	}
+	m_table_stats.rebinds++;
+	m_table_stats.elements += element_count;
+	m_table_stats.candidates += considered;
+	m_table_stats.full_scans += full ? 1 : 0;
 	const auto check_count = static_cast<uint32_t>(m_table_checks.size());
 	m_table_flags.assign(check_count, 0);
 	GetExecHelpers().ParallelFor(check_count, 256, [&](uint32_t begin, uint32_t end) {
@@ -2186,6 +2232,21 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 			break;
 		}
 	}
+	EXIT_IF(state.elements.size() != element_count);
+	watch.BeginTracking(full);
+	if (full) {
+		for (uint32_t index = 0; index < element_count; index++) {
+			TrackTableElement(state, index);
+		}
+	} else {
+		for (const auto index: m_table_checks) {
+			TrackTableElement(state, index);
+		}
+		for (const auto index: prepared.table_visits) {
+			TrackTableElement(state, index);
+		}
+	}
+	watch.Finish(image_seq, element_seq);
 }
 
 void RenderExecutor::FlushDeferredDispatchBarrier() {
@@ -2245,7 +2306,7 @@ void RenderExecutor::ResetBindings() {
 	for (auto& elements: m_retired_table_elements) {
 		for (auto& [dwords, element]: elements) {
 			if (element.version_slot < m_table_element_versions.size()) {
-				m_table_element_versions[element.version_slot]++;
+				BumpTableElementVersion(element.version_slot);
 				m_free_table_element_versions.push_back(element.version_slot);
 			}
 		}
@@ -3086,11 +3147,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 	const auto tick = m_context.GetTextureCache().m_gc_tick;
 	EXIT_IF(prepared.table_sources.size() != prepared.table_images.size());
-	const auto element_changed = [&](uint32_t slot) {
-		if (slot < m_table_element_versions.size()) {
-			m_table_element_versions[slot]++;
-		}
-	};
+	const auto element_changed = [&](uint32_t slot) { BumpTableElementVersion(slot); };
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
 		const auto& source = prepared.table_sources[k];
 		auto& texture = *prepared.table_images[k];

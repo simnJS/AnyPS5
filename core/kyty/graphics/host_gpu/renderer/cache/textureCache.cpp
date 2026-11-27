@@ -280,7 +280,8 @@ std::atomic<uint32_t>& TextureCache::ImageVersions::Counter(uint32_t index) {
 
 void TextureCache::AttachImageVersion(ImageId id) {
 	auto& image   = m_slot_images[id];
-	image.version = &m_image_versions.Counter(id.index);
+	image.version       = &m_image_versions.Counter(id.index);
+	image.version_index = id.index;
 	image.StateChanged();
 }
 

@@ -6,6 +6,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/image/imageChangeJournal.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <algorithm>
@@ -216,10 +217,12 @@ public:
 	void StateChanged() const noexcept {
 		state_epoch.fetch_add(1u, std::memory_order_relaxed);
 		if (version != nullptr) {
+			change_journal.Push(version_index);
 			version->fetch_add(1u, std::memory_order_release);
 		}
 	}
 	static inline std::atomic<uint64_t> state_epoch {0};
+	static inline ImageChangeJournal    change_journal;
 	[[nodiscard]] static uint64_t       StateEpoch() noexcept { return state_epoch.load(std::memory_order_relaxed); }
 	void HeapChanged() const {
 		StateChanged();
@@ -269,7 +272,8 @@ public:
 #if defined(ANYPS5_KYTY)
 	std::array<uint64_t, 4> target_frames {};
 #endif
-	std::atomic<uint32_t>* version = nullptr;
+	std::atomic<uint32_t>* version       = nullptr;
+	uint32_t               version_index = 0;
 
 private:
 	friend struct ImageTestAccess;

@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/tableResolutionCache.h"
+#include "graphics/host_gpu/renderer/pipeline/tableWatch.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/upscaler/upscaler.h"
@@ -343,6 +344,10 @@ private:
 		uint64_t left_renewed = 0;
 		uint64_t left_size    = 0;
 		uint64_t retired_bindings = 0;
+		uint64_t rebinds      = 0;
+		uint64_t elements     = 0;
+		uint64_t candidates   = 0;
+		uint64_t full_scans   = 0;
 		uint64_t resets       = 0;
 		uint64_t window_ns    = 0;
 		bool     idle_logged  = false;
@@ -359,8 +364,12 @@ private:
 	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
 	[[nodiscard]] bool TableElementBackingReadable(const TableElementResolution& element);
 	void TableElementChanged(const TableElementResolution& element) {
-		if (element.version_slot < m_table_element_versions.size()) {
-			m_table_element_versions[element.version_slot]++;
+		BumpTableElementVersion(element.version_slot);
+	}
+	void BumpTableElementVersion(uint32_t slot) {
+		if (slot < m_table_element_versions.size()) {
+			m_table_element_journal->Push(slot);
+			m_table_element_versions[slot]++;
 		}
 	}
 
@@ -429,7 +438,9 @@ private:
 		uint64_t                             slot_version   = 1;
 		uint64_t                             slot_log_floor = 1;
 		std::vector<std::pair<uint64_t, uint32_t>> slot_log;
+		TableWatch                           watch;
 	};
+	static void TrackTableElement(TableBindingState& state, uint32_t element);
 	[[nodiscard]] TableBindingState::RingSet* AcquireTableRingSet(TableBindingState&      state,
 	                                                              vk::DescriptorSetLayout layout);
 	[[nodiscard]] bool ProveTableSlotsLive(const TableBindingState& state);
@@ -643,6 +654,8 @@ private:
 	std::vector<uint32_t>                              m_table_checks;
 	std::vector<uint8_t>                               m_table_flags;
 	std::vector<uint32_t>                              m_table_element_versions;
+	std::unique_ptr<TableElementJournal>               m_table_element_journal = std::make_unique<TableElementJournal>();
+	std::vector<uint32_t>                              m_bound_image_indices;
 	std::vector<uint32_t>                              m_table_patch_indices;
 	std::vector<uint32_t>                              m_free_table_element_versions;
 	std::vector<uint64_t>                              m_bound_image_marks;
