@@ -209,7 +209,7 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* unavailable = gpu.Initialize()) {
+	if (const auto* unavailable = gpu.Initialize(false, true)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n",
 		             name, required ? "FAILED" : "skipped", unavailable);
