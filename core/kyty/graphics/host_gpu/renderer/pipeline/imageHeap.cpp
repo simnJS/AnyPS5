@@ -60,6 +60,11 @@ uint64_t Probes(uint64_t size, uint64_t first, uint64_t step) {
 	return size >= first + 4u ? (size - first - 4u) / step + 1u : 0u;
 }
 
+size_t CountUnique(std::vector<Slots::KeyWordArray>& keys) {
+	std::ranges::sort(keys);
+	return static_cast<size_t>(std::ranges::unique(keys).begin() - keys.begin());
+}
+
 std::unique_ptr<Buffer> SlotBuffer(RenderContext& context, uint64_t size) {
 	return std::make_unique<Buffer>(
 	    context.GetGraphics(), context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
@@ -247,12 +252,11 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		return &candidate->shape == &shape && candidate->limit == limit;
 	});
 	if (view == views.end()) {
-		auto created    = std::make_unique<View>(View {.memory = **memory,
-		                                               .shape  = shape,
-		                                               .limit  = limit,
-		                                               .count  = std::min(limit, Probes(bytes, first, request.step))});
-		created->buffer = SlotBuffer(m_context, bytes);
-		view            = views.insert(views.end(), std::move(created));
+		auto created = std::make_unique<View>(View {.memory = **memory,
+		                                            .shape  = shape,
+		                                            .limit  = limit,
+		                                            .count  = std::min(limit, Probes(bytes, first, request.step))});
+		view         = views.insert(views.end(), std::move(created));
 	}
 	auto& selected = **view;
 	SyncMemory(selected.memory);
@@ -266,7 +270,9 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		Upload(selected.memory.base, selected.memory.base + selected.memory.size);
 		UpdateProbes(selected.memory);
 	}
-	if (selected.overflowed && selected.capacity && selected.overflow_epoch != m_capacity_epoch) {
+	if (selected.overflowed && selected.capacity &&
+	    (selected.overflow_epoch != m_capacity_epoch || selected.demand.required != 0u) &&
+	    CouldFit(selected.demand, ReclaimSlots(true))) {
 		selected.discover     = true;
 		selected.discover_all = true;
 	}
@@ -274,6 +280,12 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	if (selected.overflowed) {
 		UseFallback(selected.memory);
 		return false;
+	}
+	if (selected.buffer == nullptr) {
+		selected.buffer  = SlotBuffer(m_context, bytes);
+		selected.full    = true;
+		selected.clear   = true;
+		selected.written = 0;
 	}
 	if (request.table && (shape.kinds.size() != 1u || !IR::ImageTableHeapExemplar(m_profiles[profile], shape.kinds[0]))) {
 		UseFallback(selected.memory);
@@ -330,6 +342,11 @@ void ImageHeap::Discover(View& view) {
 	MergeRanges(view.found, m_ranges, view.count);
 	view.found.clear();
 	++m_stats.discoveries;
+	if (!FitsFreeSlots(view)) {
+		Refuse(view, Refusal::Capacity);
+		return;
+	}
+	view.demand = {};
 	const std::span<const uint32_t> words {memory.words};
 	const auto                      first = shape.first / 4u;
 	const auto                      step  = shape.step / 4u;
@@ -388,6 +405,9 @@ ImageHeap::Refusal ImageHeap::AdmitKey(Shape& shape, const Slots::KeyWordArray& 
 }
 
 void ImageHeap::Refuse(View& view, Refusal refusal) {
+	if (refusal == Refusal::Capacity && view.demand.required == 0u) {
+		view.demand = {m_insertions, FreeSlots(true) + 1u};
+	}
 	if (!view.overflowed) ++m_stats.overflows;
 	view.overflowed     = true;
 	view.full           = true;
@@ -441,6 +461,7 @@ uint32_t ImageHeap::Entry(const Key& key, uint32_t kind, bool table) {
 			m_sweep_frame = std::min(m_sweep_frame, m_frame);
 			return 0u;
 		}
+		++m_insertions;
 		found->second = index;
 		auto& element = m_elements[index];
 		element.key   = key;
@@ -762,6 +783,68 @@ ImageId ImageHeap::CurrentImage(const Image::HeapChange& change) {
 	return current;
 }
 
+size_t ImageHeap::FreeSlots(bool table) const {
+	const auto available = IR::ImageHeapCapacity - m_elements.size() + m_free.size();
+	return table ? available - std::min<size_t>(available, SlotsKeptFromTables) : available;
+}
+
+void ImageHeap::ReclaimCompleted(uint64_t tick) {
+	while (!m_retired.empty() && m_retired.front().first <= tick) {
+		m_free.push_back(m_retired.front().second);
+		m_retired.pop_front();
+	}
+}
+
+size_t ImageHeap::ReclaimSlots(bool table) {
+	Retire();
+	auto&      master = m_context.GetCommandScheduler().GetMasterSemaphore();
+	const auto tick   = master.CurrentTick();
+	ReclaimCompleted(master.KnownGpuTick());
+	if (!m_retired.empty() && m_retired.front().first < tick && m_reclaim_tick != tick) {
+		m_reclaim_tick = tick;
+		master.Refresh();
+		ReclaimCompleted(master.KnownGpuTick());
+	}
+	return FreeSlots(table);
+}
+
+bool ImageHeap::CouldFit(const SlotDemand& demand, size_t available) const {
+	return demand.required <= available || demand.required - available <= m_insertions - demand.insertions;
+}
+
+bool ImageHeap::FitsFreeSlots(View& view) {
+	const auto& shape = view.shape;
+	const bool  table = m_table_profiles[shape.profile];
+	uint64_t    probes = 0;
+	for (const auto& range: m_ranges) probes += range.end - range.begin;
+	if (probes <= FreeSlots(true)) return true;
+	const auto available = ReclaimSlots(true);
+	if (!CouldFit(view.demand, available)) return false;
+	if (probes <= available) return true;
+	const auto&                     profile   = m_profiles[shape.profile];
+	const auto                      key_words = profile.r128 ? 4u : 8u;
+	const std::span<const uint32_t> words {view.memory.words};
+	const auto                      first = shape.first / 4u;
+	const auto                      step  = shape.step / 4u;
+	m_absent.clear();
+	for (const auto& range: m_ranges) {
+		for (auto probe = range.begin; probe < range.end; ++probe) {
+			const auto key = Slots::ReadKey(words, first + uint64_t {probe} * step, key_words);
+			if (Slots::NullKey(key)) continue;
+			const Key wanted {.value = {.dwords = key, .dword_count = 8u}, .profile = m_key_profiles[shape.profile]};
+			if (m_index.contains(wanted)) continue;
+			auto       value = wanted.value;
+			const auto kind  = table ? IR::ImageTableHeapKind(profile, value) : IR::ImageHeapKind(profile, value);
+			if (kind != 0u) m_absent.push_back(key);
+		}
+	}
+	const auto required = CountUnique(m_absent);
+	if (required <= available) return true;
+	view.demand   = {m_insertions, required};
+	m_sweep_frame = std::min(m_sweep_frame, m_frame);
+	return false;
+}
+
 uint32_t ImageHeap::Allocate(bool may_fail) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	const auto reclaim = [&] {
@@ -804,6 +887,7 @@ uint32_t ImageHeap::Allocate(bool may_fail) {
 }
 
 void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
+	const bool shrinks = size < memory.size || base != memory.base;
 	{
 		std::scoped_lock lock {m_mutex};
 		memory.base = base;
@@ -824,7 +908,9 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 		view->full  = true;
 		view->pending.clear();
 		view->found.clear();
-		if ((size / 4u + 1u) * sizeof(uint32_t) > view->buffer->Size()) {
+		view->demand = {};
+		if (shrinks) view->clear = true;
+		if (view->buffer != nullptr && (size / 4u + 1u) * sizeof(uint32_t) > view->buffer->Size()) {
 			if (scheduler.Active()) {
 				scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
 			}
@@ -878,6 +964,7 @@ void ImageHeap::AddBytes(View& view, uint64_t begin, uint64_t end, bool discover
 	if (!view.full) view.pending.push_back(range);
 	if (!discover) return;
 	view.discover = true;
+	view.demand   = {};
 	if (view.overflowed || view.found.size() >= MaxFoundRanges) {
 		view.discover_all = true;
 		view.found.clear();
@@ -1042,6 +1129,7 @@ void ImageHeap::UpdateProbes(Memory& memory) {
 		if (cpu_all) {
 			view->discover     = true;
 			view->discover_all = true;
+			view->demand       = {};
 			view->found.clear();
 		}
 		if (cpu_all || gpu_all || m_frame - view->filled >= RefillFrames) view->full = true;
