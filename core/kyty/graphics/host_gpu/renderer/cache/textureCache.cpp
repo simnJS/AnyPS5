@@ -63,7 +63,6 @@ constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
 constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
 constexpr uint64_t PartialUploadMaxShare = 2;
 constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
-constexpr uint64_t GcDownloadAge = 80;
 
 void AddWrittenPages(RangeSet& written, uint64_t address, uint64_t size) {
 	const auto first = Common::AlignDown(address, TRACKER_PAGE_SIZE);
@@ -4035,10 +4034,16 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
+	CollectAt(std::chrono::steady_clock::now());
+}
+
+void TextureCache::CollectAt(std::chrono::steady_clock::time_point now) {
 	Common::ScopedLock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	const uint64_t tick = m_gc_tick;
+	m_gc_history.FinishPass(tick, now);
 	{
 		Common::ScopedLock pending {m_pending_meta_lock};
+		++m_gc_tick;
 		for (auto it = m_pending_meta_clears.begin(); it != m_pending_meta_clears.end();) {
 			const auto next = std::next(it);
 			if (m_gc_tick - it->second.tick > 1) {
@@ -4069,18 +4074,15 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) KYTY_REQUIRES(m_lock) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		uint64_t age        = 16;
-		size_t   deletions  = 10;
-		if (aggressive) {
-			age       = 2;
-			deletions = 40;
-		} else if (pressured) {
-			age       = 8;
-			deletions = 20;
+		size_t   deletions  = aggressive ? 40 : pressured ? 20 : 10;
+		const auto cutoff = aggressive ? m_gc_history.Cutoff<2>(tick)
+		                  : pressured  ? m_gc_history.Cutoff<8>(tick)
+		                               : m_gc_history.Cutoff<16>(tick);
+		if (!cutoff) {
+			return;
 		}
-		age = std::min(age, tick);
 		std::vector<ImageId> candidates;
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
+		m_lru_cache.ForEachItemBelow(*cutoff, [&](ImageId id) { candidates.push_back(id); });
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
@@ -4098,8 +4100,8 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->SafeToDownload() &&
-			    ((!pressured && owner->lru_tick + GcDownloadAge > tick) || owner->info.HasStencil() ||
-			     !DownloadImageMemory(id))) {
+			    ((!pressured && !m_gc_history.OldEnough<GcDownloadAge>(tick, owner->lru_tick)) ||
+			     owner->info.HasStencil() || !DownloadImageMemory(id))) {
 				continue;
 			}
 			--deletions;
