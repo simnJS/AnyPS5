@@ -19,11 +19,11 @@ class PrecacheSelectionTest(unittest.TestCase):
                               b''.join(struct.pack('<QII', code, 1, 1) + b'x' for code in (1, 2, 3)))
             manifest = root / 'input.kpm'
             manifest.write_text('# kyty pipeline manifest v1\n'
-                                'M a vs code=0000000000000001 cur=6 sb=-\n'
-                                'M b vs code=0000000000000001 cur=17 sb=st:4\n'
+                                'M a vs code=0000000000000001 cur=6 wave=32 clip=1 sb=-\n'
+                                'M b vs code=0000000000000001 cur=17 clip=1 wave=32 sb=st:4\n'
                                 'M c ps code=0000000000000002 cur=12 ss=-\n'
                                 'M d cs code=0000000000000003\n'
-                                'P v=a p=c c0=R8Unorm\nP v=b p=c c0=R8Unorm\n'
+                                'P v=a p=c c0=R8Unorm\nP c0=R8Unorm p=c v=b\n'
                                 'P v=b p=c c0=R8Uint plain\n')
             output = root / 'prepared'
             command = [sys.executable, str(PRECACHE), 'prepare-graphics', str(store), str(manifest), str(output)]
@@ -32,7 +32,7 @@ class PrecacheSelectionTest(unittest.TestCase):
             lines = (cache / 'fixture_1.graphics.kpm').read_text().splitlines()
             self.assertEqual(len(lines), 5)
             vs, ps = [next(line for line in lines if f' {stage} ' in line) for stage in ('vs', 'ps')]
-            self.assertTrue(vs.endswith('cur=33 gg'))
+            self.assertTrue(vs.endswith('cur=33 gg clip=1 wave=32'))
             self.assertTrue(ps.endswith('cur=19 gg'))
             prefix = f'P v={vs.split()[1]} p={ps.split()[1]}'
             self.assertEqual(set(lines[-2:]), {prefix + ' c0=R8Unorm', prefix + ' c0=R8Uint plain'})
