@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cinttypes>
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <span>
 #include <tuple>
 #include <xxhash.h>
 
@@ -47,6 +49,14 @@ constexpr uint64_t StampBytes           = uint64_t {IR::ImageHeapCapacity} * siz
 constexpr size_t   MaxFoundRanges       = 64;
 constexpr uint32_t ReportFrames         = 300;
 constexpr uint64_t CompareBytes         = 32;
+constexpr uint64_t ReadsBytes           = uint64_t {IR::ImageHeapCapacity} / 8u;
+constexpr size_t   MaxReadbacks         = 4;
+constexpr uint32_t UnreadMs             = 60'000;
+constexpr uint32_t ParkCheckMs          = 1'000;
+constexpr uint64_t ParkPercent          = 60;
+constexpr uint64_t ParkStopPercent      = 50;
+constexpr uint64_t MaxParkBytes         = uint64_t {512} << 20u;
+constexpr size_t   MaxParks             = 1024;
 static_assert(Slots::ArmShift == IR::ImageHeapKindShift);
 static_assert(IR::ImageHeapCapacity - 1u <= Slots::IndexMask);
 
@@ -149,13 +159,14 @@ ImageHeap::ImageHeap(RenderContext& context): m_context(context), m_check(SlotCh
 	                     IR::ImageHeapCapacity);
 
 	m_layout = CreateLayout(graphics.device);
-	const vk::DescriptorPoolSize pool_size {vk::DescriptorType::eSampledImage,
-	                                        IR::ImageHeapCapacity};
+	const std::array<vk::DescriptorPoolSize, 2> pool_sizes {
+	    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, IR::ImageHeapCapacity},
+	    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 1u}};
 	vk::DescriptorPoolCreateInfo pool_info {};
 	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
 	pool_info.maxSets       = 1;
-	pool_info.poolSizeCount = 1;
-	pool_info.pPoolSizes    = &pool_size;
+	pool_info.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
+	pool_info.pPoolSizes    = pool_sizes.data();
 	EXIT_IF(MemoryTelemetry::Create(graphics.device, pool_info, m_pool) !=
 	        vk::Result::eSuccess);
 	vk::DescriptorSetAllocateInfo allocate {};
@@ -169,24 +180,40 @@ ImageHeap::ImageHeap(RenderContext& context): m_context(context), m_check(SlotCh
 	m_uses.emplace_back();
 	m_writes.push_back({0u, {nullptr, nullptr, vk::ImageLayout::eShaderReadOnlyOptimal}});
 	WriteDescriptors();
+	m_epoch = std::chrono::steady_clock::now();
+	m_read_stamps.Resize(IR::ImageHeapCapacity);
+	m_reads = std::make_unique<Buffer>(graphics, context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
+	                                   vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc |
+	                                       vk::BufferUsageFlagBits::eStorageBuffer,
+	                                   ReadsBytes);
+	const vk::DescriptorBufferInfo reads {m_reads->Handle(), 0, ReadsBytes};
+	vk::WriteDescriptorSet         write {};
+	write.dstSet          = m_set;
+	write.dstBinding      = IR::ImageHeapReadsBinding;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
+	write.pBufferInfo     = &reads;
+	graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
 }
 
 vk::DescriptorSetLayout ImageHeap::CreateLayout(vk::Device device) {
-	const vk::DescriptorBindingFlags binding_flags =
-	    vk::DescriptorBindingFlagBits::ePartiallyBound |
-	    vk::DescriptorBindingFlagBits::eUpdateAfterBind |
-	    vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+	const std::array<vk::DescriptorBindingFlags, 2> binding_flags {
+	    vk::DescriptorBindingFlagBits::ePartiallyBound | vk::DescriptorBindingFlagBits::eUpdateAfterBind |
+	        vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending,
+	    vk::DescriptorBindingFlags {}};
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
-	flags_info.bindingCount  = 1;
-	flags_info.pBindingFlags = &binding_flags;
-	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eSampledImage,
-	                                              IR::ImageHeapCapacity,
-	                                              vk::ShaderStageFlagBits::eAll, nullptr};
+	flags_info.bindingCount  = static_cast<uint32_t>(binding_flags.size());
+	flags_info.pBindingFlags = binding_flags.data();
+	const std::array<vk::DescriptorSetLayoutBinding, 2> bindings {
+	    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, IR::ImageHeapCapacity,
+	                                    vk::ShaderStageFlagBits::eAll, nullptr},
+	    vk::DescriptorSetLayoutBinding {IR::ImageHeapReadsBinding, vk::DescriptorType::eStorageBuffer, 1u,
+	                                    vk::ShaderStageFlagBits::eAll, nullptr}};
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.pNext        = &flags_info;
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
-	layout_info.bindingCount = 1;
-	layout_info.pBindings    = &binding;
+	layout_info.bindingCount = static_cast<uint32_t>(bindings.size());
+	layout_info.pBindings    = bindings.data();
 	vk::DescriptorSetLayout layout = nullptr;
 	EXIT_IF(device.createDescriptorSetLayout(&layout_info, nullptr, &layout) != vk::Result::eSuccess);
 	return layout;
@@ -1571,8 +1598,16 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	}
 	if (stale) Repoint();
 	Requeue();
+	const auto stamp = m_pending.empty() ? 0u : ReadStamp(std::chrono::steady_clock::now());
 	for (const auto index: m_pending) {
 		if (m_elements[index].freed) continue;
+		if (!m_parking.empty() && m_parking.erase(m_elements[index].key) != 0u) {
+			auto& element  = m_elements[index];
+			element.parked = true;
+			m_writes.push_back({index, {nullptr, nullptr, vk::ImageLayout::eGeneral}});
+			if (element.table) Hash(index);
+			continue;
+		}
 		auto binding = resolve(m_elements[index]);
 		auto& element = m_elements[index];
 		if (binding.image_id) {
@@ -1580,6 +1615,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
 			element.image      = binding.image_id;
 			element.serial     = image.serial;
+			element.since      = stamp;
 			binding.layout     = image.ReadLayout();
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
 			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back(index);
@@ -1594,6 +1630,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		if (element.table) Hash(index);
 	}
 	m_pending.clear();
+	m_parking.clear();
 	if (!m_declined.empty()) {
 		for (const auto index: m_declined) Mark(index, State::Buried);
 		m_declined.clear();
@@ -1685,12 +1722,20 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void ImageHeap::RunGarbageCollector() {
+	CollectAt(std::chrono::steady_clock::now());
+}
+
+void ImageHeap::CollectAt(std::chrono::steady_clock::time_point now) {
 	++m_frame;
 	if (std::exchange(m_capacity_changed, false)) ++m_capacity_epoch;
+	const auto stamp = ReadStamp(now);
+	TakeReads();
 	if (m_context.GetCommandScheduler().Active()) {
 		AdvanceSweep();
+		RecordReads(stamp);
 		Retire();
 	}
+	ParkUnread(stamp);
 	{
 		std::scoped_lock lock {m_mutex};
 		if (std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
@@ -1706,6 +1751,117 @@ void ImageHeap::RunGarbageCollector() {
 		m_suspend_draw = m_draw;
 	}
 	Report();
+	ReportReads();
+}
+
+uint32_t ImageHeap::ReadStamp(std::chrono::steady_clock::time_point now) const {
+	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_epoch).count();
+	return static_cast<uint32_t>(std::max<int64_t>(elapsed, 0)) + 1u;
+}
+
+void ImageHeap::TakeReads() {
+	auto& scheduler = m_context.GetCommandScheduler();
+	while (!m_readbacks.empty()) {
+		auto& front = m_readbacks.front();
+		if (front.tick == scheduler.CurrentTick() || !scheduler.IsFree(front.tick)) break;
+		front.buffer->Invalidate(0, ReadsBytes);
+		m_read_stamps.MarkWords(
+		    std::span(reinterpret_cast<const uint32_t*>(front.buffer->Mapped().data()), ReadsBytes / sizeof(uint32_t)));
+		m_read_stamps.Fold(front.stamp, [&](uint64_t index) {
+			if (index < m_elements.size() && m_elements[index].parked) m_unparked.push_back(static_cast<uint32_t>(index));
+		});
+		m_read_seen = front.stamp;
+		++m_read_stats.readbacks;
+		m_free_readbacks.push_back(std::move(front.buffer));
+		m_readbacks.pop_front();
+	}
+	if (m_unparked.empty()) return;
+	for (const auto index: m_unparked) {
+		auto& element = m_elements[index];
+		if (!element.parked || element.freed || element.state != State::Live) continue;
+		element.parked = false;
+		++m_read_stats.unparked;
+		Mark(index, State::Stale);
+	}
+	m_unparked.clear();
+	Repoint();
+}
+
+void ImageHeap::RecordReads(uint32_t stamp) {
+	if (m_readbacks.size() >= MaxReadbacks) return;
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto& buffer    = scheduler.Current();
+	buffer.EndRendering();
+	std::unique_ptr<Buffer> target;
+	if (m_free_readbacks.empty()) {
+		target = HostBuffer(m_context, ReadsBytes);
+	} else {
+		target = std::move(m_free_readbacks.back());
+		m_free_readbacks.pop_back();
+	}
+	const auto native = buffer.Handle();
+	GlobalBarrier(native, vk::PipelineStageFlagBits::eAllCommands, AnyAccess, vk::PipelineStageFlagBits::eTransfer,
+	              vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
+	const vk::BufferCopy copy {0, 0, ReadsBytes};
+	native.copyBuffer(m_reads->Handle(), target->Handle(), 1, &copy);
+	native.fillBuffer(m_reads->Handle(), 0, ReadsBytes, 0u);
+	GlobalBarrier(native, vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite,
+	              vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	              AnyAccess | vk::AccessFlagBits::eHostRead);
+	m_readbacks.push_back({.buffer = std::move(target), .tick = scheduler.CurrentTick(), .stamp = stamp});
+}
+
+const Image* ImageHeap::Parkable(const Element& element, uint32_t index) const {
+	if (element.freed || element.parked || element.evicting || element.state != State::Live || !element.image ||
+	    (!element.table && element.refs == 0u) || m_read_stamps.Pending(index)) {
+		return nullptr;
+	}
+	const auto last = std::max(element.since, m_read_stamps.Stamp(index));
+	if (last == 0u || m_read_seen < last || m_read_seen - last < UnreadMs) return nullptr;
+	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(element.image);
+	if (image == nullptr || image->serial != element.serial || !image->registered || image->depth_id ||
+	    image->is_depth_copy || image->is_stencil_copy || image->usage.render_target || image->usage.video_out ||
+	    TextureCache::IsTargetImage(*image) || image->binding.is_target || image->binding.shader_write ||
+	    image->binding.force_general || image->IsGpuModified() || image->IsBufferModified() ||
+	    image->gpu_write_sequence != 0u || image->info.metadata.kind != ImageMetadataKind::None ||
+	    image->info.data.Empty()) {
+		return nullptr;
+	}
+	return image;
+}
+
+void ImageHeap::ParkUnread(uint32_t stamp) {
+	if (m_read_seen == 0u || stamp - m_park_check < ParkCheckMs) return;
+	m_park_check = stamp;
+	const auto local = m_context.GetGraphics().GetLocalMemoryUsage();
+	if (local.budget == 0u) return;
+	m_pressure = local.usage * 100u >= local.budget * (m_pressure ? ParkStopPercent : ParkPercent);
+	if (!m_pressure) return;
+	uint64_t bytes = 0;
+	size_t   parks = 0;
+	for (uint32_t index = 1; index < m_elements.size() && parks < MaxParks && bytes < MaxParkBytes; ++index) {
+		const auto& element = m_elements[index];
+		const auto* image   = Parkable(element, index);
+		if (image == nullptr) continue;
+		bytes += image->AccountedSize();
+		++parks;
+		m_parking.insert(element.key);
+		Mark(index, State::Stale);
+	}
+	if (parks == 0u) return;
+	m_read_stats.parked += parks;
+	m_read_stats.parked_bytes += bytes;
+	Repoint();
+}
+
+void ImageHeap::ReportReads() {
+	if (m_frame < m_read_stats.reported + ReportFrames || m_read_stats.readbacks == 0u) return;
+	m_read_stats.reported = m_frame;
+	std::fprintf(stderr,
+	             "[kyty-image-heap-reads] %" PRIu64 " readbacks, %" PRIu64 " unread slots parked (%" PRIu64
+	             " MiB), %" PRIu64 " read again, pressure %s\n",
+	             m_read_stats.readbacks, m_read_stats.parked, m_read_stats.parked_bytes >> 20u, m_read_stats.unparked,
+	             m_pressure ? "on" : "off");
 }
 
 void ImageHeap::Report() {

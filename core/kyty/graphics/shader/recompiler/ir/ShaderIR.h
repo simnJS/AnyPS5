@@ -443,6 +443,7 @@ inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
 inline constexpr uint32_t ImageBindingCount           = 50u;
 inline constexpr uint32_t ImageHeapSet                = 1u;
+inline constexpr uint32_t ImageHeapReadsBinding       = 1u;
 inline constexpr uint32_t ImageHeapCapacity           = 65536u;
 inline constexpr uint32_t ImageHeapKindShift          = 20u;
 

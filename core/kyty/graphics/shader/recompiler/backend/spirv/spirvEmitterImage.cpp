@@ -714,6 +714,49 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return texel;
 }
 
+void EmitHeapRead(EmitterState& state, uint32_t entry) {
+	EXIT_IF(state.heap_reads_variable == 0);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	const auto u32     = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	const auto scope   = ConstantU32(state, spv::ScopeSubgroup);
+	const auto element = Binary(state, spv::OpBitwiseAnd, u32, entry, ConstantU32(state, IR::ImageHeapCapacity - 1u));
+	const auto mark    = [&] {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                          state.heap_reads_variable, ConstantU32(state, 0),
+		                          Binary(state, spv::OpShiftRightLogical, u32, element, ConstantU32(state, 5u)));
+		const auto bit = Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1u),
+		                        Binary(state, spv::OpBitwiseAnd, u32, element, ConstantU32(state, 31u)));
+		const auto seen = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, seen, pointer);
+		const auto unseen = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, seen, bit),
+		                           ConstantU32(state, 0u));
+		EmitIfCondition(state, unseen, [&] {
+			const auto first = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst, u32, first, scope, element);
+			const auto elected = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformElect, boolean, elected, scope);
+			const auto store = Binary(state, spv::OpLogicalOr, boolean, elected,
+			                          Binary(state, spv::OpINotEqual, boolean, element, first));
+			EmitIfCondition(state, store, [&] {
+				const auto previous = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAtomicOr, u32, previous, pointer, ConstantU32(state, spv::ScopeDevice),
+				                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+			});
+		});
+	};
+	if (state.program.stage != ShaderType::Pixel) {
+		mark();
+		return;
+	}
+	EXIT_IF(state.helper_invocation_variable == 0);
+	const auto helper = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, boolean, helper, state.helper_invocation_variable);
+	EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, helper), mark);
+}
+
 template <typename Emit>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
                      const Emit& emit, uint32_t key_override = 0u, uint32_t view = IR::ImageResource::NoIndirectImage) {
@@ -753,6 +796,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		                                ConstantU32(state, 2u)),
 		                         image.indirect_mapping_offset - 3u)
 		    : EmitImageHeapEntry(state, heap_key, image.indirect_mapping_offset);
+		EmitHeapRead(state, entry);
 		const auto kinds = static_cast<uint32_t>(image.indirect_resources.size()) - 1u;
 		if (kinds == 1u) return emit(image.indirect_resources[1], entry);
 		const auto element = Binary(state, spv::OpBitwiseAnd, TypeU32(state), entry,

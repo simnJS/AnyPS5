@@ -121,6 +121,7 @@ private:
 		vk::PhysicalDeviceVulkan12Features features12 {
 		    .pNext = &robustness,
 		    .storageBuffer8BitAccess = require_tiling,
+		    .shaderSampledImageArrayNonUniformIndexing = supported12.shaderSampledImageArrayNonUniformIndexing,
 		    .descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
 		    .descriptorBindingUpdateUnusedWhilePending = VK_TRUE,
 		    .descriptorBindingPartiallyBound = VK_TRUE,

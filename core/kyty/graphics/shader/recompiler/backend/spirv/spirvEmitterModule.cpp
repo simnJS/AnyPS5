@@ -350,6 +350,16 @@ void DefineDescriptors(EmitterState& state) {
 			EXIT("shader image has an invalid descriptor type or mip count");
 		}
 		if (image.heap) {
+			if (state.heap_reads_variable == 0) {
+				state.heap_reads_variable = state.builder.DefineGlobalVariable(
+				    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state, state.storage_buffers[2])),
+				    spv::StorageClassStorageBuffer);
+				state.builder.AddName(state.heap_reads_variable, "heap_reads");
+				state.builder.AddAnnotation(spv::OpDecorate, state.heap_reads_variable, spv::DecorationDescriptorSet,
+				                            IR::ImageHeapSet);
+				state.builder.AddAnnotation(spv::OpDecorate, state.heap_reads_variable, spv::DecorationBinding,
+				                            IR::ImageHeapReadsBinding);
+			}
 			auto& definition = state.heap_images[IR::ImageBindingIndex(*kind)];
 			if (image.indirect_resources.empty() && definition.variable == 0) {
 				DefineImageArray(state, definition, image, IR::ImageHeapCapacity, IR::ImageHeapSet, 0u);
@@ -833,7 +843,9 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
-	if (state.program.info.helper_invocation || state.quad_lanes) {
+	if (state.program.info.helper_invocation || state.quad_lanes ||
+	    (state.program.stage == ShaderType::Pixel &&
+	     std::ranges::any_of(state.program.info.images, &IR::ImageResource::heap))) {
 		const auto variable = DefineInterfaceVariable(state, TypeBool(state), spv::StorageClassInput,
 		                                              "gl_HelperInvocation");
 		state.helper_invocation_variable = variable;

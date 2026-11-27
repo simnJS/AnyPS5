@@ -3,14 +3,17 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/usageBitmap.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeapSlots.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,6 +45,15 @@ public:
 	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout);
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
+
+	struct ReadStats {
+		uint64_t readbacks     = 0;
+		uint64_t parked        = 0;
+		uint64_t parked_bytes  = 0;
+		uint64_t unparked      = 0;
+		uint32_t reported      = 0;
+	};
+	[[nodiscard]] const ReadStats& Reads() const noexcept { return m_read_stats; }
 
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
@@ -103,11 +115,19 @@ private:
 		uint32_t kind     = 0;
 		uint32_t refs     = 0;
 		uint32_t born     = 0;
+		uint32_t since    = 0;
 		State    state    = State::Live;
 		bool     table    = false;
 		bool     hashed   = false;
 		bool     freed    = false;
 		bool     evicting = false;
+		bool     parked   = false;
+	};
+
+	struct Readback {
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                tick  = 0;
+		uint32_t                stamp = 0;
 	};
 
 	struct Shape {
@@ -284,6 +304,13 @@ private:
 	void     PurgeDirectory();
 	void     RecordChecks(CommandBuffer& buffer);
 	void     FinishChecks();
+	void     CollectAt(std::chrono::steady_clock::time_point now);
+	uint32_t ReadStamp(std::chrono::steady_clock::time_point now) const;
+	void     TakeReads();
+	void     RecordReads(uint32_t stamp);
+	void     ParkUnread(uint32_t stamp);
+	const Image* Parkable(const Element& element, uint32_t index) const;
+	void     ReportReads();
 
 	RenderContext&                                                      m_context;
 	std::mutex                                                          m_mutex;
@@ -356,8 +383,20 @@ private:
 	vk::DescriptorSetLayout                                             m_layout = nullptr;
 	vk::DescriptorPool                                                  m_pool   = nullptr;
 	vk::DescriptorSet                                                   m_set    = nullptr;
+	std::chrono::steady_clock::time_point                               m_epoch;
+	std::unique_ptr<Buffer>                                             m_reads;
+	std::deque<Readback>                                                m_readbacks;
+	std::vector<std::unique_ptr<Buffer>>                                m_free_readbacks;
+	UsageBitmap                                                         m_read_stamps;
+	std::unordered_set<Key, KeyHash>                                    m_parking;
+	std::vector<uint32_t>                                               m_unparked;
+	uint32_t                                                            m_read_seen   = 0;
+	uint32_t                                                            m_park_check  = 0;
+	bool                                                                m_pressure    = false;
+	ReadStats                                                           m_read_stats;
 
 	friend struct ImageHeapTestAccess;
+	friend struct ImageHeapReadsTestAccess;
 };
 
 }
