@@ -174,6 +174,8 @@ struct EmitterState {
 	bool                                             converged_calls         = false;
 	std::unordered_set<const IR::Inst*>             pair_shared;
 	uint32_t                                         bda_masked_function     = 0;
+	uint32_t                                         bda_dword_function      = 0;
+	uint32_t                                         bda_dword_masked_function = 0;
 	std::map<std::array<uint32_t, 2>, uint32_t>      bda_load_functions;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
