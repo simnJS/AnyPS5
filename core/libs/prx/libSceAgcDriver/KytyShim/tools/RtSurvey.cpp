@@ -99,6 +99,9 @@ struct Row {
     std::uint32_t empty = 0;
     std::uint32_t emulated = 0;
     int spirv = -1;
+    std::uint32_t addressWrites = 0;
+    std::uint32_t selfSizedWrites = 0;
+    std::uint32_t tableWrites = 0;
     DiagnosticCounts diagnostics{};
 };
 
@@ -320,6 +323,11 @@ void Probe(Prepared& prepared, const std::vector<std::uint32_t>& code, bool defa
         auto compiled = Recompiler::CompileProgram(std::move(translated), prepared.options, specialization,
                                                    prepared.module.push_data_cursor);
         Count(compiled.program, row);
+        row.addressWrites = compiled.program.has_address_writes ? 1u : 0u;
+        row.selfSizedWrites = static_cast<std::uint32_t>(std::ranges::count_if(
+            compiled.program.info.self_sized_buffers, [](const auto& buffer) { return buffer.written; }));
+        row.tableWrites = static_cast<std::uint32_t>(std::ranges::count_if(
+            compiled.program.info.buffers, [](const auto& buffer) { return buffer.indirect_write_table; }));
         if (compiled.spirv.empty()) {
             row.spirv = -1;
         } else if (settings.validate) {
@@ -349,6 +357,8 @@ void Print(const Row& row) {
                 row.fromManifest ? "manifest" : "code", row.status.c_str());
     std::printf(" bvh=%u native=%u oracle=%u lane=%u empty=%u emulated=%u spirv=%s", row.bvh, row.native, row.oracle, row.lane,
                 row.empty, row.emulated, row.spirv < 0 ? "none" : row.spirv == 0 ? "invalid" : "valid");
+    std::printf(" address_writes=%u self_sized_writes=%u table_writes=%u", row.addressWrites, row.selfSizedWrites,
+                row.tableWrites);
     const char* separator = " diagnostics=";
     for (std::size_t index = 0; index < DiagnosticCodes.size(); ++index) {
         if (row.diagnostics[index] == 0) continue;
@@ -479,7 +489,7 @@ int RunSurvey(const SurveySettings& settings) {
             if (!decoded) ++undecodable;
             bvh = bvhByCode.emplace(key.hash, decoded ? static_cast<std::int64_t>(decoded->bvh) : 0).first;
         }
-        if (bvh->second == 0) continue;
+        if (bvh->second == 0 && !settings.every) continue;
         if (code.empty()) code = load(key.hash);
         std::vector<std::uint32_t> back;
         if (key.back != 0) {
@@ -523,7 +533,7 @@ int RunSurvey(const SurveySettings& settings) {
             ++undecodable;
             continue;
         }
-        if (decoded->bvh == 0) continue;
+        if (decoded->bvh == 0 && !settings.every) continue;
         const bool compute = decoded->exportsPosition == 0 && decoded->exportsTarget == 0;
         if (!compute) {
             Row row;

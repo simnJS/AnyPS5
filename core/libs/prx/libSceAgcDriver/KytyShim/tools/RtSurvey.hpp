@@ -33,6 +33,7 @@ struct SurveySettings {
     std::uint32_t subgroup = 32;
     std::uint32_t ldsLimitBytes = 49152;
     bool validate = true;
+    bool every = false;
     std::string build;
 };
 

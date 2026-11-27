@@ -321,7 +321,7 @@ int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, 
 }
 
 int Usage() {
-	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-63] [--stats] [--robust] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex> | --cache <file.code> --all [--kpm <file.kpm>] [--subgroup 32|64] [--lds-limit bytes] [--no-validate])\n       kyty_rt_probe --version\n");
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-63] [--stats] [--robust] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex> | --cache <file.code> --all [--every] [--kpm <file.kpm>] [--subgroup 32|64] [--lds-limit bytes] [--no-validate])\n       kyty_rt_probe --version\n");
 	return 64;
 }
 
@@ -341,6 +341,7 @@ int main(int argc, char** argv) {
 	const char* kpmPath   = nullptr;
 	bool        all       = false;
 	bool        noValidate = false;
+	bool        every      = false;
 	uint32_t    ldsLimit  = 49152;
 	for (int i = 1; i < argc; ++i) {
 		const std::string_view arg = argv[i];
@@ -392,6 +393,8 @@ int main(int argc, char** argv) {
 			ldsLimit = static_cast<uint32_t>(std::atoi(argv[++i]));
 		} else if (arg == "--no-validate") {
 			noValidate = true;
+		} else if (arg == "--every") {
+			every = true;
 		} else if (arg == "--cache") {
 			if (cachePath || i + 1 >= argc) return Usage();
 			cachePath = argv[++i];
@@ -411,10 +414,11 @@ int main(int argc, char** argv) {
 		survey.subgroup      = settings.subgroup != 0 ? settings.subgroup : 32u;
 		survey.ldsLimitBytes = ldsLimit;
 		survey.validate      = !noValidate;
+		survey.every         = every;
 		survey.build         = std::string(APS5_TRACE_COMMIT) + (APS5_TRACE_DIRTY > 0 ? "+modified" : "");
 		return AgcDriver::RunSurvey(survey);
 	}
-	if (kpmPath != nullptr || noValidate) return Usage();
+	if (kpmPath != nullptr || noValidate || every) return Usage();
 	if (cachePath || cacheHash) {
 		uint64_t hash = 0;
 		if (!cachePath || !*cachePath || !cacheHash || !files.empty() || !ParseShaderHash(cacheHash, hash)) return Usage();
