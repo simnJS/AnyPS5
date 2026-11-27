@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/spscQueue.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -16,6 +17,7 @@
 #include "graphics/host_gpu/renderer/execHelpers.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/submitStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
@@ -40,6 +42,22 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 constexpr uint64_t StaleAge      = 2048;
 constexpr uint64_t PinnedAge     = 4 * uint64_t {BufferCache::USE_SCAN_PERIOD};
 static_assert(PinnedAge < StaleAge);
+
+vk::Result SubmitReadbackQueue(vk::Queue queue, const vk::SubmitInfo& submit, vk::Fence fence, uint64_t needed) {
+	if (!SubmitStats::Enabled()) {
+		return queue.submit(1, &submit, fence);
+	}
+	const auto start  = Common::SteadyNs();
+	const auto result = queue.submit(1, &submit, fence);
+	const auto end    = Common::SteadyNs();
+	SubmitStats::Record({.queue           = SubmitStats::Queue::Readback,
+	                     .batches         = 1,
+	                     .command_buffers = submit.commandBufferCount,
+	                     .waits           = submit.waitSemaphoreCount,
+	                     .call_ns         = end - start,
+	                     .tick            = needed});
+	return result;
+}
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -1065,7 +1083,7 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 	submit.pWaitDstStageMask  = &wait_stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &command;
-	if (m_graphics.readback_queue.submit(1, &submit, queue.fence) != vk::Result::eSuccess) {
+	if (SubmitReadbackQueue(m_graphics.readback_queue, submit, queue.fence, needed) != vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
 	read.slot           = slot;
@@ -2582,7 +2600,7 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	submit.pWaitDstStageMask  = &wait_stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &command;
-	if (m_graphics.readback_queue.submit(1, &submit, m_readback.fence) != vk::Result::eSuccess) {
+	if (SubmitReadbackQueue(m_graphics.readback_queue, submit, m_readback.fence, needed) != vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
 #if defined(ANYPS5_KYTY)

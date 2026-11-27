@@ -895,6 +895,17 @@ add_test(NAME kyty_shim_uniform_scalar_loads COMMAND kyty_shim_uniform_scalar_lo
 set_tests_properties(kyty_shim_uniform_scalar_loads PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_uniform_scalar_loads: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+add_test_executable(kyty_shim_submit_stats_tests ${CMAKE_CURRENT_SOURCE_DIR}/SubmitStats.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_submit_stats_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_submit_stats_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_submit_stats_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_submit_stats_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_submit_stats COMMAND kyty_shim_submit_stats_tests)
+set_tests_properties(kyty_shim_submit_stats PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_submit_stats: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 add_test_executable(kyty_shim_ab_switches_tests ${CMAKE_CURRENT_SOURCE_DIR}/AbSwitches.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_ab_switches_tests PRIVATE ${LIBS_INCLUDE_DIR})
 configure_host_test_executable(kyty_shim_ab_switches_tests)

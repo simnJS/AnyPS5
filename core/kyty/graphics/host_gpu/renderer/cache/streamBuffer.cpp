@@ -4,8 +4,10 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/submitStats.h"
 
 #include <array>
 #include <cinttypes>
@@ -197,8 +199,18 @@ void Buffer::Commit(uint64_t offset, uint64_t size) {
 	bind_info.bufferBindCount    = 1;
 	bind_info.pBufferBinds       = &buffer_bind;
 	{
+		const bool stats      = SubmitStats::Enabled();
+		const auto lock_start = stats ? Common::SteadyNs() : 0;
 		Common::LockGuard lock {graphics.queue_mutex};
+		const auto call_start = stats ? Common::SteadyNs() : 0;
 		EXIT_IF(graphics.queue.submit(1, &submit, nullptr) != vk::Result::eSuccess);
+		if (stats) {
+			SubmitStats::Record({.queue           = SubmitStats::Queue::Sparse,
+			                     .batches         = 1,
+			                     .command_buffers = submit.commandBufferCount,
+			                     .lock_ns         = call_start - lock_start,
+			                     .call_ns         = Common::SteadyNs() - call_start});
+		}
 		const auto result = graphics.queue.bindSparse(1, &bind_info, fence);
 		if (result != vk::Result::eSuccess) {
 			EXIT("Buffer: sparse bind of %zu blocks at 0x%" PRIx64 " failed: %s (block %" PRIu64
