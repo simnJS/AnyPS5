@@ -2381,38 +2381,47 @@ void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& s
 	}
 }
 
-bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shape) {
-	if ((plan.stage != ShaderType::Vertex && plan.stage != ShaderType::Pixel && plan.stage != ShaderType::Mesh) ||
-	    !plan.resource_tracking_complete || !plan.srt_plan_complete || !plan.source_reads.empty())
+bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shape, const char** refusal) {
+	const auto refuse = [&](const char* reason) {
+		if (refusal != nullptr) *refusal = reason;
 		return false;
+	};
+	if (plan.stage != ShaderType::Vertex && plan.stage != ShaderType::Pixel && plan.stage != ShaderType::Mesh)
+		return refuse("stage");
+	if (!plan.resource_tracking_complete) return refuse("resource_tracking_incomplete");
+	if (!plan.srt_plan_complete) return refuse("srt_plan_incomplete");
+	if (!plan.source_reads.empty()) return refuse("source_reads");
 	uint32_t table_source = UINT32_MAX;
 	for (uint32_t i = 0; i < plan.descriptor_sources.size(); ++i) {
 		const auto& source = plan.descriptor_sources[i];
 		if (!source.indirect_descriptor) continue;
-		if (table_source != UINT32_MAX || !source.indirect_descriptor->table_array ||
-		    source.dword_count != 8u) return false;
+		if (table_source != UINT32_MAX) return refuse("several_indirect_tables");
+		if (!source.indirect_descriptor->table_array) return refuse("indirect_descriptor_not_table_array");
+		if (source.dword_count != 8u) return refuse("indirect_table_not_8_dwords");
 		table_source = i;
 	}
 	for (const auto& memory: plan.memory_info) {
 		if (memory.planning_only) continue;
 		if (memory.kind != ResourceKind::Buffer || !memory.formatted) continue;
-		if (memory.data_bits != 32u || (memory.typed &&
+		if (memory.data_bits != 32u) return refuse("formatted_buffer_not_32_bit");
+		if (memory.typed &&
 		    Format::GetFormatInfo(Format::DecodeTBufferFormat(memory.data_format, memory.number_format)).type ==
-		        Format::ComponentType::Unknown))
-			return false;
+		        Format::ComponentType::Unknown)
+			return refuse("typed_buffer_format_unknown");
 	}
 	shape = {};
 	shape.buffers.resize(plan.info.buffers.size());
 	for (const auto& buffer: plan.info.buffers) {
-		if (buffer.formatted && (buffer.written || buffer.atomic)) return false;
+		if (buffer.formatted && (buffer.written || buffer.atomic)) return refuse("formatted_buffer_written");
 	}
 	ReadStridesAtRunTime(plan, shape);
 	for (const auto& image: plan.info.images) {
 		const bool table = image.source == table_source && table_source != UINT32_MAX;
-		if (image.mip_mode != ImageMipMode::None ||
-		    (!table && image.paired_view != ImageResource::NoIndirectImage) ||
-		    (table && (image.resource_class != ImageResourceClass::Sampled || image.depth_compare ||
-		               image.atomic || image.written || image.r128))) return false;
+		if (image.mip_mode != ImageMipMode::None) return refuse("image_mip_mode");
+		if (!table && image.paired_view != ImageResource::NoIndirectImage) return refuse("image_paired_view");
+		if (table && (image.resource_class != ImageResourceClass::Sampled || image.depth_compare ||
+		              image.atomic || image.written || image.r128))
+			return refuse("table_image_not_plain_sampled");
 		auto& view = shape.images.emplace_back();
 		if (table) {
 			view.table = 0;

@@ -218,6 +218,8 @@ struct PipelineCache::ManifestState {
 	std::vector<uint8_t>               missing_code;
 	std::vector<const ShaderModule*>   modules;
 	std::vector<uint8_t>               module_failed;
+	std::vector<std::string>           module_failure;
+	std::vector<uint8_t>               module_refused;
 	std::vector<std::vector<uint32_t>> module_pipelines;
 	std::vector<uint8_t>               missing_modules;
 	std::vector<uint32_t>              module_rank;
@@ -241,6 +243,8 @@ struct PipelineCache::ManifestState {
 	uint32_t                              pipelines        = 0;
 	uint32_t                              pipelines_known  = 0;
 	uint32_t                              pipelines_failed = 0;
+	uint32_t                              generic_refused  = 0;
+	uint32_t                              pipelines_skipped = 0;
 	size_t                                restored_graphics = 0;
 	uint32_t                              compute          = 0;
 	uint32_t                              compute_cached   = 0;
@@ -930,6 +934,8 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 			state.module_words.push_back(0);
 			state.modules.push_back(cached[loaded_index]);
 			state.module_failed.push_back(0);
+			state.module_failure.emplace_back();
+			state.module_refused.push_back(0);
 			state.module_pipelines.emplace_back();
 			if (const auto* hit = cached[loaded_index]) {
 				const auto id = ManifestModuleIdentity(module, StaticKey(module));
@@ -970,15 +976,18 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 			for (const auto stage: pipeline.stages) {
 				if (stage == ManifestPipeline::NoStage || state.modules[stage] != nullptr) continue;
 				if (state.module_failed[stage] != 0) {
-					missing = UINT8_MAX;
+					AddManifestStage(missing, ManifestStage::Failed);
+				} else if (state.module_refused[stage] != 0) {
+					AddManifestStage(missing, ManifestStage::Refused);
 				} else {
 					state.module_pipelines[stage].push_back(index);
-					missing = missing == UINT8_MAX ? missing : static_cast<uint8_t>(missing + 1);
+					AddManifestStage(missing, ManifestStage::Pending);
 				}
 			}
-			if (missing == 0) {
-				state.QueuePipeline(index);
-			}
+			const auto change = FinishManifestPipelineStages(missing);
+			state.pipelines_skipped += change.skipped;
+			if (state.startup) state.startup_done += change.skipped;
+			if (change.queue) state.QueuePipeline(index);
 		}
 		if (state.startup) {
 			state.startup_total += static_cast<uint32_t>(new_modules.size() + new_pipelines.size());
@@ -2892,26 +2901,37 @@ void PipelineCache::FinishStartupIfIdle() {
 		std::lock_guard lock(m_driver_cache_mutex);
 		PostDueDriverCache(true);
 	}
-	const auto unresolved_modules = std::ranges::count(state.modules, nullptr);
-	const auto unresolved_graphics = std::ranges::count_if(state.missing_modules, [](auto missing) { return missing != 0; });
+	const auto unresolved_modules = std::ranges::count(state.modules, nullptr) - state.generic_refused;
+	const auto unresolved_graphics = std::ranges::count_if(state.missing_modules, ManifestPipelineUnresolved);
 	for (size_t i = 0; i < state.missing_modules.size(); ++i) {
-		if (state.missing_modules[i] == 0) continue;
+		if (!ManifestPipelineUnresolved(state.missing_modules[i])) continue;
 		ManifestLog("[kyty-startup] unresolved_graphics variant={:016x} reason=missing_stage",
 		            ManifestPipelineIdentity(state.warm_pipelines[i]));
 	}
 	for (size_t i = 0; i < state.modules.size(); ++i) {
 		if (state.modules[i] != nullptr) continue;
 		const auto& record = state.warm_modules[i];
-		ManifestLog("[kyty-startup] unresolved_module stage={} program={:016x} variant={:016x} reason={}",
+		if (state.module_refused[i] != 0) {
+			ManifestLog("[kyty-startup] generic_refused stage={} program={:016x} variant={:016x} reason={}",
+			            static_cast<unsigned>(record.stage), record.ProgramHash(),
+			            ManifestModuleIdentity(record, StaticKey(record)), state.module_failure[i]);
+			continue;
+		}
+		ManifestLog("[kyty-startup] unresolved_module stage={} program={:016x} variant={:016x} generic={} reason={}{}{}",
 		            static_cast<unsigned>(record.stage), record.ProgramHash(),
-		            ManifestModuleIdentity(record, StaticKey(record)),
-		            state.module_failed[i] != 0 ? "failed" : "missing_code");
+		            ManifestModuleIdentity(record, StaticKey(record)), record.generic_graphics ? 1 : 0,
+		            state.module_failed[i] != 0 ? "failed" : "missing_code",
+		            state.module_failure[i].empty() ? "" : " detail=", state.module_failure[i]);
 	}
 	state.ReleaseStartup(unresolved_modules == 0 && unresolved_graphics == 0 &&
 	                             state.pipelines_failed == 0 && state.compute_failed == 0 &&
 	                             state.unsupported == 0 && state.unreadable == 0 ? "ready" : "partial");
 	ManifestLog("[kyty-startup] unresolved modules={} graphics_dependencies={} unsupported={} unreadable={}",
 	            unresolved_modules, unresolved_graphics, state.unsupported, state.unreadable);
+	if (state.generic_refused != 0) {
+		ManifestLog("[kyty-startup] generic candidates refused modules={} pipelines_skipped={}",
+		            state.generic_refused, state.pipelines_skipped);
+	}
 	ManifestLog("Pipeline manifest: startup modules {} built, {} cached, {} failed; graphics pipelines {} built, "
 	            "{} known, {} failed; compute pipelines {} built, {} cached, {} failed",
 	            state.built, state.found, state.failed, state.pipelines, state.pipelines_known, state.pipelines_failed,
@@ -3071,6 +3091,8 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	options.rt_emulation       = Config::RayTracingEmulation();
 	std::vector<uint32_t> spirv;
 	std::vector<uint32_t> plain_spirv;
+	std::string           refusal;
+	bool                  generic_refusal = false;
 
 	const auto build_compute = [&](const ShaderModule* module) {
 		if (module == nullptr || module->info.stage != ShaderType::Compute) return;
@@ -3103,8 +3125,13 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		{
 			std::scoped_lock lock(state.mutex);
 			state.modules[index] = module;
-			if (module == nullptr) {
+			if (module == nullptr && generic_refusal) {
+				state.module_refused[index] = 1;
+				state.module_failure[index] = refusal;
+				state.generic_refused++;
+			} else if (module == nullptr) {
 				state.module_failed[index] = 1;
+				state.module_failure[index] = refusal.empty() ? "unknown" : refusal;
 				state.failed++;
 			} else {
 				(built ? state.built : state.found)++;
@@ -3129,13 +3156,13 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 					state.module_generation.fetch_add(1, std::memory_order_release);
 				}
 			}
+			const auto stage = module != nullptr ? ManifestStage::Built
+			                   : generic_refusal ? ManifestStage::Refused : ManifestStage::Failed;
 			for (const auto pipeline: state.module_pipelines[index]) {
-				if (module == nullptr) {
-					state.missing_modules[pipeline] = UINT8_MAX;
-				} else if (state.missing_modules[pipeline] != UINT8_MAX &&
-				           --state.missing_modules[pipeline] == 0) {
-					state.QueuePipeline(pipeline);
-				}
+				const auto change = SettleManifestStage(state.missing_modules[pipeline], stage);
+				state.pipelines_skipped += change.skipped;
+				if (state.startup) state.startup_done += change.skipped;
+				if (change.queue) state.QueuePipeline(pipeline);
 			}
 		}
 		state.available.notify_all();
@@ -3158,16 +3185,27 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	std::optional<ShaderModule>                       module;
 	const auto what = fmt::format("module {:016x}", record.code_hash);
-	RunDroppable(state.dropped, record.from_assets, record.code_hash, 0, what, [&] {
+	const bool ran = RunDroppable(state.dropped, record.from_assets, record.code_hash, 0, what, [&] {
 		auto source = ShaderRecompiler::PrepareShaderSource(code, options);
-		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
+		if (source.unsupported_call_pc != UINT32_MAX) {
+			refusal = fmt::format("unsupported_call_pc_{:x}", source.unsupported_call_pc);
+			return;
+		}
+		if (!source.calls.empty()) {
+			refusal = fmt::format("calls_{}", source.calls.size());
 			return;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
 		plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		if (record.generic_graphics) {
-			if (!ShaderRecompiler::IR::GenericGraphicsShape(*plan, specialization)) return;
+			const char* shape_refusal = "shape";
+			if (!ShaderRecompiler::IR::GenericGraphicsShape(*plan, specialization, &shape_refusal)) {
+				refusal         = shape_refusal;
+				generic_refusal = true;
+				return;
+			}
 		} else if (!ShaderRecompiler::IR::ResourceSpecializationFits(translated.program, record.specialization)) {
+			refusal = "specialization_does_not_fit";
 			return;
 		}
 		if (record.stage == ShaderType::Compute && RuntimeStride(key.hash)) {
@@ -3194,9 +3232,12 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			}
 		}
 #endif
+		std::string build_refusal;
 		module          = BuildModule(key, options, std::move(translated), specialization, {},
-		                              record.push_data_cursor, spirv, plain_spirv);
+		                              record.push_data_cursor, spirv, plain_spirv, &build_refusal);
+		if (!module) refusal = build_refusal.empty() ? "build_refused" : fmt::format("build_{}", build_refusal);
 	});
+	if (!ran) refusal = "dropped_after_fatal_error";
 	if (compiled != nullptr) {
 		finish(compiled, false);
 		return;
@@ -3381,11 +3422,11 @@ PipelineCache::ManifestBacklog PipelineCache::GetManifestBacklog() const {
 	for (const auto index: state.module_jobs) {
 		backlog.compute_modules += state.warm_modules[index].stage == ShaderType::Compute ? 1u : 0u;
 	}
-	backlog.modules_done     = state.built + state.found + state.failed;
+	backlog.modules_done     = state.built + state.found + state.failed + state.generic_refused;
 	backlog.modules_total    = state.warm_modules.size();
 	backlog.failures         = state.failed + state.pipelines_failed + state.compute_failed +
 	                           state.dropped.load(std::memory_order_relaxed);
-	backlog.pipelines_done   = state.pipelines + state.pipelines_known + state.pipelines_failed;
+	backlog.pipelines_done   = state.pipelines + state.pipelines_known + state.pipelines_failed + state.pipelines_skipped;
 	backlog.threads          = static_cast<uint32_t>(state.threads.size());
 	backlog.module_seconds   = state.module_time.Get();
 	backlog.pipeline_seconds = state.pipeline_time.Get();
@@ -3406,8 +3447,9 @@ bool PipelineCache::WaitForManifestCompletion(std::chrono::milliseconds timeout)
 		const bool complete = !state.scanning.load(std::memory_order_acquire) &&
 		                      state.module_jobs.empty() && state.pipeline_jobs.empty() &&
 		                      state.large_compute.empty() && m_restore_jobs.empty() && state.running == 0 &&
-		                      state.built + state.found + state.failed == state.warm_modules.size() &&
-		                      state.pipelines + state.pipelines_known + state.pipelines_failed ==
+		                      state.built + state.found + state.failed + state.generic_refused ==
+		                          state.warm_modules.size() &&
+		                      state.pipelines + state.pipelines_known + state.pipelines_failed + state.pipelines_skipped ==
 		                          state.warm_pipelines.size() + state.restored_graphics &&
 		                      std::ranges::all_of(state.missing_code, [](uint8_t missing) { return missing == 0; });
 		if (complete) {
@@ -3442,8 +3484,8 @@ void PipelineCache::ManifestProgress(bool force) {
 	if (!idle && !force) {
 		ManifestLog("Pipeline manifest: {}/{} modules, {}/{} pipelines ({} modules wait for "
 		            "their shaders) at {:.1f} s",
-		            state.built + state.found + state.failed, modules,
-		            state.pipelines + state.pipelines_known + state.pipelines_failed, pipelines,
+		            state.built + state.found + state.failed + state.generic_refused, modules,
+		            state.pipelines + state.pipelines_known + state.pipelines_failed + state.pipelines_skipped, pipelines,
 		            waiting, Seconds(now - state.start));
 		return;
 	}

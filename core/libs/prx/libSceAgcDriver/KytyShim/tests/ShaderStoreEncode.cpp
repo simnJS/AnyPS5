@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -364,6 +365,53 @@ void StoredComputeModuleSelection() {
             "replay accepted a truncated frame after the selected module");
 }
 
+void GenericShapeRefusalsNameTheirReason() {
+    const auto refusal = [](const ResourcePlan& plan) -> std::string {
+        ResourceSpecialization shape;
+        const char* reason = nullptr;
+        if (GenericGraphicsShape(plan, shape, &reason)) return "accepted";
+        return reason == nullptr ? "unnamed" : reason;
+    };
+    const auto graphics = [] {
+        ResourcePlan plan;
+        plan.stage = ShaderType::Vertex;
+        plan.resource_tracking_complete = true;
+        plan.srt_plan_complete = true;
+        return plan;
+    };
+    const auto table = [](bool array) {
+        DescriptorSource source;
+        source.dword_count = 8;
+        source.indirect_descriptor.emplace();
+        source.indirect_descriptor->table_array = array;
+        return source;
+    };
+
+    auto loose = graphics();
+    loose.descriptor_sources.push_back(table(false));
+    Require(refusal(loose) == "indirect_descriptor_not_table_array", "a non-array indirect descriptor was not named");
+
+    auto two = graphics();
+    two.descriptor_sources.push_back(table(true));
+    two.descriptor_sources.push_back(table(true));
+    Require(refusal(two) == "several_indirect_tables", "two indirect tables were not named");
+
+    auto written = graphics();
+    written.stage = ShaderType::Pixel;
+    auto& buffer = written.info.buffers.emplace_back();
+    buffer.formatted = true;
+    buffer.written = true;
+    Require(refusal(written) == "formatted_buffer_written", "a written formatted buffer was not named");
+
+    auto compute = graphics();
+    compute.stage = ShaderType::Compute;
+    Require(refusal(compute) == "stage", "a compute stage was not named");
+
+    auto single = graphics();
+    single.descriptor_sources.push_back(table(true));
+    Require(refusal(single) == "accepted", "a single table array was refused");
+}
+
 }
 
 int main() {
@@ -375,6 +423,7 @@ int main() {
     GraphicsStageDataRoundTrips();
     GenericStageDataRoundTrips();
     GenericSampledImageBanks();
+    GenericShapeRefusalsNameTheirReason();
     TableGraphicsModuleRoundTrips();
     NativeGraphicsRequiresExactTableStages();
     StoredComputeModuleSelection();
