@@ -650,10 +650,7 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 	        range.base_layer + range.layer_count > depth.backing.layers);
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
-	depth.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range,
-	              command);
-	copy.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, range,
-	             command);
+	copy.PrepareTransfer(command, depth, range, range, vk::PipelineStageFlagBits2::eCopy);
 	std::vector<vk::ImageCopy> copies;
 	for (const auto aspect: {vk::ImageAspectFlagBits::eDepth, vk::ImageAspectFlagBits::eStencil}) {
 		if (!(aspects & aspect)) {
@@ -3033,7 +3030,9 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		CommitGpuWrite(image);
 		return;
 	}
-	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+	const ImageSubresourceRange cleared {range.baseMipLevel, range.levelCount, range.baseArrayLayer,
+	                                     range.layerCount};
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, cleared,
 	              command.Handle());
 	auto native_range = range;
 	if (image.info.IsVolume()) {

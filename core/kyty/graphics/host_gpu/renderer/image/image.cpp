@@ -200,7 +200,17 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.levelCount     = 1;
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
-					barriers.push_back(barrier);
+					if (!barriers.empty() &&
+					    barriers.back().subresourceRange.baseMipLevel == level &&
+					    barriers.back().subresourceRange.baseArrayLayer +
+					            barriers.back().subresourceRange.layerCount == layer &&
+					    barriers.back().oldLayout == barrier.oldLayout &&
+					    barriers.back().srcAccessMask == barrier.srcAccessMask &&
+					    barriers.back().srcStageMask == barrier.srcStageMask) {
+						barriers.back().subresourceRange.layerCount++;
+					} else {
+						barriers.push_back(barrier);
+					}
 					subresource_state = {destination_stage, destination_access, destination_layout};
 				}
 			}
@@ -338,7 +348,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	buffer_barrier.size                = size;
 	const auto image_barriers =
 	    GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
-	                vk::PipelineStageFlagBits2::eCopy, {});
+	                vk::PipelineStageFlagBits2::eTransfer, {});
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
@@ -379,6 +389,28 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 		destination_layers = depth;
 	}
 	return {source_layers, destination_layers};
+}
+
+void Image::PrepareTransfer(CommandRecorder command, Image& source, ImageSubresourceRange source_range,
+                            ImageSubresourceRange destination_range, vk::PipelineStageFlagBits2 stage) {
+	auto reads = source.GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	                                vk::PipelineStageFlagBits2::eTransfer, source_range);
+	auto writes = GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	                          stage, destination_range);
+	const auto submit = [&](const Barriers& barriers) {
+		if (!barriers.empty()) {
+			vk::DependencyInfo dependency {};
+			dependency.setImageMemoryBarriers(barriers);
+			command.pipelineBarrier2(dependency);
+		}
+	};
+	if (source.backing.image == backing.image || reads.empty()) {
+		submit(reads);
+		submit(writes);
+	} else {
+		reads.insert(reads.end(), writes.begin(), writes.end());
+		submit(reads);
+	}
 }
 
 void Image::CopyImage(Image& source) {
@@ -424,9 +456,8 @@ void Image::CopyImage(Image& source) {
 		}
 	}
 	auto command = m_scheduler.Current().Handle();
-	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
-	               command);
-	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	PrepareTransfer(command, source, {0, levels, 0, copies[0].srcSubresource.layerCount},
+	                {0, levels, 0, copies[0].dstSubresource.layerCount}, vk::PipelineStageFlagBits2::eCopy);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, levels, copies.data());
 }
@@ -463,10 +494,8 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
-	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
-	               resolved_source_range, command);
-	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
-	        resolved_destination_range, command);
+	PrepareTransfer(command, source, resolved_source_range, resolved_destination_range,
+	                copy ? vk::PipelineStageFlagBits2::eCopy : vk::PipelineStageFlagBits2::eResolve);
 	if (copy) {
 		vk::ImageCopy region {};
 		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,
@@ -530,9 +559,11 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &barrier;
 	auto command                        = m_scheduler.Current().Handle();
-	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
-	               command);
-	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	const auto source_slices = source.info.IsVolume() ? source.backing.extent.depth : source.backing.layers;
+	const auto destination_slices = info.IsVolume() ? backing.extent.depth : backing.layers;
+	const auto slices = std::min(source_slices, destination_slices);
+	PrepareTransfer(command, source, {0, levels, 0, slices}, {0, levels, 0, slices},
+	                vk::PipelineStageFlagBits2::eCopy);
 	for (uint32_t level = 0; level < levels; level++) {
 		const auto width             = std::max(source.backing.extent.width >> level, 1u);
 		const auto height            = std::max(source.backing.extent.height >> level, 1u);
@@ -620,9 +651,8 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 		copy.extent         = {width, height, depth};
 	}
 	auto command = m_scheduler.Current().Handle();
-	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
-	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
-	               command);
+	PrepareTransfer(command, source, {0, 1, 0, source_layers}, {mip, 1, layer, destination_layers},
+	                vk::PipelineStageFlagBits2::eCopy);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
 }

@@ -31,6 +31,13 @@ struct TextureCacheTestAccess {
 		return cache.InsertImage(info);
 	}
 
+	static void ClearLayers(TextureCache& cache, CommandBuffer& command, ImageId image,
+	                        uint32_t first, uint32_t count, uint32_t value) {
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, first, count};
+		const vk::ClearValue clear {.color = {.uint32 = {std::array<uint32_t, 4> {value, 0, 0, 0}}}};
+		cache.ClearImage(command, image, vk::Format::eR32Uint, range, clear);
+	}
+
 	static bool QueueDownload(TextureCache& cache, ImageId image) {
 		Common::ScopedLock lock {cache.m_lock};
 		return cache.DownloadImageMemory(image);
@@ -741,6 +748,55 @@ const char* CheckRangePicksLatestWrite(GraphicContext& graphics, uint64_t addres
 	return nullptr;
 }
 
+const char* CheckLayerTransfers(GraphicContext& graphics, uint64_t address) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint32_t Layers = 4;
+	constexpr uint32_t Width = 64;
+	ImageInfo info;
+	info.data.address = address;
+	info.pixel_format = vk::Format::eR32Uint;
+	info.guest_format = Prospero::BufferFormat::k32UInt;
+	info.extent = vk::Extent3D {Width, 1, 1};
+	info.pitch = Width;
+	info.resources = {1, Layers};
+	info.UpdateSize();
+	if (info.data.size > GuestBytes / 2) return "the layer transfer does not fit its backing";
+	const auto source = TextureCacheTestAccess::Create(textures, info);
+	info.data.address += GuestBytes / 2;
+	const auto destination = TextureCacheTestAccess::Create(textures, info);
+	auto& command = scheduler.Current();
+	TextureCacheTestAccess::ClearLayers(textures, command, source, 0, Layers, ImageValue);
+	TextureCacheTestAccess::ClearLayers(textures, command, destination, 0, Layers, FillValue);
+	TextureCacheTestAccess::ClearLayers(textures, command, source, 1, 2, CopyValue);
+	auto& from = textures.GetImage(source);
+	auto& to = textures.GetImage(destination);
+	to.Resolve(from, {0, 1, 1, 2}, {0, 1, 0, 2});
+	TextureCacheTestAccess::ClearLayers(textures, command, destination, 1, 1, CpuValue);
+	to.Resolve(from, {0, 1, 0, 1}, {0, 1, 2, 1});
+
+	constexpr uint64_t Bytes = Width * Layers * sizeof(uint32_t);
+	Buffer readback(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, Bytes);
+	const std::array regions {vk::BufferImageCopy {0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, Layers},
+	                                               {}, info.extent}};
+	to.Download(regions, readback.Handle(), 0, Bytes);
+	const auto tick = scheduler.CurrentTick();
+	scheduler.Wait(tick);
+	scheduler.WaitPriorityOperations(tick);
+	readback.Invalidate(0, Bytes);
+	const std::array expected {CopyValue, CpuValue, ImageValue, FillValue};
+	const auto* pixels = reinterpret_cast<const uint32_t*>(readback.Mapped().data());
+	for (uint32_t i = 0; i < Width * Layers; ++i) {
+		if (pixels[i] != expected[i / Width]) return "layer transfer changed the wrong texels";
+	}
+	return nullptr;
+}
+
 struct LayerFormat {
 	vk::Format             host;
 	Prospero::BufferFormat guest;
@@ -952,7 +1008,10 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 		return 1;
 	}
 	const auto address = reinterpret_cast<uint64_t>(guest);
-	auto failure = CheckWriteBackOrder(graphics, address);
+	auto failure = CheckLayerTransfers(graphics, address);
+	if (failure == nullptr) {
+		failure = CheckWriteBackOrder(graphics, address);
+	}
 	if (failure == nullptr) {
 		failure = CheckWriteBackRefreshesBufferCopy(graphics, address + GuestBytes / 4);
 	}

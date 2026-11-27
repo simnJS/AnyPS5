@@ -1522,7 +1522,8 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 }
 
 static void CopyGpuFlatLoads(RenderContext& context, const vk::DescriptorBufferInfo& target,
-                             std::span<const ShaderRecompiler::IR::GpuFlatLoad> loads) {
+                             std::span<const ShaderRecompiler::IR::GpuFlatLoad> loads,
+                             vk::PipelineStageFlags consumer_stage) {
 	auto& cache = context.GetBufferCache();
 	std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
 	copies.reserve(loads.size());
@@ -1545,12 +1546,19 @@ static void CopyGpuFlatLoads(RenderContext& context, const vk::DescriptorBufferI
 	for (const auto& [source, copy]: copies) {
 		native.copyBuffer(source, target.buffer, 1, &copy);
 	}
-	vk::MemoryBarrier after {};
-	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	after.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eUniformRead;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
-	                       nullptr);
+	vk::BufferMemoryBarrier2 after {};
+	after.srcStageMask        = vk::PipelineStageFlagBits2::eCopy;
+	after.srcAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	after.dstStageMask        = vk::PipelineStageFlags2 {static_cast<VkPipelineStageFlags>(consumer_stage)};
+	after.dstAccessMask       = vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eUniformRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = target.buffer;
+	after.offset              = target.offset;
+	after.size                = target.range;
+	vk::DependencyInfo dependency {};
+	dependency.setBufferMemoryBarriers(after);
+	native.pipelineBarrier2(dependency);
 }
 
 static bool TableTextureStale(const TextureBinding& texture, const Image* image) {
@@ -3005,7 +3013,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocati
 		}
 		prepared.flattened_srt_known = snapshot.gpu_flat_loads.empty();
 		if (!snapshot.gpu_flat_loads.empty()) {
-			CopyGpuFlatLoads(m_context, prepared.flattened_srt, snapshot.gpu_flat_loads);
+			CopyGpuFlatLoads(m_context, prepared.flattened_srt, snapshot.gpu_flat_loads,
+			                 ShaderPipelineStages(NativeShaderStage(program.stage)));
 			snapshot.gpu_flat_loads.clear();
 		}
 		if (layout.flattened_srt_uniform_index != UINT32_MAX) {

@@ -84,6 +84,8 @@ public:
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
+	void PrepareTransfer(CommandRecorder command, Image& source, ImageSubresourceRange source_range,
+	                     ImageSubresourceRange destination_range, vk::PipelineStageFlagBits2 stage);
 	void CopyImage(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
