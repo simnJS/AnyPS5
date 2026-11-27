@@ -20,8 +20,7 @@ On by default unless the row says otherwise.
 | `KYTY_GPU_THREAD_CPUS` | unset, `off`, or a comma-separated list of logical CPUs | Unset: GPU stage threads keep to the CPUs sharing the largest L3 cache; on Windows each is pinned to its own core there, performance cores first. `off`: no placement. A list pins the stages, in the order command processor, execute, record, resolve, host copy; on Windows a listed CPU the machine does not have stops with a message |
 | `KYTY_EARLY_FLIP` | `0`, `1` (default) | Hand flips back to the game as soon as the presentation copy is submitted |
 | `KYTY_SUSPEND_POINT_DEPTH` | 1 to 64, `8` by default | Suspend points the GPU may have in flight; `1` is Kyty's behaviour |
-| `KYTY_LABELS_AFTER_DUMPS` | `0`, `1` (default) | Deferred labels wait for the newest pending occlusion dump instead of their own command buffer |
-| `KYTY_LABELS_AROUND_GPU_WRITES` | `0`, `1` (default) | A label next to bytes the GPU writes is deferred behind the pending labels instead of draining the GPU |
+| `KYTY_LABELS_AROUND_GPU_WRITES` | `0`, `1` (default) | A label next to bytes the GPU writes is deferred to the completion of its producer instead of draining the GPU |
 | `KYTY_TABLE_DESCRIPTOR_WRITES` | `0`, `1`; default `1` on RADV, `0` on other drivers | Fill a draw's bindless texture tables with descriptor writes instead of descriptor copies, which are slow on RADV. `0` copies them and `1` writes them on any driver |
 | `KYTY_TABLE_RESOLUTIONS` | 1 to 4096, `256` by default | Size of the cache of resolved bindless texture tables. Evicting a table only makes the draws that use it resolve their tables again |
 | `KYTY_DRAW_TEMPLATES`, `KYTY_DRAW_BUFFERS` | `2` and `1` by default; `0` turns off | Kyty's draw templates and grouped draw-buffer copies, on by default in AnyKyty |

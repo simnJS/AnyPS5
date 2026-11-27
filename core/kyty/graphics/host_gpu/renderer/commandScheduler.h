@@ -52,14 +52,9 @@ public:
 	                            uint64_t size = UINT64_MAX);
 	void DeferPriorityOperation(Common::UniqueFunction<void>&&                     operation,
 	                            const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
-#if defined(ANYPS5_KYTY)
-	void DeferPriorityOperationAfter(uint64_t tick, Common::UniqueFunction<void>&& operation,
-	                                 uint64_t address, uint64_t size);
-	[[nodiscard]] uint64_t NewestPendingGuestOperation(uint64_t address, uint64_t size,
-	                                                   uint64_t after);
-#endif
 	void DeferHostOperation(Common::UniqueFunction<void>&& operation, bool priority = false);
 #if defined(ANYPS5_KYTY)
+	[[nodiscard]] uint64_t NewestPendingGuestOperation(uint64_t address, uint64_t size, uint64_t after);
 	void DeferFlipCompletion(Common::UniqueFunction<void>&& complete);
 #endif
 	[[nodiscard]] bool HasPendingPriorityOperations();

@@ -279,12 +279,8 @@ private:
 	bool     m_predicate_skip = false;
 	std::unique_ptr<DrawStateObserver> m_draw_observer;
 	bool     m_occlusion_wait_requested = false;
-	std::atomic<uint32_t> m_deferred_labels {0};
 #if defined(ANYPS5_KYTY)
-	static bool                         LabelsAfterDumps();
 	static bool                         LabelsAroundGpuWrites();
-	static inline std::atomic<uint32_t> s_deferred_labels {0};
-	const bool                          m_labels_after_dumps = LabelsAfterDumps();
 	const bool                          m_labels_around_gpu_writes = LabelsAroundGpuWrites();
 #endif
 	bool m_wait_since_operation = false;
