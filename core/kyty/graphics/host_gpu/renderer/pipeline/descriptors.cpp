@@ -46,6 +46,7 @@
 #include <mutex>
 #include <span>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 #include <xxhash.h>
 
@@ -3400,6 +3401,42 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
+		struct Use {
+			vk::ImageLayout layout;
+			vk::AccessFlags2 access;
+			std::optional<ImageSubresourceRange> range;
+			bool operator==(const Use&) const = default;
+		};
+		Image::Barriers pending;
+		std::unordered_map<vk::Image, Use> uses;
+		const auto flush_images = [&] {
+			if (!pending.empty()) {
+				vk::DependencyInfo dependency {};
+				dependency.setImageMemoryBarriers(pending);
+				vk_buffer.pipelineBarrier2(dependency);
+				pending.clear();
+				uses.clear();
+			}
+		};
+		const auto prepare_image = [&](Image& image, vk::ImageLayout layout, vk::AccessFlags2 access,
+		                               std::optional<ImageSubresourceRange> range) {
+			constexpr auto stages = vk::PipelineStageFlagBits2::eAllGraphics |
+			                        vk::PipelineStageFlagBits2::eComputeShader;
+			auto barriers = image.GetBarriers(layout, access, stages, range);
+			if (barriers.empty()) return;
+			const Use use {layout, access, range};
+			if (const auto found = uses.find(image.backing.image); found != uses.end()) {
+				if (found->second == use) return;
+				flush_images();
+			}
+			if (pending.empty()) {
+				buffer.EndRendering();
+				pending = std::move(barriers);
+			} else {
+				pending.insert(pending.end(), barriers.begin(), barriers.end());
+			}
+			uses.emplace(image.backing.image, use);
+		};
 		const auto transit = [&](TextureBinding& binding) {
 			if (!binding.image_id) return;
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
@@ -3419,23 +3456,23 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						EXIT("sampling a writable depth/stencil attachment aspect\n");
 					}
 				}
-				image.Transit(layout,
+				prepare_image(image, layout,
 				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
 				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),
-				              {}, vk_buffer);
+				              {});
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+				prepare_image(image, vk::ImageLayout::eGeneral,
+				              vk::AccessFlagBits2::eShaderRead | storage_access, {});
 			} else if (storage) {
-				image.Transit(vk::ImageLayout::eGeneral,
+				prepare_image(image, vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-				              range, vk_buffer);
+				              range);
 			} else {
-				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+				prepare_image(image, image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range);
 			}
 			binding.layout = image.backing.state.layout;
 		};
@@ -3453,6 +3490,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				transit(table_state->elements[index].resolution->texture);
 			}
 		}
+
+		flush_images();
 
 		const bool copy_tables = !pipeline.uses_push_descriptors && table_state != nullptr &&
 		                         descriptors.tables_reused && table_state->slot_set_current;
