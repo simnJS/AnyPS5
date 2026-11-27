@@ -86,7 +86,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 FaultManager::~FaultManager() {
-	m_graphics.device.destroyPipeline(m_fault_process_pipeline, nullptr);
+	MemoryTelemetry::Destroy(m_graphics.device, m_fault_process_pipeline);
 	m_graphics.device.destroyPipelineLayout(m_fault_process_pipeline_layout, nullptr);
 	m_graphics.device.destroyDescriptorSetLayout(m_fault_process_desc_layout, nullptr);
 }

@@ -80,7 +80,7 @@ RenderExecutor::~RenderExecutor() {
 		ReleaseUpscalerFeature(context.feature);
 	}
 	const auto device = m_context.GetGraphics().device;
-	device.destroyPipeline(m_pssr_pipeline, nullptr);
+	MemoryTelemetry::Destroy(device, m_pssr_pipeline);
 	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);
 	device.destroyDescriptorSetLayout(m_pssr_descriptor_layout, nullptr);
 	for (const auto& [hash, update_template]: m_commit_templates) {

@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 
 #include "common/abi.h"
+#include "graphics/host_gpu/memoryTelemetry.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
@@ -537,13 +538,17 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 
+	template <class Key, class Value, class Hash = std::hash<Key>>
+	using CacheMap = std::unordered_map<Key, Value, Hash, std::equal_to<Key>,
+	                                    MemoryTelemetry::PipelineAllocator<std::pair<const Key, Value>>>;
+
 	struct Program {
 		const ShaderModule* GenericModule(uint32_t cursor) const;
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::deque<ShaderModule>                     modules;
+		std::deque<ShaderModule, MemoryTelemetry::PipelineAllocator<ShaderModule>>                     modules;
 		bool                                         skip_dispatch = false;
 		bool                                         serve_runtime_samplers = false;
 		std::array<size_t, 2>                        last_module {SIZE_MAX, SIZE_MAX};
@@ -604,7 +609,7 @@ private:
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	const bool m_compile_compute_pipelines;
 	const size_t m_large_manifest_workers;
-	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache KYTY_GUARDED_BY(m_program_lock);
+	CacheMap<ProgramKey, Program, ProgramKeyHash> m_program_cache KYTY_GUARDED_BY(m_program_lock);
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key KYTY_GUARDED_BY(m_program_lock);
 	bool                                   m_guest_traversal KYTY_GUARDED_BY(m_program_lock) = false;
@@ -621,9 +626,9 @@ private:
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	std::chrono::steady_clock::time_point m_driver_cache_posted;
 	bool                          m_driver_cache_dirty = false;
-	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
-	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_native_graphics_pipelines;
-	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
+	CacheMap<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
+	CacheMap<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_native_graphics_pipelines;
+	CacheMap<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts KYTY_GUARDED_BY(m_program_lock);
 	GraphicsPipelineKey m_last_graphics_key {};
 	Pipeline*           m_last_graphics_pipeline = nullptr;
@@ -757,14 +762,14 @@ private:
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_pending_graphics;
 	std::unordered_set<uint64_t>                                     m_async_pending_compute;
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_failed_graphics;
-	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_async_ready;
+	CacheMap<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_async_ready;
 	struct AsyncNativePipeline {
 		std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
 		Pipeline                           pipeline;
 	};
-	std::unordered_map<GraphicsPipelineKey, AsyncNativePipeline, GraphicsPipelineKeyHash> m_async_native;
+	CacheMap<GraphicsPipelineKey, AsyncNativePipeline, GraphicsPipelineKeyHash> m_async_native;
 	std::shared_ptr<const std::atomic<bool>>                                   m_pipeline_waiting;
-	std::unordered_map<uint64_t, Pipeline>                                     m_async_ready_compute;
+	CacheMap<uint64_t, Pipeline>                                     m_async_ready_compute;
 #if defined(ANYPS5_KYTY)
 	std::unordered_set<uint64_t>                                               m_installed_compute_ready;
 #endif

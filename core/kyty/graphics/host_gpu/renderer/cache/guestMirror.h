@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GUESTMIRROR_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GUESTMIRROR_H_
 
+#include "graphics/host_gpu/memoryTelemetry.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/cache/mirrorWindowTable.h"
 #include "common/threadSafety.h"
@@ -149,6 +150,7 @@ private:
 		uint64_t         requested = 0;
 	};
 	struct Chunk {
+		MemoryTelemetry::Allocation charge;
 		vk::DeviceMemory memory     = nullptr;
 		VmaAllocator     allocator  = nullptr;
 		VmaAllocation    allocation = nullptr;

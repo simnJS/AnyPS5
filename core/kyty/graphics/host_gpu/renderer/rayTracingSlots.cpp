@@ -746,7 +746,7 @@ RayTracing::Allocation RayTracing::Arena::Allocate(uint64_t size, uint64_t align
 	auto chunk       = std::make_unique<Chunk>();
 	chunk->dedicated = size > ChunkSize / 2;
 	chunk->buffer    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
-	                                            AsFlags, chunk->dedicated ? size : ChunkSize);
+	                                            AsFlags, chunk->dedicated ? size : ChunkSize, MemoryTelemetry::Kind::Blas);
 	chunk->free_ranges.emplace(0, chunk->buffer->Size());
 	chunk->free_bytes = chunk->buffer->Size();
 	m_reserved += chunk->buffer->Size();
@@ -863,13 +863,13 @@ void RayTracing::DestroySlots() {
 			device.destroyAccelerationStructureKHR(tlas.handle);
 		}
 	}
-	device.destroyPipeline(m_tlas_pipeline);
-	device.destroyPipeline(m_blas_pipeline);
+	MemoryTelemetry::Destroy(device, m_tlas_pipeline);
+	MemoryTelemetry::Destroy(device, m_blas_pipeline);
 	device.destroyPipelineLayout(m_tlas_layout);
 	device.destroyPipelineLayout(m_blas_layout);
-	device.destroyPipeline(m_hle_tlas_pipeline);
+	MemoryTelemetry::Destroy(device, m_hle_tlas_pipeline);
 	device.destroyPipelineLayout(m_hle_tlas_layout);
-	device.destroyPipeline(m_hle_refit_pipeline);
+	MemoryTelemetry::Destroy(device, m_hle_refit_pipeline);
 	device.destroyPipelineLayout(m_hle_refit_layout);
 	device.destroyDescriptorSetLayout(m_walk_descriptor_layout);
 }
@@ -904,7 +904,7 @@ void RayTracing::CreatePipelines() {
 		vk::ComputePipelineCreateInfo pipeline_info {};
 		pipeline_info.stage  = stage;
 		pipeline_info.layout = layout;
-		const auto result = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline);
+		const auto result = MemoryTelemetry::Create(device, nullptr, pipeline_info, pipeline);
 		device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create native ray tracing pipeline");
 		SetVulkanObjectNameF(device, pipeline, "%s", name);
@@ -983,7 +983,7 @@ void RayTracing::CreateTlasObject(TlasObject& tlas, uint32_t capacity) {
 	device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice, &info,
 	                                             &capacity, &sizes);
 	tlas.storage = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
-	                                        AsFlags, sizes.accelerationStructureSize);
+	                                        AsFlags, sizes.accelerationStructureSize, MemoryTelemetry::Kind::Tlas);
 	vk::AccelerationStructureCreateInfoKHR create {};
 	create.buffer = tlas.storage->Handle();
 	create.size   = sizes.accelerationStructureSize;

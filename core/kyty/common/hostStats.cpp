@@ -25,6 +25,9 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
@@ -544,6 +547,37 @@ void SamplePlatform(PlatformState& , HostStats& stats, Counters& now) {
 
 constexpr size_t BUSIEST_THREADS = 6;
 
+}
+
+ProcessMemory ReadProcessMemory() {
+	ProcessMemory result {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	PROCESS_MEMORY_COUNTERS_EX memory {};
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory))) {
+		result.rss = memory.WorkingSetSize;
+		result.private_bytes = memory.PrivateUsage;
+	}
+#elif defined(__APPLE__)
+	task_vm_info_data_t memory {};
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&memory), &count) == KERN_SUCCESS) {
+		result.rss = memory.resident_size;
+	}
+#else
+	const auto values = ReadProcValues("/proc/self/smaps_rollup");
+	result.rss = Find(values, "Rss");
+	if (!result.rss) result.rss = Find(ReadProcValues("/proc/self/status"), "VmRSS");
+	const auto clean = Find(values, "Private_Clean");
+	const auto dirty = Find(values, "Private_Dirty");
+	if (clean && dirty) result.private_bytes = *clean + *dirty + Find(values, "Private_Hugetlb").value_or(0);
+#if defined(__GLIBC__)
+#if __GLIBC_PREREQ(2, 33)
+	const auto heap = mallinfo2();
+	result.malloc_bytes = heap.uordblks + heap.hblkhd;
+#endif
+#endif
+#endif
+	return result;
 }
 
 std::optional<SystemMemory> ReadSystemMemory() {

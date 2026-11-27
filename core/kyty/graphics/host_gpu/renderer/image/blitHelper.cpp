@@ -45,10 +45,10 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 
 BlitHelper::~BlitHelper() {
 	for (const auto& pipeline: m_pipelines) {
-		m_graphics.device.destroyPipeline(pipeline.handle, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, pipeline.handle);
 	}
 	if (m_to_color_pipeline != nullptr) {
-		m_graphics.device.destroyPipeline(m_to_color_pipeline, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, m_to_color_pipeline);
 		m_graphics.device.destroyPipelineLayout(m_to_color_layout, nullptr);
 		m_graphics.device.destroyDescriptorSetLayout(m_to_color_descriptor_layout, nullptr);
 	}
@@ -115,7 +115,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 
 	vk::Pipeline pipeline = nullptr;
 	RequireVulkanSuccess(
-	    m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
+	    MemoryTelemetry::Create(m_graphics.device, nullptr, create, pipeline),
 	    "create color-to-depth pipeline");
 	m_pipelines.push_back({key, pipeline});
 	return pipeline;
@@ -249,8 +249,7 @@ void BlitHelper::CopyDepthToColor(Image& depth, Image& color) {
 		create.stage.module = module;
 		create.stage.pName  = "main";
 		create.layout       = m_to_color_layout;
-		RequireVulkanSuccess(m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr,
-		                                                              &m_to_color_pipeline),
+		RequireVulkanSuccess(MemoryTelemetry::Create(m_graphics.device, nullptr, create, m_to_color_pipeline),
 		                     "create depth-to-color pipeline");
 		m_graphics.device.destroyShaderModule(module, nullptr);
 	}

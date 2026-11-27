@@ -89,11 +89,11 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 
 TileManager::~TileManager() {
 	for (auto pipeline: m_pipelines) {
-		m_graphics.device.destroyPipeline(pipeline, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, pipeline);
 	}
 	for (auto pipeline: {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform,
 	                     m_color_clear}) {
-		m_graphics.device.destroyPipeline(pipeline, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, pipeline);
 	}
 	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
 	m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
@@ -263,7 +263,7 @@ vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
 	create.layout         = m_pipeline_layout;
 	vk::Pipeline pipeline = nullptr;
 	const auto   result =
-	    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
+	    MemoryTelemetry::Create(m_graphics.device, nullptr, create, pipeline);
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create TileManager pipeline");
 	return pipeline;
@@ -481,7 +481,7 @@ TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer inpu
 		}
 		buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
 		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
-		        vk::BufferUsageFlagBits::eTransferDst, size);
+		        vk::BufferUsageFlagBits::eTransferDst, size, MemoryTelemetry::Kind::Tiling);
 	}
 	return {buffer->Handle(), 0, size};
 }

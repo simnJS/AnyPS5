@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/memoryTelemetry.h"
 
 #include <algorithm>
 #include <atomic>
@@ -78,6 +79,7 @@ public:
 
 private:
 	struct Imported {
+		MemoryTelemetry::Allocation charge;
 		vk::Buffer       buffer  = nullptr;
 		vk::DeviceMemory memory  = nullptr;
 		uint64_t         address = 0;

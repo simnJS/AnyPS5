@@ -112,7 +112,11 @@ void GuestHostView::Refuse(uint64_t guest, uint64_t bytes, const char* why) {
 
 void GuestHostView::Destroy(Imported& import) {
 	if (import.buffer) m_graphics.device.destroyBuffer(import.buffer);
-	if (import.memory) m_graphics.device.freeMemory(import.memory);
+	if (import.memory) {
+		m_graphics.device.freeMemory(import.memory);
+		import.charge.Release();
+		MemoryTelemetry::imported.fetch_sub(import.bytes, std::memory_order_relaxed);
+	}
 	import = {};
 }
 
@@ -158,8 +162,13 @@ bool GuestHostView::ImportPiece(uint8_t* host, uint64_t guest, uint64_t bytes, I
 	const vk::ImportMemoryHostPointerInfoEXT imported {.handleType = ImportHandle, .pHostPointer = host};
 	const vk::MemoryAllocateFlagsInfo        flags {.pNext = &imported, .flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
 	const vk::MemoryAllocateInfo allocate {.pNext = &flags, .allocationSize = bytes, .memoryTypeIndex = type};
-	if (device.allocateMemory(&allocate, nullptr, &import.memory) != vk::Result::eSuccess ||
-	    device.bindBufferMemory(import.buffer, import.memory, 0) != vk::Result::eSuccess) {
+	const auto allocated = device.allocateMemory(&allocate, nullptr, &import.memory);
+	if (allocated == vk::Result::eSuccess) {
+		import.bytes = bytes;
+		import.charge.Add(MemoryTelemetry::Kind::Other, m_graphics.IsLocalMemoryType(type), bytes);
+		MemoryTelemetry::imported.fetch_add(bytes, std::memory_order_relaxed);
+	}
+	if (allocated != vk::Result::eSuccess || device.bindBufferMemory(import.buffer, import.memory, 0) != vk::Result::eSuccess) {
 		Destroy(import);
 		Refuse(guest, bytes, "the driver refused to import its host pages");
 		return false;
@@ -167,7 +176,6 @@ bool GuestHostView::ImportPiece(uint8_t* host, uint64_t guest, uint64_t bytes, I
 	const vk::BufferDeviceAddressInfo address {.buffer = import.buffer};
 	import.address = device.getBufferAddress(&address);
 	import.guest   = guest;
-	import.bytes   = bytes;
 	import.host    = host;
 	return true;
 }

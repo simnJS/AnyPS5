@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 
+#include "graphics/host_gpu/memoryTelemetry.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -50,7 +51,8 @@ struct MirrorWindow {
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+	       MemoryTelemetry::Kind category = MemoryTelemetry::Kind::Buffer);
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
 	       MirrorWindow mirror);
 	~Buffer();
@@ -102,6 +104,7 @@ private:
 	uint64_t                      m_handle_offset = 0;
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
+	MemoryTelemetry::Allocation   m_charge;
 	VmaAllocation                 m_allocation = nullptr;
 	VmaAllocator                  m_allocator  = nullptr;
 	uint64_t                      m_size;
@@ -124,7 +127,7 @@ public:
 	};
 
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, MemoryTelemetry::Kind category = MemoryTelemetry::Kind::Buffer);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);

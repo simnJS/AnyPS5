@@ -72,13 +72,13 @@ DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master
 }
 
 DescriptorHeap::~DescriptorHeap() {
-	m_graphics.device.destroyDescriptorPool(m_current_pool.pool, nullptr);
+	MemoryTelemetry::Destroy(m_graphics.device, m_current_pool.pool);
 	for (const auto& [set, pool]: m_persistent_pools) {
-		m_graphics.device.destroyDescriptorPool(pool, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, pool);
 	}
 	for (const auto& [pool, tick]: m_pending_pools) {
 		m_master_semaphore.Wait(tick);
-		m_graphics.device.destroyDescriptorPool(pool.pool, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, pool.pool);
 	}
 }
 
@@ -133,7 +133,7 @@ vk::DescriptorSet DescriptorHeap::CommitPersistent(vk::DescriptorSetLayout layou
 	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
 	create.pPoolSizes    = sizes.data();
 	vk::DescriptorPool pool;
-	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &pool) !=
+	EXIT_IF(MemoryTelemetry::Create(m_graphics.device, create, pool) !=
 	        vk::Result::eSuccess);
 	vk::DescriptorSetAllocateInfo allocate {};
 	allocate.descriptorPool     = pool;
@@ -149,7 +149,7 @@ void DescriptorHeap::ReleasePersistent(vk::DescriptorSet set) {
 	if (set) {
 		const auto pool = m_persistent_pools.find(set);
 		EXIT_IF(pool == m_persistent_pools.end());
-		m_graphics.device.destroyDescriptorPool(pool->second, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, pool->second);
 		m_persistent_pools.erase(pool);
 	}
 }
@@ -160,7 +160,7 @@ void DescriptorHeap::TrimCompletedPools() {
 	}
 	m_master_semaphore.Refresh();
 	while (m_pending_pools.size() > 1 && m_master_semaphore.IsFree(m_pending_pools[1].second)) {
-		m_graphics.device.destroyDescriptorPool(m_pending_pools.front().first.pool, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, m_pending_pools.front().first.pool);
 		m_pending_pools.pop_front();
 	}
 }
@@ -229,7 +229,7 @@ void DescriptorHeap::CreateDescriptorPool(std::span<const vk::DescriptorPoolSize
 	create.pPoolSizes    = sizes.data();
 	Pool pool;
 	pool.sizes.assign(sizes.begin(), sizes.end());
-	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &pool.pool) !=
+	EXIT_IF(MemoryTelemetry::Create(m_graphics.device, create, pool.pool) !=
 	        vk::Result::eSuccess);
 	UsePool(std::move(pool));
 }

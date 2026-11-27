@@ -16,7 +16,7 @@ struct TestVulkanDevice {
 	vk::detail::DynamicLoader loader;
 	Libs::Graphics::GraphicContext graphics;
 
-	const char* Initialize(bool require_tiling = false, bool sparse = false) {
+	const char* Initialize(bool require_tiling = false, bool sparse = false, bool report_budget = false) {
 		if (!loader.success()) {
 			return "Vulkan loader unavailable";
 		}
@@ -37,7 +37,7 @@ struct TestVulkanDevice {
 			return "Vulkan device enumeration failed";
 		}
 		for (const auto device : devices.value) {
-			if (InitializeDevice(device, require_tiling, sparse)) {
+			if (InitializeDevice(device, require_tiling, sparse, report_budget)) {
 				return nullptr;
 			}
 		}
@@ -58,7 +58,7 @@ struct TestVulkanDevice {
 	}
 
 private:
-	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse) {
+	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse, bool report_budget) {
 		vk::PhysicalDeviceVulkan12Properties limits {};
 		vk::PhysicalDeviceVulkan11Properties properties11 {.pNext = &limits};
 		vk::PhysicalDeviceProperties2 properties {.pNext = &properties11};
@@ -171,6 +171,10 @@ private:
 		const bool host_memory = std::ranges::any_of(extensions.value, [](const auto& extension) {
 			return std::string_view(extension.extensionName.data()) == VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
 		});
+		const bool budget = report_budget && std::ranges::any_of(extensions.value, [](const auto& extension) {
+			return std::string_view(extension.extensionName.data()) == VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+		});
+		if (budget) enabled_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 		if (host_memory) enabled_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 		const vk::DeviceCreateInfo device_info {
 		    .pNext = &features13, .queueCreateInfoCount = queue_count, .pQueueCreateInfos = queue_infos.data(),
@@ -182,6 +186,7 @@ private:
 		}
 		VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
 		graphics.physical_device = physical;
+		graphics.memory_budget_ext_enabled = budget;
 		graphics.physical_device_properties = properties.properties;
 		graphics.subgroup_supported_stages = properties11.subgroupSupportedStages;
 		graphics.subgroup_supported_operations = properties11.subgroupSupportedOperations;

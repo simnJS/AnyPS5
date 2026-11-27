@@ -109,8 +109,10 @@ void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 }
 
 void ShaderStoreWriter::Append(std::vector<uint8_t>&& record) {
-	Post([this, record = std::move(record)] {
+	MemoryTelemetry::PipelineBytes queued(record.capacity());
+	Post([this, record = std::move(record), queued = std::move(queued)] {
 		std::vector<uint8_t> bytes(sizeof(Frame) + ZSTD_compressBound(record.size()));
+		MemoryTelemetry::PipelineBytes compressed(bytes.capacity());
 		const auto size = ZSTD_compress(bytes.data() + sizeof(Frame), bytes.size() - sizeof(Frame),
 		                                record.data(), record.size(), 3);
 		EXIT_IF(ZSTD_isError(size));

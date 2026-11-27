@@ -159,7 +159,7 @@ void CreateCheckComparePipeline(vk::Device device, const char* check, const char
 
 void DestroyCheckComparePipeline(vk::Device device, CheckComparePipeline& compare) {
 	if (compare.pipeline) {
-		device.destroyPipeline(compare.pipeline, nullptr);
+		MemoryTelemetry::Destroy(device, compare.pipeline);
 	}
 	if (compare.pipeline_layout) {
 		device.destroyPipelineLayout(compare.pipeline_layout, nullptr);

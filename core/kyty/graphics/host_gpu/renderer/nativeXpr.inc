@@ -67,7 +67,7 @@ struct RenderExecutor::NativeXprCache {
 	static constexpr size_t   StatesKept       = 2048;
 	uint64_t                  states_swept_frame = UINT64_MAX;
 	~NativeXprCache() {
-		for (auto pool: pools) device.destroyDescriptorPool(pool);
+		for (auto pool: pools) MemoryTelemetry::Destroy(device, pool);
 	}
 };
 
@@ -145,7 +145,7 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
 	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
 	create.pPoolSizes    = sizes.data();
 	vk::DescriptorPool pool = nullptr;
-	EXIT_IF(device.createDescriptorPool(&create, nullptr, &pool) != vk::Result::eSuccess);
+	EXIT_IF(MemoryTelemetry::Create(device, create, pool) != vk::Result::eSuccess);
 	cache.pools.push_back(pool);
 	allocate.descriptorPool = pool;
 	if (device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess) {

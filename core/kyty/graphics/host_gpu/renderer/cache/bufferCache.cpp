@@ -277,7 +277,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_null_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB, MemoryTelemetry::Kind::Staging),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
@@ -333,7 +333,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetSubmitHook(nullptr, nullptr);
-	m_graphics.device.destroyPipeline(m_wait_pipeline);
+	MemoryTelemetry::Destroy(m_graphics.device, m_wait_pipeline);
 	m_graphics.device.destroyPipelineLayout(m_wait_layout);
 	m_graphics.device.destroyDescriptorSetLayout(m_wait_set_layout);
 	m_guest_mirror->ForEachRequested(m_guest_mirror->Base(), m_guest_mirror->GuestSpan(), [this](uint64_t begin, uint64_t end) {
@@ -345,20 +345,20 @@ BufferCache::~BufferCache() {
 	m_host_view.reset();
 	m_guest_mirror.reset();
 	if (m_scatter_pipeline) {
-		m_graphics.device.destroyPipeline(m_scatter_pipeline);
+		MemoryTelemetry::Destroy(m_graphics.device, m_scatter_pipeline);
 	}
 	if (m_scatter_layout) {
 		m_graphics.device.destroyPipelineLayout(m_scatter_layout);
 	}
 	if (m_readback.pool) {
 		m_graphics.device.destroyFence(m_readback.fence);
-		m_graphics.device.destroyCommandPool(m_readback.pool);
+		MemoryTelemetry::Destroy(m_graphics.device, m_readback.pool);
 	}
 	for (auto& slot: m_readback_slots) {
 		if (slot.queue.pool) {
 			(void)m_graphics.device.waitForFences(1, &slot.queue.fence, VK_TRUE, UINT64_MAX);
 			m_graphics.device.destroyFence(slot.queue.fence);
-			m_graphics.device.destroyCommandPool(slot.queue.pool);
+			MemoryTelemetry::Destroy(m_graphics.device, slot.queue.pool);
 		}
 	}
 	if (!m_gpu_modified_ranges.Empty()) {
@@ -924,7 +924,7 @@ bool BufferCache::StartReadbackQueueRead(uint64_t vaddr, uint64_t size, uint64_t
 		allocate.commandBufferCount = 1;
 		vk::FenceCreateInfo fence_info {};
 		fence_info.flags = vk::FenceCreateFlagBits::eSignaled;
-		if (device.createCommandPool(&pool_info, nullptr, &queue.pool) != vk::Result::eSuccess ||
+		if (MemoryTelemetry::Create(device, pool_info, queue.pool) != vk::Result::eSuccess ||
 		    (allocate.commandPool = queue.pool,
 		     device.allocateCommandBuffers(&allocate, &queue.command) != vk::Result::eSuccess) ||
 		    device.createFence(&fence_info, nullptr, &queue.fence) != vk::Result::eSuccess) {
@@ -1860,14 +1860,14 @@ void BufferCache::NoteStreamCopy(uint64_t vaddr, uint64_t size, uint64_t offset)
 
 StreamBuffer& BufferCache::GetTableUploadBuffer() {
 	if (!m_table_upload) {
-		m_table_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 32 * MiB);
+		m_table_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 32 * MiB, MemoryTelemetry::Kind::Upload);
 	}
 	return *m_table_upload;
 }
 
 vk::DeviceAddress BufferCache::TableUpload(const void* data, uint64_t size) {
 	if (!m_table_upload) {
-		m_table_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 32 * MiB);
+		m_table_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 32 * MiB, MemoryTelemetry::Kind::Upload);
 	}
 	return m_table_upload->BufferDeviceAddress() + m_table_upload->Copy(data, size, 16);
 }
@@ -2501,7 +2501,7 @@ bool BufferCache::DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies
 		allocate.level              = vk::CommandBufferLevel::ePrimary;
 		allocate.commandBufferCount = 1;
 		const vk::FenceCreateInfo fence_info {};
-		if (device.createCommandPool(&pool_info, nullptr, &m_readback.pool) != vk::Result::eSuccess ||
+		if (MemoryTelemetry::Create(device, pool_info, m_readback.pool) != vk::Result::eSuccess ||
 		    (allocate.commandPool = m_readback.pool,
 		     device.allocateCommandBuffers(&allocate, &m_readback.command) != vk::Result::eSuccess) ||
 		    device.createFence(&fence_info, nullptr, &m_readback.fence) != vk::Result::eSuccess) {
@@ -3305,7 +3305,7 @@ bool BufferCache::ScatterUploadBatch(const CommandRecorder& native) {
 		vk::ComputePipelineCreateInfo pipeline_info {};
 		pipeline_info.stage  = stage;
 		pipeline_info.layout = m_scatter_layout;
-		const auto result    = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &m_scatter_pipeline);
+		const auto result    = MemoryTelemetry::Create(device, nullptr, pipeline_info, m_scatter_pipeline);
 		device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create buffer scatter pipeline");
 		SetVulkanObjectNameF(device, m_scatter_pipeline, "Kyty.BufferScatter");

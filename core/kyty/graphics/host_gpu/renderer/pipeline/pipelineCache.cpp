@@ -1972,20 +1972,20 @@ PipelineCache::~PipelineCache() {
 	if (m_libraries != nullptr) {
 		m_libraries->Stop();
 		for (const auto& optimized: m_libraries->TakeOptimized()) {
-			m_graphics.device.destroyPipeline(optimized.pipeline, nullptr);
+			MemoryTelemetry::Destroy(m_graphics.device, optimized.pipeline);
 		}
 	}
 	for (const auto& optimized: m_optimized_deferred) {
-		m_graphics.device.destroyPipeline(optimized.pipeline, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, optimized.pipeline);
 	}
 	for (const auto retired: m_retired_pipelines) {
-		m_graphics.device.destroyPipeline(retired, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, retired);
 	}
 #endif
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
-			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			MemoryTelemetry::Destroy(m_graphics.device, pipeline.pipeline);
 			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 		}
@@ -1996,7 +1996,7 @@ PipelineCache::~PipelineCache() {
 	destroy(m_async_ready);
 	destroy(m_async_ready_compute);
 	for (const auto& native: m_async_native | std::views::values) {
-		m_graphics.device.destroyPipeline(native.pipeline.pipeline, nullptr);
+		MemoryTelemetry::Destroy(m_graphics.device, native.pipeline.pipeline);
 		m_graphics.device.destroyPipelineLayout(native.pipeline.pipeline_layout, nullptr);
 		m_graphics.device.destroyDescriptorSetLayout(native.pipeline.descriptor_set_layout, nullptr);
 	}
@@ -2018,7 +2018,7 @@ PipelineCache::~PipelineCache() {
 #if defined(ANYPS5_KYTY)
 	m_libraries.reset();
 #endif
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	MemoryTelemetry::Destroy(m_graphics.device, m_driver_cache);
 }
 
 bool PipelineCache::InitializeDriverCache() {
@@ -2051,6 +2051,7 @@ bool PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
 	}
 	std::vector<uint8_t> initial_data;
+	MemoryTelemetry::PipelineBytes tracked_bytes;
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
@@ -2060,6 +2061,7 @@ bool PipelineCache::InitializeDriverCache() {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
+			tracked_bytes.Set(initial_data.capacity());
 			uint32_t signature_read = 0;
 			uint32_t hash_read      = 0;
 			uint32_t payload_read   = 0;
@@ -2086,14 +2088,14 @@ bool PipelineCache::InitializeDriverCache() {
 	vk::PipelineCacheCreateInfo create {};
 	create.initialDataSize = initial_data.size();
 	create.pInitialData    = initial_data.empty() ? nullptr : initial_data.data();
-	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+	auto result = MemoryTelemetry::Create(m_graphics.device, create, m_driver_cache);
 	if (result != vk::Result::eSuccess && !initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
 		                 vk::to_string(result));
 		initial_data.clear();
 		create.initialDataSize = 0;
 		create.pInitialData    = nullptr;
-		result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+		result = MemoryTelemetry::Create(m_graphics.device, create, m_driver_cache);
 	}
 	if (result != vk::Result::eSuccess) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled ({})", vk::to_string(result));
@@ -2169,6 +2171,7 @@ void PipelineCache::WriteDriverCache() {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
+	MemoryTelemetry::PipelineBytes tracked_bytes;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
@@ -2177,6 +2180,7 @@ void PipelineCache::WriteDriverCache() {
 			break;
 		}
 		payload.resize(size);
+		tracked_bytes.Set(payload.capacity());
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
 		if (result != vk::Result::eIncomplete) {
 			break;
@@ -4433,7 +4437,7 @@ bool PipelineCache::CreateGraphicsPipelineNow(Pipeline& pipeline, const Graphics
 		m_libraries->QueueOptimized(pipeline, key, stages);
 		return true;
 	}
-	m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	MemoryTelemetry::Destroy(m_graphics.device, pipeline.pipeline);
 	m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 	m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 	pipeline = {};

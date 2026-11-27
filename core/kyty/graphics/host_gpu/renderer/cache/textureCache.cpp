@@ -2758,6 +2758,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 			}
 		}
 		auto& image = m_slot_images[result];
+		if (desc.type == BindingType::VideoOut) image.backing.charge.Reclassify(MemoryTelemetry::Kind::Color);
 		if (view_mip >= 0) {
 			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
 		}
@@ -2888,6 +2889,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	TouchImage(image);
 	if (!image.usage.render_target) {
 		image.usage.render_target = true;
+		image.backing.charge.Reclassify(MemoryTelemetry::Kind::Color);
 		image.StateChanged();
 	}
 	RefreshImage(id);
@@ -3414,6 +3416,7 @@ private:
 		uint64_t                   capacity = 0;
 	};
 	struct Pool {
+		~Pool() { MemoryTelemetry::cpu_copies.fetch_sub(bytes, std::memory_order_relaxed); }
 		std::mutex        mutex;
 		std::vector<Free> free;
 		uint64_t          bytes = 0;
@@ -3446,7 +3449,9 @@ PooledBytes PooledBytes::Acquire(uint64_t size) {
 			return bytes;
 		}
 	}
-	return {std::make_unique_for_overwrite<uint8_t[]>(size), size};
+	auto data = std::make_unique_for_overwrite<uint8_t[]>(size);
+	MemoryTelemetry::cpu_copies.fetch_add(size, std::memory_order_relaxed);
+	return {std::move(data), size};
 }
 
 void PooledBytes::Return() noexcept {
@@ -3460,6 +3465,7 @@ void PooledBytes::Return() noexcept {
 	while (pool.bytes > MaxPooledBytes) {
 		const auto smallest = std::ranges::min_element(pool.free, {}, &Free::capacity);
 		pool.bytes -= smallest->capacity;
+		MemoryTelemetry::cpu_copies.fetch_sub(smallest->capacity, std::memory_order_relaxed);
 		pool.free.erase(smallest);
 	}
 }
