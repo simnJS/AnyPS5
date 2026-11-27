@@ -574,7 +574,8 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr)) == 0) {
+	const auto zero = cp.CompareMemory(addr, sizeof(uint32_t), 0, UINT32_MAX, 3);
+	if (zero.value_or(false)) {
 		return payload_dw + exec_count;
 	}
 
@@ -604,8 +605,9 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	if (TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr), reference, mask,
-	                        function)) {
+	const auto take = cp.CompareMemory(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t), reference, mask, function);
+	if (!take) return payload_dw;
+	if (*take) {
 		cp.PrepareCommandFetch({then_buffer, then_num_dw});
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
@@ -1032,6 +1034,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = registers.Value(i);
+		cp.ObserveIndirectRegister(0, raw_cmd_offset, value);
 
 		if (cmd_offset == Pm4::CX_NOP) {
 			continue;
@@ -1101,6 +1104,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = registers.Value(i);
+		cp.ObserveIndirectRegister(1, raw_cmd_offset, value);
 
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;
@@ -1152,6 +1156,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = registers.Value(i);
+		cp.ObserveIndirectRegister(2, raw_cmd_offset, value);
 
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
@@ -1233,9 +1238,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
 	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu,
 	    (buffer[0] & (1u << 21u)) != 0);
-	if (((buffer[1] >> 24u) & 0x7u) == 0 || ((buffer[1] >> 24u) & 0x7u) == 3) {
-		cp.BufferFlushIfBatchReady();
-	}
 
 	return 7;
 }

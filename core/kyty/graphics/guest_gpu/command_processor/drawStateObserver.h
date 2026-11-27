@@ -56,14 +56,6 @@ public:
 			case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
 			case Pm4::IT_SET_SH_REG_INDIRECT:
 			case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
-				if (packet_dw < 5) {
-					Dirty(0x03000000u | opcode);
-					return;
-				}
-				WriteIndirectBlock(opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? 0u
-				                   : opcode == Pm4::IT_SET_SH_REG_INDIRECT    ? 1u
-				                                                              : 2u,
-				                   packet);
 				return;
 			case Pm4::IT_CLEAR_STATE: Invalidate(); return;
 			case Pm4::IT_INDEX_BASE:
@@ -95,12 +87,6 @@ public:
 		}
 	}
 
-private:
-	[[nodiscard]] static bool ShFree(uint32_t offset) noexcept {
-		return (offset >= 0x0cu && offset <= 0x2bu) || (offset >= 0x8cu && offset <= 0xabu) ||
-		       (offset >= 0x10cu && offset <= 0x12bu) || offset >= 0x200u;
-	}
-
 	void WriteRegister(uint32_t space, uint32_t raw_offset, uint32_t value) noexcept {
 		const auto offset = raw_offset & 0xffffu;
 		const auto update = [&](auto& values) {
@@ -124,18 +110,10 @@ private:
 		}
 	}
 
-	void WriteIndirectBlock(uint32_t space, const uint32_t* packet) noexcept {
-		const auto* block =
-		    reinterpret_cast<const uint32_t*>((uint64_t(packet[1]) & 0xfffffffcu) | (uint64_t(packet[2]) << 32u));
-		const uint32_t pairs = packet[4] & 0x3fffu;
-		if (block == nullptr) {
-			Dirty(0x03000000u | 0xffeu);
-			return;
-		}
-		for (uint32_t i = 0; i < pairs; ++i) {
-			if (block[2 * i] == 0xffffffffu) continue;
-			WriteRegister(space, block[2 * i], block[2 * i + 1]);
-		}
+private:
+	[[nodiscard]] static bool ShFree(uint32_t offset) noexcept {
+		return (offset >= 0x0cu && offset <= 0x2bu) || (offset >= 0x8cu && offset <= 0xabu) ||
+		       (offset >= 0x10cu && offset <= 0x12bu) || offset >= 0x200u;
 	}
 
 	void Dirty(uint32_t cause) noexcept {

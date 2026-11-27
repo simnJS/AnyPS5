@@ -242,6 +242,7 @@ foreach(name IN ITEMS standard256 standard4 standard4_3d standard64 standard64_3
     kyty_embed_shader(gpu_tiler_shaders gpu_tiler_${name} gpu_tiler_${name}.comp)
 endforeach()
 kyty_embed_shader(gpu_tiler_shaders fault_buffer_process fault_buffer_process.comp -DCACHING_PAGEBITS=14)
+kyty_embed_shader(gpu_tiler_shaders wait_reg_mem wait_reg_mem.comp)
 kyty_embed_shader(gpu_tiler_shaders indirect_thread_dispatch indirect_thread_dispatch.comp)
 kyty_embed_shader(gpu_tiler_shaders buffer_scatter buffer_scatter.comp)
 kyty_embed_shader(gpu_tiler_shaders occlusion_counters occlusion_counters.comp)

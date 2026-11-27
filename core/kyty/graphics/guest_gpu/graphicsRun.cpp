@@ -245,7 +245,7 @@ bool GuestGpu::PostReadbackCommand(Common::UniqueFunction<void>&& command) {
 	return true;
 }
 
-uint64_t GuestGpu::WaitForOrderedOperations(uint64_t begin, uint64_t end) {
+uint64_t GuestGpu::OrderedSequence(uint64_t begin, uint64_t end) {
 	EXIT_IF(!g_cp_thread);
 	ForgetExecutedWrites();
 	uint64_t needed = m_cp_ordered;
@@ -255,7 +255,11 @@ uint64_t GuestGpu::WaitForOrderedOperations(uint64_t begin, uint64_t end) {
 			needed = std::max(needed, write.sequence);
 		}
 	}
-	needed = std::min(needed, m_emitted);
+	return std::min(needed, m_emitted);
+}
+
+uint64_t GuestGpu::WaitForOrderedOperations(uint64_t begin, uint64_t end) {
+	const auto needed = OrderedSequence(begin, end);
 	if (needed != 0) {
 		WaitForExecution(needed);
 	}
@@ -820,40 +824,10 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		}
 	}
 	m_renderer.GetBufferCache().SetStreamInPlace(operation.stream_in_place);
-#if defined(ANYPS5_KYTY)
-	const bool submit_when_idle = operation.kind != GpuOperationKind::Callback;
-#else
-	const bool submit_when_idle = false;
-#endif
 	struct CommitWriteTicks {
-		RenderContext& renderer;
-		bool           submit_when_idle;
-		~CommitWriteTicks() {
-			auto& scheduler = renderer.GetCommandScheduler();
-			if (renderer.GetBufferCache().CommitWriteTicks()) {
-				scheduler.Flush();
-			} else if (submit_when_idle) {
-				const auto submitted = scheduler.SubmittedTick();
-				if (submitted + 1 != scheduler.CurrentTick()) {
-					return;
-				}
-				auto& master = scheduler.GetMasterSemaphore();
-				bool  idle   = master.IsFree(submitted);
-				if (!idle) {
-					static thread_local std::chrono::steady_clock::time_point last_refresh {};
-					const auto now = std::chrono::steady_clock::now();
-					if (now - last_refresh >= std::chrono::microseconds(25)) {
-						last_refresh = now;
-						master.Refresh();
-						idle = master.IsFree(submitted);
-					}
-				}
-				if (idle) {
-					scheduler.Flush();
-				}
-			}
-		}
-	} commit_write_ticks {m_renderer, submit_when_idle};
+		BufferCache& buffers;
+		~CommitWriteTicks() { buffers.CommitWriteTicks(); }
+	} commit_write_ticks {m_renderer.GetBufferCache()};
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:
 		case GpuOperationKind::DrawAuto: {
@@ -924,24 +898,6 @@ void CommandProcessor::BufferFlush() {
 	EmitCallback([this] { GetScheduler().Flush(); });
 }
 
-void CommandProcessor::NoteRecordedWork() {
-	const auto tick = GetScheduler().CurrentTick();
-	if (tick != m_batch_tick) {
-		m_batch_tick = tick;
-		m_batch_work = 0;
-	}
-	m_batch_work++;
-}
-
-void CommandProcessor::BufferFlushIfBatchReady() {
-	EmitCallback([this] {
-		constexpr uint32_t MinBatchWork = 64;
-		if (GetScheduler().CurrentTick() == m_batch_tick && m_batch_work >= MinBatchWork) {
-			GetScheduler().Flush();
-		}
-	});
-}
-
 void CommandProcessor::BufferWait() {
 	EmitCallback([this] { GetScheduler().Finish(); });
 }
@@ -986,6 +942,96 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+void CommandProcessor::SampleWait(const std::shared_ptr<Pm4Execution::WaitProbe>& probe) {
+	using Result = Pm4Execution::WaitResult;
+	auto& scheduler = GetScheduler();
+	auto& buffers = m_renderer.GetBufferCache();
+	const auto [address, reference, mask, bytes, function, wait] = probe->condition;
+	scheduler.PopPendingOperations();
+	if (const auto pending = scheduler.PendingGuestTick(address, bytes); pending != 0) {
+		if (pending == scheduler.CurrentTick()) {
+			scheduler.Flush();
+			probe->flushed = true;
+		}
+		probe->result.store(Result::Retry, std::memory_order_release);
+		return;
+	}
+	const bool cached = GuestRange {address, bytes}.Valid() && buffers.MayBeGpuModified(address, bytes);
+	const bool image = GuestRange {address, bytes}.Valid() && m_renderer.GetTextureCache().IsRegionGpuModified(address, bytes);
+	if (cached && !image && buffers.HasGpuDirtyBytes(address, bytes)) {
+		if (!m_wait_output || m_wait_output.use_count() != 1) {
+			m_wait_output = std::make_shared<Buffer>(m_renderer.GetGraphics(), scheduler, MemoryUsage::Download, 0,
+			                                         vk::BufferUsageFlagBits::eStorageBuffer, sizeof(uint32_t));
+		}
+		buffers.CompareWaitLabel(address, bytes, reference, mask, function, *m_wait_output);
+		scheduler.DeferHostOperation([output = m_wait_output, probe] {
+			output->Invalidate(0, sizeof(uint32_t));
+			uint32_t passed;
+			std::memcpy(&passed, output->Mapped().data(), sizeof(passed));
+			probe->result.store(passed ? Result::Passed : Result::Failed, std::memory_order_release);
+		}, true);
+		scheduler.Flush();
+		probe->flushed = true;
+		return;
+	}
+	uint64_t value = 0;
+	const void* source = cached && !image ? LibKernel::Memory::FindBackingPointer(address, bytes) : nullptr;
+	CopyFromGuest(&value, source ? source : reinterpret_cast<const void*>(address), bytes);
+	const bool passed = TestWaitRegMemValue(value, reference, mask, function);
+	if (wait && !passed && !probe->flushed && scheduler.Active()) {
+		scheduler.Flush();
+		probe->flushed = true;
+	}
+	probe->result.store(passed ? Result::Passed : Result::Failed, std::memory_order_release);
+}
+
+std::optional<bool> CommandProcessor::CompareMemory(uint64_t address, uint32_t bytes, uint64_t reference,
+                                                    uint64_t mask, uint32_t function, bool wait) {
+	using Result = Pm4Execution::WaitResult;
+	const Pm4Execution::WaitCondition condition {address, reference, mask, bytes, function, wait};
+	auto& probe = g_current_execution->m_wait_probe;
+	if (!probe || probe->condition != condition) {
+		probe.reset();
+		if (function == 0) return true;
+		if (m_pipeline && m_pipeline->m_executed.Load() == m_pipeline->m_emitted &&
+		    GuestRange {address, bytes}.Valid() && !GetScheduler().HasPendingGuestOperations(address, bytes) &&
+		    !m_renderer.GetTextureCache().IsRegionGpuModified(address, bytes) &&
+		    !LibKernel::Memory::MayFaultOnGpuRead(address, bytes)) {
+			if (const auto* backing = LibKernel::Memory::FindBackingPointer(address, bytes)) {
+				uint64_t value = 0;
+				CopyFromGuest(&value, backing, bytes);
+				const bool passed = TestWaitRegMemValue(value, reference, mask, function);
+				if (passed || !wait) return passed;
+			}
+		}
+		probe = std::make_shared<Pm4Execution::WaitProbe>();
+		probe->condition = condition;
+	} else {
+		const auto previous = probe->result.load(std::memory_order_acquire);
+		if (previous == Result::Passed || (previous == Result::Failed && !wait)) {
+			probe.reset();
+			return previous == Result::Passed;
+		}
+		if (previous == Result::Pending) {
+			SuspendPm4();
+			return std::nullopt;
+		}
+		probe->result.store(Result::Pending, std::memory_order_relaxed);
+	}
+	if (m_pipeline != nullptr) {
+		EmitCallback([this, probe] { SampleWait(probe); });
+	} else {
+		SampleWait(probe);
+	}
+	const auto sampled = probe->result.load(std::memory_order_acquire);
+	if (sampled == Result::Passed || (sampled == Result::Failed && !wait)) {
+		probe.reset();
+		return sampled == Result::Passed;
+	}
+	SuspendPm4();
+	return std::nullopt;
+}
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
@@ -993,8 +1039,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
-	m_wait_since_operation = true;
-	if (TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
+	EXIT_NOT_IMPLEMENTED(func > 6);
+	if (CompareMemory(reinterpret_cast<uint64_t>(addr), sizeof(T), ref, mask, func, true).value_or(false)) {
+		m_wait_since_operation = true;
 		m_renderer.CollectHotPageWrites();
 	} else {
 		if (g_gpu_state != nullptr) {
@@ -1005,7 +1052,6 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(addr), sizeof(T));
 #endif
 		}
-		SuspendPm4();
 	}
 }
 
@@ -1523,6 +1569,13 @@ bool GuestGpu::OtherQueueWaitsOn(uint64_t address, uint64_t size) const {
 	return false;
 }
 
+bool GuestGpu::HasReadyCommands() {
+	Common::LockGuard lock(m_queue_mutex);
+	return std::ranges::any_of(m_queues, [](const auto& queue) {
+		return !queue.empty() && !queue.front().blocked && queue.front().type == SubmissionType::Commands;
+	});
+}
+
 bool GuestGpu::Process(Submission& submission) {
 	m_current_queue = submission.queue_id;
 #if defined(ANYPS5_KYTY)
@@ -1546,13 +1599,16 @@ bool GuestGpu::Process(Submission& submission) {
 			const auto result  = cp.Process(submission.execution, submission.commands);
 			complete           = result == Pm4ProcessResult::Complete;
 			submission.yielded = result == Pm4ProcessResult::Yielded;
-			if (submission.execution.MadeProgress() && !submission.yielded) {
+			m_batch_open |= submission.execution.MadeProgress();
+			const bool waiting_for_sample = submission.execution.m_wait_probe || submission.execution.m_register_read;
+			if (m_batch_open && !submission.yielded && !waiting_for_sample && (!complete || !HasReadyCommands())) {
 				cp.BufferFlush();
+				m_batch_open = false;
 			}
 #if defined(ANYPS5_KYTY)
 			if (submission.execution.MadeProgress()) {
 				submission.wait_flushed = 0;
-			} else if (!complete && !submission.yielded) {
+			} else if (!complete && !submission.yielded && !waiting_for_sample) {
 				const auto& range = m_wait_ranges[m_current_queue];
 				if (range.begin != range.end) {
 					const auto newest = m_renderer.GetCommandScheduler().NewestPendingGuestOperation(
@@ -1584,6 +1640,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 #endif
 			cp.BufferFlush();
+			m_batch_open = false;
 			cp.Reset();
 			break;
 	}
@@ -1645,22 +1702,52 @@ const uint32_t* CommandProcessor::StageIndirectRegisters(uint32_t opcode, const 
 	const auto     address = (uint64_t {packet[1]} & 0xfffffffcu) | (uint64_t {packet[2]} << 32u);
 	const uint32_t count   = packet[4] & 0x3fffu;
 	const uint64_t bytes   = uint64_t {count} * ((packet[3] & Pm4::LOAD_REG_INDEX_OFFSET_AND_DATA) != 0 ? 8u : 4u);
-	if (address == 0 || bytes == 0 || !GuestRange {address, bytes}.Valid() ||
-	    !LibKernel::Memory::MayFaultOnGpuRead(address, bytes) ||
-	    !m_renderer.GetBufferCache().NeverGpuWritten(address, bytes) ||
-	    m_renderer.GetTextureCache().IsRegionGpuModified(address, bytes)) {
-		return packet;
+	if (address == 0 || bytes == 0 || !GuestRange {address, bytes}.Valid()) return packet;
+	const auto staged_packet = [&](const uint32_t* words) {
+		const auto staged = reinterpret_cast<uint64_t>(words);
+		std::copy_n(packet, m_indirect_packet.size(), m_indirect_packet.begin());
+		m_indirect_packet[1] = static_cast<uint32_t>(staged) | (packet[1] & 3u);
+		m_indirect_packet[2] = static_cast<uint32_t>(staged >> 32u);
+		return m_indirect_packet.data();
+	};
+	auto& read = g_current_execution->m_register_read;
+	if (read && std::equal(read->packet.begin(), read->packet.end(), packet)) {
+		return m_pipeline->m_executed.Load() >= read->sequence ? staged_packet(read->words.data()) : nullptr;
 	}
-	m_indirect_stage.assign(size_t {count} * 2u, 0u);
-	if (!LibKernel::Memory::TryReadBacking(address, m_indirect_stage.data(), bytes)) {
-		return packet;
+	const auto ordered = m_pipeline->OrderedSequence(address, address + bytes);
+	auto& buffers = m_renderer.GetBufferCache();
+	if (m_pipeline->m_executed.Load() >= ordered && !GetScheduler().HasPendingGuestOperations(address, bytes)) {
+		if (!LibKernel::Memory::MayFaultOnGpuRead(address, bytes) &&
+		    !m_renderer.GetTextureCache().IsRegionGpuModified(address, bytes)) return packet;
+		if (buffers.NeverGpuWritten(address, bytes) && !m_renderer.GetTextureCache().IsRegionGpuModified(address, bytes)) {
+			m_indirect_stage.resize(bytes / sizeof(uint32_t));
+			if (LibKernel::Memory::TryReadBacking(address, m_indirect_stage.data(), bytes)) {
+				BufferCache::NoteStagedCommandProcessorRead();
+				return staged_packet(m_indirect_stage.data());
+			}
+		}
 	}
-	const auto staged = reinterpret_cast<uint64_t>(m_indirect_stage.data());
-	std::copy_n(packet, m_indirect_packet.size(), m_indirect_packet.begin());
-	m_indirect_packet[1] = (static_cast<uint32_t>(staged) & 0xfffffffcu) | (packet[1] & 3u);
-	m_indirect_packet[2] = static_cast<uint32_t>(staged >> 32u);
-	BufferCache::NoteStagedCommandProcessorRead();
-	return m_indirect_packet.data();
+	read = std::make_shared<Pm4Execution::RegisterRead>();
+	read->words.resize(bytes / sizeof(uint32_t));
+	std::copy_n(packet, read->packet.size(), read->packet.begin());
+	read->sequence = EmitCallback([this, address, bytes, read] {
+		auto& scheduler = GetScheduler();
+		if (const auto tick = scheduler.PendingGuestTick(address, bytes); tick != 0) {
+			scheduler.Wait(tick);
+			scheduler.WaitPriorityOperations(tick);
+			scheduler.PopPendingOperations();
+		}
+		if (LibKernel::Memory::TryReadGpuCleanBacking(address, read->words.data(), bytes)) {
+			BufferCache::NoteStagedCommandProcessorRead();
+		} else {
+			auto& buffers = m_renderer.GetBufferCache();
+			if (!m_renderer.GetTextureCache().IsRegionGpuModified(address, bytes) && buffers.IsRegionGpuModified(address, bytes)) {
+				buffers.ReadMemory(address, bytes);
+			}
+			CopyFromGuest(read->words.data(), reinterpret_cast<const volatile void*>(address), bytes);
+		}
+	});
+	return nullptr;
 }
 
 void CommandProcessor::PrepareCommandFetch(std::span<const uint32_t> commands) {
@@ -1701,6 +1788,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
+			execution.m_register_read.reset();
+			execution.m_wait_probe.reset();
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
@@ -1712,6 +1801,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				LOGF("CP: trailing dword 0x%08" PRIx32 " at offset=0x%05" PRIx32 "\n", packet[0],
 				     total_dw - remaining_dw);
 			}
+			execution.m_register_read.reset();
+			execution.m_wait_probe.reset();
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
@@ -1723,15 +1814,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
-		const auto* const view = StageIndirectRegisters(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw));
-
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
-			if (m_draw_observer != nullptr) m_draw_observer->ObservePacket(opcode, view, packet_dw, true);
+			if (m_draw_observer != nullptr) m_draw_observer->ObservePacket(opcode, packet, packet_dw, true);
+			execution.m_register_read.reset();
+			execution.m_wait_probe.reset();
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			continue;
+		}
+
+		const auto* const view = StageIndirectRegisters(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw));
+		if (view == nullptr) {
+			SuspendPm4();
+			return;
 		}
 
 		auto handler = g_cp_op_func[opcode];
@@ -1767,6 +1864,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (execution.m_suspended) {
 			return;
 		}
+		execution.m_register_read.reset();
+		execution.m_wait_probe.reset();
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
@@ -1874,10 +1973,13 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			}
 			m_occlusion_wait_requested = false;
 		} break;
-		case 0x03:
+		case 0x03: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			value = ReadDecisionValue<uint64_t>(address);
+			const auto nonzero = CompareMemory(reinterpret_cast<uint64_t>(address), sizeof(uint64_t), 0, UINT64_MAX, 4);
+			if (!nonzero) return;
+			value = *nonzero;
 			break;
+		}
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
 	switch (condition) {
@@ -1895,7 +1997,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 }
 
 void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndexArgs args) {
-	NoteRecordedWork();
+
 	if (args.instance_count == 0) {
 		args.instance_count = ResolveNumInstances(operation);
 	}
@@ -2079,7 +2181,7 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		}
 		m_indirect_instances_sequence = operation.num_instances.sequence;
 		m_has_indirect_instances      = true;
-		NoteRecordedWork();
+
 		auto& executor = m_renderer.GetRenderExecutor();
 		if (indirect.indexed && count_address == 0 && indirect.max_count <= 64 &&
 		    indirect.stride >= sizeof(vk::DrawIndexedIndirectCommand) && (indirect.stride & 3u) == 0 &&
@@ -2686,7 +2788,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint32_t thread_group_x,
                                              uint32_t thread_group_y, uint32_t thread_group_z,
                                              uint32_t mode) {
-	NoteRecordedWork();
+
 
 	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x,
 	                                              thread_group_y, thread_group_z, mode,
@@ -2718,7 +2820,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode, std::
 
 void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
 	const auto& dispatch = operation.dispatch;
-	NoteRecordedWork();
+
 	if ((dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		m_renderer.GetRenderExecutor().DispatchIndirectThreads(CurrentBuffer(), dispatch.args_addr,
 		                                                       dispatch.mode,
@@ -2737,7 +2839,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 }
 
 void CommandProcessor::ExecuteDrawAuto(const GpuOperation& operation, DrawAutoArgs args) {
-	NoteRecordedWork();
+
 	if (args.instance_count == 0) {
 		args.instance_count = ResolveNumInstances(operation);
 	}

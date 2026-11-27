@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "gpu_tiler_shaders/buffer_scatter_spv.h"
+#include "gpu_tiler_shaders/wait_reg_mem_spv.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/hackNotice.h"
@@ -410,6 +411,9 @@ void BufferCache::UpdateMemoryThresholds(uint64_t budget_bytes) {
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetSubmitHook(nullptr, nullptr);
+	m_graphics.device.destroyPipeline(m_wait_pipeline);
+	m_graphics.device.destroyPipelineLayout(m_wait_layout);
+	m_graphics.device.destroyDescriptorSetLayout(m_wait_set_layout);
 	if (m_scatter_pipeline) {
 		m_graphics.device.destroyPipeline(m_scatter_pipeline);
 	}
@@ -773,12 +777,10 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 	uint64_t          pages_begin = 0;
 	uint64_t          pages_end   = 0;
 	ReadbackQueueRead queue_read;
-	const bool        ordered        = command_processor;
-	const bool        readback_queue = !command_processor || ordered;
-	if (ordered) {
+	if (command_processor) {
 		const auto started = SteadyNs();
 		const auto skipped = gpu.WaitForOrderedOperations(
-		    Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) + ReadAheadLimit);
+		    Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE));
 		auto& stats = g_readback_stats;
 		stats.cp_ordered.fetch_add(1, std::memory_order_relaxed);
 		stats.cp_ordered_ns.fetch_add(static_cast<uint64_t>(SteadyNs() - started), std::memory_order_relaxed);
@@ -799,7 +801,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-		read_size    = guest_fault ? ReadAheadSize(buffer, vaddr, size) : size;
+		read_size    = guest_fault && !command_processor ? ReadAheadSize(buffer, vaddr, size) : size;
 		pages_begin  = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 		pages_end    = Common::AlignUp(vaddr + read_size, TRACKER_PAGE_SIZE);
 		tick         = InFlightReadbackTick(pages_begin, pages_end);
@@ -807,17 +809,17 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			InPlaceMemory::NoteReadWait();
 			tick = std::max(tick, in_place);
 		}
-		NoteReadbackWait(pages_begin, pages_end, false,
-		                 m_write_ticks.Latest(pages_begin, pages_end) >= m_scheduler.CurrentTick());
+
+		m_readback_count++;
 		const bool guest_read = guest_fault && !is_write;
 		if (guest_read && !command_processor) {
 			(m_gpu_modified_ranges.Intersects(vaddr, size) ? g_readback_stats.other_gpu_bytes
 			                                                : g_readback_stats.other_false_sharing)
 			    .fetch_add(1, std::memory_order_relaxed);
 		}
-		if (tick == 0 && readback_queue &&
+		if (tick == 0 &&
 		    StartReadbackQueueRead(buffer, vaddr, read_size, pages_begin, pages_end, queue_read,
-		                           guest_read)) {
+		                           guest_read && !command_processor)) {
 			tick = queue_read.recorded;
 		} else if (DownloadBufferMemory<true>(buffer, vaddr, read_size)) {
 			const auto recorded = m_scheduler.CurrentTick();
@@ -2221,56 +2223,71 @@ uint64_t BufferCache::WriteTicks::Latest(uint64_t begin, uint64_t end) const {
 	return cursor >= end ? latest : UINT64_MAX;
 }
 
-void BufferCache::NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address,
-                                   bool drained) {
-	const auto count = ++m_readback_count;
-	if (device_address && (drained || m_device_address_hot != 0)) {
-		m_device_address_hot = count;
+void BufferCache::CompareWaitLabel(uint64_t address, uint32_t bytes, uint64_t reference, uint64_t mask,
+                                   uint32_t function, Buffer& result) {
+	struct Push {
+		uint32_t reference[2];
+		uint32_t mask[2];
+		uint32_t index;
+		uint32_t wide;
+		uint32_t function;
+	};
+	if (!m_wait_pipeline) {
+		const vk::DescriptorSetLayoutBinding bindings[] {
+		    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+		    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+		};
+		vk::DescriptorSetLayoutCreateInfo set {};
+		set.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set.setBindings(bindings);
+		RequireVulkanSuccess(m_graphics.device.createDescriptorSetLayout(&set, nullptr, &m_wait_set_layout),
+		                     "create wait label descriptor layout");
+		const vk::PushConstantRange range {vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push)};
+		vk::PipelineLayoutCreateInfo layout {};
+		layout.setSetLayouts(m_wait_set_layout);
+		layout.setPushConstantRanges(range);
+		RequireVulkanSuccess(m_graphics.device.createPipelineLayout(&layout, nullptr, &m_wait_layout),
+		                     "create wait label pipeline layout");
+		m_wait_pipeline = CreateComputePipeline(m_graphics.device, WAIT_REG_MEM_SPV, m_wait_layout, "create wait label pipeline");
 	}
-	std::erase_if(m_readback_hot, [count](const HotReadback& hot) {
-		return count - hot.last_hit >= HotReadbackLifetime;
-	});
-	begin = Common::AlignDown(begin, TRACKER_PAGE_SIZE);
-	end   = Common::AlignUp(end, TRACKER_PAGE_SIZE);
-	for (auto& hot: m_readback_hot) {
-		if (begin < hot.end && hot.begin < end) {
-			hot.begin    = std::min(hot.begin, begin);
-			hot.end      = std::max(hot.end, end);
-			hot.last_hit = count;
-			return;
-		}
+	const auto [buffer, offset] = ObtainBuffer(address, bytes, false);
+	const auto base = Common::AlignDown(offset, m_graphics.StorageMinAlignment());
+	const vk::DescriptorBufferInfo infos[] {
+	    {buffer->Handle(), base, offset - base + bytes},
+	    {result.Handle(), 0, sizeof(uint32_t)},
+	};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t i = 0; i < writes.size(); ++i) {
+		writes[i].dstBinding = i;
+		writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+		writes[i].descriptorCount = 1;
+		writes[i].pBufferInfo = &infos[i];
 	}
-	if (drained && !device_address) {
-		if (m_readback_hot.size() == MaxHotReadbacks) {
-			m_readback_hot.erase(std::ranges::min_element(m_readback_hot, {}, &HotReadback::last_hit));
-		}
-		m_readback_hot.push_back({begin, end, count});
-	}
+	const Push push {{static_cast<uint32_t>(reference), static_cast<uint32_t>(reference >> 32u)},
+	                 {static_cast<uint32_t>(mask), static_cast<uint32_t>(mask >> 32u)},
+	                 static_cast<uint32_t>((offset - base) / 4u), bytes == 8u, function};
+	m_scheduler.EndRendering();
+	const auto native = m_scheduler.Current().Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::PipelineStageFlagBits::eComputeShader, {}, 1, &before, 0, nullptr, 0, nullptr);
+	native.bindPipeline(vk::PipelineBindPoint::eCompute, m_wait_pipeline);
+	native.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_wait_layout, 0, writes);
+	native.pushConstants(m_wait_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	native.dispatch(1, 1, 1);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                       vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eAllCommands,
+	                       {}, 1, &after, 0, nullptr, 0, nullptr);
 }
 
-bool BufferCache::TakeFlushRequest() {
-	if (!m_flush_requested) {
-		return false;
-	}
-	if (m_flush_deferred_tick != 0 && m_scheduler.CurrentTick() != m_flush_deferred_tick) {
-		m_flush_requested     = false;
-		m_flush_deferred_tick = 0;
-		return false;
-	}
-	const auto now = std::chrono::steady_clock::now();
-	if (now - m_last_requested_flush < MinRequestedFlushInterval) {
-		m_flush_deferred_tick = m_scheduler.CurrentTick();
-		return false;
-	}
-	m_last_requested_flush = now;
-	m_flush_requested      = false;
-	m_flush_deferred_tick  = 0;
-	return true;
-}
-
-bool BufferCache::CommitWriteTicks() {
+void BufferCache::CommitWriteTicks() {
 	if (m_pending_writes.empty() && !m_device_address_pending) {
-		return TakeFlushRequest();
+		return;
 	}
 	const auto tick = m_scheduler.CurrentTick();
 	for (const auto& [vaddr, size]: m_pending_writes) {
@@ -2286,7 +2303,6 @@ bool BufferCache::CommitWriteTicks() {
 		m_device_address_pending = false;
 		m_device_address_tick    = tick;
 	}
-	return TakeFlushRequest();
 }
 
 void BufferCache::MarkMirrorLinesWritten(uint64_t vaddr, uint64_t size, uint64_t tick) {
@@ -2295,9 +2311,6 @@ void BufferCache::MarkMirrorLinesWritten(uint64_t vaddr, uint64_t size, uint64_t
 	     it != m_mirror_lines.end() && it->first < end; ++it) {
 		auto& line = it->second;
 		line.tick  = 0;
-		if (m_mirror_uses - line.last_use < MirrorFlushLifetime) {
-			m_flush_requested = true;
-		}
 		if (line.dirty_tick != tick) {
 			line.dirty_tick = tick;
 			m_mirror_dirty.push_back(it->first);
@@ -2387,7 +2400,6 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 		return false;
 	}
 	m_scheduler.GetMasterSemaphore().Wait(wait);
-	m_mirror_flush_use = m_mirror_uses;
 	m_scheduler.WaitPriorityOperations(needed);
 	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size)) {
 		return false;
@@ -2488,6 +2500,7 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	if (!m_graphics.readback_queue || m_device_address_pending) {
 		return false;
 	}
+	m_readback_count++;
 	const auto buffer_address = buffer.CpuAddress();
 	uint64_t needed = m_device_address_tick;
 	const auto readback_begin = buffer_address + copies.front().srcOffset;
@@ -2497,18 +2510,15 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 		const auto end   = begin + copy.size;
 		for (const auto& [vaddr, size]: m_pending_writes) {
 			if (vaddr < end && begin < vaddr + size) {
-				NoteReadbackWait(readback_begin, readback_end, false, true);
 				return false;
 			}
 		}
 		needed = std::max(needed, m_write_ticks.Latest(begin, end));
 	}
-	const bool device_address = needed != 0 && needed == m_device_address_tick;
 	if (needed >= m_scheduler.CurrentTick()) {
-		NoteReadbackWait(readback_begin, readback_end, device_address, true);
 		return false;
 	}
-	NoteReadbackWait(readback_begin, readback_end, device_address, false);
+
 #if defined(ANYPS5_KYTY)
 	const auto submit_from = std::chrono::steady_clock::now();
 	bool       submit_reported = false;

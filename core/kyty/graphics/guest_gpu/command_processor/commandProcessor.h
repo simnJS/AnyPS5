@@ -42,12 +42,35 @@ public:
 
 private:
 	friend class CommandProcessor;
+	friend class GuestGpu;
 
 	struct BufferCursor {
 		std::span<const uint32_t> commands;
 		uint32_t                  offset_dw = 0;
 	};
 
+	struct WaitCondition {
+		uint64_t address;
+		uint64_t reference;
+		uint64_t mask;
+		uint32_t bytes;
+		uint32_t function;
+		bool wait;
+		bool operator==(const WaitCondition&) const = default;
+	};
+	enum class WaitResult { Pending, Retry, Failed, Passed };
+	struct WaitProbe {
+		WaitCondition condition;
+		std::atomic<WaitResult> result {WaitResult::Pending};
+		bool flushed = false;
+	};
+	std::shared_ptr<WaitProbe> m_wait_probe;
+	struct RegisterRead {
+		std::array<uint32_t, 5> packet;
+		std::vector<uint32_t> words;
+		uint64_t sequence = 0;
+	};
+	std::shared_ptr<RegisterRead> m_register_read;
 	std::vector<BufferCursor> m_buffer_stack;
 	std::span<const uint32_t> m_next_buffer;
 	bool                      m_chain         = false;
@@ -76,7 +99,7 @@ public:
 
 	void BufferInit();
 	void BufferFlush();
-	void BufferFlushIfBatchReady();
+
 	void BufferWait();
 	HW::Context& GetCtx() {
 		m_ctx_dirty = true;
@@ -91,6 +114,11 @@ public:
 		return m_sh_ctx;
 	}
 
+	void ObserveIndirectRegister(uint32_t space, uint32_t offset, uint32_t value) {
+		if (m_draw_observer != nullptr && offset != UINT32_MAX) {
+			m_draw_observer->WriteRegister(space, offset, value);
+		}
+	}
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);
 	void SetIndexBufferSize(uint32_t index_buffer_size);
@@ -135,12 +163,8 @@ public:
 	void EmitPsrBlasBuilt();
 	Psr::Shader ComputePsrShader(uint64_t data_addr);
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
-	template <typename T>
-	[[nodiscard]] T ReadDecisionValue(const volatile void* address) {
-		T value {};
-		ReadDecisionMemory(address, &value, sizeof(T));
-		return value;
-	}
+	std::optional<bool> CompareMemory(uint64_t address, uint32_t bytes, uint64_t reference, uint64_t mask, uint32_t function,
+	                                  bool wait = false);
 
 	void Execute(GpuOperation& operation);
 
@@ -173,6 +197,7 @@ public:
 private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void SampleWait(const std::shared_ptr<Pm4Execution::WaitProbe>& probe);
 	const void*         IndexAddress(uint32_t first_index) const;
 	static const void*  IndexAddress(uint64_t base, uint32_t type_and_size, uint32_t first_index);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
@@ -186,7 +211,7 @@ private:
 	                    const void* value = nullptr);
 
 	void BindState(const GpuRegisterState& state);
-	void NoteRecordedWork();
+
 	[[nodiscard]] uint32_t ResolveNumInstances(const GpuOperation& operation);
 	void ExecuteDrawIndex(const GpuOperation& operation, DrawIndexArgs args);
 	void ExecuteDrawAuto(const GpuOperation& operation, DrawAutoArgs args);
@@ -235,6 +260,7 @@ private:
 	uint64_t       m_draw_indirect_args_base_addr     = 0;
 	uint64_t       m_dispatch_indirect_args_base_addr = 0;
 	uint64_t       m_fetch_sync_sequence              = 0;
+	std::shared_ptr<Buffer> m_wait_output;
 	std::vector<uint32_t> m_indirect_stage;
 	std::array<uint32_t, 5> m_indirect_packet {};
 	GpuNumInstances m_num_instances;
@@ -306,8 +332,8 @@ private:
 	std::unordered_map<uint64_t, Psr::Shader> m_cs_psr_shaders;
 
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;
-	uint64_t m_batch_tick = 0;
-	uint32_t m_batch_work = 0;
+
+
 	uint32_t m_indirect_instances         = 0;
 	uint64_t m_indirect_instances_sequence = 0;
 	bool     m_has_indirect_instances      = false;

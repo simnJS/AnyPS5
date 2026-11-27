@@ -396,7 +396,7 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&& operation, 
 		Common::ScopedLock lock(m_guest_writes_mutex);
 		id = ++m_next_guest_write;
 		m_guest_writes.push_back(
-		    {id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
+		    {CurrentTick(), id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
 	}
 	return [this, id, operation = std::move(operation)]() mutable {
 		operation();
@@ -418,7 +418,7 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&&            
 		id = ++m_next_guest_write;
 		for (const auto& [address, size]: ranges) {
 			m_guest_writes.push_back(
-			    {id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
+			    {CurrentTick(), id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
 		}
 	}
 	return [this, id, operation = std::move(operation)]() mutable {
@@ -442,12 +442,17 @@ uint64_t CommandScheduler::NewestPendingGuestOperation(uint64_t address, uint64_
 }
 #endif
 
-bool CommandScheduler::HasPendingGuestOperations(uint64_t address, uint64_t size) {
-	const auto      end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+uint64_t CommandScheduler::PendingGuestTick(uint64_t address, uint64_t size) {
+	const auto end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
 	Common::ScopedLock lock(m_guest_writes_mutex);
-	return std::any_of(m_guest_writes.begin(), m_guest_writes.end(), [&](const GuestWrite& write) {
-		return write.begin < end && address < write.end;
-	});
+	for (auto it = m_guest_writes.rbegin(); it != m_guest_writes.rend(); ++it) {
+		if (it->begin < end && address < it->end) return it->tick;
+	}
+	return 0;
+}
+
+bool CommandScheduler::HasPendingGuestOperations(uint64_t address, uint64_t size) {
+	return PendingGuestTick(address, size) != 0;
 }
 
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation) {

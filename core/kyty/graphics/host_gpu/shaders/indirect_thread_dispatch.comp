@@ -23,12 +23,14 @@ layout(push_constant) uniform push_data {
     uint  args_index;
     uint  groups_index;
     uint  limit_index;
+    uint  shared_groups;
     uvec3 max_groups;
     uint  clamp_slot;
 };
 
 void main() {
     bool over = false;
+    uvec3 counts;
     for (uint axis = 0u; axis < 3u; axis++) {
         const uint threads = args[args_index + axis];
         const uint size    = max(local_size[axis], 1u);
@@ -37,10 +39,15 @@ void main() {
             count = max_groups[axis];
             over  = true;
         }
-        groups[groups_index + axis] = count;
+        counts[axis] = count;
         limit[limit_index + axis]   = threads;
     }
-    if (over) {
-        clamped[clamp_slot] = 1u;
+    bool overflow = false;
+    if (shared_groups != 0u && all(notEqual(counts, uvec3(0u)))) {
+        overflow = counts.x > shared_groups / counts.y / counts.z;
     }
+    for (uint axis = 0u; axis < 3u; axis++) {
+        groups[groups_index + axis] = overflow ? 0u : counts[axis];
+    }
+    clamped[clamp_slot] = overflow ? 2u : uint(over);
 }
