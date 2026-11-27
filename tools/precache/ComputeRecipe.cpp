@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include <xxhash.h>
 
@@ -83,6 +84,60 @@ int PrepareComputeRecipe(const char* signatures) {
 	const bool queue_dependent = ShaderRecompiler::Decoder::ComputeShaderDependsOnQueue(code);
 	PipelineManifest manifest;
 	size_t index = 0;
+	bool observed_buffers = false;
+	bool observed_samplers = false;
+	for (const auto& record: library.modules) {
+		if (record.stage == ShaderType::Compute && record.code_hash == input.hash) {
+			observed_buffers |= record.runtime_buffers;
+			observed_samplers |= record.runtime_samplers;
+		}
+	}
+	const auto prepare = [&](uint32_t push_data_cursor, bool& buffers, bool& samplers) {
+		ShaderRecompiler::TranslateResult translated;
+		std::vector<ResourceSpecialization> variants;
+		if (!Common::Fallback::Run("incompatible compute dispatch mode", "PrepareComputeRecipe", input.hash,
+		                           index, true, [&] {
+			    translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+			    const auto plan = IR::ExtractResourcePlan(translated.program);
+			    buffers |= IR::HasIndirectBuffers(plan);
+			    samplers |= std::ranges::any_of(plan.info.samplers, [&](const auto& sampler) {
+				    return sampler.source < plan.descriptor_sources.size() &&
+				           plan.descriptor_sources[sampler.source].indirect_descriptor.has_value();
+			    });
+			    auto recipes = SynthesizeComputeVariants(info, queue_dependent, translated.program, plan,
+			                                             library.modules);
+			    for (auto& recipe: recipes) {
+			        auto& shape = recipe.specialization;
+			        if (std::ranges::find(variants, shape) == variants.end()) {
+			            variants.push_back(std::move(shape));
+			        }
+			    }
+			})) {
+			samplers |= IR::TakeRuntimeSamplerStop();
+			return true;
+		}
+		for (size_t variant = 0; variant < variants.size(); ++variant) {
+			const auto variant_index = index++;
+			const auto& shape = variants[variant];
+			ShaderRecompiler::CompileResult result;
+			if (!Common::Fallback::Run("incompatible compute view signature", "PrepareComputeRecipe", input.hash,
+			                           variant_index, true, [&] {
+				    if (variant != 0) translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+				    result = ShaderRecompiler::CompileProgram(std::move(translated), options, shape, push_data_cursor);
+				}) || result.spirv.empty()) continue;
+			std::ofstream spv("compute-" + std::to_string(variant_index) + ".spv", std::ios::binary);
+			spv.write(reinterpret_cast<const char*>(result.spirv.data()), result.spirv.size() * sizeof(uint32_t));
+			spv.close();
+			if (!spv) return false;
+			manifest.modules.push_back({.stage = ShaderType::Compute, .code_hash = input.hash,
+			                            .user_data_count = static_cast<uint32_t>(user_data.size()),
+			                            .push_data_cursor = push_data_cursor,
+			                            .runtime_buffers = options.runtime_buffer_descriptors,
+			                            .runtime_samplers = options.runtime_sampler_descriptors,
+			                            .input = info, .specialization = shape});
+		}
+		return true;
+	};
 	for (const auto mode: DispatchModes) {
 		info.dispatch_thread_dimensions = mode.thread_dimensions;
 		info.dispatch_indirect_threads = mode.indirect_threads;
@@ -90,38 +145,16 @@ int PrepareComputeRecipe(const char* signatures) {
 		for (const bool async: {false, true}) {
 			if (async && !queue_dependent) continue;
 			info.async_compute = async;
-			ShaderRecompiler::TranslateResult translated;
-			std::vector<ResourceSpecialization> variants;
-			if (!Common::Fallback::Run("incompatible compute dispatch mode", "PrepareComputeRecipe", input.hash,
-			                           index, true, [&] {
-				    translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-				    const auto plan = IR::ExtractResourcePlan(translated.program);
-				    auto recipes = SynthesizeComputeVariants(info, queue_dependent, translated.program, plan,
-				                                             library.modules);
-				    for (auto& recipe: recipes) {
-				        auto& shape = recipe.specialization;
-				        if (std::ranges::find(variants, shape) == variants.end()) {
-				            variants.push_back(std::move(shape));
-				        }
-				    }
-				})) continue;
-			for (size_t variant = 0; variant < variants.size(); ++variant) {
-				const auto variant_index = index++;
-				const auto& shape = variants[variant];
-				ShaderRecompiler::CompileResult result;
-				if (!Common::Fallback::Run("incompatible compute view signature", "PrepareComputeRecipe", input.hash,
-				                           variant_index, true, [&] {
-					    if (variant != 0) translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-					    result = ShaderRecompiler::CompileProgram(std::move(translated), options, shape, push_data_cursor);
-					}) || result.spirv.empty()) continue;
-				std::ofstream spv("compute-" + std::to_string(variant_index) + ".spv", std::ios::binary);
-				spv.write(reinterpret_cast<const char*>(result.spirv.data()), result.spirv.size() * sizeof(uint32_t));
-				spv.close();
-				if (!spv) return 74;
-				manifest.modules.push_back({.stage = ShaderType::Compute, .code_hash = input.hash,
-				                            .user_data_count = static_cast<uint32_t>(user_data.size()),
-				                            .push_data_cursor = push_data_cursor,
-				                            .input = info, .specialization = shape});
+			bool buffers = observed_buffers;
+			bool samplers = observed_samplers;
+			for (const bool runtime_samplers: {false, true}) {
+				if (runtime_samplers && !samplers) continue;
+				options.runtime_sampler_descriptors = runtime_samplers;
+				for (const bool runtime_buffers: {false, true}) {
+					if (runtime_buffers && !buffers) continue;
+					options.runtime_buffer_descriptors = runtime_buffers;
+					if (!prepare(push_data_cursor, buffers, samplers)) return 74;
+				}
 			}
 		}
 	}

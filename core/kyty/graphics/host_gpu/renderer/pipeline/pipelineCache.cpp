@@ -2726,23 +2726,11 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	}
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		const auto* exact = module != modules.end() ? &*module : nullptr;
-		const bool specializes = SpecializesComputeInBackground();
-		if (ShaderRecompiler::IR::GenericComputeVariants() &&
-		    (!specializes || std::ranges::any_of(specialization.buffers,
-		                                        &ShaderRecompiler::IR::ResourceSpecialization::Buffer::scalar_empty)) &&
-		    (exact == nullptr || !ComputePipelineReady(*exact, true))) {
-			const auto ready = FindReadyComputeVariant(*program, resources, specialization, push_data_cursor, exact, true);
-			const auto covered = ready != SIZE_MAX &&
-			                     !modules[ready].linked_prepared &&
-			                     ShaderRecompiler::IR::PopulatedBuffersCoverEmptySpecialization(
-			                         program->resource_plan, specialization, modules[ready].specialization);
-			if (covered ||
-			    (!specializes && (ready != SIZE_MAX ||
-			                     FindReadyComputeVariant(*program, resources, specialization, push_data_cursor, exact, true,
-			                                             true) != SIZE_MAX))) {
-				ahead.reads.Fail(AheadRefusal::Variant);
-				return nullptr;
-			}
+		if (ShaderRecompiler::IR::GenericComputeVariants() && (exact == nullptr || !ComputePipelineReady(*exact, true)) &&
+		    (FindReadyComputeVariant(*program, resources, specialization, push_data_cursor, exact, true) != SIZE_MAX ||
+		     FindReadyComputeVariant(*program, resources, specialization, push_data_cursor, exact, true, true) != SIZE_MAX)) {
+			ahead.reads.Fail(AheadRefusal::Variant);
+			return nullptr;
 		}
 	}
 #endif
