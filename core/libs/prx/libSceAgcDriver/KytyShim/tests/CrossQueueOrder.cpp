@@ -169,6 +169,23 @@ std::vector<Stream> waitsOnOtherQueue(std::uint32_t writer, std::uint32_t waiter
     return {blocked, work, finishedClock()};
 }
 
+std::vector<Stream> generatedCommandBuffer() {
+    Words child;
+    wait(child, SharedLabel, WaitEqual, 1);
+    writeData(child, OwnLabel, Published);
+    Stream parent;
+    for (std::size_t word = 0; word < child.size(); ++word) {
+        writeData(parent.words, Input + word * sizeof(std::uint32_t), child[word]);
+    }
+    dispatch(parent.words, Input, Scratch, One);
+    append(parent.words, 0x42, {0});
+    append(parent.words, 0x3f, {low(Scratch), high(Scratch), static_cast<std::uint32_t>(child.size())});
+    writeData(parent.words, OwnLabel + sizeof(std::uint32_t), Recycled);
+    Stream producer{ComputeQueue, {}};
+    releaseValue(producer.words, SharedLabel, 1);
+    return {parent, producer};
+}
+
 std::vector<Stream> recycledLabel() {
     Stream follower{ComputeQueue, {}};
     wait(follower.words, SharedLabel, WaitGreaterOrEqual, 1u);
@@ -443,6 +460,14 @@ int main(int argc, char** argv) {
         } else if (scenario == "graphics_waits_compute_clock") {
             streams = waitsOnOtherQueue(ComputeQueue, GraphicsQueue);
             judge = [](const Replay& result) { return clockVerdict(result, "the graphics queue passed its wait"); };
+        } else if (scenario == "generated_command_buffer") {
+            streams = generatedCommandBuffer();
+            judge = [](const Replay& result) -> Verdict {
+                if (result.labels[0] != Published || result.labels[1] != Recycled || result.labels[2] != 1) {
+                    return {1, "the GPU-written command buffer, its dependency or its caller did not finish"};
+                }
+                return {0, "the GPU-written command buffer and its caller finished"};
+            };
         } else if (scenario == "recycled_label") {
             streams = recycledLabel();
             judge = recycledVerdict;
