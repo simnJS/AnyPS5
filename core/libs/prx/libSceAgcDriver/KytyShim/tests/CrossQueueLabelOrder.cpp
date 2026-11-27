@@ -249,8 +249,15 @@ const char* ProbeBufferWriteCoverageCase(GraphicContext& graphics, bool per_invo
 			for (const uint32_t bytes: {4u, 8u}) {
 				const uint64_t value = bytes == 8u ? pair : FirstWrite;
 				const uint64_t mask = bytes == 8u ? UINT64_C(0xff00ff00ff00ff00) : UINT64_C(0xff00ff00);
+				const auto masked = value & mask;
+				std::vector<uint64_t> references {masked - 1u, masked, masked + 1u};
+				if (bytes == 8u) {
+					const auto high = masked & UINT64_C(0xffffffff00000000);
+					references.push_back(high - 1u);
+					references.push_back(high + (uint64_t {1} << 32u));
+				}
 				for (uint32_t function = 0; function <= 6; ++function) {
-					for (const auto reference: {(value & mask) - 1u, value & mask, (value & mask) + 1u}) {
+					for (const auto reference: references) {
 						auto result = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
 						                                       vk::BufferUsageFlagBits::eStorageBuffer, sizeof(uint32_t));
 						renderer.GetBufferCache().CompareWaitLabel(output + 2u * sizeof(uint32_t), bytes, reference,
