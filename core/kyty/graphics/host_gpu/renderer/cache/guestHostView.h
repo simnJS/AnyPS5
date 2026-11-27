@@ -41,7 +41,7 @@ public:
 	~GuestHostView();
 	KYTY_CLASS_NO_COPY(GuestHostView);
 
-	[[nodiscard]] bool     Enabled() const noexcept { return m_root != nullptr; }
+	[[nodiscard]] bool     Enabled() const noexcept { return m_enabled; }
 	[[nodiscard]] uint64_t TableAddress() const noexcept;
 	[[nodiscard]] uint64_t Lookup(uint64_t vaddr) const;
 	[[nodiscard]] Stats    Totals() const;
@@ -101,6 +101,7 @@ private:
 	uint64_t                             m_size       = 0;
 	uint64_t                             m_alignment  = 0;
 	std::unique_ptr<Buffer>              m_root;
+	bool                                 m_enabled    = false;
 	std::vector<std::unique_ptr<Buffer>> m_chunks;
 	std::map<uint64_t, Imported>         m_imports;
 	std::vector<uint64_t>                m_words;

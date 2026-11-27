@@ -303,6 +303,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		     "cannot run on this GPU\n",
 		     m_guest_mirror->Description().c_str());
 	}
+	EXIT_IF(m_guest_mirror->Base() % GuestMirror::WindowSize != 0);
 	SetVulkanObjectNameF(m_graphics.device, m_guest_mirror->Handle(), "Kyty.GuestMirror[size=0x{:x}]",
 	                     m_guest_mirror->Size());
 	m_storage = std::make_unique<Buffer>(
@@ -319,6 +320,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	                           WRITE_BITMAP_OFFSET / sizeof(uint32_t), LibKernel::Memory::kExtendedMemoryBase,
 	                           LOWER_ADDRESS_SIZE, m_host_view->TableAddress()};
 	static_assert(sizeof(metadata) == HOST_TABLE_OFFSET + sizeof(uint64_t) && sizeof(metadata) <= RESIDENCY_OFFSET);
+	EXIT_IF(m_host_view->TableAddress() == 0);
 	const auto source = m_staging_buffer.Copy(metadata, sizeof(metadata), alignof(uint64_t));
 	GetFaultBuffer()->CopyFrom(m_scheduler.Current(), m_staging_buffer, source, 0, sizeof(metadata));
 	m_residency_words.resize(RESIDENCY_SIZE / sizeof(uint32_t));

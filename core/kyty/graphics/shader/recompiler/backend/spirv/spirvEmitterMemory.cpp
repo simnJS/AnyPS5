@@ -2328,7 +2328,11 @@ void EmitRayMarkCount(EmitterState& state, uint32_t counter, uint32_t count) {
 	}
 }
 
-uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset) {
+namespace {
+
+constexpr std::array<uint32_t, 4> MirrorMetadataOffsets {0, 8, 16, static_cast<uint32_t>(BufferCache::HOST_TABLE_OFFSET)};
+
+uint32_t LoadFaultMetadata64(EmitterState& state, uint32_t offset) {
 	const auto load = [&](uint32_t index) {
 		const auto pointer = FaultElementPointer(state, ConstantU32(state, index));
 		const auto value = state.builder.AllocateId();
@@ -2338,14 +2342,49 @@ uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset) {
 	return PackU64(state, load(offset / 4), load(offset / 4 + 1));
 }
 
+uint32_t LoadPhysicalU64(EmitterState& state, uint32_t address) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr,
+	                          TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU64(state)), pointer, address);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU64(state), value, pointer, spv::MemoryAccessAlignedMask,
+	                          static_cast<uint32_t>(sizeof(uint64_t)));
+	return value;
+}
+
+}
+
+void DeclareMirrorMetadata(EmitterState& state) {
+	if (!state.program.info.uses_dma || state.fault_buffer_variable == 0) return;
+	for (size_t i = 0; i < MirrorMetadataOffsets.size(); i++) {
+		state.mirror_metadata[i] = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeU64(state)), spv::StorageClassPrivate);
+	}
+}
+
+void StoreMirrorMetadata(EmitterState& state) {
+	for (size_t i = 0; i < MirrorMetadataOffsets.size(); i++) {
+		if (state.mirror_metadata[i] == 0) continue;
+		state.builder.AddFunction(spv::OpStore, state.mirror_metadata[i],
+		                          LoadFaultMetadata64(state, MirrorMetadataOffsets[i]));
+	}
+}
+
+uint32_t LoadMirrorMetadata64(EmitterState& state, uint32_t offset) {
+	for (size_t i = 0; i < MirrorMetadataOffsets.size(); i++) {
+		if (MirrorMetadataOffsets[i] != offset || state.mirror_metadata[i] == 0) continue;
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU64(state), value, state.mirror_metadata[i]);
+		return value;
+	}
+	return LoadFaultMetadata64(state, offset);
+}
+
 uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t size, uint32_t extent, bool in_page) {
 	using View = GuestHostView;
 	const auto u64 = TypeU64(state), boolean = TypeBool(state);
 	const auto zero = ConstantU64(state, 0);
-	const auto load = [&](uint32_t pointer) {
-		const auto high = Binary(state, spv::OpIAdd, u64, pointer, ConstantU64(state, sizeof(uint32_t)));
-		return PackU64(state, EmitBdaPointerLoad(state, pointer, false), EmitBdaPointerLoad(state, high, false));
-	};
+	const auto load = [&](uint32_t pointer) { return LoadPhysicalU64(state, pointer); };
 	const auto nonzero = [&](uint32_t value) { return Binary(state, spv::OpINotEqual, boolean, value, zero); };
 	const auto slot = [&](uint32_t table, uint32_t index) {
 		return Binary(state, spv::OpIAdd, u64, table,
@@ -2353,7 +2392,8 @@ uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t siz
 	};
 	const auto table = LoadMirrorMetadata64(state, BufferCache::HOST_TABLE_OFFSET);
 	const auto entry_of = [&](uint32_t at, uint32_t wanted) {
-		const auto chunk = EmitValueOrDefaultIfCondition(state, AndCondition(state, wanted, nonzero(table)), u64, zero, [&] {
+		const auto present = wanted == ConstantBool(state, true) ? nonzero(table) : AndCondition(state, wanted, nonzero(table));
+		const auto chunk = EmitValueOrDefaultIfCondition(state, present, u64, zero, [&] {
 			return load(slot(table, Binary(state, spv::OpShiftRightLogical, u64, at, ConstantU32(state, View::ChunkBits))));
 		});
 		const auto page = Binary(state, spv::OpBitwiseAnd, u64,
@@ -2379,7 +2419,92 @@ uint32_t EmitGuestHostAddress(EmitterState& state, uint32_t offset, uint32_t siz
 	return Select(state, u64, usable, Binary(state, spv::OpIAdd, u64, entry, inside), zero);
 }
 
+uint32_t EmitGuestPageAddress(EmitterState& state, uint32_t offset) {
+	using View = GuestHostView;
+	const auto u64 = TypeU64(state), boolean = TypeBool(state);
+	const auto zero = ConstantU64(state, 0);
+	const auto slot = [&](uint32_t table, uint32_t index) {
+		return Binary(state, spv::OpIAdd, u64, table, Binary(state, spv::OpShiftLeftLogical, u64, index, ConstantU32(state, 3)));
+	};
+	const auto table = LoadMirrorMetadata64(state, BufferCache::HOST_TABLE_OFFSET);
+	const auto chunk = LoadPhysicalU64(state,
+	                                   slot(table, Binary(state, spv::OpShiftRightLogical, u64, offset, ConstantU32(state, View::ChunkBits))));
+	const auto present = Binary(state, spv::OpINotEqual, boolean, chunk, zero);
+	const auto page = Binary(state, spv::OpBitwiseAnd, u64,
+	                         Binary(state, spv::OpShiftRightLogical, u64, offset, ConstantU32(state, View::PageBits)),
+	                         ConstantU64(state, View::EntriesPerChunk - 1));
+	const auto entry = LoadPhysicalU64(state, Select(state, u64, present, slot(chunk, page), table));
+	return Select(state, u64, AndCondition(state, present, Binary(state, spv::OpINotEqual, boolean, entry, zero)),
+	              Binary(state, spv::OpIAdd, u64, entry,
+	                     Binary(state, spv::OpBitwiseAnd, u64, offset, ConstantU64(state, View::PageSize - 1))),
+	              zero);
+}
+
+uint32_t EmitMirrorDwordAddress(EmitterState& state, uint32_t address, uint32_t active) {
+	using LibKernel::Memory::kExtendedMemoryBase;
+	using LibKernel::Memory::kExtendedMemorySize;
+	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
+	const auto zero = ConstantU64(state, 0);
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, boolean, address, ConstantU64(state, kExtendedMemoryBase));
+	const auto packed = Select(state, u64, extended,
+	                           Binary(state, spv::OpISub, u64, address, ConstantU64(state, kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	                           address);
+	const auto limit = Select(state, u64, extended, ConstantU64(state, LOWER_ADDRESS_SIZE + kExtendedMemorySize),
+	                          ConstantU64(state, LOWER_ADDRESS_SIZE));
+	const auto representable = Binary(state, spv::OpULessThan, boolean, packed, limit);
+	const auto valid = active == ConstantBool(state, true) ? representable : AndCondition(state, active, representable);
+	const auto block = Unary(state, spv::OpUConvert, u32,
+	                         Binary(state, spv::OpShiftRightLogical, u64, Select(state, u64, valid, packed, zero),
+	                                ConstantU32(state, BufferCache::MIRROR_BLOCK_BITS)));
+	const auto entry = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, u32, entry, FaultElementPointer(state, Binary(state, spv::OpIAdd, u32,
+	    ConstantU32(state, BufferCache::RESIDENCY_OFFSET / 4), Binary(state, spv::OpShiftRightLogical, u32, block, ConstantU32(state, 4)))));
+	const auto resident = Binary(state, spv::OpINotEqual, boolean,
+	    Binary(state, spv::OpBitwiseAnd, u32, entry, Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1),
+	        Binary(state, spv::OpBitwiseAnd, u32, block, ConstantU32(state, BufferCache::RESIDENCY_BLOCKS - 1)))),
+	    ConstantU32(state, 0));
+	const auto ready = AndCondition(state, valid, resident);
+	const auto index = Binary(state, spv::OpShiftRightLogical, u32, block, ConstantU32(state, 5));
+	const auto bit = Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1),
+	                        Binary(state, spv::OpBitwiseAnd, u32, block, ConstantU32(state, 31)));
+	const auto word = [&](uint64_t bitmap) {
+		return FaultElementPointer(state, Binary(state, spv::OpIAdd, u32, ConstantU32(state, bitmap / 4), index));
+	};
+	const auto scope = ConstantU32(state, spv::ScopeDevice);
+	const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+	const auto use = word(BufferCache::USE_BITMAP_OFFSET);
+	const auto used = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicLoad, u32, used, use, scope, relaxed);
+	const auto unused = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, used, bit), ConstantU32(state, 0));
+	EmitIfCondition(state, AndCondition(state, ready, unused), [&] {
+		state.builder.AddFunction(spv::OpAtomicOr, u32, state.builder.AllocateId(), use, scope, relaxed, bit);
+	});
+	const auto miss = [&](uint32_t offset) {
+		state.builder.AddFunction(spv::OpAtomicOr, u32, state.builder.AllocateId(), word(BufferCache::FAULT_BITMAP_OFFSET),
+		                          scope, relaxed, bit);
+		const auto guest = EmitGuestPageAddress(state, offset);
+		state.builder.AddFunction(spv::OpAtomicIAdd, u32, state.builder.AllocateId(),
+		                          FaultElementPointer(state, ConstantU32(state, BufferCache::HOST_ACCESS_OFFSET / 4)),
+		                          scope, relaxed,
+		                          Select(state, u32, Binary(state, spv::OpINotEqual, boolean, guest, zero),
+		                                 ConstantU32(state, 1), ConstantU32(state, 0)));
+		return guest;
+	};
+	const auto missed = AndCondition(state, valid, Unary(state, spv::OpLogicalNot, boolean, resident));
+	const auto offset = Binary(state, spv::OpISub, u64, address, LoadMirrorMetadata64(state, 8));
+	const auto inside = Binary(state, spv::OpULessThan, boolean, offset, LoadMirrorMetadata64(state, 16));
+	const auto guest_page = EmitValueOrDefaultIfCondition(state, AndCondition(state, missed, inside), u64, zero,
+	                                                      [&] { return miss(offset); });
+	const auto translated = Binary(state, spv::OpBitwiseOr, u64,
+	    Binary(state, spv::OpShiftLeftLogical, u64,
+	           Unary(state, spv::OpUConvert, u64, Binary(state, spv::OpShiftRightLogical, u32, entry, ConstantU32(state, BufferCache::RESIDENCY_BLOCKS))),
+	           ConstantU32(state, GuestMirror::WindowBits)),
+	    Binary(state, spv::OpBitwiseAnd, u64, address, ConstantU64(state, GuestMirror::WindowSize - 1)));
+	return Select(state, u64, ready, Binary(state, spv::OpIAdd, u64, LoadMirrorMetadata64(state, 0), translated), guest_page);
+}
+
 uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address, uint32_t active, uint32_t extent, bool in_page) {
+	if (in_page && extent == ConstantU32(state, sizeof(uint32_t))) return EmitMirrorDwordAddress(state, address, active);
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
 	const auto mirror_base = LoadMirrorMetadata64(state, 0);
 	const auto guest_base = LoadMirrorMetadata64(state, 8);

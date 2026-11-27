@@ -1884,6 +1884,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.lane_count == 2 && !program.dispatcher_fallback && program.inlined_call_entries.empty()) {
 		state.pair_shared = FindPairSharedValues(program);
 	}
+	DeclareMirrorMetadata(state);
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
 	DefineBvhIntersect(state);
@@ -2002,6 +2003,7 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	EmitFunctionEntryValues(state);
+	StoreMirrorMetadata(state);
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
