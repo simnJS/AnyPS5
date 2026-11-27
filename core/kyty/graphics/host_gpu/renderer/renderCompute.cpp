@@ -404,17 +404,12 @@ static std::array<uint32_t, 3> MaxWorkGroups(const GraphicContext& graphics) {
 }
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
-                             PreparedBindings& bindings, uint64_t indirect_args = 0) {
+                             PreparedBindings& bindings) {
 	if (input.stage.module->info.bindings.descriptor_counts[
 	        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) {
 		return;
 	}
 	auto& cache = context.GetBufferCache();
-	if (indirect_args != 0) {
-		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
-		            sizeof(input.workgroup_counts));
-	}
 	const auto groups = MaxWorkGroups(context.GetGraphics());
 	for (uint32_t axis = 0; axis < 3u; ++axis) {
 		input.workgroup_counts[axis] = std::min(input.workgroup_counts[axis], groups[axis]);
@@ -432,6 +427,18 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		}
 	}
 	bindings.shared_memory = {storage.Handle(), 0, size};
+}
+
+static uint32_t BindIndirectSharedMemory(RenderContext& context, const ShaderComputeInputInfo& input,
+                                         PreparedBindings& bindings) {
+	if (input.stage.module->info.bindings.descriptor_counts[
+	        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) return 0;
+	auto& storage = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
+	const auto limit = std::min<uint64_t>(storage.Size(), context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	const uint64_t bytes = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);
+	EXIT_IF(bytes == 0 || bytes > limit);
+	bindings.shared_memory = {storage.Handle(), 0, limit};
+	return static_cast<uint32_t>(limit / bytes);
 }
 
 static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
@@ -622,9 +629,6 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
 			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
 			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
-			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
-				m_context.GetBufferCache().RequestFlushForReadbacks();
-			}
 		}
 		PrepareRayQuery(m_context, input_info.stage, bindings);
 		if (program.info.uses_image_heap) {
@@ -819,10 +823,8 @@ struct IndirectThreadClamps {
 	static constexpr uint32_t Slots = 1024;
 
 	IndirectThreadClamps(GraphicContext& graphics, CommandScheduler& scheduler)
-	    : buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags, uint64_t {Slots + 1u} * sizeof(uint32_t)) {
-		std::memset(buffer.Mapped().data(), 0, buffer.Size());
-		buffer.Flush(0, buffer.Size());
-	}
+	    : stride(std::max<uint64_t>(sizeof(uint32_t), graphics.GetPhysicalDeviceProperties().limits.nonCoherentAtomSize)),
+	      buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags, Slots * stride) {}
 
 	uint32_t Acquire() {
 		Common::LockGuard lock(mutex);
@@ -837,21 +839,20 @@ struct IndirectThreadClamps {
 	}
 
 	void Finish(uint32_t slot, uint64_t shader_hash) {
-		if (slot >= Slots) return;
-		const auto offset = uint64_t {slot} * sizeof(uint32_t);
+		const auto offset = slot * stride;
 		buffer.Invalidate(offset, sizeof(uint32_t));
 		uint32_t clamped = 0;
 		std::memcpy(&clamped, buffer.Mapped().data() + offset, sizeof(clamped));
+		EXIT_IF(clamped == 2u);
 		if (clamped != 0u) {
 			Common::HackNotice::Report("indirect dispatch group count clamped to maxComputeWorkGroupCount on the GPU",
 			                           "IndirectThreadPass", shader_hash, 0);
-			std::memset(buffer.Mapped().data() + offset, 0, sizeof(clamped));
-			buffer.Flush(offset, sizeof(clamped));
 		}
 		Common::LockGuard lock(mutex);
 		pending[slot] = false;
 	}
 
+	uint64_t                  stride;
 	Buffer                    buffer;
 	Common::Mutex             mutex;
 	std::array<bool, Slots>   pending {};
@@ -909,7 +910,8 @@ struct IndirectThreadPass {
 		uint32_t args_index;
 		uint32_t groups_index;
 		uint32_t limit_index;
-		uint32_t padding[2];
+		uint32_t shared_groups;
+		uint32_t padding;
 		uint32_t max_groups[3];
 		uint32_t clamp_slot;
 	};
@@ -917,6 +919,12 @@ struct IndirectThreadPass {
 	template <typename Recorder>
 	void Record(const Recorder& vk_buffer, const vk::DescriptorBufferInfo (&infos)[3], Push push,
 	            uint64_t shader_hash) {
+		auto slot = clamps->Acquire();
+		if (slot == IndirectThreadClamps::Slots) {
+			clamps = std::make_shared<IndirectThreadClamps>(graphics, scheduler);
+			slot = clamps->Acquire();
+		}
+		push.clamp_slot = static_cast<uint32_t>(slot * clamps->stride / sizeof(uint32_t));
 		const vk::DescriptorBufferInfo all[] {infos[0], infos[1], infos[2],
 		                                      {clamps->buffer.Handle(), 0, clamps->buffer.Size()}};
 		std::array<vk::WriteDescriptorSet, 4> writes {};
@@ -927,7 +935,6 @@ struct IndirectThreadPass {
 			writes[index].pBufferInfo     = &all[index];
 		}
 		std::copy(max_groups.begin(), max_groups.end(), std::begin(push.max_groups));
-		push.clamp_slot = clamps->Acquire();
 		vk::MemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
 		                       vk::AccessFlagBits::eHostWrite;
@@ -947,11 +954,7 @@ struct IndirectThreadPass {
 		                          vk::PipelineStageFlagBits::eDrawIndirect |
 		                              vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eHost,
 		                          {}, 1, &after, 0, nullptr, 0, nullptr);
-		if (push.clamp_slot < IndirectThreadClamps::Slots) {
-			scheduler.DeferHostOperation([clamps = clamps, slot = push.clamp_slot, shader_hash] {
-				clamps->Finish(slot, shader_hash);
-			});
-		}
+		scheduler.DeferHostOperation([clamps = clamps, slot, shader_hash] { clamps->Finish(slot, shader_hash); });
 	}
 
 	GraphicContext&                       graphics;
@@ -1015,9 +1018,6 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
 		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
 		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
-		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
-			m_context.GetBufferCache().RequestFlushForReadbacks();
-		}
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
 	if (program.info.uses_image_heap) {
@@ -1026,18 +1026,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	RebindImages(bindings);
 	(void)PrepareIndirectWriteTargets(m_context, bindings);
 	constexpr uint64_t ArgsSize = 3 * sizeof(uint32_t);
-	if (program.bindings.descriptor_counts[static_cast<size_t>(
-	        ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] != 0) {
-		m_context.GetBufferCache().ReadMemory(args_addr, ArgsSize);
-		const auto* threads = reinterpret_cast<const uint32_t*>(args_addr);
-		const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
-		                                cs_regs.cs_regs.num_thread_z};
-		for (uint32_t axis = 0; axis < 3u; ++axis) {
-			const auto size = std::max(group_sizes[axis], 1u);
-			input_info.workgroup_counts[axis] = threads[axis] / size + (threads[axis] % size != 0u);
-		}
-		BindSharedMemory(m_context, input_info, bindings);
-	}
+	const auto shared_groups = BindIndirectSharedMemory(m_context, input_info, bindings);
 	const auto [args_buffer, args_offset] =
 	    m_context.GetBufferCache().ObtainBuffer(args_addr, ArgsSize, false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
@@ -1072,6 +1061,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	push.args_index     = static_cast<uint32_t>((args_offset - args_base) / sizeof(uint32_t));
 	push.groups_index   = 0;
 	push.limit_index    = thread_limit ? program.bindings.dispatch_thread_dword : 4u;
+	push.shared_groups  = shared_groups;
 	pass.Record(vk_buffer, infos, push, program.shader_hash);
 
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -1104,7 +1094,9 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
-	const bool cpu_args = !m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	const bool cpu_args = !m_context.GetCommandScheduler().HasPendingGuestOperations(args_addr, sizeof(args)) &&
+	                      !m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	                      !m_context.GetTextureCache().IsRegionGpuModified(args_addr, sizeof(args)) &&
 	                      LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args));
 	if (cpu_args && (args.x == 0 || args.y == 0 || args.z == 0)) {
 		return;
@@ -1149,12 +1141,17 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			const ShaderStageRuntime* const dma_stage = &input_info.stage;
 			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
 			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
-			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
-				m_context.GetBufferCache().RequestFlushForReadbacks();
-			}
 		}
 		PrepareRayQuery(m_context, input_info.stage, bindings);
-		BindSharedMemory(m_context, input_info, bindings, args_addr);
+		uint32_t shared_groups = 0;
+		if (cpu_args) {
+			input_info.workgroup_counts[0] = args.x;
+			input_info.workgroup_counts[1] = args.y;
+			input_info.workgroup_counts[2] = args.z;
+			BindSharedMemory(m_context, input_info, bindings);
+		} else {
+			shared_groups = BindIndirectSharedMemory(m_context, input_info, bindings);
+		}
 		if (program.info.uses_image_heap) {
 			m_context.GetImageHeap().Rebind(*this);
 		}
@@ -1206,6 +1203,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			push.args_index     = static_cast<uint32_t>((args_offset - args_base) / sizeof(uint32_t));
 			push.groups_index   = 0;
 			push.limit_index    = 4;
+			push.shared_groups  = shared_groups;
 			ThreadPass(m_indirect_thread_pass, m_context).Record(buffer.Handle(), infos, push, program.shader_hash);
 			dispatch_buffer = stream.Handle();
 			dispatch_offset = scratch_offset;

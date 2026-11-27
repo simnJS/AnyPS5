@@ -14,7 +14,6 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -273,24 +272,13 @@ public:
 		return buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(vaddr, size) ? *owner : BufferId {};
 	}
 	void               RunGarbageCollector();
-	[[nodiscard]] bool CommitWriteTicks();
+	void CommitWriteTicks();
+	void CompareWaitLabel(uint64_t address, uint32_t bytes, uint64_t reference, uint64_t mask, uint32_t function,
+	                      Buffer& result);
 	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
-	void RequestFlushForReadbacks() noexcept {
-		if ((m_device_address_hot != 0 &&
-		     m_readback_count - m_device_address_hot < HotReadbackLifetime) ||
-		    m_mirror_uses - m_mirror_flush_use < MirrorFlushLifetime) {
-			m_flush_requested = true;
-		}
-	}
 	void BeginIndirectWrites() noexcept { m_indirect_writes_pending.fetch_add(1, std::memory_order_acq_rel); }
 	void EndIndirectWrites() noexcept { m_indirect_writes_pending.fetch_sub(1, std::memory_order_acq_rel); }
-	void NoteDeviceAddressUse() noexcept {
-		m_device_address_pending = true;
-		if (m_device_address_hot != 0 &&
-		    m_readback_count - m_device_address_hot < HotReadbackLifetime) {
-			m_flush_requested = true;
-		}
-	}
+	void NoteDeviceAddressUse() noexcept { m_device_address_pending = true; }
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -382,16 +370,8 @@ private:
 		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
 			m_pending_writes.emplace_back(vaddr, size);
-			for (const auto& hot: m_readback_hot) {
-				if (vaddr < hot.end && hot.begin < vaddr + size) {
-					m_flush_requested = true;
-					break;
-				}
-			}
 		}
 	}
-	void NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address, bool drained);
-	[[nodiscard]] bool TakeFlushRequest();
 
 	class WriteTicks {
 	public:
@@ -464,6 +444,7 @@ private:
 	std::atomic<uint32_t>                             m_stale_ring_next {0};
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
+	uint64_t                                          m_readback_count = 0;
 	WriteTicks                                        m_write_ticks;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_writes;
 	struct InFlightReadback {
@@ -474,20 +455,6 @@ private:
 	std::vector<InFlightReadback>                     m_inflight_readbacks;
 	uint64_t                                          m_device_address_tick    = 0;
 	bool                                              m_device_address_pending = false;
-	struct HotReadback {
-		uint64_t begin    = 0;
-		uint64_t end      = 0;
-		uint64_t last_hit = 0;
-	};
-	static constexpr uint64_t HotReadbackLifetime = 4096;
-	static constexpr size_t   MaxHotReadbacks     = 32;
-	std::vector<HotReadback>  m_readback_hot;
-	uint64_t                  m_readback_count = 0;
-	uint64_t                  m_device_address_hot = 0;
-	bool                      m_flush_requested    = false;
-	static constexpr std::chrono::microseconds MinRequestedFlushInterval {1000};
-	std::chrono::steady_clock::time_point      m_last_requested_flush {};
-	uint64_t                                   m_flush_deferred_tick = 0;
 	struct ReadbackQueue {
 		vk::CommandPool         pool    = nullptr;
 		vk::CommandBuffer       command = nullptr;
@@ -527,7 +494,6 @@ private:
 	static constexpr uint64_t MirrorLineSize      = 64;
 	static constexpr uint64_t MirrorMaxRead       = 256;
 	static constexpr uint32_t MaxMirrorLines      = 8192;
-	static constexpr uint64_t MirrorFlushLifetime = 4096;
 	void                      MarkMirrorLinesWritten(uint64_t vaddr, uint64_t size, uint64_t tick);
 	void                      AddMirrorLine(uint64_t line);
 	void                      RecordMirrorCopies(CommandBuffer& command);
@@ -536,7 +502,6 @@ private:
 	std::vector<uint32_t>          m_mirror_free_slots;
 	std::unique_ptr<Buffer>        m_mirror;
 	uint64_t                       m_mirror_uses      = 0;
-	uint64_t                       m_mirror_flush_use = 0;
 	StreamBuffer                                      m_staging_buffer;
 	struct UploadBatch;
 	bool                                              m_upload_batching   = false;
@@ -548,6 +513,9 @@ private:
 	};
 	std::vector<UploadBatchBuffer>                    m_upload_batch_buffers;
 	std::vector<vk::BufferCopy>                       m_upload_batch_copies;
+	vk::DescriptorSetLayout                           m_wait_set_layout = nullptr;
+	vk::PipelineLayout                                m_wait_layout     = nullptr;
+	vk::Pipeline                                      m_wait_pipeline   = nullptr;
 	vk::PipelineLayout                                m_scatter_layout   = nullptr;
 	vk::Pipeline                                      m_scatter_pipeline = nullptr;
 	StreamBuffer                                      m_stream_buffer;

@@ -1,0 +1,29 @@
+#version 450
+
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Label { uint words[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Result { uint passed; };
+layout(push_constant) uniform Comparison {
+	uvec2 reference;
+	uvec2 mask;
+	uint index;
+	uint wide;
+	uint function;
+} pc;
+
+void main() {
+	uvec2 value = uvec2(words[pc.index], 0u);
+	if (pc.wide != 0u) value.y = words[pc.index + 1u];
+	value &= pc.mask;
+	bool equal = all(equal(value, pc.reference));
+	bool less = value.y < pc.reference.y || (value.y == pc.reference.y && value.x < pc.reference.x);
+	switch (pc.function) {
+		case 0u: passed = 1u; break;
+		case 1u: passed = uint(less); break;
+		case 2u: passed = uint(less || equal); break;
+		case 3u: passed = uint(equal); break;
+		case 4u: passed = uint(!equal); break;
+		case 5u: passed = uint(!less); break;
+		case 6u: passed = uint(!less && !equal); break;
+	}
+}

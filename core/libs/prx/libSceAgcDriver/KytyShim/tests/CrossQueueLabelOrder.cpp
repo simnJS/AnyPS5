@@ -21,9 +21,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <semaphore>
 #include <span>
 #include <stdexcept>
+#include <vector>
 
 using namespace Libs::Graphics;
 
@@ -104,7 +106,7 @@ const char* ProbeCrossQueueLabelOrder(GraphicContext& graphics) {
 	    GuestArena::GuestArenaAllocate_nid_postfix(GuestBytes, GuestBytes));
 	Require(guest != nullptr, "could not allocate guest test memory");
 	GuestArena::GuestArenaCommit_nid_postfix(guest, GuestBytes, 0x04, GuestBytes);
-	guest[0] = 0;
+	guest[0] = ReleaseValue;
 	const auto label = reinterpret_cast<uint64_t>(guest);
 	const auto dump_address = label + 0x2000;
 	const char* failure = nullptr;
@@ -234,6 +236,38 @@ const char* ProbeBufferWriteCoverageCase(GraphicContext& graphics, bool per_invo
 		Pm4Execution dispatch;
 		Require(producer.Process(dispatch, commands) == Pm4ProcessResult::Complete,
 		        "the storage-buffer dispatch did not finish recording");
+		if (per_invocation) {
+			struct Check {
+				uint32_t bytes;
+				uint64_t reference;
+				uint64_t mask;
+				uint32_t function;
+				std::unique_ptr<Buffer> result;
+			};
+			const uint64_t pair = uint64_t {FirstWrite} << 32u | FirstWrite;
+			std::vector<Check> checks;
+			for (const uint32_t bytes: {4u, 8u}) {
+				const uint64_t value = bytes == 8u ? pair : FirstWrite;
+				const uint64_t mask = bytes == 8u ? UINT64_C(0xff00ff00ff00ff00) : UINT64_C(0xff00ff00);
+				for (uint32_t function = 0; function <= 6; ++function) {
+					for (const auto reference: {(value & mask) - 1u, value & mask, (value & mask) + 1u}) {
+						auto result = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+						                                       vk::BufferUsageFlagBits::eStorageBuffer, sizeof(uint32_t));
+						renderer.GetBufferCache().CompareWaitLabel(output + 2u * sizeof(uint32_t), bytes, reference,
+						                                           mask, function, *result);
+						checks.push_back({bytes, reference, mask, function, std::move(result)});
+					}
+				}
+			}
+			scheduler.Finish();
+			for (auto& check: checks) {
+				check.result->Invalidate(0, sizeof(uint32_t));
+				uint32_t passed;
+				std::memcpy(&passed, check.result->Mapped().data(), sizeof(passed));
+				Require(passed == TestWaitRegMemValue(check.bytes == 8u ? pair : FirstWrite, check.reference,
+				                                      check.mask, check.function), "GPU wait comparison differs from PM4");
+			}
+		}
 		const std::array guest_words {0u, FirstWord + words, last_word + words};
 		for (const auto index: guest_words) {
 			Libs::LibKernel::Memory::WriteBacking(output + sizeof(uint32_t) * index, &GuestWrite,

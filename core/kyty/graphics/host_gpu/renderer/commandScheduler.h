@@ -43,6 +43,7 @@ public:
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
+	[[nodiscard]] uint64_t PendingGuestTick(uint64_t address, uint64_t size);
 	[[nodiscard]] bool HasPendingGuestOperations(uint64_t address, uint64_t size);
 	void               WaitPriorityOperations(uint64_t tick);
 	void DeferOperation(Common::UniqueFunction<void>&& operation, uint64_t address = 0,
@@ -165,6 +166,7 @@ private:
 	OperationState               m_operation_state KYTY_GUARDED_BY(m_operation_mutex) = OperationState::Open;
 	uint64_t                     m_priority_active_tick KYTY_GUARDED_BY(m_operation_mutex) = 0;
 	struct GuestWrite {
+		uint64_t tick  = 0;
 		uint64_t id    = 0;
 		uint64_t begin = 0;
 		uint64_t end   = 0;

@@ -118,6 +118,7 @@ private:
 	void              StopExecution();
 	void              ExecuteSync(Common::UniqueFunction<void>&& command);
 	bool              Process(Submission& submission);
+	bool              HasReadyCommands();
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
@@ -160,6 +161,7 @@ private:
 	std::array<WaitRange, QueueCount> m_wait_ranges {};
 	uint32_t                          m_waiting_queues = 0;
 	uint32_t                          m_current_queue  = 0;
+	bool                              m_batch_open = false;
 #if defined(ANYPS5_KYTY)
 
 	struct BlockedSlot {
@@ -198,6 +200,7 @@ private:
 	size_t                        m_pending_first = 0;
 	size_t                        m_pending_count = 0;
 	void                          ForgetExecutedWrites();
+	uint64_t                      OrderedSequence(uint64_t begin, uint64_t end);
 	uint64_t                      m_cp_ordered = 0;
 	void PostUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies);
 	void                                      RunUrgentCommands();
