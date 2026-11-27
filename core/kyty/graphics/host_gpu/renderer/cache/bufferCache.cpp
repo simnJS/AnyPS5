@@ -43,7 +43,8 @@ constexpr uint64_t StaleAge      = 2048;
 constexpr uint64_t PinnedAge     = 4 * uint64_t {BufferCache::USE_SCAN_PERIOD};
 static_assert(PinnedAge < StaleAge);
 
-vk::Result SubmitReadbackQueue(vk::Queue queue, const vk::SubmitInfo& submit, vk::Fence fence, uint64_t needed) {
+vk::Result SubmitReadbackQueue(vk::Queue queue, const vk::SubmitInfo& submit, vk::Fence fence, uint64_t needed,
+                               std::source_location where = std::source_location::current()) {
 	if (!SubmitStats::Enabled()) {
 		return queue.submit(1, &submit, fence);
 	}
@@ -55,7 +56,8 @@ vk::Result SubmitReadbackQueue(vk::Queue queue, const vk::SubmitInfo& submit, vk
 	                     .command_buffers = submit.commandBufferCount,
 	                     .waits           = submit.waitSemaphoreCount,
 	                     .call_ns         = end - start,
-	                     .tick            = needed});
+	                     .tick            = needed,
+	                     .where           = where});
 	return result;
 }
 

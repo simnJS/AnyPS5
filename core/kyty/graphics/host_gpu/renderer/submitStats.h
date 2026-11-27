@@ -57,11 +57,10 @@ struct Caller {
 
 class Window {
 public:
-	void                                   Record(const Call& call);
-	void                                   EndFrame();
+	void                                   Record(const Call& call, bool ends_frame = false);
 	[[nodiscard]] bool                     Empty() const;
 	[[nodiscard]] std::vector<std::string> Summary(double seconds);
-	void                                   Reset();
+	[[nodiscard]] Window                   TakeCompleted();
 
 private:
 	QueueWindow                                             m_queues[static_cast<int>(Queue::Count)] {};
@@ -73,8 +72,7 @@ private:
 [[nodiscard]] bool        Enabled() noexcept;
 [[nodiscard]] const char* QueueName(Queue queue) noexcept;
 [[nodiscard]] std::string CallerName(const std::source_location& where);
-void                      Record(const Call& call);
-void                      EndFrame();
+void                      Record(const Call& call, bool ends_frame = false);
 
 }
 

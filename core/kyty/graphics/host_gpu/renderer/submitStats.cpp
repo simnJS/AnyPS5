@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
+#include <optional>
 
 namespace Libs::Graphics::SubmitStats {
 
@@ -45,8 +46,13 @@ uint64_t Percentile(std::vector<uint64_t>& values, double fraction) {
 }
 
 std::string SlowestCall(const Call& call) {
-	auto text = fmt::format("{:.1f} us at tick {} ({} batches, {} command buffers, {} waits", Us(call.call_ns),
-	                        call.tick, call.batches, call.command_buffers, call.waits);
+	auto text = fmt::format("{:.1f} us", Us(call.call_ns));
+	if (call.queue == Queue::Graphics) {
+		text += fmt::format(" at tick {}", call.tick);
+	} else if (call.queue == Queue::Readback) {
+		text += fmt::format(" waiting on tick {}", call.tick);
+	}
+	text += fmt::format(" ({} batches, {} command buffers, {} waits", call.batches, call.command_buffers, call.waits);
 	if (call.where.line() != 0) {
 		text += fmt::format(", from {}", CallerName(call.where));
 	}
@@ -67,28 +73,6 @@ std::string FrameText(const Frame& frame) {
 	return text;
 }
 
-void WriteLines(const std::vector<std::string>& lines) {
-	for (const auto& line: lines) {
-		::Log::WriteToConsoleAndLog(line);
-	}
-}
-
-void FlushIfDue(State& state, std::vector<std::string>& lines) KYTY_REQUIRES(state.mutex) {
-	const auto now = Common::SteadyNs();
-	if (state.window_start == 0) {
-		state.window_start = now;
-		return;
-	}
-	if (now - state.window_start < SummaryNs) {
-		return;
-	}
-	if (!state.window.Empty()) {
-		lines = state.window.Summary(static_cast<double>(now - state.window_start) / 1e9);
-	}
-	state.window.Reset();
-	state.window_start = now;
-}
-
 }
 
 uint64_t Frame::CallNs() const {
@@ -99,7 +83,7 @@ uint64_t Frame::CallNs() const {
 	return total;
 }
 
-void Window::Record(const Call& call) {
+void Window::Record(const Call& call, bool ends_frame) {
 	auto& queue = m_queues[static_cast<int>(call.queue)];
 	queue.calls++;
 	queue.batches += call.batches;
@@ -124,11 +108,10 @@ void Window::Record(const Call& call) {
 		caller.calls++;
 		caller.call_ns += call.call_ns;
 	}
-}
-
-void Window::EndFrame() {
-	m_frames.push_back(m_frame);
-	m_frame = {};
+	if (ends_frame) {
+		m_frames.push_back(m_frame);
+		m_frame = {};
+	}
 }
 
 bool Window::Empty() const {
@@ -186,11 +169,13 @@ std::vector<std::string> Window::Summary(double seconds) {
 		auto by_time = m_frames;
 		std::sort(by_time.begin(), by_time.end(),
 		          [](const Frame& a, const Frame& b) { return a.CallNs() < b.CallNs(); });
-		const auto max_calls = *std::max_element(calls.begin(), calls.end());
+		const auto max_calls    = *std::max_element(calls.begin(), calls.end());
+		const auto median_calls = Percentile(calls, 0.5);
+		const auto p99_calls    = Percentile(calls, 0.99);
 		lines.push_back(fmt::format(
-		    "[kyty-submit] per frame: graphics calls median {} max {}, graphics batches median {}; time in vkQueueSubmit "
+		    "[kyty-submit] per frame: graphics calls median {} p99 {} max {}, graphics batches median {}; time in vkQueueSubmit "
 		    "median {:.1f} us, p99 {:.1f} us, max {:.1f} us\n",
-		    Percentile(calls, 0.5), max_calls, Percentile(batches, 0.5), Us(by_time[by_time.size() / 2].CallNs()),
+		    median_calls, p99_calls, max_calls, Percentile(batches, 0.5), Us(by_time[by_time.size() / 2].CallNs()),
 		    Us(by_time[std::min(by_time.size() - 1, by_time.size() * 99 / 100)].CallNs()), Us(by_time.back().CallNs())));
 		lines.push_back(fmt::format("[kyty-submit] slowest frame: {}\n", FrameText(by_time.back())));
 		lines.push_back(fmt::format("[kyty-submit] median frame: {}\n", FrameText(by_time[by_time.size() / 2])));
@@ -198,12 +183,10 @@ std::vector<std::string> Window::Summary(double seconds) {
 	return lines;
 }
 
-void Window::Reset() {
-	for (auto& queue: m_queues) {
-		queue = {};
-	}
-	m_frames.clear();
-	m_callers.clear();
+Window Window::TakeCompleted() {
+	Window next;
+	next.m_frame = m_frame;
+	return std::exchange(*this, std::move(next));
 }
 
 bool Enabled() noexcept {
@@ -228,26 +211,28 @@ std::string CallerName(const std::source_location& where) {
 	return fmt::format("{}:{}", file.substr(file.find_last_of("/\\") + 1), where.line());
 }
 
-void Record(const Call& call) {
-	auto&                    state = GetState();
-	std::vector<std::string> lines;
+void Record(const Call& call, bool ends_frame) {
+	auto&                 state = GetState();
+	std::optional<Window> completed;
+	uint64_t              elapsed = 0;
 	{
 		Common::ScopedLock lock(state.mutex);
-		FlushIfDue(state, lines);
-		state.window.Record(call);
+		const auto now = Common::SteadyNs();
+		if (state.window_start == 0) {
+			state.window_start = now;
+		}
+		elapsed = now - state.window_start;
+		if (elapsed >= SummaryNs) {
+			completed.emplace(state.window.TakeCompleted());
+			state.window_start = now;
+		}
+		state.window.Record(call, ends_frame);
 	}
-	WriteLines(lines);
-}
-
-void EndFrame() {
-	auto&                    state = GetState();
-	std::vector<std::string> lines;
-	{
-		Common::ScopedLock lock(state.mutex);
-		FlushIfDue(state, lines);
-		state.window.EndFrame();
+	if (completed) {
+		for (const auto& line: completed->Summary(static_cast<double>(elapsed) / 1e9)) {
+			::Log::WriteToConsoleAndLog(line);
+		}
 	}
-	WriteLines(lines);
 }
 
 }

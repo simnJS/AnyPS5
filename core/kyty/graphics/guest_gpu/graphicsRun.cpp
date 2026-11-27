@@ -3307,7 +3307,8 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
 #endif
-		GetScheduler().Flush();
+		SubmitInfo submit {.ends_frame = true};
+		GetScheduler().Flush(submit);
 #if defined(ANYPS5_KYTY)
 		NoteAbFlip();
 #endif
@@ -3339,7 +3340,8 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		GetScheduler().DeferHostOperation(
 		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
 #endif
-		GetScheduler().Flush();
+		SubmitInfo submit {.ends_frame = true};
+		GetScheduler().Flush(submit);
 #if defined(ANYPS5_KYTY)
 		NoteAbFlip();
 #endif
