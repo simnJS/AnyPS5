@@ -333,16 +333,12 @@ void printTail(const std::string& log) {
 }
 
 std::uint64_t manifestCompute(const std::string& log) {
-    const auto at = log.rfind("Pipeline manifest: idle at ");
-    if (at == std::string::npos) return UINT64_MAX;
-    const auto end = log.find('\n', at);
-    const auto line = log.substr(at, end == std::string::npos ? end : end - at);
-    const auto phrase = line.find(" compute pipelines created");
-    if (phrase == std::string::npos) return UINT64_MAX;
-    auto start = phrase;
-    while (start > 0 && line[start - 1] >= '0' && line[start - 1] <= '9') --start;
-    if (start == phrase) return UINT64_MAX;
-    return std::strtoull(line.c_str() + start, nullptr, 10);
+    const auto at = log.rfind("; compute pipelines ");
+    unsigned built = 0, cached = 0, failed = 0;
+    if (at == std::string::npos ||
+        std::sscanf(log.c_str() + at, "; compute pipelines %u built, %u cached, %u failed", &built, &cached, &failed) != 3 ||
+        failed != 0) return UINT64_MAX;
+    return static_cast<std::uint64_t>(built) + cached;
 }
 
 bool changedOutput(std::string_view output) {
