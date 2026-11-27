@@ -702,16 +702,18 @@ const char* CheckRepeatedDetile(GraphicContext& graphics, uint64_t address) {
 			data[17] ^= 0xffffffffu;
 			Libs::LibKernel::Memory::WriteBacking(source, data.data(), bytes);
 		} else if (step == 2) {
+			if (!textures.ClearImageFromBuffer(scheduler.Current(), address, bytes, 0)) {
+				failure = "the destination image clear was rejected";
+				break;
+			}
+		} else if (step == 3) {
 			(void)textures.InvalidateMemory(address, bytes);
 			Libs::LibKernel::Memory::WriteBacking(address, data.data(), bytes);
 			textures.UpdateImage(target);
 			textures.MarkGpuWritten(target);
-		} else if (step == 3) {
+		} else if (step == 4) {
 			const auto [buffer, offset] = buffers.ObtainBuffer(source, bytes, true, false);
 			buffer->Fill(offset, bytes, FillValue);
-		} else if (step == 4 && !textures.ClearImageFromBuffer(scheduler.Current(), address, bytes, 0)) {
-			failure = "the destination image clear was rejected";
-			break;
 		}
 		textures.MarkGpuWritten(reference);
 		const auto before = image.write_count;
