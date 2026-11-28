@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "loader/systemContent.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/skipLog.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -702,6 +703,7 @@ const ShaderModule* RenderExecutor::ResolveComputeHere(const HW::ComputeShaderIn
 }
 
 void RenderExecutor::LogResolveSummary() {
+	Common::SkipLog::Summarize(m_context.FrameNumber());
 	const auto now  = Common::SteadyNs();
 	auto       last = g_resolve_line.load(std::memory_order_relaxed);
 	if (last == 0) {
@@ -1793,11 +1795,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 	m_context.GetImageHeap().BeginDraw();
 	if (!shaders_resolved) {
 		const auto begin = Common::SteadyNs();
+		Common::SkipLog::Request(0);
 		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state, prefer_generic);
 		Bump(g_execute_resolve.here_ns[0], Common::SteadyNs() - begin);
 		Bump(g_execute_resolve.here[0][static_cast<size_t>(m_execute_cause)]);
 	}
 	if (state.vertex_info[0].stage.module == nullptr) {
+		Common::SkipLog::Lost(Common::SkipLog::Kind::Draw);
 		return false;
 	}
 	const auto& vp = buffer.GetRegisters().GetScreenViewport();
@@ -2225,6 +2229,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		        !SmallColorTargetDraw(buffer.GetRegisters()));
 	}
 	if (pipeline_ptr == nullptr) {
+		const auto* stage = state.ps_active ? state.ps_input_info.stage.module : state.vertex_info[0].stage.module;
+		Common::SkipLog::Lost(Common::SkipLog::Kind::Draw, Common::SkipLog::Cause::NoPipeline, stage != nullptr ? stage->info.shader_hash : 0);
 		return;
 	}
 	auto& pipeline = *pipeline_ptr;
