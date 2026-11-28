@@ -32,6 +32,35 @@ LIBRARY_FIELDS = {
     "fs": ("ms", "sshade", "a2c"),
 }
 
+BUFFER_AXES = {"f": "buffer-format", "sw": "buffer-format", "oob": "buffer-empty", "empty": "buffer-empty",
+               "ir": "buffer-table", "im": "buffer-table", "is": "buffer-table"}
+IMAGE_AXES = {"n": "image-class", "d": "image-dimension", "cube": "image-dimension", "tc": "image-table-capacity",
+              "t": "image-table", "tm": "image-table", "te": "image-table", "heap": "image-heap",
+              "ir": "image-search", "im": "image-search", "is": "image-search"}
+KEY_FLAGS = {"rb": "key-runtime-buffers", "rs": "key-runtime-samplers", "async": "key-async-queue"}
+AXIS_GROUPS = (
+    ("image-addressing", ("image-search", "image-search-classes", "image-search-candidates", "image-heap",
+                          "image-table", "image-table-capacity")),
+    ("buffer-bounds-bits", ("buffer-bounds-bits",)),
+    ("buffer-layout", ("buffer-count", "buffer-stride", "buffer-format", "buffer-empty", "buffer-table")),
+    ("image-class", ("image-class",)),
+    ("image-shape", ("image-count", "image-dimension", "image-format")),
+    ("samplers", ("sampler-count", "sampler-table")),
+    ("program-key", ("key-runtime-buffers", "key-runtime-samplers", "key-async-queue", "key-static-interface",
+                     "push-data-cursor")),
+    ("function-code", ("function-code",)),
+)
+AXIS_GROUP = {axis: group for group, axes in AXIS_GROUPS for axis in axes}
+STATE_AXES = (
+    ("color-format", re.compile(r"cc|c\d")),
+    ("depth-format", re.compile(r"depth|stencil")),
+    ("color-mask", re.compile(r"m\d")),
+    ("blend", re.compile(r"b\d")),
+    ("samples", re.compile(r"ms|sshade|a2c")),
+    ("rasterizer", re.compile(r"neg|noclip|pvlast|poly|pcp|mhull")),
+    ("vertex-input", re.compile(r"topo|restart|vb|va")),
+)
+
 STALL = re.compile(r"\[kyty-gpl\] stall (\d+\.\d+) s (\S+) 0x([0-9a-fA-F]{16})(?: (.*?))? ?@(\d+)\s*$")
 TRANSLATE = re.compile(r"\[kyty-gpl\] translate (\d+\.\d+) s 0x([0-9a-fA-F]{16})(?: (.*?))? ?@(\d+)\s*$")
 WAITING = re.compile(r"\[kyty-gpl\] waiting_shader shader=([0-9a-fA-F]{16}) elapsed_s=(\d+\.\d+) monotonic_ns=(\d+)")
@@ -60,10 +89,10 @@ class Module:
     def program_key(self):
         return (self.stage, self.code) + tuple(
             (key, value) for key, value in sorted(self.fields.items())
-            if key not in VARIATION_FIELDS and key != "gg" and (key != "cur" or self.stage == "cs"))
+            if key not in VARIATION_FIELDS and key not in ("gg", "fn") and (key != "cur" or self.stage == "cs"))
 
     def recipe_key(self, canonical):
-        return self.program_key() + (self.generic,) + tuple(
+        return self.program_key() + (self.generic, self.fields.get("fn", "")) + tuple(
             canonical_elements(key, self.fields.get(key, "")) if canonical else self.fields.get(key, "")
             for key in VARIATION_FIELDS)
 
@@ -141,6 +170,115 @@ def canonical_elements(key, text):
             element = "/".join(name if value is True else f"{name}:{value}" for name, value in fields.items())
         elements.append(element)
     return ",".join(elements)
+
+
+ELEMENT_AXES = {}
+
+
+def element_axes(kind, element, canonical=False):
+    cached = ELEMENT_AXES.get((kind, element, canonical))
+    if cached is not None:
+        return cached
+    axes = defaultdict(list)
+    names = BUFFER_AXES if kind == "buffer" else IMAGE_AXES
+    fields = element_fields(element)
+    for name, value in sorted(fields.items()):
+        if kind == "buffer" and name == "st":
+            stride = int(value) if isinstance(value, str) and value.isdigit() else 0
+            read_at_run_time = canonical and "ir" not in fields and stride & STRIDE_MASK == STRIDE_MASK
+            if stride & BOUNDS_BITS and not read_at_run_time:
+                axes["buffer-bounds-bits"].append(stride & BOUNDS_BITS)
+            axes["buffer-stride"].append(stride & ~BOUNDS_BITS)
+        else:
+            axes[names.get(name, f"{kind}-format")].append((name, value))
+    cached = {axis: tuple(values) for axis, values in axes.items()}
+    ELEMENT_AXES[(kind, element, canonical)] = cached
+    return cached
+
+
+def recipe_axes(module, canonical=False):
+    axes = {}
+    static = []
+    for name, value in sorted(module.fields.items()):
+        if name in KEY_FLAGS:
+            axes[KEY_FLAGS[name]] = True
+        elif name == "fn":
+            axes["function-code"] = value
+        elif name == "cur":
+            if module.stage == "cs":
+                axes["push-data-cursor"] = value
+        elif name not in VARIATION_FIELDS and name != "gg":
+            static.append((name, value))
+    axes["key-static-interface"] = tuple(static)
+    buffers = split_elements(module.fields.get("sb", ""))
+    axes["buffer-count"] = len(buffers)
+    per_axis = defaultdict(list)
+    for index, element in enumerate(buffers):
+        for axis, value in element_axes("buffer", element, canonical).items():
+            per_axis[axis].append((index, value))
+    images = split_elements(module.fields.get("si", ""))
+    counts = Counter(images)
+    roots = set()
+    plain = set()
+    for element in counts:
+        root = element_fields(element).get("ir")
+        if root is None:
+            plain.add(element)
+        elif isinstance(root, str) and root.isdigit() and int(root) < len(images) and images[int(root)] == element:
+            roots.add(int(root))
+    if plain:
+        roots.update(index for index, element in enumerate(images) if element in plain)
+    for index in roots:
+        counts[images[index]] -= 1
+    candidates = tuple(sorted((element, count) for element, count in counts.items() if count > 0))
+    axes["image-count"] = len(roots)
+    if candidates:
+        axes["image-search-candidates"] = sum(count for _, count in candidates)
+        axes["image-search-classes"] = candidates
+    for position, index in enumerate(sorted(roots)):
+        for axis, value in element_axes("image", images[index]).items():
+            per_axis[axis].append((position, value))
+    for axis, values in per_axis.items():
+        axes[axis] = tuple(values)
+    samplers = split_elements(module.fields.get("ss", ""))
+    axes["sampler-count"] = len(samplers)
+    if any(element not in ("", "-") for element in samplers):
+        axes["sampler-table"] = tuple(samplers)
+    return axes
+
+
+def state_axes(state):
+    axes = defaultdict(list)
+    for name, value in state:
+        axis = next((label for label, pattern in STATE_AXES if pattern.fullmatch(name)), "other-state")
+        axes[axis].append((name, value))
+    return {axis: tuple(values) for axis, values in axes.items()}
+
+
+def axis_table(groups, grouping=None):
+    table = defaultdict(lambda: {"groups": 0, "values": 0, "merged": 0})
+    for recipes in groups:
+        distinct = {tuple(sorted(recipe.items(), key=lambda item: item[0])) for recipe in map(freeze_axes, recipes)}
+        if len(distinct) < 2:
+            continue
+        names = defaultdict(set)
+        for recipe in distinct:
+            for name, _ in recipe:
+                names[grouping.get(name, name) if grouping else name].add(name)
+        for label, members in names.items():
+            values = {tuple(item for item in recipe if item[0] in members) for recipe in distinct}
+            if len(values) < 2:
+                continue
+            without = {tuple(item for item in recipe if item[0] not in members) for recipe in distinct}
+            row = table[label]
+            row["groups"] += 1
+            row["values"] += len(values) - 1
+            row["merged"] += len(distinct) - len(without)
+    return dict(sorted(table.items(), key=lambda item: (-item[1]["values"], item[0])))
+
+
+def freeze_axes(axes):
+    return {name: value if isinstance(value, (tuple, str, int, bool)) else repr(value) for name, value in axes.items()}
 
 
 def read_manifest(path, module_limit=None, pipeline_limit=None):
@@ -239,6 +377,9 @@ def closest_recipe(wanted, prepared, canonical):
             step, why = diff_elements(key, left, right)
             distance += step
             reasons |= why
+        if wanted.fields.get("fn", "") != candidate.fields.get("fn", ""):
+            distance += 1
+            reasons.add("function-code")
         if best is None or distance < best[0]:
             best = (distance, reasons, candidate)
     return best
@@ -508,6 +649,81 @@ class Session:
             wait.cause = "other:prepared-module-without-driver-pipeline"
             wait.evidence = "every recipe requested was in the manifest loaded at startup"
 
+    def variant_map(self, top=20):
+        loaded = defaultdict(list)
+        fresh = defaultdict(list)
+        seen = set()
+        for module in self.prepared.modules:
+            recipe = module.recipe_key(self.canonical_strides)
+            if not module.generic and recipe not in seen:
+                seen.add(recipe)
+                loaded[(module.stage, module.code)].append(module)
+        for modules in self.new_programs.values():
+            for module in modules:
+                fresh[(module.stage, module.code)].append(module)
+        axes = {}
+
+        def axes_of(module):
+            found = axes.get(id(module))
+            if found is None:
+                found = axes[id(module)] = recipe_axes(module, self.canonical_strides)
+            return found
+
+        programs = sorted(set(loaded) | set(fresh))
+        groups = {program: [axes_of(module) for module in loaded.get(program, []) + fresh.get(program, [])]
+                  for program in programs}
+        made_new = defaultdict(lambda: {"variants": 0, "alone": 0, "programs": set()})
+        for program, modules in fresh.items():
+            known = [axes_of(module) for module in loaded.get(program, [])]
+            for module in modules:
+                wanted = axes_of(module)
+                if not known:
+                    names = {"no-loaded-recipe"}
+                else:
+                    names = min(({AXIS_GROUP.get(name, name) for name in set(wanted) | set(other)
+                                  if wanted.get(name) != other.get(name)} for other in known), key=len)
+                for name in names or {"order-of-elements"}:
+                    row = made_new[name]
+                    row["variants"] += 1
+                    row["alone"] += len(names) <= 1
+                    row["programs"].add(program)
+        table = axis_table(groups.values())
+        grouped = axis_table(groups.values(), AXIS_GROUP)
+        ranked = sorted(programs, key=lambda item: -(len(loaded.get(item, [])) + len(fresh.get(item, []))))
+        listing = []
+        for program in ranked[:top] if top else ranked:
+            own = axis_table([groups[program]], AXIS_GROUP)
+            listing.append({"stage": program[0], "program": program[1], "loaded": len(loaded.get(program, [])),
+                            "new": len(fresh.get(program, [])),
+                            "fields": {name: row["values"] + 1 for name, row in own.items()}})
+        states = defaultdict(set)
+        fresh_states = defaultdict(set)
+        for manifest, target in ((self.prepared, states), (self.recorded, fresh_states)):
+            for pipeline in manifest.pipelines:
+                stages = self.pipeline_programs(manifest, pipeline)
+                if stages is not None:
+                    target[tuple((stage[1], stage[2]) for stage in stages)].add(pipeline.state)
+        new_states = sum(len(found - states.get(pair, set())) for pair, found in fresh_states.items())
+        for pair, found in fresh_states.items():
+            states[pair] |= found
+        state_table = axis_table([[state_axes(state) for state in found] for found in states.values()])
+        return {
+            "programs": len(programs),
+            "stages": dict(Counter(program[0] for program in programs)),
+            "loaded": sum(len(modules) for modules in loaded.values()),
+            "new": sum(len(modules) for modules in fresh.values()),
+            "programs_with_new": len(fresh),
+            "field_groups": grouped,
+            "fields": table,
+            "new_fields": {name: {"variants": row["variants"], "alone": row["alone"], "programs": len(row["programs"])}
+                           for name, row in sorted(made_new.items(), key=lambda item: -item[1]["variants"])},
+            "top_programs": listing,
+            "stage_sets": len(states),
+            "render_states": sum(len(found) for found in states.values()),
+            "new_render_states": new_states,
+            "state_fields": state_table,
+        }
+
     def summary(self):
         families = {name: {"waits": 0, "seconds": 0.0, "programs": set(), "causes": defaultdict(lambda: [0, 0.0, set()])}
                     for name, _ in FAMILIES}
@@ -595,6 +811,42 @@ def print_report(session, detail, limit):
         print(f"{'':12s}{wait.evidence}")
 
 
+def print_variants(session, top):
+    report = session.variant_map(top)
+    stages = ", ".join(f"{count} {stage}" for stage, count in sorted(report["stages"].items()))
+    print(f"variants: {report['programs']} programs with recipes ({stages}); {report['loaded']} distinct recipes "
+          f"loaded at startup, {report['new']} new in this session in {report['programs_with_new']} programs")
+    print()
+    members = dict(AXIS_GROUPS)
+    print("fields that make the variants, over the loaded and the new recipes")
+    print(f"{'programs':>9} {'values':>7} {'merged':>7}  field")
+    for name, row in report["field_groups"].items():
+        print(f"{row['groups']:9d} {row['values']:7d} {row['merged']:7d}  {name}")
+        for member in members.get(name, ()):
+            detail = report["fields"].get(member)
+            if detail is not None and len(members[name]) > 1:
+                print(f"{detail['groups']:9d} {detail['values']:7d} {detail['merged']:7d}      {member}")
+    print("  values: variants the field makes on its own (its distinct values per program, minus one)")
+    print("  merged: recipes that would fold into another one if the field left the key")
+    print()
+    print("fields that made the new variants of this session, against the closest loaded recipe")
+    print(f"{'variants':>9} {'alone':>7} {'programs':>9}  field")
+    for name, row in report["new_fields"].items():
+        print(f"{row['variants']:9d} {row['alone']:7d} {row['programs']:9d}  {name}")
+    print()
+    print("programs with the most variants")
+    print(f"{'loaded':>7} {'new':>5}  stage program           fields (distinct values)")
+    for row in report["top_programs"][:top or 20]:
+        fields = ", ".join(f"{name} {count}" for name, count in row["fields"].items())
+        print(f"{row['loaded']:7d} {row['new']:5d}  {row['stage']:5s} {row['program']}  {fields}")
+    print()
+    print(f"render states: {report['render_states']} over {report['stage_sets']} sets of stage programs, "
+          f"{report['new_render_states']} new in this session")
+    print(f"{'sets':>9} {'values':>7} {'merged':>7}  field")
+    for name, row in report["state_fields"].items():
+        print(f"{row['groups']:9d} {row['values']:7d} {row['merged']:7d}  {name}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Classify every shader and pipeline wait of a session by the reason the generic form did not serve it.")
@@ -605,6 +857,8 @@ def main():
     parser.add_argument("--code-store", type=Path)
     parser.add_argument("--detail", action="store_true", help="list every wait with its evidence")
     parser.add_argument("--top", type=int, default=0, help="with --detail, only the longest N waits")
+    parser.add_argument("--variants", action="store_true",
+                        help="map the variants: which fields of the key make them, per program and overall")
     parser.add_argument("--json", action="store_true")
     arguments = parser.parse_args()
     results = []
@@ -614,6 +868,8 @@ def main():
                           arguments.code_store or code)
         if arguments.json:
             report = session.summary()
+            if arguments.variants:
+                report["variants"] = session.variant_map(arguments.top)
             if arguments.detail:
                 report["list"] = [
                     {"kind": wait.kind, "stage": wait.stage, "program": wait.program, "seconds": wait.seconds,
@@ -625,6 +881,9 @@ def main():
             if index:
                 print()
             print_report(session, arguments.detail, arguments.top)
+            if arguments.variants:
+                print()
+                print_variants(session, arguments.top or 20)
     if arguments.json:
         json.dump(results, sys.stdout, indent=1)
         print()

@@ -189,6 +189,48 @@ class StallReportTests(unittest.TestCase):
         summary = session.summary()
         self.assertEqual((summary["waits"], summary["engine_causes"], summary["unknown_waits"]), (4, 2, 1))
 
+    def test_variant_map_ranks_the_fields_that_make_variants(self):
+        search = "n:Float/d:2D/ir:0"
+        prepared = [
+            f"M 000000000001 cs code=0000000000000ab1 {COMPUTE} sb=st:16,st:1 si=n:Float/d:2D/heap",
+            f"M 000000000002 cs code=0000000000000ab1 {COMPUTE} sb=st:2097168,st:4194305 si=n:Float/d:2D/heap",
+            f"M 000000000003 cs code=0000000000000ab1 {COMPUTE} sb=st:16,st:1 si=n:Float/d:2D/t:0/tc:65536",
+            f"M 000000000004 cs code=0000000000000ab1 {COMPUTE} async sb=st:16,st:1 si=n:Float/d:2D/t:0/tc:65536",
+            f"M 000000000005 ps code=0000000000000ab2 {PIXEL} sb=st:48",
+            f"M 000000000006 ps code=0000000000000ab2 {PIXEL} gg",
+            f"M 000000000007 vs code=0000000000000ab3 ud=4 cur=33",
+            f"P v=000000000007 p=000000000005 {STATE}",
+            f"P v=000000000007 p=000000000005 cc=1 c0=R16G16B16A16Sfloat depth=D32Sfloat m0=f",
+        ]
+        recorded = [line for line in prepared if "st:2097168" not in line] + [
+            f"M 000000000011 cs code=0000000000000ab1 {COMPUTE} sb=st:16,st:1 "
+            f"si=n:Float/d:2D/ir:0/im:9,{search},{search},n:Uint/d:2D/ir:0",
+            f"M 000000000012 ps code=0000000000000ab2 {PIXEL} sb=st:2097200",
+            f"M 000000000013 cs code=0000000000000ab4 {COMPUTE} fn=be8a0381be802002",
+        ]
+        session = self.session([], prepared, recorded, ["0000000000000ab1"])
+        report = session.variant_map()
+        self.assertEqual((report["programs"], report["loaded"], report["new"], report["programs_with_new"]), (4, 6, 3, 3))
+        groups = report["field_groups"]
+        self.assertEqual(groups["image-addressing"], {"groups": 1, "values": 2, "merged": 2})
+        self.assertEqual(groups["buffer-bounds-bits"], {"groups": 2, "values": 2, "merged": 2})
+        self.assertEqual(groups["program-key"], {"groups": 1, "values": 1, "merged": 1})
+        self.assertEqual(report["fields"]["key-async-queue"]["merged"], 1)
+        self.assertEqual(report["fields"]["image-search-candidates"]["values"], 1)
+        self.assertEqual(report["new_fields"], {
+            "image-addressing": {"variants": 1, "alone": 1, "programs": 1},
+            "buffer-bounds-bits": {"variants": 1, "alone": 1, "programs": 1},
+            "no-loaded-recipe": {"variants": 1, "alone": 1, "programs": 1},
+        })
+        first = report["top_programs"][0]
+        self.assertEqual((first["program"], first["loaded"], first["new"]), ("0000000000000ab1", 4, 1))
+        self.assertEqual((report["stage_sets"], report["render_states"]), (1, 2))
+        self.assertEqual(report["state_fields"]["color-format"], {"groups": 1, "values": 1, "merged": 1})
+        text = subprocess.run([sys.executable, "-B", str(TOOL), str(self.root), "--variants"],
+                              check=True, capture_output=True, text=True).stdout
+        self.assertIn("fields that made the new variants of this session", text)
+        self.assertIn("image-addressing", text)
+
     def test_command_line_report(self):
         self.session(
             ["[kyty-gpl] stall 0.500 s compute-sync 0x0000000000000aa1  why=writes-buffers @3000000000"],
