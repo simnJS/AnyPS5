@@ -31,3 +31,4 @@ kyty_shim_wave_split_written_reads	same device requirement as kyty_shim_depth_ta
 kyty_shim_depth_meta_fill	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_async_pipeline_waits	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_image_heap_reads_cost	a GPU timing of the heap read marks: 67 million texel fetches per run, which llvmpipe runs on the CPU for minutes and whose timings would mean nothing
+kyty_shim_generic_graphics_selectors	same device requirement as kyty_shim_depth_target_alias

@@ -641,7 +641,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
                                    const SrtRuntime& runtime, ResourceSnapshot& snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
-                                   Normalize&& normalize) {
+                                   Normalize&& normalize, uint32_t fixed_keys = 0u,
+                                   uint32_t fixed_children = 0u) {
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
@@ -1186,8 +1187,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	const auto selected_keys = byte_keys ? std::span<const uint32_t>(byte_offsets)
 	                                    : std::span<const uint32_t>(keys);
 	const auto key_count = sources.empty() ? selected_keys.size() : sources.size();
+	if (fixed_keys != 0u && key_count > fixed_keys) return false;
 	const bool stable_layout = g_stable_indirect_layouts.load(std::memory_order_relaxed);
-	const auto key_capacity  = !stable_layout ? key_count : std::max<size_t>(
+	const auto key_capacity  = fixed_keys != 0u ? size_t {fixed_keys} : !stable_layout ? key_count : std::max<size_t>(
 	    program.stage == ShaderType::Compute ? g_compute_indirect_keys.load(std::memory_order_relaxed)
 	                                         : MinIndirectMappingCapacity,
 	    std::bit_ceil(key_count));
@@ -1223,7 +1225,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = key;
 		snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = ordinal;
 	}
-	if (descriptors.size() == children_begin) {
+	if (fixed_keys != 0u) {
+		const auto children = descriptors.size() - children_begin;
+		if (children > fixed_children) return false;
+		auto child          = root_resource;
+		child.indirect_root = resource_index;
+		for (auto padded = children; padded < fixed_children; ++padded) {
+			descriptors.push_back(descriptors[resource_index]);
+			specializations.push_back(child);
+		}
+		auto& root                      = specializations[resource_index];
+		root.indirect_root              = resource_index;
+		root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
+		root.indirect_search_iterations = std::bit_width(key_capacity);
+	} else if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
 #if defined(ANYPS5_KYTY)
@@ -2525,6 +2540,38 @@ void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& s
 	}
 }
 
+constexpr uint32_t GenericSelectedImageKeys   = 8u;
+constexpr uint32_t GenericSelectedImageViews  = 4u;
+constexpr uint32_t GenericSelectedSamplerKeys = 256u;
+constexpr uint32_t GenericSelectedSamplers    = 16u;
+
+static bool GenericSelectedSource(const ResourcePlan& plan, uint32_t index) {
+	const auto& indirect = *plan.descriptor_sources[index].indirect_descriptor;
+	if (!indirect.selector || indirect.table_array || !indirect.sources.empty() || indirect.pointer_table ||
+	    indirect.table_scalar || indirect.workgroup_axis != UINT32_MAX || IsBoundedDescriptorTable(plan, indirect))
+		return false;
+	bool used = false;
+	for (const auto& buffer: plan.info.buffers) {
+		if (buffer.source == index) return false;
+	}
+	for (const auto& image: plan.info.images) {
+		if (image.source != index) continue;
+		if (image.resource_class != ImageResourceClass::Sampled || image.written || image.atomic) return false;
+		used = true;
+	}
+	for (const auto& sampler: plan.info.samplers) {
+		if (sampler.source != index) continue;
+		if (sampler.runtime_descriptor) return false;
+		used = true;
+	}
+	return used;
+}
+
+static bool SelectedSource(const ResourcePlan& plan, uint32_t index) {
+	return index < plan.descriptor_sources.size() && plan.descriptor_sources[index].indirect_descriptor &&
+	       !plan.descriptor_sources[index].indirect_descriptor->table_array;
+}
+
 bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shape, const char** refusal) {
 	const auto refuse = [&](const char* reason) {
 		if (refusal != nullptr) *refusal = reason;
@@ -2539,8 +2586,11 @@ bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shap
 	for (uint32_t i = 0; i < plan.descriptor_sources.size(); ++i) {
 		const auto& source = plan.descriptor_sources[i];
 		if (!source.indirect_descriptor) continue;
+		if (!source.indirect_descriptor->table_array) {
+			if (GenericSelectedSource(plan, i)) continue;
+			return refuse("indirect_descriptor_not_table_array");
+		}
 		if (table_source != UINT32_MAX) return refuse("several_indirect_tables");
-		if (!source.indirect_descriptor->table_array) return refuse("indirect_descriptor_not_table_array");
 		if (source.dword_count != 8u) return refuse("indirect_table_not_8_dwords");
 		table_source = i;
 	}
@@ -2559,27 +2609,43 @@ bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shap
 		if (buffer.formatted && (buffer.written || buffer.atomic)) return refuse("formatted_buffer_written");
 	}
 	ReadStridesAtRunTime(plan, shape);
+	auto flattened = static_cast<uint32_t>(plan.srt_reads.size());
 	for (const auto& image: plan.info.images) {
 		const bool table = image.source == table_source && table_source != UINT32_MAX;
 		if (image.mip_mode != ImageMipMode::None) return refuse("image_mip_mode");
 		if (!table && image.paired_view != ImageResource::NoIndirectImage) return refuse("image_paired_view");
-		if (table && (image.resource_class != ImageResourceClass::Sampled || image.depth_compare ||
-		              image.atomic || image.written || image.r128))
+		if (table && (image.resource_class != ImageResourceClass::Sampled || image.atomic || image.written ||
+		              image.r128))
 			return refuse("table_image_not_plain_sampled");
+		const auto index = static_cast<uint32_t>(shape.images.size());
 		auto& view = shape.images.emplace_back();
 		if (table) {
 			view.table = 0;
 			view.table_capacity = ImageTableCapacity(0);
 			view.table_entry_mask = plan.descriptor_sources[table_source].indirect_descriptor->table_mask >> 5u;
 			view.skip_degamma = image.skip_degamma;
+		} else if (SelectedSource(plan, image.source)) {
+			view.indirect_root              = index;
+			view.indirect_mapping_offset    = flattened;
+			view.indirect_search_iterations = std::bit_width(GenericSelectedImageKeys);
+			flattened += 1u + GenericSelectedImageKeys * 2u;
 		}
 		view.dimension = image.dimension == Decoder::ImageDimension::Unknown ? Decoder::ImageDimension::Dim2D : image.dimension;
 		view.numeric_class = image.atomic ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float;
 		view.cube = image.cube;
 	}
 	for (uint32_t i = 0; i < plan.info.images.size(); ++i) {
+		if (shape.images[i].indirect_search_iterations == 0u) continue;
+		auto child                       = shape.images[i];
+		child.indirect_mapping_offset    = 0;
+		child.indirect_search_iterations = 0;
+		for (uint32_t view = 1; view < GenericSelectedImageViews; ++view) shape.images.push_back(child);
+	}
+	for (uint32_t i = 0; i < plan.info.images.size(); ++i) {
 		const auto& resource = plan.info.images[i];
-		if (resource.depth_compare || resource.atomic || shape.images[i].table_capacity != 0u) continue;
+		if (resource.depth_compare || resource.atomic || shape.images[i].table_capacity != 0u ||
+		    shape.images[i].indirect_search_iterations != 0u)
+			continue;
 		shape.images[i].indirect_root = i;
 		auto view = shape.images[i];
 		view.numeric_class = Prospero::TextureNumericClass::Uint;
@@ -2590,18 +2656,39 @@ bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shap
 		}
 	}
 	shape.samplers.resize(plan.info.samplers.size());
+	for (uint32_t i = 0; i < plan.info.samplers.size(); ++i) {
+		if (!SelectedSource(plan, plan.info.samplers[i].source)) continue;
+		auto& root                      = shape.samplers[i];
+		root.indirect_root              = i;
+		root.indirect_mapping_offset    = flattened;
+		root.indirect_search_iterations = std::bit_width(GenericSelectedSamplerKeys);
+		flattened += 1u + GenericSelectedSamplerKeys * 2u;
+	}
+	for (uint32_t i = 0; i < plan.info.samplers.size(); ++i) {
+		if (shape.samplers[i].indirect_search_iterations == 0u) continue;
+		for (uint32_t sampler = 1; sampler < GenericSelectedSamplers; ++sampler)
+			shape.samplers.push_back({.indirect_root = i});
+	}
 	return true;
 }
 
 bool BindGenericGraphics(const ResourcePlan& plan, ResourceSnapshot& snapshot,
                          const ResourceSpecialization& live, const ResourceSpecialization& generic) {
+	size_t selected_views = 0;
+	for (size_t i = plan.info.images.size(); i < generic.images.size(); ++i) {
+		const auto root = generic.images[i].indirect_root;
+		selected_views += root < generic.images.size() && generic.images[root].indirect_search_iterations != 0u;
+	}
 	if (live.images.size() > generic.images.size() || live.samplers != generic.samplers ||
 	    live.buffers.size() != generic.buffers.size() || snapshot.buffers.size() != generic.buffers.size() ||
 	    snapshot.images.size() != live.images.size() || snapshot.samplers.size() != live.samplers.size() ||
-	    plan.info.buffers.size() != live.buffers.size() || plan.info.images.size() != live.images.size()) return false;
+	    plan.info.buffers.size() != live.buffers.size() ||
+	    plan.info.images.size() + selected_views != live.images.size()) return false;
 	snapshot.graphics_image_banks.assign(live.images.size(), 0);
 	for (size_t i = 0; i < live.images.size(); ++i) {
-		const auto& image = plan.info.images[i];
+		const auto root = i < plan.info.images.size() ? i : live.images[i].indirect_root;
+		if (root >= plan.info.images.size()) return false;
+		const auto& image = plan.info.images[root];
 		auto expected = generic.images[i];
 		if (expected.table_capacity != 0u) {
 			const auto& observed = live.images[i];
@@ -2618,7 +2705,7 @@ bool BindGenericGraphics(const ResourcePlan& plan, ResourceSnapshot& snapshot,
 			expected.table_mapping_offset = observed.table_mapping_offset;
 			snapshot.graphics_image_banks[i] = observed.table_mapping_offset;
 		}
-		if (expected.indirect_root == i) {
+		if (expected.indirect_root == i && expected.indirect_search_iterations == 0u) {
 			expected.indirect_root = ImageResource::NoIndirectImage;
 			if (live.images[i].numeric_class == Prospero::TextureNumericClass::Uint ||
 			    (image.resource_class == ImageResourceClass::Sampled &&
@@ -2895,11 +2982,44 @@ bool IndirectSamplerMaterializationFailed() {
 	return t_indirect_sampler_failure;
 }
 
+struct FixedCandidates {
+	uint32_t keys     = 0;
+	uint32_t children = 0;
+};
+
+template <typename View>
+static FixedCandidates GenericCandidates(std::span<const View> views, uint32_t resource) {
+	if (resource >= views.size() || views[resource].indirect_root != resource ||
+	    views[resource].indirect_search_iterations == 0u)
+		return {};
+	FixedCandidates fixed {.keys = 1u << (views[resource].indirect_search_iterations - 1u)};
+	for (size_t i = 0; i < views.size(); ++i) fixed.children += i != resource && views[i].indirect_root == resource;
+	return fixed;
+}
+
+template <typename Specialization>
+static void AppendIdleCandidates(std::vector<uint32_t>& flattened_srt, std::vector<DescriptorValue>& descriptors,
+                                 std::vector<Specialization>& specializations, uint32_t resource,
+                                 uint32_t dword_count, FixedCandidates fixed) {
+	auto child          = specializations[resource];
+	child.indirect_root = resource;
+	for (uint32_t i = 0; i < fixed.children; ++i) {
+		descriptors.push_back({.dword_count = dword_count});
+		specializations.push_back(child);
+	}
+	auto& root                      = specializations[resource];
+	root.indirect_root              = resource;
+	root.indirect_mapping_offset    = static_cast<uint32_t>(flattened_srt.size());
+	root.indirect_search_iterations = std::bit_width(fixed.keys);
+	flattened_srt.resize(flattened_srt.size() + 1u + fixed.keys * 2u, 0u);
+}
+
 static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtRuntime& runtime,
                                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                                          [[maybe_unused]] std::span<const ResourceSpecialization::Image> views,
                                          [[maybe_unused]] const ResourceSnapshot* original = nullptr,
-                                         [[maybe_unused]] const ResourceSpecialization* natural = nullptr) {
+                                         [[maybe_unused]] const ResourceSpecialization* natural = nullptr,
+                                         const ResourceSpecialization* fixed_layout = nullptr) {
 	t_indirect_buffer_failure = false;
 	t_indirect_sampler_failure = false;
 	t_record_blocks.clear();
@@ -3116,7 +3236,11 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 		}
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
+			const auto fixed = fixed_layout != nullptr
+			                       ? GenericCandidates(std::span(fixed_layout->images), i) : FixedCandidates {};
 			if (!WalkedActive(program, image.source) || !WalkedImageActive(program, active_view)) {
+				if (fixed.keys != 0u)
+					AppendIdleCandidates(snapshot.flattened_srt, snapshot.images, specialization.images, i, 8u, fixed);
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
@@ -3143,8 +3267,8 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;
-			        })) {
-				return resource_failed("image", i, image.source, snapshot.images.size());
+			        }, fixed.keys, fixed.children)) {
+				return fixed.keys != 0u ? false : resource_failed("image", i, image.source, snapshot.images.size());
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i])) {
@@ -3173,10 +3297,17 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
 			if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
+				const auto fixed = fixed_layout != nullptr
+				                       ? GenericCandidates(std::span(fixed_layout->samplers), i) : FixedCandidates {};
+				if (!WalkedActive(program, source)) {
+					if (fixed.keys != 0u)
+						AppendIdleCandidates(snapshot.flattened_srt, snapshot.samplers, specialization.samplers, i, 4u,
+						                     fixed);
+				} else if (!MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
 				        specialization.samplers,
-				        [](DescriptorValue&) { return true; })) {
+				        [](DescriptorValue&) { return true; }, fixed.keys, fixed.children)) {
+					if (fixed.keys != 0u) return false;
 					t_indirect_sampler_failure = true;
 					return resource_failed("sampler", i, source, snapshot.samplers.size());
 				}
@@ -3253,7 +3384,7 @@ bool MaterializeGenericGraphics(const ResourcePlan& plan, const SrtRuntime& runt
 		snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 		return true;
 	}
-	return MaterializeResourcesForViews(plan, runtime, snapshot, live, generic.images) &&
+	return MaterializeResourcesForViews(plan, runtime, snapshot, live, generic.images, nullptr, nullptr, &generic) &&
 	       BindGenericGraphics(plan, snapshot, live, generic);
 }
 

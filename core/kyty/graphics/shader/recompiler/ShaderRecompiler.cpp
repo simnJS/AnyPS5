@@ -861,7 +861,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&
-				                ((!ir.generic_graphics && ir.info.images[resource].indirect_root == resource) ||
+				                ((ir.info.images[resource].indirect_root == resource &&
+				                  (!ir.generic_graphics || ir.info.images[resource].indirect_search_iterations != 0u)) ||
 				                 ir.info.images[resource].table_capacity != 0u) ? 1u : 0u;
 			} else if (op == IR::ValueOpcode::GetSamplerResource) {
 				const auto resource = inst.Flags<uint32_t>();

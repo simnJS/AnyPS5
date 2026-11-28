@@ -932,6 +932,21 @@ if(WIN32)
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
 endif()
 
+add_test_executable(kyty_shim_generic_graphics_selectors_tests ${CMAKE_CURRENT_SOURCE_DIR}/GenericGraphicsSelectors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_generic_graphics_selectors_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_generic_graphics_selectors_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_generic_graphics_selectors_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_generic_graphics_selectors_tests)
+add_dependencies(kyty_shim_generic_graphics_selectors_tests agc_frame_replay)
+add_test(NAME kyty_shim_generic_graphics_selectors COMMAND kyty_shim_generic_graphics_selectors_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_generic_graphics_selectors PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_generic_graphics_selectors: ok")
+if(WIN32)
+    set_property(TEST kyty_shim_generic_graphics_selectors APPEND PROPERTY
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+endif()
+
 add_test_executable(kyty_shim_depth_meta_fill_tests ${CMAKE_CURRENT_SOURCE_DIR}/DepthMetaFillReplay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
 target_include_directories(kyty_shim_depth_meta_fill_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
