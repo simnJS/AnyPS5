@@ -1115,7 +1115,10 @@ const char* CheckSparseImport(GraphicContext& graphics) {
 		for (const auto at: Written) {
 			*reinterpret_cast<volatile uint64_t*>(Sparse + at) = (uint64_t {Pattern(at)} << 32u) | Pattern(at + 1);
 		}
-		if (!renderer.MapMemory(Sparse, Bytes)) return "the sparse fixture was not admitted";
+		if (!renderer.MapMemory(Sparse, Bytes)) {
+			g_unchecked = "the device did not admit the 4 GiB sparse fixture";
+			return nullptr;
+		}
 		renderer.PrepareBda(false, false);
 		const auto imported = ShmemBytes();
 		if (before == UINT64_MAX || imported == UINT64_MAX) return "RssShmem cannot be read";
