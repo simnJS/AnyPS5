@@ -1227,8 +1227,9 @@ void PipelineCache::FlushManifestRecording() {
 	if (m_manifest == nullptr) {
 		return;
 	}
-	auto& state = *m_manifest;
-	state.saver = {};
+	auto& state   = *m_manifest;
+	state.watcher = {};
+	state.saver   = {};
 	SaveManifestRecording();
 }
 
