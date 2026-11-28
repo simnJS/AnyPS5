@@ -196,8 +196,10 @@ std::size_t count(const std::string& text, std::string_view line) {
 
 bool vulkanUnavailable(const Replay& result) {
     if (result.status == 0) return false;
-    constexpr std::array<std::string_view, 5> diagnostics{
-        "Could not find suitable device:",
+    if (result.log.find("[Vulkan][E]") != std::string::npos || result.log.find("Validation Error:") != std::string::npos) return false;
+    if (result.log.find("Could not find suitable device:") != std::string::npos) return true;
+    if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) return false;
+    constexpr std::array<std::string_view, 4> diagnostics{
         "kyty presentation: the Vulkan loader offers no window surface extension",
         "Unable to find a compatible Vulkan Driver",
         "Could not load Vulkan",
@@ -273,7 +275,10 @@ int main(int argc, char** argv) {
         if (!seed.completed) {
             std::cerr << "call program replay files: " << root << '\n';
             printTail(seed.log);
-            if (std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr && vulkanUnavailable(seed)) return 77;
+            if (vulkanUnavailable(seed)) {
+                std::cerr << "kyty_shim_call_program_replay: skipped, no usable Vulkan device for replay\n";
+                return 77;
+            }
             throw std::runtime_error("the seed replay of the call program did not complete");
         }
         require(wrote(seed, One) && seed.log.find("TEMPORARY COMPUTE DISPATCH SKIP") == std::string::npos,

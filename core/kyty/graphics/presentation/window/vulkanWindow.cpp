@@ -84,6 +84,13 @@ vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noe
 	return {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
 }
 
+static std::vector<vk::ExtensionProperties> DeviceExtensions(vk::PhysicalDevice device) {
+	return EnumerateVulkan<vk::ExtensionProperties>(
+	    "vkEnumerateDeviceExtensionProperties", [&](uint32_t* count, vk::ExtensionProperties* values) {
+		    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
+	    });
+}
+
 static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions, const char* name) {
 	return std::any_of(extensions.begin(), extensions.end(),
 	                   [name](const auto& ext) { return strcmp(ext.extensionName, name) == 0; });
@@ -327,11 +334,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.multiDrawIndirect, "multiDrawIndirect");
 
 		if (!skip_device) {
-			auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
-			    "vkEnumerateDeviceExtensionProperties",
-			    [&](uint32_t* count, vk::ExtensionProperties* values) {
-				    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
-			    });
+			const auto available_extensions = DeviceExtensions(device);
 			EXIT_NOT_IMPLEMENTED(available_extensions.empty());
 
 			for (const char* ext: device_extensions) {
@@ -431,11 +434,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
-	    "vkEnumerateDeviceExtensionProperties",
-	    [&](uint32_t* count, vk::ExtensionProperties* values) {
-		    return physical_device.enumerateDeviceExtensionProperties(nullptr, count, values);
-	    });
+	const auto available_extensions = DeviceExtensions(physical_device);
 	const auto add = [&](const char* name) {
 		const bool available = HasExtension(available_extensions, name);
 		if (available) device_extensions.push_back(name);
@@ -1403,26 +1402,34 @@ bool CreateHeadlessVulkanChecked(GraphicContext& graphics, const VulkanDeviceIde
 	    "vkEnumeratePhysicalDevices", [&](uint32_t* count, vk::PhysicalDevice* values) {
 		    return graphics.instance.enumeratePhysicalDevices(count, values);
 	    });
+	auto required_extensions = RequiredDeviceExtensions();
+	std::string missing_extension;
 	for (const auto& device: devices) {
 		vk::PhysicalDeviceProperties properties {};
 		device.getProperties(&properties);
-		if (identity == nullptr) {
-			if (graphics.physical_device == nullptr ||
-			    properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
-				graphics.physical_device = device;
-			}
+		if (identity != nullptr &&
+		    (properties.vendorID != identity->vendor_id || properties.deviceID != identity->device_id ||
+		     properties.driverVersion != identity->driver_version ||
+		     std::memcmp(properties.pipelineCacheUUID.data(), identity->cache_uuid.data(),
+		                 identity->cache_uuid.size()) != 0)) {
 			continue;
 		}
-		if (properties.vendorID == identity->vendor_id && properties.deviceID == identity->device_id &&
-		    properties.driverVersion == identity->driver_version &&
-		    std::memcmp(properties.pipelineCacheUUID.data(), identity->cache_uuid.data(),
-		                identity->cache_uuid.size()) == 0) {
-			graphics.physical_device = device;
-			break;
+		const auto available = DeviceExtensions(device);
+		const auto missing = std::ranges::find_if(required_extensions, [&](const char* name) {
+			return !HasExtension(available, name);
+		});
+		if (missing != required_extensions.end()) {
+			missing_extension = fmt::format("{} on {}", *missing, properties.deviceName.data());
+			continue;
 		}
+		if (graphics.physical_device == nullptr || properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+			graphics.physical_device = device;
+		}
+		if (identity != nullptr) break;
 	}
 	if (graphics.physical_device == nullptr) {
-		error = "the emulator's GPU was not found";
+		error = missing_extension.empty() ? "the emulator's GPU was not found"
+		                                  : "missing required Vulkan device extension " + missing_extension;
 		return false;
 	}
 	if (identity != nullptr) {
@@ -1438,7 +1445,7 @@ bool CreateHeadlessVulkanChecked(GraphicContext& graphics, const VulkanDeviceIde
 		}
 	}
 	graphics.physical_device.getMemoryProperties(&graphics.physical_device_memory_properties);
-	graphics.device = VulkanCreateDevice(graphics, RequiredDeviceExtensions(), extensions);
+	graphics.device = VulkanCreateDevice(graphics, std::move(required_extensions), extensions);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
 	return true;
 #else

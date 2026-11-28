@@ -29,6 +29,5 @@ kyty_shim_cross_queue_early_label	same device requirement as kyty_shim_depth_tar
 kyty_shim_cross_queue_recycled_label_serial	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_wave_split_written_reads	same device requirement as kyty_shim_depth_target_alias, and the wave64 split it checks needs subgroups of 32
 kyty_shim_depth_meta_fill	same device requirement as kyty_shim_depth_target_alias
-kyty_shim_async_pipeline_waits	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_image_heap_reads_cost	a GPU timing of the heap read marks: 67 million texel fetches per run, which llvmpipe runs on the CPU for minutes and whose timings would mean nothing
 kyty_shim_generic_graphics_selectors	same device requirement as kyty_shim_depth_target_alias
