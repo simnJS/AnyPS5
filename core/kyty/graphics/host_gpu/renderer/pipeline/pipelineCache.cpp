@@ -32,6 +32,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineChainThreads.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/programLock.h"
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
 #endif
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1919,6 +1920,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 		return nullptr;
 	}
+#if defined(ANYPS5_KYTY)
+	struct TranslationWait {
+		explicit TranslationWait(uint64_t hash) { StallSnapshot::EnterCompileWait(this, "shader-translation", hash); }
+		~TranslationWait() { StallSnapshot::LeaveCompileWait(this); }
+	} const translation_wait(params.hash);
+#endif
 	const GuestClockHold clock_hold;
 	if (WaitForCompile(m_lookup_key)) {
 		return GetProgram(params, input_info, push_data_cursor, prefer_generic);
