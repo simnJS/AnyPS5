@@ -13,6 +13,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <span>
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
@@ -64,6 +65,12 @@ uint64_t B(float value) {
 
 uint32_t Dword(uint32_t low, uint32_t high) {
 	return (low & 15u) | ((high & 3u) << 4u);
+}
+
+bool HostQuery(Op op) {
+	return op == Op::RayQueryValid || op == Op::RayQueryProceed || op == Op::RayQueryCandidate || op == Op::RayQueryCandidateInstance ||
+	       op == Op::RayQueryCandidateFrontFace || op == Op::RayQueryInit || op == Op::RayQueryNext || op == Op::RayQueryMatch ||
+	       op == Op::RayQuerySelectedLeaf || op == Op::RayQueryResult;
 }
 
 struct Layout {
@@ -143,6 +150,23 @@ public:
 		m_active.assign(m_wave, 1u);
 		m_varying.assign(slots, 0u);
 		m_kept.assign(slots, 0u);
+		m_refused.assign(slots, 0u);
+		m_free.assign(slots, 0u);
+		{
+			std::vector<size_t> ends(program.blocks.size(), 0);
+			for (size_t index = 0; index < program.blocks.size(); ++index) {
+				for (const auto* next: program.blocks[index]->ImmSuccessors()) {
+					const auto at = m_block_index.at(next);
+					if (at <= index) ends[at] = std::max(ends[at], index + 1);
+				}
+			}
+			for (size_t start = 0; start < program.blocks.size(); ++start) {
+				if (ends[start] == 0 || (start <= m_first && m_first < ends[start])) continue;
+				for (size_t index = start; index < ends[start]; ++index) {
+					for (const auto& inst: *program.blocks[index]) m_free[m_slot.at(&inst)] = 1u;
+				}
+			}
+		}
 		for (bool changed = true; changed;) {
 			changed = false;
 			for (const auto* block: program.blocks) {
@@ -160,6 +184,16 @@ public:
 						case Op::SubgroupUMaxU32:
 						case Op::SubgroupOrU32:
 						case Op::LiveMask:
+						case Op::RayQueryValid:
+						case Op::RayQueryProceed:
+						case Op::RayQueryCandidate:
+						case Op::RayQueryCandidateInstance:
+						case Op::RayQueryCandidateFrontFace:
+						case Op::RayQueryInit:
+						case Op::RayQueryNext:
+						case Op::RayQueryMatch:
+						case Op::RayQuerySelectedLeaf:
+						case Op::RayQueryResult:
 						case Op::GetUserData: varying = false; break;
 						case Op::LaneId: varying = true; break;
 						case Op::GetBuiltin: {
@@ -549,8 +583,10 @@ private:
 		const char* failure = Compute(inst);
 		if (failure != nullptr || m_walk) return failure;
 		const auto out = m_slot.at(&inst);
-		if (inst.GetOpcode() != Op::ConditionRef && inst.GetType() == Type::U1 && m_varying[out] != 0 && m_kept[out] == 0) {
-			for (uint32_t lane = 0; lane < m_wave; ++lane) At(out, lane) = m_active[lane];
+		if (inst.GetOpcode() != Op::ConditionRef && inst.GetType() == Type::U1 && m_varying[out] != 0 && m_kept[out] == 0 &&
+		    m_free[out] == 0) {
+			const bool off = m_refused[out] != 0;
+			for (uint32_t lane = 0; lane < m_wave; ++lane) At(out, lane) = off ? 0u : m_active[lane];
 		}
 		return nullptr;
 	}
@@ -558,6 +594,89 @@ private:
 public:
 	[[nodiscard]] uint8_t MaskHalf(uint32_t slot) const { return m_mask_half[slot]; }
 	void                  Keep(uint32_t slot) { m_kept[slot] = 1u; }
+
+	void Demand(std::span<Inst* const> served) {
+		std::unordered_map<uint32_t, bool> demands;
+		std::unordered_set<uint32_t>       conflicts;
+		std::unordered_set<uint64_t>       seen;
+		const auto forced = [&](const Inst& inst) {
+			const auto slot = m_slot.at(&inst);
+			return inst.GetType() == Type::U1 && inst.GetOpcode() != Op::ConditionRef && !Inside(inst.Parent()) && m_varying[slot] != 0 &&
+			       m_kept[slot] == 0 && m_free[slot] == 0;
+		};
+		const auto lane_bits = [&](const Inst& test) -> const Inst* {
+			if (test.Arg(1).Resolve() != Value(0u)) return nullptr;
+			const auto* bit = test.Arg(0).Resolve().TryInstruction();
+			if (bit == nullptr || bit->GetOpcode() != Op::BitwiseAnd32) return nullptr;
+			for (uint32_t side = 0; side < 2; ++side) {
+				if (bit->Arg(1 - side).Resolve() != Value(1u)) continue;
+				const auto* shift = bit->Arg(side).Resolve().TryInstruction();
+				if (shift == nullptr || shift->GetOpcode() != Op::ShiftRightLogical32) return nullptr;
+				const auto* lane = shift->Arg(1).Resolve().TryInstruction();
+				if (lane != nullptr && lane->GetOpcode() == Op::BitwiseAnd32) lane = lane->Arg(0).Resolve().TryInstruction();
+				if (lane == nullptr || lane->GetOpcode() != Op::LaneId) return nullptr;
+				return shift->Arg(0).Resolve().TryInstruction();
+			}
+			return nullptr;
+		};
+		const std::function<void(Value, bool, bool, uint32_t)> visit = [&](Value value, bool want, bool mask, uint32_t depth) {
+			const auto* inst = value.Resolve().TryInstruction();
+			if (inst == nullptr || depth > 96) return;
+			const auto slot = m_slot.at(inst);
+			if (!seen.insert(static_cast<uint64_t>(slot) << 2u | (want ? 2u : 0u) | (mask ? 1u : 0u)).second) return;
+			const auto op = inst->GetOpcode();
+			const auto each = [&](bool next, bool all) {
+				if (all) {
+					visit(inst->Arg(0), next, mask, depth + 1);
+					visit(inst->Arg(1), next, mask, depth + 1);
+					return;
+				}
+				const auto settled = [&](size_t arg) {
+					const auto* used = inst->Arg(arg).Resolve().TryInstruction();
+					if (used == nullptr) return false;
+					const auto known = demands.find(m_slot.at(used));
+					return known != demands.end() && known->second != next;
+				};
+				visit(inst->Arg(settled(0) && !settled(1) ? 1 : 0), next, mask, depth + 1);
+			};
+			if (op == Op::Phi) {
+				for (size_t index = 0; index < inst->NumArgs(); ++index) {
+					if (!Inside(inst->PhiBlock(index))) visit(inst->Arg(index), want, mask, depth + 1);
+				}
+				return;
+			}
+			if (mask) {
+				if (op == Op::BitwiseAnd32) return each(want, want);
+				if (op == Op::BitwiseOr32) return each(want, !want);
+				if (op == Op::BitwiseNot32) return visit(inst->Arg(0), !want, true, depth + 1);
+				if (op == Op::SelectU32 && LowLanes(inst->Arg(0))) {
+					visit(inst->Arg(1), want, true, depth + 1);
+					return visit(inst->Arg(2), want, true, depth + 1);
+				}
+				if (op == Op::CompositeExtractU32x4) {
+					const auto* ballot = inst->Arg(0).Resolve().TryInstruction();
+					if (ballot != nullptr && ballot->GetOpcode() == Op::Ballot) visit(ballot->Arg(0), want, false, depth + 1);
+				}
+				return;
+			}
+			if (inst->GetType() != Type::U1) return;
+			if (forced(*inst)) {
+				const auto [known, fresh] = demands.try_emplace(slot, want);
+				if (!fresh && known->second != want) conflicts.insert(slot);
+				return;
+			}
+			if (op == Op::LogicalNot) return visit(inst->Arg(0), !want, false, depth + 1);
+			if (op == Op::LogicalAnd) return each(want, want);
+			if (op == Op::LogicalOr) return each(want, !want);
+			if (op == Op::INotEqual32 || op == Op::IEqual32) {
+				if (const auto* bits = lane_bits(*inst)) visit(Value(const_cast<Inst*>(bits)), (op == Op::INotEqual32) == want, true, depth + 1);
+			}
+		};
+		for (const auto* bvh: served) visit(bvh->Arg(2), true, false, 0);
+		for (const auto& [slot, want]: demands) {
+			if (!want && !conflicts.contains(slot)) m_refused[slot] = 1u;
+		}
+	}
 	[[nodiscard]] bool    IsActive(uint32_t lane) const { return m_active[lane] != 0; }
 	[[nodiscard]] uint64_t ActiveMask(uint8_t half) const {
 		const uint32_t first = half == 1u ? 0u : 32u;
@@ -1096,8 +1215,9 @@ private:
 			return "an instruction the interpreter does not run";
 		}
 		if (TypeOf(op) == Type::Void) return nullptr;
+		const bool query = HostQuery(op);
 		for (uint32_t lane = 0; lane < m_wave; ++lane) {
-			for (uint32_t k = 0; k < 4; ++k) At(out, lane, k) = Hash((static_cast<uint64_t>(out) << 20u) + k);
+			for (uint32_t k = 0; k < 4; ++k) At(out, lane, k) = query ? 0u : Hash((static_cast<uint64_t>(out) << 20u) + k);
 		}
 		return nullptr;
 	}
@@ -1181,6 +1301,8 @@ private:
 	std::vector<uint8_t>                       m_mask_half;
 	std::vector<uint8_t>                       m_varying;
 	std::vector<uint8_t>                       m_kept;
+	std::vector<uint8_t>                       m_refused;
+	std::vector<uint8_t>                       m_free;
 	uint64_t                                   m_work = 0;
 	std::vector<std::pair<uint64_t, uint32_t>> m_records;
 	std::vector<uint64_t>                      m_lists;
@@ -1409,6 +1531,7 @@ private:
 	std::array<Value, 2>           m_node {};
 	std::vector<std::pair<Block*, Block*>> m_path;
 	Block*                         m_preheader = nullptr;
+	bool                           m_reverse   = false;
 	struct EntryInput {
 		uint32_t slot = 0;
 		uint8_t  kind = 0;
@@ -1465,6 +1588,9 @@ const char* Analysis::Prepare() {
 			}
 			inst = incoming;
 		}
+		if (inst != nullptr && m_machine.Inside(inst->Parent()) && inst->GetOpcode() == Op::SelectU32) {
+			inst = inst->Arg(1).Resolve().TryInstruction();
+		}
 		if (inst == nullptr || m_machine.Inside(inst->Parent())) return std::nullopt;
 		return m_machine.SlotOf(inst);
 	};
@@ -1485,6 +1611,7 @@ const char* Analysis::Prepare() {
 		if (address == nullptr || address->GetOpcode() != Op::MakeImageAddress || words >= address->NumArgs()) continue;
 		if (const auto extent = entry_slot(address->Arg(words)); extent && m_machine.InstOf(*extent)->GetType() != Type::U1) add_entry(*extent, EntryExtent);
 	}
+	m_machine.Demand(m_served);
 	return nullptr;
 }
 
@@ -1747,7 +1874,8 @@ bool Analysis::Answer(World& world, std::span<const Machine::Call> calls, std::s
 			lane.proposed  = best;
 			lane.leaf      = world.Leaf(best);
 			lane.entry     = world.triangles[best].entry;
-			answers[index] = {lane.leaf, world.root + 8u, Miss, Miss};
+			answers[index] = m_reverse ? std::array<uint32_t, 4> {world.root + 8u, lane.leaf, Miss, Miss}
+			                           : std::array<uint32_t, 4> {lane.leaf, world.root + 8u, Miss, Miss};
 		}
 	}
 	for (size_t index = 0; index < calls.size(); ++index) {
@@ -2586,6 +2714,11 @@ const char* Analysis::Derive() {
 		if (usable < 2) continue;
 		if (!m_starts.empty() && start.inst != m_starts.front().inst) return "the walk starts at another place in another world";
 		const char* trial_failure = Trial(seed, start);
+		if (trial_failure != nullptr && m_seeds.empty()) {
+			m_reverse     = !m_reverse;
+			trial_failure = Trial(seed, start);
+			if (trial_failure != nullptr) m_reverse = !m_reverse;
+		}
 		if (trial_failure != nullptr) {
 			continue;
 		}

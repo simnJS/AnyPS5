@@ -41,6 +41,7 @@ struct Settings {
 	bool     replay    = false;
 	bool     oracleSet = false;
 	bool     robust    = false;
+	bool     emulation = true;
 	std::string spirv;
 };
 
@@ -161,6 +162,7 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 	options.profile               = &profile;
 	options.native_ray_tracing    = !settings.disabled;
 	options.rt_oracle             = settings.disabled ? 0u : settings.oracle;
+	options.rt_emulation          = settings.emulation;
 	options.user_data             = user_data;
 	options.input_info.compute    = &compute;
 	ShaderPixelInputInfo pixel {};
@@ -258,6 +260,7 @@ bool CompileVariant(const std::vector<uint32_t>& code, uint64_t hash, const Sett
 	options.profile            = &profile;
 	options.native_ray_tracing = native;
 	options.rt_oracle          = native ? settings.oracle : 0u;
+	options.rt_emulation       = settings.emulation;
 	options.user_data          = user_data;
 	options.input_info.compute = &compute;
 	ShaderPixelInputInfo pixel {};
@@ -326,7 +329,7 @@ int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, 
 }
 
 int Usage() {
-	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-63] [--stats] [--robust] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex> | --cache <file.code> --all [--every] [--kpm <file.kpm>] [--subgroup 32|64] [--lds-limit bytes] [--no-validate])\n       kyty_rt_probe --version\n");
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--no-emulation] [--oracle 0-63] [--stats] [--robust] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex> | --cache <file.code> --all [--every] [--kpm <file.kpm>] [--subgroup 32|64] [--lds-limit bytes] [--no-validate])\n       kyty_rt_probe --version\n");
 	return 64;
 }
 
@@ -382,6 +385,8 @@ int main(int argc, char** argv) {
 			continue;
 		} else if (arg == "--off") {
 			settings.disabled = true;
+		} else if (arg == "--no-emulation") {
+			settings.emulation = false;
 		} else if (arg == "--replay-check") {
 			settings.replay = true;
 		} else if (arg == "--spirv" && i + 1 < argc) {
@@ -420,6 +425,7 @@ int main(int argc, char** argv) {
 		survey.ldsLimitBytes = ldsLimit;
 		survey.validate      = !noValidate;
 		survey.every         = every;
+		survey.emulation     = settings.emulation;
 		survey.build         = std::string(APS5_TRACE_COMMIT) + (APS5_TRACE_DIRTY > 0 ? "+modified" : "");
 		return AgcDriver::RunSurvey(survey);
 	}

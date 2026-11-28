@@ -707,14 +707,16 @@ void DescriptorHighWord() {
     Expect(refused(HighWord::SwizzleBit), "a computed high word that sets a swizzle bit is refused");
 }
 
-void PrologueFlag() {
+IR::EntrySample SampleFlag(bool negated) {
     using Op = IR::ValueOpcode;
     IR::Block   entry, header, body, merge;
     IR::Program program;
     program.blocks = {&entry, &header, &body, &merge};
     program.stage  = Libs::Graphics::ShaderType::Compute;
     const auto u32  = [](uint32_t value) { return IR::Value(value); };
-    const auto flag = IR::Value(&entry.AppendNewInst(Op::INotEqual32, {IR::Value(&entry.AppendNewInst(Op::LaneId)), u32(2)}));
+    const auto lane = IR::Value(&entry.AppendNewInst(Op::LaneId));
+    const auto flag = negated ? IR::Value(&entry.AppendNewInst(Op::LogicalNot, {IR::Value(&entry.AppendNewInst(Op::IEqual32, {lane, u32(2)}))}))
+                              : IR::Value(&entry.AppendNewInst(Op::INotEqual32, {lane, u32(2)}));
     entry.terminator.kind       = CFG::TerminatorKind::Branch;
     entry.terminator.true_block = &header;
     entry.AddBranch(&header);
@@ -740,7 +742,11 @@ void PrologueFlag() {
     node.AddPhiOperand(&body, IR::Value(&first));
     merge.AppendNewInst(Op::Phi, {}, word).AddPhiOperand(&header, IR::Value(&first));
     std::vector<IR::Inst*> served {&bvh};
-    const auto sample = IR::SampleWalkEntry(program, {.wave_size = 32}, &header, &body, served, 1);
+    return IR::SampleWalkEntry(program, {.wave_size = 32}, &header, &body, served, 1);
+}
+
+void PrologueFlag() {
+    const auto sample = SampleFlag(false);
     Expect(sample.failure == nullptr, "the prologue of the test walk runs");
     if (sample.failure != nullptr || sample.flags.size() != 1 || sample.active.size() != 32) {
         Expect(false, "the test walk samples one entry flag per lane");
@@ -752,6 +758,22 @@ void PrologueFlag() {
     for (uint32_t lane = 0; lane < 32; ++lane) {
         if (sample.active[lane] == 0) Expect(lanes[lane] == 0u, "an inactive lane enters the walk disabled");
     }
+}
+
+void NegatedPrologueFlag() {
+    const auto sample = SampleFlag(true);
+    Expect(sample.failure == nullptr, "the prologue of the walk with a negated flag runs");
+    if (sample.failure != nullptr || sample.flags.size() != 1 || sample.active.size() != 32) {
+        Expect(false, "the walk with a negated flag samples one entry flag per lane");
+        return;
+    }
+    const auto& lanes = sample.flags.front();
+    bool entered = false;
+    for (uint32_t lane = 0; lane < 32; ++lane) {
+        entered = entered || (sample.active[lane] != 0 && lanes[lane] == 1u);
+        if (sample.active[lane] == 0) Expect(lanes[lane] == 0u, "an inactive lane enters the walk with a negated flag disabled");
+    }
+    Expect(entered, "active lanes enter a walk whose flag negates a per-lane condition");
 }
 
 void EntryLanes() {
@@ -767,6 +789,7 @@ void EntryLanes() {
 int main() {
     EntryLanes();
     PrologueFlag();
+    NegatedPrologueFlag();
     ScalarHeaderWalk();
     TwoTlasWalks();
     RecordLayouts();
