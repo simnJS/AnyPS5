@@ -50,9 +50,13 @@ bool ConcurrentSlotReuse() {
 		reader = std::thread([&] {
 			for (unsigned i = 0; i < rounds; ++i) {
 				phase.arrive_and_wait();
-				if (auto request = publication.Find(page)) {
+				auto request = publication.Find(page);
+				phase.arrive_and_wait();
+				if (request) {
 					ReadbackPublication::Wait(request);
 					if (!request->copied.load(std::memory_order_relaxed)) valid.store(false);
+				} else {
+					valid.store(false);
 				}
 				phase.arrive_and_wait();
 			}
@@ -62,6 +66,7 @@ bool ConcurrentSlotReuse() {
 		auto first = publication.Begin(page, page + 4096);
 		phase.arrive_and_wait();
 		std::array pending {first, publication.Begin(page, page + 4096)};
+		phase.arrive_and_wait();
 		if (i % 2) std::swap(pending[0], pending[1]);
 		for (const auto& request: pending) {
 			request->copied.store(true, std::memory_order_relaxed);
