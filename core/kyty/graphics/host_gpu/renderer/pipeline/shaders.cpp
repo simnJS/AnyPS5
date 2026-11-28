@@ -58,6 +58,7 @@ struct DriverCreation {
 	bool        active = false;
 	const char* names[4] {};
 	uint64_t    hashes[4] {};
+	uint64_t    words = 0;
 };
 
 thread_local DriverCreation t_driver_creation;
@@ -76,6 +77,7 @@ public:
 	ScopedDriverCreation(const std::array<const char*, 4>& names,
 	                     const std::array<uint64_t, 4>&    hashes) {
 		t_driver_creation.active = true;
+		t_driver_creation.words  = 0;
 		for (size_t i = 0; i < 4; i++) {
 			t_driver_creation.names[i]  = names[i];
 			t_driver_creation.hashes[i] = hashes[i];
@@ -153,6 +155,57 @@ constexpr uint32_t                MinComputeBinaryWords = 50'000;
 constexpr std::array<char, 8>     ComputeBinaryMagic {'K', 'Y', 'T', 'Y', 'C', 'B', '1', '\0'};
 std::atomic<uint64_t>             g_compute_binary_files {0};
 
+struct BinaryLookup {
+	const char* reason = "absent";
+	vk::Result  result = vk::Result::eSuccess;
+};
+
+struct LastBinaryLookup {
+	uint64_t     pipeline = 0;
+	BinaryLookup lookup;
+};
+
+thread_local LastBinaryLookup t_last_binary_lookup;
+
+std::string DriverCreationName() {
+	std::string text;
+	for (size_t i = 0; i < 4; i++) {
+		if (t_driver_creation.names[i] == nullptr) {
+			continue;
+		}
+		if (!text.empty()) {
+			text += ' ';
+		}
+		text += fmt::format("{}={:016x}", t_driver_creation.names[i], t_driver_creation.hashes[i]);
+	}
+	return text;
+}
+
+std::string BinaryLookupText(const BinaryLookup& lookup) {
+	if (lookup.result == vk::Result::eSuccess) {
+		return lookup.reason;
+	}
+	return fmt::format("{}:{}", lookup.reason, vk::to_string(lookup.result));
+}
+
+void LogDriverCompile(const char* kind, std::string_view file, std::string_view binary, std::string_view cache,
+                      std::chrono::steady_clock::duration elapsed, vk::Result result, bool saved) {
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-pipeline-compile] kind={} {} words={} file={} binary={} cache={} ms={:.1f} result={} saved={}\n", kind,
+	    DriverCreationName(), t_driver_creation.words, file, binary, cache,
+	    std::chrono::duration<double, std::milli>(elapsed).count(), vk::to_string(result), saved ? 1 : 0));
+}
+
+void LogBinaryRefused(const char* kind, std::string_view file, uint64_t pipeline, const BinaryLookup& lookup) {
+	const auto& last = t_last_binary_lookup;
+	if (last.pipeline == pipeline && last.lookup.reason == lookup.reason && last.lookup.result == lookup.result) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format("[kyty-pipeline-binary] refused kind={} {} words={} file={} reason={}\n", kind,
+	                                      DriverCreationName(), t_driver_creation.words, file,
+	                                      BinaryLookupText(lookup)));
+}
+
 struct ComputeBinaryKey {
 	uint32_t                                                  size = 0;
 	std::array<uint8_t, VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR> bytes {};
@@ -223,29 +276,34 @@ struct ComputeBinaryHandles {
 template <class CreateInfo>
 std::optional<vk::Result> RestorePipelineBinary(vk::Device device, const std::filesystem::path& path,
                                                 const ComputeBinaryHeader& expected, CreateInfo info,
-                                                vk::Pipeline& pipeline) {
+                                                vk::Pipeline& pipeline, BinaryLookup& lookup) {
+	lookup = {};
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
 	if (!file) {
 		return std::nullopt;
 	}
 	const auto end = file.tellg();
+	lookup.reason  = "size";
 	if (end < static_cast<std::streamoff>(sizeof(ComputeBinaryHeader)) ||
 	    end > static_cast<std::streamoff>(MaxComputeBinaryFile)) {
 		return std::nullopt;
 	}
 	std::vector<uint8_t> bytes(static_cast<size_t>(end));
 	file.seekg(0);
+	lookup.reason = "read";
 	if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
 		return std::nullopt;
 	}
 	ComputeBinaryHeader header;
 	std::memcpy(&header, bytes.data(), sizeof(header));
+	lookup.reason = "header";
 	if (header.magic != ComputeBinaryMagic || !header.device.Valid() || !header.pipeline.Valid() ||
 	    header.device != expected.device || header.pipeline != expected.pipeline || header.count == 0 ||
 	    header.count > MaxComputeBinaryCount) {
 		return std::nullopt;
 	}
 	size_t offset = sizeof(header);
+	lookup.reason = "records";
 	if (bytes.size() - offset < header.count * sizeof(ComputeBinaryRecord)) {
 		return std::nullopt;
 	}
@@ -259,8 +317,11 @@ std::optional<vk::Result> RestorePipelineBinary(vk::Device device, const std::fi
 		const auto& record = records[i];
 		total += record.size;
 		if (!record.key.Valid() || record.size == 0 || total > MaxComputeBinaryBytes ||
-		    bytes.size() - offset < record.size ||
-		    XXH3_64bits(bytes.data() + offset, record.size) != record.checksum) {
+		    bytes.size() - offset < record.size) {
+			return std::nullopt;
+		}
+		if (XXH3_64bits(bytes.data() + offset, record.size) != record.checksum) {
+			lookup.reason = "checksum";
 			return std::nullopt;
 		}
 		keys[i].keySize = record.key.size;
@@ -270,6 +331,7 @@ std::optional<vk::Result> RestorePipelineBinary(vk::Device device, const std::fi
 		offset += record.size;
 	}
 	if (offset != bytes.size()) {
+		lookup.reason = "size";
 		return std::nullopt;
 	}
 	const vk::PipelineBinaryKeysAndDataKHR keys_and_data {.binaryCount         = header.count,
@@ -284,6 +346,7 @@ std::optional<vk::Result> RestorePipelineBinary(vk::Device device, const std::fi
 		return result;
 	}
 	if (result != vk::Result::eSuccess) {
+		lookup = {.reason = "driver-binaries", .result = result};
 		return std::nullopt;
 	}
 	vk::PipelineBinaryInfoKHR binaries {.pNext             = info.pNext,
@@ -292,6 +355,7 @@ std::optional<vk::Result> RestorePipelineBinary(vk::Device device, const std::fi
 	info.pNext = &binaries;
 	result     = MemoryTelemetry::Create(device, nullptr, info, pipeline);
 	if (result == vk::Result::eSuccess && pipeline) {
+		lookup = {.reason = "restored"};
 		return result;
 	}
 	if (pipeline) {
@@ -301,6 +365,7 @@ std::optional<vk::Result> RestorePipelineBinary(vk::Device device, const std::fi
 	if (result == vk::Result::eErrorDeviceLost) {
 		return result;
 	}
+	lookup = {.reason = "driver-pipeline", .result = result};
 	return std::nullopt;
 }
 
@@ -404,11 +469,22 @@ std::optional<vk::Result> CreatePipelineWithBinary(const GraphicContext& graphic
 	}
 	const auto path = graphics.compute_pipeline_binary_directory /
 	                  fmt::format("{:016x}-{:016x}.bin", header.device.Hash(), header.pipeline.Hash());
+	constexpr const char* kind = std::is_same_v<CreateInfo, vk::ComputePipelineCreateInfo> ? "compute" : "graphics";
+	const auto            name = path.filename().string();
+	const auto            hash = header.pipeline.Hash();
+	BinaryLookup          lookup {.reason = "skipped"};
 	if (cache_mode != ComputePipelineCacheMode::KnownMiss) {
-		if (const auto restored = RestorePipelineBinary(device, path, header, info, pipeline)) {
+		const auto restored = RestorePipelineBinary(device, path, header, info, pipeline, lookup);
+		if (restored) {
 			mode = "binary";
 			return restored;
 		}
+		if (std::string_view(lookup.reason) != "absent") {
+			LogBinaryRefused(kind, name, hash, lookup);
+		}
+		t_last_binary_lookup = {.pipeline = hash, .lookup = lookup};
+	} else if (t_last_binary_lookup.pipeline == hash) {
+		lookup = t_last_binary_lookup.lookup;
 	}
 	if (cache_mode == ComputePipelineCacheMode::Lookup) {
 		return std::nullopt;
@@ -416,6 +492,7 @@ std::optional<vk::Result> CreatePipelineWithBinary(const GraphicContext& graphic
 	if (driver_cache && !graphics.pipeline_cache_lookup_enabled) {
 		return std::nullopt;
 	}
+	const char* cache = cache_mode == ComputePipelineCacheMode::KnownMiss ? "miss" : "none";
 	if (cache_mode == ComputePipelineCacheMode::Full && driver_cache) {
 		auto probe = info;
 		probe.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
@@ -431,6 +508,7 @@ std::optional<vk::Result> CreatePipelineWithBinary(const GraphicContext& graphic
 		if (found == vk::Result::eErrorDeviceLost) {
 			return found;
 		}
+		cache = "miss";
 	}
 	const vk::PipelineCreateFlags2CreateInfoKHR flags {
 	    .pNext = info.pNext,
@@ -439,18 +517,22 @@ std::optional<vk::Result> CreatePipelineWithBinary(const GraphicContext& graphic
 	             vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR};
 	auto capture  = info;
 	capture.pNext = &flags;
-	const auto result = MemoryTelemetry::Create(device, nullptr, capture, pipeline);
+	const auto started = std::chrono::steady_clock::now();
+	const auto result  = MemoryTelemetry::Create(device, nullptr, capture, pipeline);
+	const auto elapsed = std::chrono::steady_clock::now() - started;
 	if (result != vk::Result::eSuccess || !pipeline) {
 		if (pipeline) {
 			MemoryTelemetry::Destroy(device, pipeline);
 			pipeline = nullptr;
 		}
+		LogDriverCompile(kind, name, BinaryLookupText(lookup), cache, elapsed, result, false);
 		if (result == vk::Result::eErrorDeviceLost) {
 			return result;
 		}
 		return std::nullopt;
 	}
-	SaveComputeBinary(device, path, header, pipeline);
+	const bool saved = SaveComputeBinary(device, path, header, pipeline);
+	LogDriverCompile(kind, name, BinaryLookupText(lookup), cache, elapsed, result, saved);
 	const vk::ReleaseCapturedPipelineDataInfoKHR release {.pipeline = pipeline};
 	static_cast<void>(device.releaseCapturedPipelineDataKHR(&release, nullptr));
 	mode = "binary-capture";
@@ -962,8 +1044,13 @@ public:
 		const ScopedDriverCreation creation(
 		    {Name(0, mesh ? "ms" : "vs"), Name(1, "hs"), Name(2, "ds"), Name(3, "ps")},
 		    {Hash(0), Hash(1), Hash(2), Hash(3)});
-		if (!(m_graphics.fn_get_shader_info && mesh) && CanUseGraphicsBinaries(m_graphics, m_stages)) {
-			const bool  lookup = static_cast<bool>(flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
+		for (const auto* stage: m_stages) {
+			t_driver_creation.words += stage != nullptr ? stage->spirv_words : 0;
+		}
+		const bool lookup     = static_cast<bool>(flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
+		const bool mesh_pad   = m_graphics.fn_get_shader_info && mesh;
+		const bool use_binary = !mesh_pad && CanUseGraphicsBinaries(m_graphics, m_stages);
+		if (use_binary) {
 			const char* mode   = nullptr;
 			pipeline_info.flags = flags;
 			if (const auto binary = CreateGraphicsPipelineWithBinary(
@@ -980,8 +1067,18 @@ public:
 			}
 			return result;
 		};
-		return CreateAuditedPipeline(m_graphics, "graphics", PipelineCache::GraphicsPipelineKeyHash {}(m_key),
-		                             flags, out, create);
+		const auto started = std::chrono::steady_clock::now();
+		const auto result  = CreateAuditedPipeline(m_graphics, "graphics", PipelineCache::GraphicsPipelineKeyHash {}(m_key),
+		                                           flags, out, create);
+		if (!lookup) {
+			const char* binary_state = mesh_pad                              ? "mesh-lds"
+			                           : !PipelineBinariesUsable(m_graphics) ? "off"
+			                           : use_binary                          ? "failed"
+			                                                                 : "small";
+			LogDriverCompile("graphics", "-", binary_state, cache ? "direct" : "none",
+			                 std::chrono::steady_clock::now() - started, result, false);
+		}
+		return result;
 	}
 
 	vk::Pipeline CreateLibrary(vk::PipelineLayout layout, PipelineLibraryPart part) {
@@ -1460,6 +1557,7 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 		                                    {module.info.shader_hash, 0, 0, 0});
 		const auto started = timing ? Clock::now() : Clock::time_point {};
 #if defined(ANYPS5_KYTY)
+		t_driver_creation.words = module.spirv_words;
 		const bool driver_lookup = lookup && graphics.pipeline_cache_lookup_enabled && driver_cache;
 		std::optional<vk::Result> binary;
 		if (CanUseComputeBinaries(graphics, module)) {
@@ -1474,7 +1572,17 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 				info.flags = flags;
 				return MemoryTelemetry::Create(graphics.device, driver_cache, info, pipeline.pipeline);
 			};
+			const auto created = Clock::now();
 			result = CreateAuditedPipeline(graphics, "compute", module.id, info.flags, pipeline.pipeline, create);
+			if (!lookup) {
+				const char* binary_state = !PipelineBinariesUsable(graphics)                  ? "off"
+				                           : module.spirv_words < MinComputeBinaryWords ? "small"
+				                                                                          : "failed";
+				const char* cache = cache_mode == ComputePipelineCacheMode::KnownMiss ? "miss"
+				                    : driver_cache                                     ? "direct"
+				                                                                       : "none";
+				LogDriverCompile("compute", "-", binary_state, cache, Clock::now() - created, result, false);
+			}
 		}
 #else
 		result = MemoryTelemetry::Create(graphics.device, driver_cache, info, pipeline.pipeline);
