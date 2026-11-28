@@ -413,6 +413,8 @@ class Session:
         code_count = None
         announcements = []
         self.last_write = 0
+        self.last_write_ns = 0
+        self.nested_translations = 0
         self.startup_progress = None
         with self.log.open(encoding="utf-8", errors="replace") as stream:
             for number, line in enumerate(stream, 1):
@@ -436,6 +438,7 @@ class Session:
                         self.unserved[match[1].lower()].append((int(match[5]), reason))
                 elif line.startswith(MANIFEST_WRITTEN):
                     self.last_write = number
+                    self.last_write_ns = self.waits[-1].end_ns if self.waits else 0
                 elif "[kyty-startup] " in line:
                     if match := GENERIC_REFUSED.search(line):
                         self.refused.setdefault(match[1].lower(), match[2])
@@ -454,6 +457,20 @@ class Session:
                         self.startup_progress = tuple(int(match[index]) for index in range(1, 5)) + (float(match[5]),)
                 elif match := RUNTIME_DESCRIPTORS.search(line):
                     self.runtime_descriptors[match[1].lower()].add("rb" if match[2] == "buffer" else "rs")
+        outer = {}
+        kept = []
+        for wait in self.waits:
+            if wait.kind == "translate":
+                inner = outer.get(wait.program)
+                if inner is not None and inner in kept and \
+                        wait.end_ns - int(wait.seconds * 1e9) <= inner.end_ns - int(inner.seconds * 1e9) + 1_000_000:
+                    kept.remove(inner)
+                    self.nested_translations += 1
+                    if inner.engine_cause and not wait.engine_cause:
+                        wait.cause, wait.variant, wait.engine_cause = inner.cause, inner.variant, True
+                outer[wait.program] = wait
+            kept.append(wait)
+        self.waits = kept
         for program, elapsed, at, number in announcements:
             started = at - int(elapsed * 1e9)
             owner = next((wait for wait in self.waits
@@ -609,8 +626,14 @@ class Session:
             wait.cause = f"generic-refused:{self.refused[program]}"
             wait.evidence = "generic_refused at startup"
             return
+        modes = self.runtime_descriptors.get(program, set())
+        only = sorted(mode for mode in modes if prepared and all(mode in module.fields for module in prepared))
+        if only and not fresh:
+            wait.cause = "other-key:" + "+".join(only)
+            wait.evidence = ("every prepared recipe of this program is under the run-time descriptor key: its plain form "
+                             "is translated at first use to find that it does not bind")
+            return
         if not prepared:
-            modes = self.runtime_descriptors.get(program)
             wait.cause = "generic-not-prepared:no-recipe"
             wait.evidence = "known program without any recipe in the manifest loaded at startup" + (
                 f" (run-time descriptors: {'+'.join(sorted(modes))})" if modes else "")
@@ -658,6 +681,13 @@ class Session:
         if wait.line > self.last_write and self.recorded.modules:
             wait.cause = "other:not-recorded"
             wait.evidence = "the session manifest was last written before this wait, so its variant is not recorded"
+        elif self.recorded.modules and wait.end_ns > self.last_write_ns - 2_000_000_000:
+            wait.cause = "other:not-recorded"
+            wait.evidence = "this wait ended less than 2 s before the last write of the session manifest, which may not hold it"
+        elif not compute and LIBRARY_STATE.search(wait.route):
+            missing = [part for part in ("pr", "fs") if re.search(rf"\b{part}=(queued|building)\b", wait.route)]
+            wait.cause = "library-missing:" + ("+".join(missing) or "vi+fo")
+            wait.evidence = "no new variant or pipeline is recorded for this program; libraries were linked during the wait"
         elif wait.kind == "graphics-wait":
             wait.cause = "other:prepared-pipeline-still-building"
             wait.evidence = "modules and render state were in the manifest; the draw waited for a queued creation"
@@ -782,6 +812,7 @@ class Session:
             "unknown_waits": len(unknown),
             "unknown_seconds": round(sum(wait.seconds for wait in unknown), 3),
             "engine_causes": sum(wait.engine_cause for wait in self.waits),
+            "nested_translations": self.nested_translations,
             "entered_game": self.guest_entry is not None,
             "startup_progress": None if self.startup_progress is None else dict(zip(
                 ("modules", "modules_total", "pipelines", "pipelines_total", "seconds"), self.startup_progress)),
@@ -824,6 +855,9 @@ def print_report(session, detail, limit):
     source = "computed by the engine" if summary["engine_causes"] == summary["waits"] and summary["waits"] else \
         f"computed by the engine for {summary['engine_causes']} waits, inferred from the manifests for the others"
     print(f"waits: {summary['waits']}, {summary['seconds']:.1f} s; causes {source}")
+    if summary["nested_translations"]:
+        print(f"{summary['nested_translations']} translations nested in another one of the same program are left out, "
+              "their time is in the outer one")
     if not summary["entered_game"]:
         progress = summary["startup_progress"]
         where = "" if progress is None else (

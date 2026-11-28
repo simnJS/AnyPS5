@@ -143,7 +143,10 @@ class StallReportTests(unittest.TestCase):
                 "[kyty-gpl] stall 3.500 s compute-sync 0x00000000000000d2  why=writes-images @30000000000",
                 "[kyty-gpl] stall 9.000 s compute-sync 0x00000000000000d3  why=writes-images @40000000000",
                 "[kyty-gpl] stall 0.400 s compute-wait 0x00000000000000d4  why=writes-nothing @50000000000",
+                "[kyty-gpl] stall 0.300 s compute-wait 0x00000000000000d4  why=writes-nothing @69000000000",
+                "[kyty-gpl] stall 0.200 s compute-sync 0x00000000000000d1  why=writes-buffers @70000000000",
                 "Pipeline manifest: wrote _PipelineCache/title.kpm (8 modules)",
+                "[kyty-gpl] stall 0.100 s compute-wait 0x00000000000000d4  why=writes-nothing @90000000000",
             ],
             prepared, recorded, [f"00000000000000d{index}" for index in range(1, 5)])
         self.assertEqual([wait.cause for wait in session.waits], [
@@ -151,8 +154,46 @@ class StallReportTests(unittest.TestCase):
             "generic-refused:specialization_does_not_fit",
             "generic-unbound:image-table-capacity(65536->32768)",
             "other:prepared-module-without-driver-pipeline",
+            "other:not-recorded",
+            "other-key:rs",
+            "other:not-recorded",
         ])
+        self.assertIn("less than 2 s before the last write", session.waits[4].evidence)
+        self.assertIn("last written before this wait", session.waits[6].evidence)
         self.assertTrue(session.canonical_strides)
+
+    def test_nested_translations_and_a_program_prepared_under_the_run_time_key_only(self):
+        prepared = [
+            f"M 000000000001 cs code=00000000000000e7 {COMPUTE} rs sb=st:16383 si=n:Float/d:2D ss=ir:0/im:4/is:5",
+            f"M 000000000002 ps code=00000000000000e8 {PIXEL} sb=st:48",
+            f"M 000000000003 vs code=00000000000000e9 ud=4 cur=33",
+            f"P v=000000000003 p=000000000002 {STATE}",
+        ]
+        session = self.session(
+            [
+                "[kyty] shader 0x00000000000000e7: its sampler descriptors chosen in memory tables are read at run time and "
+                "served from a fixed set of samplers when its candidates cannot be bound",
+                "[kyty-gpl] translate 0.534 s 0x00000000000000e7 @5000000000",
+                "[kyty-gpl] translate 1.247 s 0x00000000000000e7 @5000030000",
+                "[kyty-gpl] translate 0.200 s 0x00000000000000e7 cause=generic-unbound:image-heap variant=00000000000000aa "
+                "@8000000000",
+                "[kyty-gpl] translate 0.900 s 0x00000000000000e7 @8000020000",
+                "[kyty-gpl] stall 0.300 s graphics-sync 0x00000000000000e8 linked fs=queued pr=ready why=eligible @20000000000",
+                "[kyty-gpl] stall 0.100 s graphics-sync 0x00000000000000e8 linked fs=ready pr=ready why=eligible @21000000000",
+                "[kyty-gpl] stall 0.100 s compute-sync 0x00000000000000e7  why=writes-buffers @60000000000",
+                "Pipeline manifest: wrote _PipelineCache/title.kpm (3 modules)",
+            ],
+            prepared, prepared, ["00000000000000e7", "00000000000000e8", "00000000000000e9"])
+        self.assertEqual([(wait.kind, wait.seconds, wait.cause) for wait in session.waits[:4]], [
+            ("translate", 1.247, "other-key:rs"),
+            ("translate", 0.9, "generic-unbound:image-heap"),
+            ("graphics-sync", 0.3, "library-missing:fs"),
+            ("graphics-sync", 0.1, "library-missing:vi+fo"),
+        ])
+        self.assertEqual((session.waits[1].variant, session.waits[1].engine_cause), ("00000000000000aa", True))
+        summary = session.summary()
+        self.assertEqual((summary["nested_translations"], summary["waits"]), (2, 5))
+        self.assertEqual(summary["seconds"], 2.647)
 
     def test_refusal_named_by_the_compute_service(self):
         prepared = [f"M 000000000001 cs code=00000000000000e5 {COMPUTE} sb=st:16383 si=n:Float/d:2D/heap"]
