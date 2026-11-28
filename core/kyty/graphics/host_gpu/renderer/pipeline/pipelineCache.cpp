@@ -32,6 +32,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineChainThreads.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/programLock.h"
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
 #endif
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1919,6 +1920,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 		return nullptr;
 	}
+#if defined(ANYPS5_KYTY)
+	struct TranslationWait {
+		explicit TranslationWait(uint64_t hash) { StallSnapshot::EnterCompileWait(this, "shader-translation", hash); }
+		~TranslationWait() { StallSnapshot::LeaveCompileWait(this); }
+	} const translation_wait(params.hash);
+#endif
 	const GuestClockHold clock_hold;
 	if (WaitForCompile(m_lookup_key)) {
 		return GetProgram(params, input_info, push_data_cursor, prefer_generic);
@@ -3004,6 +3011,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 }
 
 struct PipelineCache::CompileJob {
+	std::stop_source                                            admission_stop;
 	std::vector<uint32_t>                                       code;
 	std::vector<uint32_t>                                       back_code;
 	ProgramKey                                                  key;
@@ -3073,7 +3081,7 @@ void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& para
 	} else {
 		job->compute = std::make_unique<ShaderComputeInputInfo>(input_info);
 	}
-	m_in_flight[key]++;
+	m_in_flight.emplace(key, job->admission_stop);
 	{
 		std::lock_guard lock(m_job_mutex);
 		m_jobs.push_back(std::move(job));
@@ -3082,17 +3090,22 @@ void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& para
 }
 
 bool PipelineCache::WaitForCompile(const ProgramKey& key) {
-	if (!m_in_flight.contains(key)) {
+	const auto pending = m_in_flight.find(key);
+	if (pending == m_in_flight.end()) return false;
+	if (pending->second) {
+		pending->second->request_stop();
+		m_in_flight.erase(pending);
 		return false;
 	}
 	const auto copy = key;
-	do {
+	for (;;) {
 		UnlockPrograms();
 		GuestGpu::RunUrgentCommandsWhileWaiting();
 		std::this_thread::yield();
 		LockPrograms();
-	} while (m_in_flight.contains(copy));
-	return true;
+		const auto active = m_in_flight.find(copy);
+		if (active == m_in_flight.end() || active->second) return true;
+	}
 }
 
 template <typename InputInfo>
@@ -3229,9 +3242,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	} else if (job.guest_traversal && plan) {
 		m_program_cache.try_emplace(job.key, Program {.resource_plan = std::move(*plan)});
 	}
-	if (const auto job_count = m_in_flight.find(job.key); --job_count->second == 0) {
-		m_in_flight.erase(job_count);
-	}
+	m_in_flight.erase(job.key);
 	UnlockPrograms();
 }
 
@@ -3248,8 +3259,17 @@ void PipelineCache::CompileWorker(const std::stop_token& stop) {
 			job = std::move(m_jobs.front());
 			m_jobs.pop_front();
 		}
-		const auto ticket = AdmitWorker(stop, job->params.code.size(), false);
-		if (!ticket) return;
+		const std::stop_callback stopping(stop, [&] { job->admission_stop.request_stop(); });
+		const auto ticket = AdmitWorker(job->admission_stop.get_token(), job->params.code.size(), false);
+		if (!ticket) {
+			if (stop.stop_requested() || !job->admission_stop.stop_requested()) return;
+			continue;
+		}
+		if (job->table == nullptr) {
+			const ProgramLockGuard lock(m_program_lock);
+			if (job->admission_stop.stop_requested()) continue;
+			m_in_flight.at(job->key).reset();
+		}
 		if (job->table != nullptr) {
 			if (job->vertex != nullptr) {
 				RunTableJob(*job, *job->vertex);
@@ -3445,7 +3465,7 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			return nullptr;
 		}
 #endif
-		m_in_flight[key]++;
+		m_in_flight.emplace(key, std::nullopt);
 		UnlockPrograms();
 		CompileJob job {.key = key, .params = params, .push_data_cursor = push_data_cursor};
 #if defined(ANYPS5_KYTY)

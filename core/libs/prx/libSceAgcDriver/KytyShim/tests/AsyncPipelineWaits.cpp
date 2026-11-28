@@ -3,9 +3,11 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window.h"
 
@@ -24,6 +26,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -249,6 +252,48 @@ void ComputeWaitWokenByWorker(PipelineCache& cache, GraphicContext& graphics, co
 	Check(wait.cpu_ms < MaxCpuMs, "the compute wait used " + std::to_string(wait.cpu_ms) + " ms of CPU: it spins");
 }
 
+PFN_vkCreateShaderModule g_create_shader_module = nullptr;
+thread_local StallSnapshot::CompileWait* t_translation = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL ObserveShaderModule(VkDevice device, const VkShaderModuleCreateInfo* info,
+                                                    const VkAllocationCallbacks* allocator, VkShaderModule* module) {
+	if (t_translation != nullptr) *t_translation = StallSnapshot::LongestCompileWait();
+	return g_create_shader_module(device, info, allocator, module);
+}
+
+void TranslateBeforeWorkerAdmission(PipelineCache& cache) {
+	static constexpr uint32_t code[] = {0xbf810000u};
+	HW::ComputeShaderInfo regs {};
+	regs.cs_regs.data_addr = reinterpret_cast<uintptr_t>(code);
+	regs.cs_regs.wave_size = 32;
+	regs.cs_regs.num_thread_x = regs.cs_regs.num_thread_y = regs.cs_regs.num_thread_z = 1;
+	ShaderMapUserData(regs.cs_regs.data_addr, {.type = Prospero::ShaderBinaryType::kCs, .code_size_bytes = sizeof(code)});
+	auto held = Access::HoldCompilationSlot(cache);
+	Require(static_cast<bool>(held), "could not reserve the translation slot");
+	ShaderComputeInputInfo input {};
+	ProgramResolution ahead;
+	Require(cache.GetComputeProgramAhead(regs, input, ahead) == nullptr && ahead.reads.Refusal() == AheadRefusal::Compiling,
+	        "the program was not queued for translation");
+	StallSnapshot::CompileWait translation;
+	auto waiter = std::async(std::launch::async, [&] {
+		t_translation = &translation;
+		const auto* module = cache.GetComputeProgram(regs, input);
+		t_translation = nullptr;
+		return module;
+	});
+	const bool ready = waiter.wait_for(2s) == std::future_status::ready;
+	held.Reset();
+	Check(ready, "foreground translation waited for an unstarted worker");
+	const auto* module = waiter.get();
+	Require(module != nullptr, "foreground translation returned no module");
+	Check(translation.count == 1 && translation.hash == ShaderHashAt(regs.cs_regs.data_addr) &&
+	          translation.what != nullptr && std::string_view(translation.what) == "shader-translation" &&
+	          !StallSnapshot::Stuck(StallSnapshot::Holder::NotIssued, StallSnapshot::StuckPeriods, translation),
+	      "the watchdog did not recognize the foreground translation");
+	Check(StallSnapshot::LongestCompileWait().count == 0, "the completed translation remained in the watchdog");
+	Check(cache.GetComputeProgram(regs, input) == module, "the translated module was not reused");
+}
+
 void GraphicsWaitWokenAtTheEnd(PipelineCache& cache) {
 	GraphicsPipelineKey key {};
 	key.stage_ids = {0x9a0001u, 0, 0, 0x9a0002u};
@@ -313,17 +358,21 @@ int Run(GraphicContext& graphics) {
 	Require(Config::AsyncPipelinesEnabled(), "the test needs KYTY_ASYNC_PIPELINES on");
 	const auto code = EmptyComputeShader();
 	graphics.image_heap_layout = ImageHeap::CreateLayout(graphics.device);
+	g_create_shader_module = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShaderModule;
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShaderModule = ObserveShaderModule;
 	g_gate.real = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateComputePipelines;
 	VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateComputePipelines = GatedCreateComputePipelines;
 	{
 		NoImageHeap   heap;
 		PipelineCache cache(graphics, &heap, {}, true, 1, 1);
 		Require(Access::AsyncWorkersRunning(cache), "the pipeline cache started no async workers");
+		TranslateBeforeWorkerAdmission(cache);
 		ComputeWaitWokenByWorker(cache, graphics, code);
 		GraphicsWaitWokenAtTheEnd(cache);
 		StopWakesEveryWait(cache, graphics, code);
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateComputePipelines = g_gate.real;
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShaderModule = g_create_shader_module;
 	if (g_failures != 0) return 1;
 	std::printf("%s: ok\n", Name);
 	return 0;

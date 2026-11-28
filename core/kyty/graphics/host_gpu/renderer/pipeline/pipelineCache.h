@@ -664,7 +664,7 @@ private:
 
 	struct CompileJob;
 	static constexpr uint32_t CompileWorkers = 6;
-	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> m_in_flight KYTY_GUARDED_BY(m_program_lock);
+	std::unordered_map<ProgramKey, std::optional<std::stop_source>, ProgramKeyHash> m_in_flight KYTY_GUARDED_BY(m_program_lock);
 #if defined(ANYPS5_KYTY)
 	std::unordered_set<ProgramKey, ProgramKeyHash> m_speculative_failed_programs KYTY_GUARDED_BY(m_program_lock);
 	std::atomic<uint64_t> m_speculative_failed {0}, m_speculative_refused {0}, m_speculative_skipped {0};
