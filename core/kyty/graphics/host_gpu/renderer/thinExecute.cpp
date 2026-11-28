@@ -120,6 +120,11 @@ ProgramFacts DescribeProgram(const ShaderRecompiler::IR::CompiledShaderInfo& pro
 	return facts;
 }
 
+void NotePipeline(ProgramFacts& facts, bool pipeline, bool uses_image_heap) {
+	facts.pipeline_ready = pipeline;
+	facts.image_heap     = facts.image_heap || uses_image_heap;
+}
+
 RefusalMask Classify(const ProgramFacts& facts) {
 	const auto  has      = [&](BindingKind kind) { return (facts.descriptor_mask & KindBit(kind)) != 0; };
 	RefusalMask refusals = 0;

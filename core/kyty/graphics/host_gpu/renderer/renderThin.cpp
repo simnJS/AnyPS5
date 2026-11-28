@@ -187,9 +187,8 @@ void RenderExecutor::LearnThinDispatch(const ShaderComputeInputInfo& input_info,
 	op->m_learning      = false;
 	const auto& program = input_info.stage.module->info;
 	constexpr uint32_t OrderedAppend = 1u << 3u;
-	auto facts                 = Thin::DescribeProgram(program, *input_info.stage.resources);
-	facts.pipeline_ready       = pipeline.pipeline != nullptr && !pipeline.uses_image_heap;
-	facts.image_heap           = facts.image_heap || pipeline.uses_image_heap;
+	auto facts = Thin::DescribeProgram(program, *input_info.stage.resources);
+	Thin::NotePipeline(facts, pipeline.pipeline != nullptr, pipeline.uses_image_heap);
 	facts.lds_storage          = input_info.lds_storage || bindings.shared_memory.buffer != nullptr;
 	facts.write_targets        = facts.write_targets || indirect_writes;
 	facts.ordered_append       = (mode & OrderedAppend) != 0 && program.info.uses_gds;
@@ -238,8 +237,7 @@ void RenderExecutor::ClassifyThinDraw(std::span<PreparedBindings* const> stages,
 		const auto& runtime  = *prepared->runtime;
 		const auto& program  = runtime.module->info;
 		auto        facts    = Thin::DescribeProgram(program, *runtime.resources);
-		facts.pipeline_ready = pipeline.pipeline != nullptr;
-		facts.image_heap     = facts.image_heap || pipeline.uses_image_heap;
+		Thin::NotePipeline(facts, pipeline.pipeline != nullptr, pipeline.uses_image_heap);
 		facts.lds_storage    = prepared->shared_memory.buffer != nullptr;
 		facts.indirect_args_on_cpu = op->m_kind == Thin::OperationKind::IndirectDraw;
 		Thin::PushPlan plan;

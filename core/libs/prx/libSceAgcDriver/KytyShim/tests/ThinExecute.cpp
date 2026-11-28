@@ -174,6 +174,18 @@ void Classification() {
 	Check(with_kind(BindingKind::FaultBuffer) == Thin::Bit(Refusal::Instrumentation), "loop guard fault buffer");
 	Check(with_kind(BindingKind::FaultBuffer, true) == Thin::Bit(Refusal::MemorySync), "fault buffer with memory");
 	Check(with_kind(BindingKind::FaultBuffer, true, true) == 0, "fault buffer once memory is ready");
+	auto heap_pipeline = Ready();
+	Thin::NotePipeline(heap_pipeline, true, true);
+	Check(Thin::Classify(heap_pipeline) == Thin::Bit(Refusal::ImageHeap),
+	      "a ready pipeline that reads the image heap waits for E, not for a pipeline");
+	auto missing = Ready();
+	Thin::NotePipeline(missing, false, false);
+	Check(Thin::Classify(missing) == Thin::Bit(Refusal::PipelineWait), "a missing pipeline is a pipeline wait");
+	auto bound_heap       = Ready();
+	bound_heap.image_heap = true;
+	Thin::NotePipeline(bound_heap, true, false);
+	Check(bound_heap.image_heap && Thin::Classify(bound_heap) == Thin::Bit(Refusal::ImageHeap),
+	      "a heap image seen in the program stays a heap access");
 	auto many            = Ready();
 	many.buffers         = true;
 	many.images          = true;

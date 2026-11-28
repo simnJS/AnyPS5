@@ -133,6 +133,8 @@ struct ProgramFacts {
 [[nodiscard]] ProgramFacts DescribeProgram(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                            const ShaderRecompiler::IR::ResourceSnapshot&  snapshot);
 
+void NotePipeline(ProgramFacts& facts, bool pipeline, bool uses_image_heap);
+
 [[nodiscard]] RefusalMask Classify(const ProgramFacts& facts);
 
 struct PushPlan {
