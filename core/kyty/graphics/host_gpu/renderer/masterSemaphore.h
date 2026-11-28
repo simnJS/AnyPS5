@@ -37,8 +37,9 @@ public:
 	void Refresh();
 	void Wait(uint64_t tick);
 #if defined(ANYPS5_KYTY)
-	void ReportStall(uint64_t tick);
+	void ReportStall(uint64_t tick, uint32_t periods);
 	void NoteIssued(uint64_t tick) noexcept;
+	void NoteSubmitting(uint64_t tick) noexcept;
 	void NoteSubmitted(uint64_t tick, std::span<const vk::Semaphore> waits, std::span<const uint64_t> values) noexcept;
 	[[nodiscard]] uint64_t SubmittedTick() const noexcept { return m_submitted.load(std::memory_order_acquire); }
 	void                   WriteSubmissions(std::FILE* file, size_t count);
@@ -76,8 +77,11 @@ private:
 	std::array<Submission, 128> m_submissions {};
 	std::atomic<uint64_t>       m_submitted {0};
 	uint32_t                    m_marker_slot      = UINT32_MAX;
-	std::atomic_flag            m_reported_gpu     = ATOMIC_FLAG_INIT;
-	std::atomic_flag            m_reported_pending = ATOMIC_FLAG_INIT;
+	std::atomic<uint64_t>       m_submitting_tick {0};
+	std::atomic<uint64_t>       m_submitting_since {0};
+	std::atomic<uint32_t>       m_cpu_snapshots {0};
+	std::atomic_flag            m_reported_gpu   = ATOMIC_FLAG_INIT;
+	std::atomic_flag            m_reported_stuck = ATOMIC_FLAG_INIT;
 #endif
 };
 

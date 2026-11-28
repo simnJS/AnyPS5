@@ -5,6 +5,7 @@
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
 #endif
 #include "graphics/presentation/precompileNotice.h"
 
@@ -213,6 +214,7 @@ PipelineCache::StallScope::StallScope(PipelineCache& cache, const char* what, ui
 	m_what    = what;
 	m_hash    = hash;
 	m_why     = why;
+	StallSnapshot::EnterCompileWait(this, what, hash);
 	std::scoped_lock lock(cache.m_stall_mutex);
 	m_started = std::chrono::steady_clock::now();
 	if (hash != 0) cache.m_shader_waits.push_back({this, hash, m_started});
@@ -344,6 +346,7 @@ std::string PipelineCache::StallCause(std::span<const uint64_t> variants, std::s
 
 PipelineCache::StallScope::~StallScope() {
 #if defined(ANYPS5_KYTY)
+	if (m_what != nullptr) StallSnapshot::LeaveCompileWait(this);
 	const auto now = std::chrono::steady_clock::now();
 	uint64_t   ns  = 0;
 	{

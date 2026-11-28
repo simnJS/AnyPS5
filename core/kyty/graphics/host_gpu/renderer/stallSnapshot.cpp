@@ -56,6 +56,15 @@ std::vector<Named>               g_names;
 std::array<Operation, Operations> g_operations;
 std::atomic<uint64_t>            g_operation_next {0};
 
+struct Compile {
+	const void* key   = nullptr;
+	const char* what  = nullptr;
+	uint64_t    hash  = 0;
+	uint64_t    since = 0;
+};
+std::mutex           g_compiles_mutex;
+std::vector<Compile> g_compiles;
+
 uint64_t SteadyNs() {
 	return static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -111,6 +120,15 @@ void WriteOperations(std::FILE* file, uint64_t reached, uint64_t now) {
 		             Ago(now, operation.ns.load(std::memory_order_relaxed)), operation.tick.load(std::memory_order_relaxed),
 		             kind != nullptr ? kind : "?", operation.queue.load(std::memory_order_relaxed),
 		             operation.submit_id.load(std::memory_order_relaxed));
+	}
+}
+
+void WriteCompiles(std::FILE* file, uint64_t now) {
+	std::scoped_lock lock(g_compiles_mutex);
+	std::fprintf(file, "\n== pipeline compile waits in progress: %zu\n", g_compiles.size());
+	for (const auto& compile: g_compiles) {
+		std::fprintf(file, "%s 0x%016" PRIx64 " for %.3f s\n", compile.what != nullptr ? compile.what : "?", compile.hash,
+		             Ago(now, compile.since));
 	}
 }
 
@@ -358,6 +376,48 @@ void NoteOperation(uint64_t tick, const char* kind, uint32_t queue, uint64_t sub
 	g_operation_next.fetch_add(1, std::memory_order_release);
 }
 
+void EnterCompileWait(const void* key, const char* what, uint64_t hash) {
+	std::scoped_lock lock(g_compiles_mutex);
+	g_compiles.push_back({key, what, hash, SteadyNs()});
+}
+
+void LeaveCompileWait(const void* key) {
+	std::scoped_lock lock(g_compiles_mutex);
+	std::erase_if(g_compiles, [key](const Compile& compile) { return compile.key == key; });
+}
+
+CompileWait LongestCompileWait() {
+	const auto       now = SteadyNs();
+	std::scoped_lock lock(g_compiles_mutex);
+	CompileWait      longest;
+	longest.count = static_cast<uint32_t>(g_compiles.size());
+	for (const auto& compile: g_compiles) {
+		const auto seconds = Ago(now, compile.since);
+		if (longest.what == nullptr || seconds > longest.seconds) {
+			longest.what    = compile.what != nullptr ? compile.what : "?";
+			longest.hash    = compile.hash;
+			longest.seconds = seconds;
+		}
+	}
+	return longest;
+}
+
+Holder Classify(uint64_t tick, uint64_t next_tick, uint64_t submitted, uint64_t submitting_tick,
+                double submitting_seconds) noexcept {
+	if (tick <= submitted) return Holder::Gpu;
+	if (submitting_tick != 0 && submitting_tick == submitted + 1 && submitting_seconds >= DriverHoldSeconds) return Holder::Driver;
+	if (tick >= next_tick) return Holder::NotIssued;
+	return Holder::Recording;
+}
+
+bool GpuSide(Holder holder) noexcept {
+	return holder == Holder::Gpu || holder == Holder::Driver;
+}
+
+bool Stuck(Holder holder, uint32_t periods, const CompileWait& compiling) noexcept {
+	return !GpuSide(holder) && periods >= StuckPeriods && compiling.count == 0;
+}
+
 std::string Write(GraphicContext& graphics, uint64_t awaited, uint64_t reached, const std::string& verdict) {
 	if (!Enabled()) return {};
 	std::error_code error;
@@ -386,6 +446,7 @@ std::string Write(GraphicContext& graphics, uint64_t awaited, uint64_t reached, 
 			std::fflush(file);
 		}
 	}
+	WriteCompiles(file, now);
 	WriteOperations(file, reached, now);
 	WriteHeaps(file, graphics);
 	std::fflush(file);

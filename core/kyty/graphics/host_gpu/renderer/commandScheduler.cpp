@@ -702,6 +702,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		EnterSubmit(SubmitStage::Submit, tick);
+		m_master.NoteSubmitting(tick);
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	EnterSubmit(SubmitStage::None, tick);

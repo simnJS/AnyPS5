@@ -54,6 +54,7 @@ void MasterSemaphore::NoteSubmitted(uint64_t tick, std::span<const vk::Semaphore
 	}
 	slot.waits.store(static_cast<uint32_t>(count), std::memory_order_relaxed);
 	slot.submitted_ns.store(SteadyNs(), std::memory_order_release);
+	m_submitting_tick.store(0, std::memory_order_release);
 	auto known = m_submitted.load(std::memory_order_relaxed);
 	while (known < tick && !m_submitted.compare_exchange_weak(known, tick, std::memory_order_release, std::memory_order_relaxed)) {
 	}
@@ -131,51 +132,77 @@ void MasterSemaphore::WriteSubmissions(std::FILE* file, size_t count) {
 	std::fprintf(file, shown == 0 ? " none\n" : "\n");
 }
 
-void MasterSemaphore::ReportStall(uint64_t tick) {
-	const bool pending = tick >= CurrentTick();
-	if ((pending ? m_reported_pending : m_reported_gpu).test_and_set()) {
-		return;
-	}
+void MasterSemaphore::NoteSubmitting(uint64_t tick) noexcept {
+	m_submitting_since.store(SteadyNs(), std::memory_order_relaxed);
+	m_submitting_tick.store(tick, std::memory_order_release);
+}
+
+void MasterSemaphore::ReportStall(uint64_t tick, uint32_t periods) {
 	uint64_t reached = 0;
 	(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &reached);
-	const auto  submitted = SubmittedTick();
-	std::string began;
-	if (const auto started = GpuBreadcrumbs::StartedTick(m_marker_slot, reached + 1); started.has_value() && !pending &&
-	                                                                                  submitted > reached) {
-		began = *started > reached ? fmt::format(" (the GPU began tick {}: it runs or waits inside it)", reached + 1)
-		                           : fmt::format(" (the GPU has not begun tick {}: it waits before it)", reached + 1);
-	}
+	const auto submitted       = SubmittedTick();
+	const auto next            = CurrentTick();
+	const auto submitting_tick = m_submitting_tick.load(std::memory_order_acquire);
+	const auto submitting_for  = Ago(SteadyNs(), m_submitting_since.load(std::memory_order_relaxed));
+	const auto holder          = StallSnapshot::Classify(tick, next, submitted, submitting_tick, submitting_for);
+	const auto compiling       = StallSnapshot::LongestCompileWait();
+	const auto waited          = uint64_t {periods} * 10u;
 	std::string verdict;
-	if (pending) {
-		verdict = fmt::format("[kyty] tick {} has been awaited for 10 s and is not submitted yet (next tick {}, the GPU is at {}): "
-		                      "the CPU side holds it",
-		                      tick, CurrentTick(), reached);
-	} else if (submitted < tick) {
-		verdict = fmt::format("[kyty] the GPU has not reached tick {} in 10 s (it is at {}, {} ticks issued after it), but tick {} "
-		                      "is not submitted to Vulkan yet (submitted up to {}): the CPU side holds it, not the GPU",
-		                      tick, reached, CurrentTick() - 1 - reached, submitted + 1, submitted);
-	} else if (const auto wait = PendingWait(reached + 1); !wait.empty() && wait.starts_with("waits for ") &&
-	                                                        !wait.starts_with("waits for nothing")) {
-		verdict = fmt::format("[kyty] the GPU has not reached tick {} in 10 s (it is at {}, {} ticks issued after it): the submission "
-		                      "of tick {} {}, the GPU waits for that signal{}",
-		                      tick, reached, CurrentTick() - 1 - reached, reached + 1, wait, began);
+	bool        snapshot = false;
+	if (!StallSnapshot::GpuSide(holder)) {
+		const bool stuck = StallSnapshot::Stuck(holder, periods, compiling);
+		if (periods != 1 && !(stuck && !m_reported_stuck.test_and_set())) {
+			return;
+		}
+		const auto compile = compiling.count == 0
+		                         ? std::string()
+		                         : fmt::format(" while {} pipeline compile wait{} run{}, the longest for {:.1f} s ({} 0x{:016x})",
+		                                       compiling.count, compiling.count == 1 ? "" : "s", compiling.count == 1 ? "s" : "",
+		                                       compiling.seconds, compiling.what, compiling.hash);
+		verdict  = stuck ? fmt::format("[kyty] tick {} has been awaited for {} s and is not submitted yet (next tick {}, submitted up "
+		                               "to {}, the GPU is at {}), and no pipeline compile runs: the CPU side is stuck",
+		                               tick, waited, next, submitted, reached)
+		                 : fmt::format("[kyty] tick {} has been awaited for {} s and is not submitted yet (next tick {}, submitted up "
+		                               "to {}, the GPU is at {}): the CPU side holds it{}",
+		                               tick, waited, next, submitted, reached, compile);
+		snapshot = stuck || m_cpu_snapshots.fetch_add(1, std::memory_order_relaxed) < 3;
 	} else {
-		verdict = fmt::format("[kyty] the GPU has not reached tick {} in 10 s (it is at {}, {} ticks issued after it): the GPU "
-		                      "stopped, look for an NVIDIA Xid in dmesg{}{}{}",
-		                      tick, reached, CurrentTick() - 1 - reached, began, wait.empty() ? "" : "; its submission ", wait);
+		if (m_reported_gpu.test_and_set()) {
+			return;
+		}
+		std::string began;
+		if (const auto started = GpuBreadcrumbs::StartedTick(m_marker_slot, reached + 1); started.has_value() && submitted > reached) {
+			began = *started > reached ? fmt::format(" (the GPU began tick {}: it runs or waits inside it)", reached + 1)
+			                           : fmt::format(" (the GPU has not begun tick {}: it waits before it)", reached + 1);
+		}
+		const auto wait = holder == StallSnapshot::Holder::Gpu ? PendingWait(reached + 1) : std::string();
+		if (holder == StallSnapshot::Holder::Driver) {
+			verdict = fmt::format("[kyty] the GPU has not reached tick {} in {} s (it is at {}, {} ticks issued after it): tick {} has "
+			                      "been in vkQueueSubmit for {:.1f} s, the driver holds it",
+			                      tick, waited, reached, next - 1 - reached, submitting_tick, submitting_for);
+		} else if (wait.starts_with("waits for ") && !wait.starts_with("waits for nothing")) {
+			verdict = fmt::format("[kyty] the GPU has not reached tick {} in {} s (it is at {}, {} ticks issued after it): the "
+			                      "submission of tick {} {}, the GPU waits for that signal{}",
+			                      tick, waited, reached, next - 1 - reached, reached + 1, wait, began);
+		} else {
+			verdict = fmt::format("[kyty] the GPU has not reached tick {} in {} s (it is at {}, {} ticks issued after it): the GPU "
+			                      "stopped, look for an NVIDIA Xid in dmesg{}{}{}",
+			                      tick, waited, reached, next - 1 - reached, began, wait.empty() ? "" : "; its submission ", wait);
+		}
+		snapshot = true;
 	}
-	if (const auto path = StallSnapshot::Write(m_graphics, tick, reached, verdict); !path.empty()) {
+	if (const auto path = snapshot ? StallSnapshot::Write(m_graphics, tick, reached, verdict) : std::string(); !path.empty()) {
 		std::fprintf(stderr, "[kyty-hang-snapshot] written to %s\n", path.c_str());
 	}
 	std::fprintf(stderr, "%s\n", verdict.c_str());
-	if (pending) {
+	if (!StallSnapshot::GpuSide(holder)) {
 		return;
 	}
 	std::array<uint64_t, 24> shaders {};
 	size_t                   count = 0;
-	const auto               next  = m_work_next.load(std::memory_order_relaxed);
+	const auto               work_next = m_work_next.load(std::memory_order_relaxed);
 	for (uint32_t i = 1; i <= m_work.size() && count < shaders.size(); i++) {
-		const auto& work = m_work[(next - i) % m_work.size()];
+		const auto& work = m_work[(work_next - i) % m_work.size()];
 		if (work.tick.load(std::memory_order_relaxed) != reached + 1) {
 			continue;
 		}
@@ -238,9 +265,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
 #if defined(ANYPS5_KYTY)
 	constexpr uint64_t StallNs = 10'000'000'000ull;
-	auto result = m_graphics.device.waitSemaphores(&wait_info, StallNs);
+	auto     result  = m_graphics.device.waitSemaphores(&wait_info, StallNs);
+	uint32_t periods = 0;
 	while (result == vk::Result::eTimeout) {
-		ReportStall(tick);
+		ReportStall(tick, ++periods);
 		result = m_graphics.device.waitSemaphores(&wait_info, StallNs);
 	}
 #else

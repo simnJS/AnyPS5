@@ -56,6 +56,38 @@ int main() {
 	Snapshot::Forget(binary);
 	Check(Snapshot::Describe(binary) == "semaphore 0x2000", "a forgotten semaphore loses its name");
 
+	using Snapshot::Holder;
+	Check(Snapshot::Classify(16186, 16187, 16185, 16186, 0.16) == Holder::Recording,
+	      "a tick issued but still in vkQueueSubmit for a moment is held by the CPU side");
+	Check(!Snapshot::GpuSide(Snapshot::Classify(16186, 16187, 16185, 16186, 0.16)), "a tick held by the CPU side is not a GPU stall");
+	Check(Snapshot::Classify(15404, 15404, 15403, 0, 0) == Holder::NotIssued, "the open tick is not issued");
+	Check(Snapshot::Classify(14420, 14421, 14420, 0, 0) == Holder::Gpu, "a submitted tick is the GPU's");
+	Check(Snapshot::Classify(14420, 14421, 14419, 14420, 12.0) == Holder::Driver,
+	      "a tick in vkQueueSubmit for more than 10 s is held by the driver");
+	Check(Snapshot::GpuSide(Holder::Driver) && Snapshot::GpuSide(Holder::Gpu), "the driver and the GPU are on the GPU side");
+	Check(Snapshot::Classify(14421, 14422, 14419, 14420, 12.0) == Holder::Driver,
+	      "a later tick behind a submission stuck in the driver is held by the driver");
+	Check(Snapshot::Classify(14420, 14421, 14419, 14418, 12.0) == Holder::Recording,
+	      "a stale submission note does not blame the driver");
+	Snapshot::CompileWait none;
+	Snapshot::CompileWait one;
+	one.count = 1;
+	Check(Snapshot::Stuck(Holder::Recording, Snapshot::StuckPeriods, none), "a CPU hold of 60 s with no compile is stuck");
+	Check(!Snapshot::Stuck(Holder::Recording, Snapshot::StuckPeriods, one), "a CPU hold during a compile is not stuck");
+	Check(!Snapshot::Stuck(Holder::NotIssued, Snapshot::StuckPeriods - 1, none), "a CPU hold under 60 s is not stuck");
+	Check(!Snapshot::Stuck(Holder::Gpu, Snapshot::StuckPeriods, none), "a GPU stall is never called a stuck CPU");
+
+	const int first_compile  = 0;
+	const int second_compile = 0;
+	Check(Snapshot::LongestCompileWait().count == 0, "no compile wait at start");
+	Snapshot::EnterCompileWait(&first_compile, "graphics-wait", 0x12);
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	Snapshot::EnterCompileWait(&second_compile, "compute-sync", 0x34);
+	const auto longest = Snapshot::LongestCompileWait();
+	Check(longest.count == 2, "two compile waits are counted");
+	Check(longest.what != nullptr && std::string(longest.what) == "graphics-wait" && longest.hash == 0x12 && longest.seconds >= 0.04,
+	      "the longest compile wait is the oldest");
+
 	static const char owner[] = "the test scheduler";
 	Snapshot::Register(const_cast<char*>(owner), "test section", &Section);
 
@@ -93,6 +125,11 @@ int main() {
 	Check(text.find("== threads (") != std::string::npos, "the threads are listed");
 	Check(text.find("read on pipe:") != std::string::npos, "a thread blocked in read names the pipe it reads");
 	Check(text.find("writing this report") != std::string::npos, "the thread that writes the report is named as such");
+	Check(text.find("== pipeline compile waits in progress: 2\ngraphics-wait 0x0000000000000012 for ") != std::string::npos,
+	      "the compile waits in progress are listed");
+	Snapshot::LeaveCompileWait(&first_compile);
+	Snapshot::LeaveCompileWait(&second_compile);
+	Check(Snapshot::LongestCompileWait().count == 0, "a compile wait that ended is forgotten");
 
 	Check(write(pipe_ends[1], "x", 1) == 1, "the blocked thread is released");
 	reader.join();

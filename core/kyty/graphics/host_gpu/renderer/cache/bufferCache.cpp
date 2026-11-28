@@ -2577,11 +2577,12 @@ bool BufferCache::DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies
 			EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(status).c_str());
 		}
 		if ((spins & 1023u) == 1023u && std::chrono::steady_clock::now() - spin_from >= SpinLimit) {
-			const auto report = [&] {
+			uint32_t   periods = 0;
+			const auto report  = [&] {
 				auto& master = m_scheduler.GetMasterSemaphore();
 				master.Refresh();
 				if (needed != 0 && !master.IsFree(needed)) {
-					master.ReportStall(needed);
+					master.ReportStall(needed, ++periods);
 					return;
 				}
 				static std::atomic_flag reported = ATOMIC_FLAG_INIT;

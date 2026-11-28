@@ -28,6 +28,24 @@ void Forget(vk::Semaphore semaphore);
 
 void NoteOperation(uint64_t tick, const char* kind, uint32_t queue, uint64_t submit_id) noexcept;
 
+struct CompileWait {
+	const char* what    = nullptr;
+	uint64_t    hash    = 0;
+	double      seconds = 0;
+	uint32_t    count   = 0;
+};
+void                      EnterCompileWait(const void* key, const char* what, uint64_t hash);
+void                      LeaveCompileWait(const void* key);
+[[nodiscard]] CompileWait LongestCompileWait();
+
+enum class Holder : uint8_t { NotIssued, Recording, Driver, Gpu };
+inline constexpr double DriverHoldSeconds = 10.0;
+inline constexpr uint32_t StuckPeriods    = 6;
+[[nodiscard]] Holder Classify(uint64_t tick, uint64_t next_tick, uint64_t submitted, uint64_t submitting_tick,
+                              double submitting_seconds) noexcept;
+[[nodiscard]] bool   GpuSide(Holder holder) noexcept;
+[[nodiscard]] bool   Stuck(Holder holder, uint32_t periods, const CompileWait& compiling) noexcept;
+
 [[nodiscard]] std::string Write(GraphicContext& graphics, uint64_t awaited, uint64_t reached, const std::string& verdict);
 
 }
