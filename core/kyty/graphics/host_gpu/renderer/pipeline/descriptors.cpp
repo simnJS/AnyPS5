@@ -55,7 +55,7 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
-constexpr size_t MaxTableElements         = size_t {1} << 16u;
+constexpr size_t MaxTableElements = size_t {1} << 16u;
 
 constexpr auto TableOversized = [](const auto& table) { return table.elements.size() > MaxTableElements; };
 
