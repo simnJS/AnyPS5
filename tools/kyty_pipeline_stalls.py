@@ -19,7 +19,7 @@ PIPELINE_ROWS = {
     "stall": re.compile(r"(?P<duration>[0-9]{1,10}\.[0-9]{3}) s (?P<stall_type>\S+) "
                         + SHADER + r"(?: (?P<route>.*?))?" + END),
     "translate": re.compile(r"(?P<duration>[0-9]{1,10}\.[0-9]{3}) s " + SHADER
-                            + r"(?: cause=(?P<cause>\S+) variant=(?P<variant>[0-9a-f]{16}))?" + END),
+                            + r"(?: cause=(?P<cause>\S+))?(?: variant=(?P<variant>[0-9a-f]{16}))?" + END),
     "compute-driver": re.compile(r"(?P<duration>[0-9]{1,10}\.[0-9]{6}) s " + SHADER
                                  + r" module=(?P<module>[0-9]{1,20}) spirv_words=(?P<spirv_words>[0-9]{1,10})"
                                  + r" mode=(?P<mode>lookup|create) result=(?P<result>\S(?:.*\S)?)" + END),

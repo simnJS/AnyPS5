@@ -1750,6 +1750,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 #if defined(ANYPS5_KYTY)
 	struct TranslateScope {
 		uint64_t                              hash;
+		const bool&                           retry_buffers;
+		const bool&                           retry_samplers;
 		std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 		~TranslateScope() {
 			static const auto threshold = std::chrono::milliseconds([] {
@@ -1757,14 +1759,17 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				return value != nullptr ? std::strtoll(value, nullptr, 10) : 100;
 			}());
 			const auto now   = std::chrono::steady_clock::now();
-			const auto cause = TakeAddedCause();
+			auto       cause = TakeAddedCause();
+			if (cause.empty() && (retry_samplers || retry_buffers)) {
+				cause = retry_samplers ? " cause=other-key:rs" : " cause=other-key:rb";
+			}
 			if (now - started >= threshold) {
 				PipelineCacheLog("[kyty-gpl] translate {:.3f} s 0x{:016x}{} @{}",
 				                 std::chrono::duration<double>(now - started).count(), hash, cause,
 				                 now.time_since_epoch().count());
 			}
 		}
-	} const translate_scope {params.hash};
+	} const translate_scope {params.hash, retry_runtime_buffers, retry_runtime_samplers};
 	(void)TakeAddedCause();
 #endif
 	if (m_queue_only) {
