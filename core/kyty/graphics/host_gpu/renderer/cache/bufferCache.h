@@ -366,6 +366,7 @@ private:
 	void CollectDownloadCopies(uint64_t vaddr, uint64_t size, std::vector<vk::BufferCopy>& copies,
 	                           uint64_t& total_size);
 	struct ReadbackQueueRead;
+	struct ReadbackTrace;
 	[[nodiscard]] bool StartReadbackQueueRead(uint64_t vaddr, uint64_t size, uint64_t pages_begin,
 	                                          uint64_t pages_end, ReadbackQueueRead& read, bool followers);
 	struct GuestReadPage {
@@ -377,10 +378,16 @@ private:
 	std::vector<GuestReadPage> m_guest_read_pages;
 	uint64_t                   m_guest_reads = 0;
 	void                       NoteGuestReadPages(uint64_t pages_begin, uint64_t pages_end);
-	void FinishReadbackQueueRead(ReadbackQueueRead& read);
+	void FinishReadbackQueueRead(ReadbackQueueRead& read, ReadbackTrace* trace);
 	void WaitReadbackQueueCopies();
 	void DrainHostCopies();
 	void NoteWrite(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate) {
+		if (m_trace_writers && size != 0) {
+			auto& [shader, immediate] = *m_trace_writers;
+			const bool from_shader = writer == HeapWriteSource::Shader;
+			(from_shader ? immediate : shader).Subtract(vaddr, size);
+			(from_shader ? shader : immediate).Add(vaddr, size);
+		}
 		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);
 		NoteHeapTransfer(vaddr, size, writer);
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
@@ -417,6 +424,11 @@ private:
 	std::vector<uint32_t>                             m_residency_words;
 	Buffer                                            m_null_buffer;
 	RangeSet                                          m_gpu_modified_ranges;
+	struct TraceWriters {
+		RangeSet shader;
+		RangeSet immediate;
+	};
+	std::unique_ptr<TraceWriters>                     m_trace_writers;
 	struct DirtyPageMask {
 		uint64_t                 page = UINT64_MAX;
 		std::array<uint64_t, 64> bits {};
