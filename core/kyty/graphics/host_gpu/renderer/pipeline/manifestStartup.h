@@ -132,31 +132,4 @@ struct ManifestStartupWait {
 	Clock::time_point last_progress;
 };
 
-struct ManifestMemoryPause {
-	using Clock = std::chrono::steady_clock;
-
-	std::optional<Clock::time_point> since;
-	std::thread::id worker;
-
-	void Sample(Clock::time_point now, uint64_t total, uint64_t available) {
-		constexpr uint64_t GiB = uint64_t {1} << 30;
-		if (!since && available < std::min(12 * GiB, total / 2)) {
-			since = now;
-		} else if (since && available > std::min(14 * GiB, total / 12 * 7)) {
-			since.reset();
-			worker = {};
-		}
-	}
-
-	bool Admit(Clock::time_point now, std::thread::id id) {
-		if (!since) return true;
-		if (now - *since >= std::chrono::seconds(30) && worker == std::thread::id {}) worker = id;
-		return worker == id;
-	}
-
-	void Finished(std::thread::id id) {
-		if (worker == id) worker = {};
-	}
-};
-
 }

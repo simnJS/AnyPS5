@@ -16,6 +16,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/manifestAdmission.h"
 #include "graphics/host_gpu/renderer/pipeline/manifestStartup.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -60,6 +61,11 @@
 #include <xxhash.h>
 #include <zstd.h>
 
+#if defined(__linux__)
+#include <sched.h>
+#include <unistd.h>
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
@@ -68,6 +74,76 @@ using ManifestText::ParseNumber;
 using ManifestText::Split;
 
 constexpr size_t LargeSpirvWords = 50'000;
+
+struct ManifestCpuCounters {
+	std::vector<std::pair<uint64_t, uint64_t>> last;
+	std::chrono::steady_clock::time_point      read;
+	double                                     busy = 0.0;
+	uint32_t                                   cpus = 0;
+};
+
+#if defined(__linux__)
+void ReadCpuBusy(ManifestCpuCounters& counters, std::chrono::steady_clock::time_point now) {
+	if (!counters.last.empty() && now - counters.read < std::chrono::seconds(1)) return;
+	cpu_set_t usable;
+	CPU_ZERO(&usable);
+	if (sched_getaffinity(0, sizeof(usable), &usable) != 0) return;
+	std::ifstream                              stat("/proc/stat");
+	std::vector<std::pair<uint64_t, uint64_t>> current;
+	std::string                                line;
+	while (std::getline(stat, line)) {
+		if (line.size() < 4 || !line.starts_with("cpu") || std::isdigit(static_cast<unsigned char>(line[3])) == 0) continue;
+		std::istringstream fields(line.substr(3));
+		size_t             cpu   = 0;
+		uint64_t           value = 0;
+		uint64_t           total = 0;
+		uint64_t           idle  = 0;
+		fields >> cpu;
+		for (int field = 0; field < 8 && fields >> value; ++field) {
+			total += value;
+			if (field == 3 || field == 4) idle += value;
+		}
+		if (cpu >= current.size()) current.resize(cpu + 1);
+		current[cpu] = {total - idle, total};
+	}
+	double   busy = 0.0;
+	uint32_t cpus = 0;
+	for (size_t cpu = 0; cpu < current.size() && cpu < CPU_SETSIZE; ++cpu) {
+		if (!CPU_ISSET(cpu, &usable)) continue;
+		++cpus;
+		if (cpu >= counters.last.size() || current[cpu].second <= counters.last[cpu].second) continue;
+		busy += static_cast<double>(current[cpu].first - std::min(current[cpu].first, counters.last[cpu].first)) /
+		        static_cast<double>(current[cpu].second - counters.last[cpu].second);
+	}
+	if (!counters.last.empty()) counters.busy = busy;
+	counters.cpus = cpus;
+	counters.last = std::move(current);
+	counters.read = now;
+}
+
+uint64_t ProcessResidentBytes() {
+	std::ifstream statm("/proc/self/statm");
+	uint64_t      size     = 0;
+	uint64_t      resident = 0;
+	statm >> size >> resident;
+	return resident * static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+}
+#endif
+
+std::optional<ManifestAdmissionSample> ReadAdmissionSample(ManifestCpuCounters& counters, std::chrono::steady_clock::time_point now) {
+	const auto memory = Common::ReadSystemMemory();
+	if (!memory) return std::nullopt;
+	ManifestAdmissionSample sample {.total = memory->total, .available = memory->available};
+#if defined(__linux__)
+	sample.process = ProcessResidentBytes();
+	ReadCpuBusy(counters, now);
+	sample.busy_cpus = counters.busy;
+	sample.cpus      = counters.cpus;
+#else
+	sample.process = Common::ReadProcessMemory().rss.value_or(0);
+#endif
+	return sample;
+}
 
 std::string SafeFileName(std::string name) {
 	for (auto& c: name) {
@@ -276,8 +352,38 @@ struct PipelineCache::ManifestState {
 	bool startup = false;
 
 	std::optional<ManifestStartupWait> startup_wait;
-	std::chrono::steady_clock::time_point next_memory_sample;
-	ManifestMemoryPause memory;
+	ManifestAdmission                     admission;
+	std::condition_variable_any           admission_changed;
+	uint64_t                              admission_epoch = 0;
+	bool                                  admission_closed = false;
+	bool                                  memory_blocked   = false;
+	bool                                  memory_refused   = false;
+	std::chrono::steady_clock::time_point next_admission_sample;
+	std::chrono::steady_clock::time_point next_admission_log;
+	ManifestCpuCounters                   cpu_counters;
+	uint32_t                              logged_modules   = 0;
+	uint32_t                              logged_pipelines = 0;
+
+	class Admitted {
+	public:
+		Admitted() = default;
+		Admitted(ManifestState* state, uint64_t ticket): m_state(state), m_ticket(ticket) {}
+		Admitted(Admitted&& other) noexcept: m_state(std::exchange(other.m_state, nullptr)), m_ticket(other.m_ticket) {}
+		Admitted(const Admitted&)            = delete;
+		Admitted& operator=(const Admitted&) = delete;
+		Admitted& operator=(Admitted&&)      = delete;
+		~Admitted() {
+			if (m_state != nullptr) m_state->Release(m_ticket);
+		}
+		explicit operator bool() const { return m_state != nullptr; }
+		void Reset() {
+			if (m_state != nullptr) std::exchange(m_state, nullptr)->Release(m_ticket);
+		}
+
+	private:
+		ManifestState* m_state  = nullptr;
+		uint64_t       m_ticket = 0;
+	};
 
 	void ReleaseStartup(std::string_view reason) {
 		startup = false;
@@ -289,30 +395,69 @@ struct PipelineCache::ManifestState {
 		            timestamp, reason, Seconds(now - start), startup_done, startup_total);
 	}
 
-	bool WaitForMemory(const std::stop_token& stop) {
-		std::unique_lock lock(mutex);
-		while (startup && !stop.stop_requested()) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= next_memory_sample) {
-				next_memory_sample = now + std::chrono::milliseconds(250);
-				if (const auto sample = Common::ReadSystemMemory()) {
-					const bool paused = memory.since.has_value();
-					memory.Sample(now, sample->total, sample->available);
-					if (paused != memory.since.has_value()) {
-						ManifestLog("Pipeline manifest: compilation {} ({:.1f} GiB available)",
-						            paused ? "resumed" : "paused", static_cast<double>(sample->available) / (1ull << 30));
-						startup_finished.notify_all();
-					}
-				}
-			}
-			const auto previous = memory.worker;
-			if (memory.Admit(now, std::this_thread::get_id())) {
-				if (memory.worker != previous) ManifestLog("Pipeline manifest: resuming one job under memory pressure");
-				break;
-			}
-			startup_finished.wait_until(lock, stop, next_memory_sample, [&] { return !startup || !memory.since; });
+	void SampleAdmission(std::chrono::steady_clock::time_point now) {
+		if (now < next_admission_sample) return;
+		next_admission_sample = now + std::chrono::milliseconds(250);
+		if (const auto sample = ReadAdmissionSample(cpu_counters, now)) admission.Sample(now, *sample);
+		const bool blocked = std::exchange(memory_refused, false);
+		if (blocked != memory_blocked) {
+			memory_blocked = blocked;
+			startup_finished.notify_all();
 		}
-		return !stop.stop_requested();
+		++admission_epoch;
+		admission_changed.notify_all();
+		LogAdmission(now);
+	}
+
+	void LogAdmission(std::chrono::steady_clock::time_point now) {
+		if (now < next_admission_log) return;
+		next_admission_log    = now + std::chrono::minutes(1);
+		const auto finished   = admission.TakeFinished();
+		const auto modules    = std::exchange(logged_modules, built);
+		const auto created    = pipelines + compute;
+		const auto previous   = std::exchange(logged_pipelines, created);
+		if (admission.Running() == 0 && finished.driver == 0 && finished.light == 0) return;
+		const auto& sample = admission.LastSample();
+		const auto  gib    = [](uint64_t bytes) { return static_cast<double>(bytes) / static_cast<double>(ManifestAdmission::GiB); };
+		ManifestLog("Pipeline manifest: concurrency {} of {} (CPU cap {}, {:.1f} of {} CPUs busy elsewhere), {:.1f} GiB available "
+		            "of {:.1f}, reserve {:.1f}, committed {:.1f}, in use by compilations {:.1f}, {:.1f} KiB per SPIR-V word{}; "
+		            "last minute: {} driver compilations, {} translations, {} modules, {} pipelines",
+		            admission.Running(), admission.Limit(), admission.CpuCap(), admission.OtherBusyCpus(), sample.cpus,
+		            gib(sample.available), gib(sample.total), gib(admission.Reserve()), gib(admission.Committed()),
+		            gib(admission.Usage()), admission.BytesPerWord() / 1024.0, memory_blocked ? ", waiting for memory" : "",
+		            finished.driver, finished.light, built - modules, created - previous);
+	}
+
+	Admitted Admit(const std::stop_token& stop, size_t words, bool driver) {
+		std::unique_lock lock(mutex);
+		const auto since = std::chrono::steady_clock::now();
+		while (!stop.stop_requested()) {
+			const auto now = std::chrono::steady_clock::now();
+			SampleAdmission(now);
+			if (const auto ticket = admission.Admit(now, words, driver, std::this_thread::get_id(), since)) return {this, *ticket};
+			const auto refusal = admission.LastRefusal();
+			if (refusal == ManifestAdmission::Refusal::Closed) break;
+			if (refusal == ManifestAdmission::Refusal::Memory) memory_refused = true;
+			const auto epoch = admission_epoch;
+			admission_changed.wait_until(lock, stop, next_admission_sample, [&] { return admission_epoch != epoch; });
+		}
+		return {};
+	}
+
+	void Release(uint64_t ticket) {
+		std::scoped_lock lock(mutex);
+		admission.Finish(ticket);
+		++admission_epoch;
+		admission_changed.notify_all();
+	}
+
+	void CloseAdmission() {
+		std::scoped_lock lock(mutex);
+		admission.Close();
+		admission_closed = true;
+		++admission_epoch;
+		admission_changed.notify_all();
+		available.notify_all();
 	}
 
 	std::array<const ShaderModule*, 4> PipelineStages(const ManifestPipeline& pipeline) const {
@@ -827,7 +972,9 @@ void PipelineCache::OpenManifest() {
 	state.startup_done = state.found;
 	state.scanning.store(!state.code.empty(), std::memory_order_relaxed);
 	state.startup = state.startup_total != state.startup_done && Config::StartupWaitSeconds() != 0;
-	const auto workers = Common::ParallelThreads();
+	const auto workers = ManifestWorkerCount();
+	state.admission.SetLimit(static_cast<uint32_t>(workers));
+	state.next_admission_log = state.start + std::chrono::minutes(1);
 	if (state.startup) {
 		ManifestLog("Pipeline manifest: startup with {} workers, {} jobs ({} modules restored)", workers,
 		            state.startup_total, state.found);
@@ -849,6 +996,10 @@ void PipelineCache::OpenManifest() {
 		auto           next   = std::chrono::steady_clock::now() + Period;
 		while (!stop.stop_requested()) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			{
+				std::scoped_lock lock(m_manifest->mutex);
+				m_manifest->SampleAdmission(std::chrono::steady_clock::now());
+			}
 			if (std::chrono::steady_clock::now() >= next) {
 				ReloadSharedManifest();
 				next = std::chrono::steady_clock::now() + Period;
@@ -1060,6 +1211,16 @@ void PipelineCache::CloseManifest() {
 	}
 	state.saver = {};
 	SaveManifestRecording();
+}
+
+size_t PipelineCache::ManifestWorkerCount() const {
+	return m_manifest_workers != 0 ? m_manifest_workers : Common::ParallelThreads();
+}
+
+void PipelineCache::StopManifestAdmission() {
+	if (m_manifest == nullptr || !m_manifest_warm) return;
+	m_manifest->CloseAdmission();
+	ManifestLog("Pipeline manifest: admission closed, {} jobs still running", GetManifestBacklog().running);
 }
 
 void PipelineCache::FlushManifestRecording() {
@@ -2966,7 +3127,7 @@ bool PipelineCache::WaitForStartupManifest(std::chrono::milliseconds timeout, ui
 	}
 	done = state.startup_done;
 	total = state.startup_total;
-	memory_paused = state.memory.since.has_value();
+	memory_paused = state.memory_blocked;
 	return !state.startup;
 }
 
@@ -2974,7 +3135,7 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large
 	KYTY_PROFILER_THREAD("Thread_PipelineManifest");
 	Common::Thread::LowerCurrentPriority();
 	auto& state = *m_manifest;
-	const bool prefer_large = allow_large && Common::ParallelThreads() > m_large_manifest_workers;
+	const bool prefer_large = allow_large && ManifestWorkerCount() > m_large_manifest_workers;
 	for (;;) {
 		std::shared_ptr<const std::vector<uint32_t>> code;
 		std::shared_ptr<const std::vector<uint32_t>> back_code;
@@ -2996,6 +3157,7 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large
 				return allow_large ? jobs.begin() : std::ranges::find_if(jobs, small);
 			};
 			if (!state.available.wait(lock, stop, [&] {
+				    if (state.admission_closed) return true;
 				    if (allow_large && !state.large_compute.empty()) return true;
 				    restore_job = eligible(m_restore_jobs, [&](const auto& job) {
 					    return job.compute ? job.module->spirv_words <= LargeSpirvWords : small_stages(job.stages);
@@ -3006,7 +3168,7 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large
 					    return small_stages(state.PipelineStages(state.warm_pipelines[job]));
 				    });
 				    return module_job != state.module_jobs.end() || pipeline_job != state.pipeline_jobs.end();
-			    }) || stop.stop_requested()) {
+			    }) || stop.stop_requested() || state.admission_closed) {
 				return;
 			}
 			if (allow_large && !state.large_compute.empty()) {
@@ -3058,7 +3220,6 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large
 		{
 			std::scoped_lock lock(state.mutex);
 			state.running--;
-			state.memory.Finished(std::this_thread::get_id());
 			if (state.startup) {
 				++state.startup_done;
 				if (state.startup_wait) state.startup_wait->last_progress = std::chrono::steady_clock::now();
@@ -3190,7 +3351,8 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		finish(compiled, false);
 		return;
 	}
-	if (!state.WaitForMemory(stop)) return;
+	auto admitted = state.Admit(stop, code.size(), false);
+	if (!admitted) return;
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	std::optional<ShaderModule>                       module;
 	const auto what = fmt::format("module {:016x}", record.code_hash);
@@ -3246,6 +3408,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		                              record.push_data_cursor, spirv, plain_spirv, &build_refusal);
 		if (!module) refusal = build_refusal.empty() ? "build_refused" : fmt::format("build_{}", build_refusal);
 	});
+	admitted.Reset();
 	if (!ran) refusal = "dropped_after_fatal_error";
 	if (compiled != nullptr) {
 		finish(compiled, false);
@@ -3321,14 +3484,19 @@ void PipelineCache::CreateManifestGraphicsPipeline(const GraphicsPipelineKey& ke
 	const auto key_hash = static_cast<uint64_t>(GraphicsPipelineKeyHash {}(key));
 	const auto what     = fmt::format("pipeline {:016x}", key_hash);
 	bool cache_hit = false;
+	bool admitted  = true;
 	const bool ran = RunDroppable(state.dropped, from_assets, stages[0]->info.shader_hash,
 	                              key_hash, what, [&] {
 #if defined(ANYPS5_KYTY)
 		cache_hit = CreateGraphicsPipelineNow(pipeline, key, stages, false);
 		if (cache_hit) return;
 #endif
-		if (state.WaitForMemory(stop)) CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
-	});
+		size_t words = 0;
+		for (const auto* stage: stages) words += stage != nullptr ? stage->spirv_words : 0;
+		const auto ticket = state.Admit(stop, words, true);
+		admitted          = static_cast<bool>(ticket);
+		if (admitted) CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+	}) && admitted;
 	const bool created = ran && pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
 	if (created) {
 		if (!stored) StorePipeline(key);
@@ -3347,6 +3515,7 @@ void PipelineCache::CreateManifestGraphicsPipeline(const GraphicsPipelineKey& ke
 		m_async_pending_graphics.erase(key);
 	}
 	m_async_finished.notify_all();
+	if (!admitted) return;
 #if defined(ANYPS5_KYTY)
 	if (created && m_libraries != nullptr) m_libraries->NotePreparedPipeline(key, stages);
 #endif
@@ -3382,12 +3551,14 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bo
 	auto&      state = *m_manifest;
 	const auto what  = fmt::format("compute pipeline {:016x}", module.info.shader_hash);
 	bool cache_hit = false;
+	bool admitted  = true;
 	const bool ran   = RunDroppable(state.dropped, from_assets, module.info.shader_hash, 0, what, [&] {
 		cache_hit = FindComputePipeline(m_graphics, pipeline, module, m_driver_cache);
-		if (!cache_hit && state.WaitForMemory(stop)) {
-			CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache, ComputePipelineCacheMode::KnownMiss);
-		}
-	});
+		if (cache_hit) return;
+		const auto ticket = state.Admit(stop, module.spirv_words, true);
+		admitted          = static_cast<bool>(ticket);
+		if (admitted) CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache, ComputePipelineCacheMode::KnownMiss);
+	}) && admitted;
 	const bool created = ran && pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
 	if (created && !cache_hit) {
 		NoteCreatedPipeline(start);
@@ -3402,6 +3573,7 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bo
 		m_async_pending_compute.erase(module.id);
 	}
 	m_async_finished.notify_all();
+	if (!admitted) return;
 	std::scoped_lock lock(state.mutex);
 	state.compute += created && !cache_hit ? 1u : 0u;
 	state.compute_cached += cache_hit ? 1u : 0u;
@@ -3428,7 +3600,7 @@ PipelineCache::ManifestBacklog PipelineCache::GetManifestBacklog() const {
 	backlog.running   = state.running;
 	backlog.startup_total = state.startup ? state.startup_total : 0;
 	backlog.startup_done  = state.startup_done;
-	backlog.memory_paused = state.startup && state.memory.since.has_value();
+	backlog.memory_paused = state.startup && state.memory_blocked;
 	backlog.scanning  = state.scanning.load(std::memory_order_acquire);
 	for (const auto index: state.module_jobs) {
 		backlog.compute_modules += state.warm_modules[index].stage == ShaderType::Compute ? 1u : 0u;
