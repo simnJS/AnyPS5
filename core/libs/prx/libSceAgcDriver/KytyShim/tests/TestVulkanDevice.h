@@ -127,6 +127,7 @@ private:
 		    .pNext = &robustness,
 		    .storageBuffer8BitAccess = require_tiling,
 		    .shaderSampledImageArrayNonUniformIndexing = supported12.shaderSampledImageArrayNonUniformIndexing,
+		    .shaderStorageBufferArrayNonUniformIndexing = supported12.shaderStorageBufferArrayNonUniformIndexing,
 		    .descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
 		    .descriptorBindingUpdateUnusedWhilePending = VK_TRUE,
 		    .descriptorBindingPartiallyBound = VK_TRUE,
