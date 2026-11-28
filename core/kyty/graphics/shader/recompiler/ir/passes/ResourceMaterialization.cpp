@@ -3518,8 +3518,41 @@ static bool ReadFallbackBufferFormat(const ResourcePlan& plan, const ResourceSna
 	return true;
 }
 
+#if defined(ANYPS5_KYTY)
+static bool RecordedPopulatedBuffer(const ResourcePlan& plan, uint32_t index, ResourceSpecialization::Buffer& form) {
+	constexpr uint32_t recorded =
+	    BufferStrideMask | (1u << 14u) | (3u << 16u) | (1u << 20u) | StructuredBufferBounds | ExactBufferBounds;
+	if (!DirectBufferSlot(plan, index, form) || form.zero_stride_oob || form.scalar_empty ||
+	    (form.packed_stride & ~recorded) != 0u) {
+		return false;
+	}
+	if (ReadsStrideAtRunTime(plan, index, form)) form.packed_stride = RuntimeStrideKey(form.packed_stride);
+	return true;
+}
+
+static void TakeKnownPopulatedBuffer(const ResourcePlan& plan, const ResourceSnapshot& snapshot, uint32_t index,
+                                     std::span<const ResourceSpecialization* const> known,
+                                     ResourceSpecialization::Buffer&                buffer) {
+	using Form = std::pair<ResourceSpecialization::Buffer, uint32_t>;
+	std::vector<Form> forms;
+	for (const auto* other: known) {
+		if (other == nullptr || other->buffers.size() <= index) continue;
+		auto form = other->buffers[index];
+		if (!RecordedPopulatedBuffer(plan, index, form) || !EmptyBufferServes(plan, snapshot, index, buffer, form)) continue;
+		const auto found = std::ranges::find(forms, form, &Form::first);
+		if (found == forms.end()) {
+			forms.emplace_back(form, 1u);
+		} else {
+			++found->second;
+		}
+	}
+	if (const auto best = std::ranges::max_element(forms, {}, &Form::second); best != forms.end()) buffer = best->first;
+}
+#endif
+
 bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                                  ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                                  ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                  std::span<const ResourceSpecialization* const> known) {
 	const bool buffer_failure  = t_indirect_buffer_failure;
 	const bool sampler_failure = t_indirect_sampler_failure;
 	const FallbackForms fallback;
@@ -3527,8 +3560,14 @@ bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime&
 	fallback_runtime.runtime_stride = true;
 	const bool ok = MaterializeResourcesForViews(program, fallback_runtime, snapshot, specialization, {});
 	if (ok) {
-		for (uint32_t i = 0; i < specialization.buffers.size(); ++i)
-			ReadFallbackBufferFormat(program, snapshot, i, specialization.buffers[i]);
+		for (uint32_t i = 0; i < specialization.buffers.size(); ++i) {
+			auto& buffer = specialization.buffers[i];
+			if (!ReadFallbackBufferFormat(program, snapshot, i, buffer) && (buffer.zero_stride_oob || buffer.scalar_empty)) {
+#if defined(ANYPS5_KYTY)
+				TakeKnownPopulatedBuffer(program, snapshot, i, known, buffer);
+#endif
+			}
+		}
 		ReadTableMappingsAtRunTime(specialization, &snapshot);
 	}
 	t_indirect_buffer_failure  = buffer_failure;

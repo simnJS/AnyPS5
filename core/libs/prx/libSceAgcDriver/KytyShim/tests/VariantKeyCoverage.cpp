@@ -500,6 +500,107 @@ void GenericGraphics() {
 	      "generic graphics: a buffer whose stride stays fixed keeps its own variant");
 }
 
+constexpr uint32_t Format16UInt = static_cast<uint32_t>(Prospero::BufferFormat::k16UInt);
+
+IR::ResourcePlan BufferFormsPlan() {
+	auto plan = CandidatePlan(ShaderType::Compute);
+	for (uint32_t buffer = 0; buffer < 2u; ++buffer) {
+		auto& source       = plan.descriptor_sources.emplace_back();
+		source.dword_count = 4;
+		for (uint32_t i = 0; i < 4; ++i) {
+			auto& word = plan.value_storage.emplace_back(IR::ValueOpcode::GetUserData);
+			word.SetArg(0, IR::Value(static_cast<IR::ScalarReg>(buffer * 4u + i)));
+			source.dwords[i] = IR::Value(&word);
+		}
+		auto& resource     = plan.info.buffers.emplace_back();
+		resource.source    = static_cast<uint32_t>(plan.descriptor_sources.size() - 1u);
+		resource.read      = true;
+		resource.written   = buffer == 1u;
+		resource.formatted = true;
+		plan.memory_info.push_back({.kind = IR::ResourceKind::Buffer, .resource = buffer, .formatted = true});
+	}
+	plan.buffer_vector_access = {1, 1};
+	IR::CompileSrtWalker(plan);
+	return plan;
+}
+
+struct BufferDispatch {
+	std::array<uint32_t, 16> user_data {};
+
+	BufferDispatch(const Sharp& read, const Sharp& written) {
+		std::copy(read.begin(), read.end(), user_data.begin());
+		std::copy(written.begin(), written.end(), user_data.begin() + 4);
+	}
+
+	[[nodiscard]] IR::SrtRuntime Runtime() const {
+		return {.user_data = user_data, .read_specialization_memory = ReadTable, .runtime_stride = true};
+	}
+};
+
+Candidates Natural(const IR::ResourcePlan& plan, const BufferDispatch& dispatch) {
+	Candidates result;
+	result.ok = IR::MaterializeResources(plan, dispatch.Runtime(), result.snapshot, result.specialization);
+	return result;
+}
+
+Candidates Fallback(const IR::ResourcePlan& plan, const BufferDispatch& dispatch,
+                    std::span<const IR::ResourceSpecialization* const> known) {
+	Candidates result;
+	result.ok = IR::MaterializeFallbackResources(plan, dispatch.Runtime(), result.snapshot, result.specialization, known);
+	return result;
+}
+
+bool Serves(const IR::ResourcePlan& plan, const BufferDispatch& dispatch, const IR::ResourceSpecialization& target) {
+	const auto live = Natural(plan, dispatch);
+	if (!live.ok) return false;
+	IR::ClearServeRefusal();
+	IR::ResourceSnapshot bound;
+	return IR::AlignResources(plan, live.snapshot, live.specialization, target, &bound) ||
+	       IR::RebindComputeImages(plan, dispatch.Runtime(), live.snapshot, live.specialization, target, bound);
+}
+
+bool RefusedAt(IR::ServeRefusal::Step step, uint32_t index) {
+	const auto refusal = IR::ClosestServeRefusal();
+	return refusal.step == step && refusal.index == index;
+}
+
+void FallbackBufferForms() {
+	IR::SetComputeIndirectFloors(1u, 1u);
+	const auto plan = BufferFormsPlan();
+	Check(plan.info.buffers.size() == 2u && plan.info.buffers[1].written && IR::FormattedReadComponents(plan, 1) != 0u,
+	      "buffer forms: the fixture reads one formatted buffer and writes another");
+	std::array<uint32_t, TableEntries> addresses {};
+	for (uint32_t entry = 0; entry < TableEntries; ++entry) addresses[entry] = TextureAddress(entry);
+	FillTable(addresses, {});
+	const auto           index   = MakeSharp(SourceAddress, Records, 3, 2, Format16UInt);
+	const auto           written = MakeSharp(TargetAddress, Records, 3, 4);
+	const BufferDispatch bound(index, written);
+	const BufferDispatch unbound(index, Sharp {});
+	const auto           recorded = Natural(plan, bound);
+	Check(recorded.ok, "buffer forms: a dispatch that writes the buffer is recorded");
+	if (!recorded.ok) return;
+	const std::array<const IR::ResourceSpecialization*, 1> known {&recorded.specialization};
+
+	const auto alone = Fallback(plan, unbound, {});
+	Check(alone.ok && (alone.specialization.buffers[1].zero_stride_oob || alone.specialization.buffers[1].scalar_empty),
+	      "buffer forms: without the recorded forms, a fallback built while the written buffer is unbound keys it empty");
+	Check(alone.ok && !Serves(plan, bound, alone.specialization) && RefusedAt(IR::ServeRefusal::Step::Buffer, 1),
+	      "buffer forms: that fallback refuses the dispatch that binds the written buffer, at buffer slot 1");
+
+	const auto from_unbound = Fallback(plan, unbound, known);
+	const auto from_bound   = Fallback(plan, bound, known);
+	Check(from_unbound.ok && from_bound.ok, "buffer forms: both fallbacks materialize");
+	if (!from_unbound.ok || !from_bound.ok) return;
+	const auto& taken = from_unbound.specialization.buffers[1];
+	Check(!taken.zero_stride_oob && !taken.scalar_empty && taken.descriptor_format == Prospero::BufferFormat::k32UInt &&
+	          IR::HasRuntimeStride(taken.packed_stride),
+	      "buffer forms: the fallback takes the form the program writes the buffer with");
+	Check(from_unbound.specialization == from_bound.specialization,
+	      "buffer forms: the fallback built while the written buffer is unbound is the one built while it is bound");
+	Check(Serves(plan, bound, from_unbound.specialization) && Serves(plan, unbound, from_unbound.specialization),
+	      "buffer forms: the fallback serves the written buffer bound and unbound");
+}
+
 }
 
 int main() {
@@ -604,6 +705,7 @@ int main() {
 
 	CandidateOrder(program);
 	MixedComputeTables(program);
+	FallbackBufferForms();
 
 	std::printf("variant key coverage: %u of %zu requests are the prepared variant\n", covered, bound.size());
 	if (g_failures != 0) {
