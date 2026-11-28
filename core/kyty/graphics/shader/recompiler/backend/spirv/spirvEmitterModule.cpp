@@ -556,6 +556,11 @@ void DefineDescriptors(EmitterState& state) {
 				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
 				state.builder.AddName(definition.variable,
 				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				if (std::ranges::any_of(state.program.info.images, [&](const IR::ImageResource& image) {
+					    return IR::NarrowImageAtomic(image) && IR::DescriptorBindingForImage(image) == kind;
+				    })) {
+					state.builder.AddAnnotation(spv::OpDecorate, definition.variable, spv::DecorationCoherent);
+				}
 				if (image_tables[IR::ImageBindingIndex(kind)]) {
 					state.builder.RequireVersion(0x00010500u);
 					state.builder.RequireCapability(spv::CapabilityShaderNonUniform);

@@ -114,7 +114,7 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		EXIT_IF(image.numeric_class == Prospero::TextureNumericClass::Sint ||
 		        image.numeric_class == Prospero::TextureNumericClass::Unsupported);
 		sampled = 2;
-		if (image.atomic) {
+		if (image.atomic && !IR::NarrowImageAtomic(image)) {
 			EXIT_IF(image.numeric_class != Prospero::TextureNumericClass::Uint);
 			format = image.atomic64 ? spv::ImageFormatR64ui : spv::ImageFormatR32ui;
 			if (image.atomic64) {

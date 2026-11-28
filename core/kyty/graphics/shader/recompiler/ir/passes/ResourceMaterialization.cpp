@@ -1641,7 +1641,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic && !Prospero::IsSupportedAtomicImageFormat(format, base.atomic64)) {
+		const bool narrow_atomic = base.atomic && !base.atomic64 && format == Prospero::BufferFormat::k8UInt;
+		if (base.atomic && !narrow_atomic && !Prospero::IsSupportedAtomicImageFormat(format, base.atomic64)) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
@@ -1699,6 +1700,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			if (raw_sint_storage || base.atomic) {
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
+			}
+			if (narrow_atomic) {
+				image.conversion_format = format;
 			}
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare &&

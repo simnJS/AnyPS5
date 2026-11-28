@@ -31,9 +31,10 @@ IR::ImageResource AtomicResource(bool wide) {
     return image;
 }
 
-void CheckAtomicStorageBinding(F format, bool wide) {
+void CheckAtomicStorageBinding(F format, bool wide, F narrow = F::kInvalid) {
     auto image = AtomicResource(wide);
     image.numeric_class = Prospero::TextureNumericClass::Uint;
+    image.conversion_format = narrow;
     const auto descriptor = AtomicDescriptor(format);
     TileSizeAlign layout;
     TileGetTextureTotalSize(format, descriptor.Width5() + 1u, descriptor.Height5() + 1u,
@@ -41,7 +42,8 @@ void CheckAtomicStorageBinding(F format, bool wide) {
     ValidateStorageTexture(image, descriptor, layout.size);
 }
 
-bool CheckAtomicImageMaterialization(Prospero::BufferFormat format, bool wide, bool expected) {
+bool CheckAtomicImageMaterialization(Prospero::BufferFormat format, bool wide, bool expected,
+                                     Prospero::BufferFormat narrow = Prospero::BufferFormat::kInvalid) {
     IR::ResourcePlan plan;
     plan.stage = ShaderType::Compute;
     plan.resource_tracking_complete = true;
@@ -59,7 +61,8 @@ bool CheckAtomicImageMaterialization(Prospero::BufferFormat format, bool wide, b
     IR::ResourceSpecialization specialization;
     const bool accepted = IR::MaterializeResources(plan, {}, snapshot, specialization);
     if (accepted == expected && (!accepted || (specialization.images.size() == 1u &&
-            specialization.images.front().numeric_class == Prospero::TextureNumericClass::Uint))) {
+            specialization.images.front().numeric_class == Prospero::TextureNumericClass::Uint &&
+            specialization.images.front().conversion_format == narrow))) {
         return true;
     }
     std::fprintf(stderr, "atomic image format %u, width %u: expected %d, materialized %d\n",
@@ -73,6 +76,7 @@ extern "C" int RunKytyImageAtomicFormatsTests(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--bindings") {
         for (const auto format : word_formats) CheckAtomicStorageBinding(format, false);
         for (const auto format : wide_formats) CheckAtomicStorageBinding(format, true);
+        CheckAtomicStorageBinding(F::k8UInt, false, F::k8UInt);
         return 0;
     }
     if (argc != 1) return 1;
@@ -85,7 +89,9 @@ extern "C" int RunKytyImageAtomicFormatsTests(int argc, char** argv) {
         passed &= CheckAtomicImageMaterialization(format, true, true);
         passed &= CheckAtomicImageMaterialization(format, false, false);
     }
-    for (const auto format : {F::k8UInt, F::k8_8_8_8UNorm, F::k32_32_32_32UInt, F::kBc1UNorm,
+    passed &= CheckAtomicImageMaterialization(F::k8UInt, false, true, F::k8UInt);
+    passed &= CheckAtomicImageMaterialization(F::k8UInt, true, false);
+    for (const auto format : {F::k8SInt, F::k8_8_8_8UNorm, F::k32_32_32_32UInt, F::kBc1UNorm,
                               F::kFmask32_S8_F4, F::kFmask64_S16_F8}) {
         passed &= CheckAtomicImageMaterialization(format, false, false);
         passed &= CheckAtomicImageMaterialization(format, true, false);

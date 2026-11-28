@@ -418,7 +418,7 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
                                                const IR::MemoryInfo& mem) {
 	const auto& image = state.program.info.images[mem.resource];
 	const auto format = image.conversion_format;
-	if (format == Prospero::BufferFormat::kInvalid) return {};
+	if (format == Prospero::BufferFormat::kInvalid || IR::NarrowImageAtomic(image)) return {};
 	const auto info = Format::GetFormatInfo(format);
 	if (IR::ReadsDepthBits(image)) return info;
 	const bool raw_signed = IR::RawSignedStorageFormat(image, format) != Prospero::BufferFormat::kInvalid;
@@ -1172,6 +1172,89 @@ void EmitMipStatsRecord(EmitterState& state, uint32_t field, uint32_t lod) {
 	});
 }
 
+uint32_t NarrowImageAtomicValue(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t old) {
+	auto&      state = ctx.state;
+	const auto u32   = TypeU32(state);
+	const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+	const auto ext   = [&](uint32_t instruction) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, u32, result, GlslStd450(state), instruction, old, value);
+		return result;
+	};
+	switch (inst.GetOpcode()) {
+		case IR::ValueOpcode::ImageAtomicCompareSwap32:
+			return Select(state, u32,
+			              Binary(state, spv::OpIEqual, TypeBool(state), old, ctx.Arg(inst, inst.NumArgs() - 2)),
+			              ctx.Arg(inst, inst.NumArgs() - 3), old);
+		case IR::ValueOpcode::ImageAtomicSwap32: return value;
+		case IR::ValueOpcode::ImageAtomicIAdd32: return Binary(state, spv::OpIAdd, u32, old, value);
+		case IR::ValueOpcode::ImageAtomicSMin32: return ext(GLSLstd450SMin);
+		case IR::ValueOpcode::ImageAtomicUMin32: return ext(GLSLstd450UMin);
+		case IR::ValueOpcode::ImageAtomicSMax32: return ext(GLSLstd450SMax);
+		case IR::ValueOpcode::ImageAtomicUMax32: return ext(GLSLstd450UMax);
+		case IR::ValueOpcode::ImageAtomicAnd32: return Binary(state, spv::OpBitwiseAnd, u32, old, value);
+		case IR::ValueOpcode::ImageAtomicOr32: return Binary(state, spv::OpBitwiseOr, u32, old, value);
+		case IR::ValueOpcode::ImageAtomicXor32: return Binary(state, spv::OpBitwiseXor, u32, old, value);
+		default: break;
+	}
+	ctx.Fail(inst, "has no 8-bit image atomic emitter");
+	return old;
+}
+
+uint32_t EmitNarrowImageAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                               uint32_t coord) {
+	auto& state = ctx.state;
+	if (state.split_hints != nullptr) {
+		state.split_hints->refusal = "8-bit image atomic serialized by subgroup election";
+	}
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityStorageImageReadWithoutFormat);
+	state.builder.RequireCapability(spv::CapabilityStorageImageWriteWithoutFormat);
+	const auto u32     = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	const auto header  = state.builder.AllocateId();
+	const auto body    = state.builder.AllocateId();
+	const auto update  = state.builder.AllocateId();
+	const auto join    = state.builder.AllocateId();
+	const auto cont    = state.builder.AllocateId();
+	const auto merge   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(state, header);
+	state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+	state.builder.AddFunction(spv::OpBranch, body);
+	EmitLabel(state, body);
+	const auto elected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformElect, boolean, elected, ConstantU32(state, spv::ScopeSubgroup));
+	state.builder.AddFunction(spv::OpSelectionMerge, join, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, elected, update, join);
+	EmitLabel(state, update);
+	const auto descriptor = LoadImageDescriptor(state, mem.resource);
+	const auto texel      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageRead, TypeU32Vector(state, 4), texel, descriptor, coord);
+	const auto old = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, u32, old, texel, 0u);
+	const auto updated =
+	    Binary(state, spv::OpBitwiseAnd, u32, NarrowImageAtomicValue(ctx, inst, old), ConstantU32(state, 0xffu));
+	const auto zero   = ConstantU32(state, 0);
+	const auto stored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), stored, updated, zero, zero, zero);
+	state.builder.AddFunction(spv::OpImageWrite, descriptor, coord, stored);
+	EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
+	const auto update_exit = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, join);
+	EmitLabel(state, join);
+	const auto done = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, boolean, done, ConstantBool(state, true), update_exit,
+	                          ConstantBool(state, false), body);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, u32, result, old, update_exit, zero, body);
+	state.builder.AddFunction(spv::OpBranchConditional, done, merge, cont);
+	EmitLabel(state, cont);
+	state.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(state, merge);
+	return result;
+}
+
 }
 
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -1507,6 +1590,14 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto dimension = image.dimension;
 		const auto result_type = TypeId(state, inst.GetType());
 		const auto zero = image.atomic64 ? ConstantU64(state, 0) : ConstantU32(state, 0);
+		if (IR::NarrowImageAtomic(image)) {
+			ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero,
+			                                               [&]() {
+				                                               return EmitNarrowImageAtomic(
+				                                                   ctx, inst, mem, CoordU32(ctx, mem, *address, dimension));
+			                                               }));
+			return;
+		}
 		ctx.Define(inst, EmitValueOrDefaultIfCondition(
 		                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
 			           const auto pointer      = state.builder.AllocateId();
