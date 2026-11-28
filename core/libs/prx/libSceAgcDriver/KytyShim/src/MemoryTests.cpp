@@ -571,9 +571,11 @@ void TestThreadRegistryRaised() {
 }
 
 std::atomic<int> g_viewHookMicros{0};
+std::atomic<bool> g_viewHookEntered{false};
 
 void WaitingViewHook(std::uint64_t, std::uint64_t) {
     const int micros = g_viewHookMicros.load();
+    g_viewHookEntered.store(true);
     if (micros > 0) std::this_thread::sleep_for(std::chrono::microseconds(micros));
 }
 
@@ -593,16 +595,19 @@ void* APS5_VABI MapPages(void* argument) {
 void TestViewHookRaised() {
     constexpr int Rounds = 100;
     Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&WaitingViewHook, &WaitingViewHook);
-    g_viewHookMicros.store(200);
+    g_viewHookMicros.store(200000);
+    g_viewHookEntered.store(false);
     RaisedHolder holder;
     g_raisedHolder = &holder;
     Require(sceKernelInstallExceptionHandler(GuestRaisedSignal, reinterpret_cast<void*>(&ParkRaisedHolder)) == 0);
     Pthread thread{};
     Require(scePthreadCreate(&thread, nullptr, MapPages, &holder, "page mapper") == 0);
     Require(WaitFor(holder.started, true, std::chrono::seconds(5)));
+    Require(WaitFor(g_viewHookEntered, true, std::chrono::seconds(5)));
     for (int round = 0; round < Rounds; ++round) {
         Require(sceKernelRaiseException(thread, GuestRaisedSignal) == 0);
         Require(WaitFor(holder.parked, true, std::chrono::seconds(5)));
+        g_viewHookMicros.store(200);
         std::atomic<bool> hooked{false};
         std::thread collector([&hooked] {
             Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&WaitingViewHook, &WaitingViewHook);

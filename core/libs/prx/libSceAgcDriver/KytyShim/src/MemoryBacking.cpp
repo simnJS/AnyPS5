@@ -915,7 +915,7 @@ bool TryWriteBackedQwords(uint64_t vaddr, const uint64_t* values, uint32_t count
 }
 
 void SetGpuRangeHooks(RangeHook map, RangeHook unmap) {
-	std::lock_guard lock(HookMutex());
+	GuestDeliveryLock lock(HookMutex());
 	g_map_hook = map;
 	g_unmap_hook = unmap;
 	if (map != nullptr) Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) { map(start, size); });
