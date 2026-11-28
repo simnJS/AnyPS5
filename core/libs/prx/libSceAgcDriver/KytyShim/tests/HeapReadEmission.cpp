@@ -15,11 +15,6 @@
 #include <span>
 #include <string>
 #include <vector>
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <sys/mman.h>
-#endif
 
 namespace {
 
@@ -33,35 +28,25 @@ constexpr std::array<uint32_t, 31> LoopWords {
     0xf40c0200u, 0x48000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00c20004u, 0xbf8c3f70u, 0x3a100108u, 0x3a120309u,
     0x3a14050au, 0x3a16070bu, 0x80038103u, 0xbf82fff1u, 0xe0781000u, 0x80010806u, 0xbf810000u,
 };
-constexpr uint64_t GuestRegion   = 0x200900000ull;
-constexpr size_t   GuestBytes    = 0x40000u;
-constexpr uint64_t TableAddress  = 0x200910000ull;
-constexpr uint64_t TextureA      = 0x200920000ull;
-constexpr uint64_t TextureB      = 0x200920100ull;
-constexpr uint64_t OutputAddress = 0x200930000ull;
+constexpr size_t GuestBytes = 0x40000u;
+alignas(4096) std::array<uint32_t, GuestBytes / sizeof(uint32_t)> g_guest {};
+
+const uint64_t GuestRegion  = reinterpret_cast<uint64_t>(g_guest.data());
+const uint64_t TableAddress = GuestRegion + 0x10000u;
+const uint64_t TextureA     = GuestRegion + 0x20000u;
+const uint64_t TextureB     = GuestRegion + 0x20100u;
+const uint64_t HeapSlots    = GuestRegion + 0x38000u;
+
 constexpr uint32_t Format8888    = 56;
 constexpr uint32_t Format32UInt  = 20;
 const char*        g_name        = "kyty_shim_heap_read_emission";
 
-int       g_failures = 0;
-uint32_t* g_guest    = nullptr;
+int g_failures = 0;
 
 void Check(bool condition, const std::string& what) {
 	if (condition) return;
 	std::fprintf(stderr, "%s: FAILED %s\n", g_name, what.c_str());
 	g_failures++;
-}
-
-bool MapGuest() {
-#if defined(_WIN32)
-	g_guest = static_cast<uint32_t*>(VirtualAlloc(reinterpret_cast<void*>(GuestRegion), GuestBytes,
-	                                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-#else
-	void* mapped = mmap(reinterpret_cast<void*>(GuestRegion), GuestBytes, PROT_READ | PROT_WRITE,
-	                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-	g_guest      = mapped == MAP_FAILED ? nullptr : static_cast<uint32_t*>(mapped);
-#endif
-	return g_guest == reinterpret_cast<uint32_t*>(GuestRegion);
 }
 
 void Poke(uint64_t address, uint32_t value) {
@@ -83,8 +68,6 @@ Texture MakeTexture(uint64_t address, uint32_t format) {
 	return {static_cast<uint32_t>(base), static_cast<uint32_t>((base >> 32u) & 0xffu) | (format << 20u) | (3u << 30u),
 	        15u, 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
 }
-
-constexpr uint64_t HeapSlots = 0x200938000ull;
 
 struct Heap final: IR::ImageHeapSource {
 	std::array<IR::DescriptorValue, 1> kinds;
@@ -139,7 +122,7 @@ Compiled Compile(uint32_t host_subgroup) {
 
 	const auto a = MakeTexture(TextureA, Format8888);
 	const auto b = MakeTexture(TextureB, Format8888);
-	std::fill_n(g_guest, GuestBytes / 4u, 0u);
+	g_guest.fill(0u);
 	for (uint32_t i = 0; i < a.size(); ++i) {
 		Poke(TableAddress + i * 4u, a[i]);
 		Poke(TableAddress + 32u + i * 4u, b[i]);
@@ -150,7 +133,6 @@ Compiled Compile(uint32_t host_subgroup) {
 	user[2]           = 3;
 	user[6]           = 96;
 	user[7]           = 0xfacu | (Format32UInt << 12u) | (1u << 24u) | (3u << 28u);
-	(void)OutputAddress;
 	Heap heap;
 	heap.kinds[0].dword_count = 8;
 	std::copy(a.begin(), a.end(), heap.kinds[0].dwords.begin());
@@ -235,10 +217,6 @@ void CheckModule(const Compiled& compiled, const char* what) {
 }
 
 int main() {
-	if (!MapGuest()) {
-		std::fprintf(stderr, "%s: could not map the guest region\n", g_name);
-		return 1;
-	}
 	try {
 		ShaderInit();
 		CheckModule(Compile(64u), "wave64 on 64 lanes");
