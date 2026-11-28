@@ -435,9 +435,10 @@ int prepared(const std::filesystem::path& tool, const std::filesystem::path& roo
     setVariable("KYTY_GENERIC_COMPUTE_SPECIALIZE", "1");
     setVariable("KYTY_ASYNC_PIPELINES", "1");
     const auto served = preparedReplay(tool, root, "bounds", "first-use", structured, true);
-    require(served.completed && served.dump == exact.dump && served.frame == exact.frame &&
-                served.log.find("\"dispatches\":1.0") != std::string::npos,
+    require(served.completed && served.dump == exact.dump && served.frame == exact.frame,
             "a pipeline prepared from a recipe with other bounds must enforce the live record bounds", served);
+    require(served.log.find("\"dispatches\":1.0") != std::string::npos,
+            "the replay served by the prepared pipeline must report its one dispatch", served);
     const auto first_dispatch = served.log.find("[kyty-startup] first_dispatch");
     require(manifestCompute(served.log) == 1 && readyPipelineIds(served.log).size() == 1 &&
                 count(served.log, ServeLine) == 0 &&
