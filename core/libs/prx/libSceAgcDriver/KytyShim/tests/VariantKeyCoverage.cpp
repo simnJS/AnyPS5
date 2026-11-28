@@ -317,6 +317,21 @@ void CandidateOrder(const Plan& program) {
 		Candidates narrow;
 		const IR::SrtRuntime no_heap {.read_specialization_memory = ReadTable};
 		narrow.ok = IR::MaterializeResources(plan, no_heap, narrow.snapshot, narrow.specialization);
+		auto mixed_target = first.specialization;
+		mixed_target.images[1].dimension = Recompiler::Decoder::ImageDimension::Dim3D;
+		IR::ResourceSnapshot mixed_slots;
+		const bool mixed_ok = IR::RebindComputeImages(plan, no_heap, narrow.snapshot, narrow.specialization,
+		                                               mixed_target, mixed_slots);
+		Check(narrow.ok && mixed_ok, "a prepared table with spare typed slots serves fewer live view classes");
+		if (mixed_ok) {
+			Check(mixed_slots.images[1].dwords[0] == 0u, "an unused 3D slot remains unbound for 2D candidates");
+			const auto mapping = mixed_target.images[0].indirect_mapping_offset + 1u;
+			for (uint32_t i = 0; i < TableEntries; ++i) {
+				const auto ordinal = mixed_slots.flattened_srt[mapping + i * 8u];
+				Check(ordinal < mixed_slots.images.size() && mixed_slots.images[ordinal].dwords[0] == few[i],
+				      "the live selector maps to its texture inside the prepared view class");
+			}
+		}
 		std::array<uint32_t, TableEntries> every {};
 		for (uint32_t entry = 0; entry < TableEntries; ++entry) every[entry] = TextureAddress(entry);
 		FillTable(every, plain);

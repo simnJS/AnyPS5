@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <string_view>
@@ -1704,6 +1705,51 @@ void OrderDenseCandidates(ResourceSpecialization& specialization) {
 	}
 }
 
+static bool PlacePreparedCandidates(ResourceSnapshot& snapshot, ResourceSpecialization& shape,
+                                    uint32_t root, std::span<const uint32_t> slots,
+                                    std::span<uint32_t> entries) {
+	const auto target = t_slot_views;
+	if (target.size() != shape.images.size() || !DenseRoot(target[root], root)) return false;
+	if (std::ranges::all_of(slots, [&](uint32_t slot) { return shape.images[slot] == target[slot]; })) return false;
+	std::map<decltype(CandidateOrder(target[root])), std::vector<uint32_t>> available;
+	for (uint32_t ordinal = slots.size(); ordinal != 0; --ordinal) {
+		const auto& view = target[slots[ordinal - 1u]];
+		if (view.indirect_root != root) return false;
+		available[CandidateOrder(view)].push_back(ordinal);
+	}
+	std::vector<uint32_t> remap(slots.size() + 1u);
+	for (const auto ordinal: entries) {
+		if (ordinal > slots.size()) return false;
+		if (ordinal != 0) remap[ordinal] = UINT32_MAX;
+	}
+	std::vector<DescriptorValue> values(slots.size(), {.dword_count = 8u});
+	for (uint32_t i = 0; i < slots.size(); ++i) {
+		if (remap[i + 1u] == 0) continue;
+		const auto& value = snapshot.images[slots[i]];
+		if (NullImageDescriptor(value)) continue;
+		auto& free = available[CandidateOrder(shape.images[slots[i]])];
+		if (free.empty()) return false;
+		remap[i + 1u] = free.back();
+		values[free.back() - 1u] = value;
+		free.pop_back();
+	}
+	auto remaining = available.begin();
+	for (uint32_t i = 1; i < remap.size(); ++i) {
+		if (remap[i] != UINT32_MAX) continue;
+		while (remaining != available.end() && remaining->second.empty()) ++remaining;
+		if (remaining == available.end()) return false;
+		remap[i] = remaining->second.back();
+		remaining->second.pop_back();
+	}
+	for (size_t i = 0; i < slots.size(); ++i) {
+		shape.images[slots[i]] = target[slots[i]];
+		snapshot.images[slots[i]] = values[i];
+	}
+	if (NullImageDescriptor(snapshot.images[root])) TakeCandidateClass(shape.images[root], target[root]);
+	for (auto& ordinal: entries) ordinal = remap[ordinal];
+	return true;
+}
+
 static void OrderDenseCandidates(ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	auto& images = specialization.images;
 	auto& flat   = snapshot.flattened_srt;
@@ -1746,7 +1792,10 @@ static void OrderDenseCandidates(ResourceSnapshot& snapshot, ResourceSpecializat
 			kind_of[child] = kind;
 			++cursor[kind];
 		}
-		if (kinds.size() < 2u) continue;
+		if (kinds.size() < 2u) {
+			if (!t_slot_views.empty()) PlacePreparedCandidates(snapshot, specialization, root, slots, entries);
+			continue;
+		}
 		order.resize(kinds.size());
 		std::iota(order.begin(), order.end(), 0u);
 		std::ranges::sort(order, {}, [&](uint32_t kind) { return CandidateOrder(kinds[kind]); });
@@ -1788,6 +1837,7 @@ static void OrderDenseCandidates(ResourceSnapshot& snapshot, ResourceSpecializat
 			snapshot.images[slots[at]] = values[at];
 		}
 		for (auto& ordinal: entries) ordinal = remap[ordinal];
+		if (!t_slot_views.empty()) PlacePreparedCandidates(snapshot, specialization, root, slots, entries);
 	}
 }
 
@@ -3447,6 +3497,13 @@ bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime&
 	if (ok) {
 		for (uint32_t i = 0; i < specialization.buffers.size(); ++i)
 			ReadFallbackBufferFormat(program, snapshot, i, specialization.buffers[i]);
+		for (uint32_t i = 0; i < specialization.images.size(); ++i) {
+			auto& view = specialization.images[i];
+			if (view.table_capacity == 0u) continue;
+			snapshot.graphics_image_banks.resize(i + 1);
+			snapshot.graphics_image_banks[i] = view.table_mapping_offset;
+			view.table_mapping_offset = RuntimeTableMapping;
+		}
 	}
 	t_indirect_buffer_failure  = buffer_failure;
 	t_indirect_sampler_failure = sampler_failure;
@@ -4342,14 +4399,23 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 		for (uint32_t index = 0; mismatch == UINT32_MAX && index < specialization.images.size(); ++index) {
 			auto view = specialization.images[index];
 			const auto& served = target.images[index];
-			if (view.table_capacity != 0 && view.table < snapshot.image_tables.size() &&
+			if (view.table_capacity != 0 && view.table < snapshot.image_tables.size() && snapshot.image_tables[view.table] &&
 			    served.table_capacity >= snapshot.image_tables[view.table]->slots.size()) {
 				view.table_capacity = served.table_capacity;
+				if (served.table_mapping_offset == RuntimeTableMapping) view.table_mapping_offset = RuntimeTableMapping;
 			}
 			if (!(view == served)) mismatch = index;
 		}
 		if (mismatch == UINT32_MAX) {
-			if (aligned != nullptr && aligned != &snapshot) *aligned = snapshot;
+			if (aligned != nullptr) {
+				if (aligned != &snapshot) *aligned = snapshot;
+				for (uint32_t i = 0; i < target.images.size(); ++i) {
+					if (target.images[i].table_capacity == 0 || target.images[i].table_mapping_offset != RuntimeTableMapping ||
+					    specialization.images[i].table_mapping_offset == RuntimeTableMapping) continue;
+					if (aligned->graphics_image_banks.size() <= i) aligned->graphics_image_banks.resize(i + 1);
+					aligned->graphics_image_banks[i] = specialization.images[i].table_mapping_offset;
+				}
+			}
 			return true;
 		}
 		return RefuseServe(ServeRefusal::Step::TableView, mismatch);
@@ -4454,12 +4520,12 @@ bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecializ
 		const auto from = Addressing(live);
 		const auto to = Addressing(served);
 		const bool to_slots = from == ImageAddressing::Heap && DenseRoot(served, index);
-		if (!to_slots && ImageViewForm(live) != ImageViewForm(served)) return RefuseServe(ServeRefusal::Step::ImageView, index);
+		if (!to_slots && !(DenseRoot(live, index) && DenseRoot(served, index)) && ImageViewForm(live) != ImageViewForm(served)) return RefuseServe(ServeRefusal::Step::ImageView, index);
 		if (from == to) {
 			const auto slots = [&](const ResourceSpecialization& shape) {
 				return std::ranges::count(std::span(shape.images).subspan(roots), index, &ResourceSpecialization::Image::indirect_root);
 			};
-			changes_addressing = changes_addressing || (DenseRoot(served, index) && slots(specialization) < slots(target));
+			changes_addressing = changes_addressing || (DenseRoot(served, index) && slots(specialization) <= slots(target) && specialization.images != target.images);
 			continue;
 		}
 		const auto* source = Source(program, program.info.images[index].source);
