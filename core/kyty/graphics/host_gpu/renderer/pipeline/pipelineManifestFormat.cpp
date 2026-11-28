@@ -825,6 +825,7 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 		}
 	}
 	ReadElements(r, "si", images);
+	if (stage == ShaderType::Compute) ShaderRecompiler::IR::OrderDenseCandidates(module.specialization);
 	ReadElements(r, "ss", samplers);
 	if (module.generic_graphics && (!buffers.empty() || !images.empty() || !samplers.empty())) return false;
 	return r.ok && module.user_data_count <= ShaderParams {}.user_data.size();

@@ -51,6 +51,10 @@ struct RecordBlocks {
 };
 thread_local std::vector<RecordBlocks> t_record_blocks;
 
+bool DenseRoot(const ResourceSpecialization::Image& image, uint32_t root) {
+	return image.indirect_root == root && !image.heap && image.table_capacity == 0u && image.indirect_search_iterations == 0u;
+}
+
 void FlushRecordBlocks(std::vector<uint32_t>& flattened_srt) {
 	for (auto& record: t_record_blocks) {
 		const auto base = static_cast<uint32_t>(flattened_srt.size());
@@ -1604,6 +1608,145 @@ static bool MemoryImageCandidates(const ResourcePlan& program, const ImageResour
 	       source->indirect_descriptor->sources.empty();
 }
 
+static auto CandidateOrder(const ResourceSpecialization::Image& image) {
+	return std::tuple(image.numeric_class, image.dimension, image.mip_count, image.conversion_format, image.shader_swizzle,
+	                  image.srgb_decode, image.cube, image.skip_degamma, image.fmask, image.heap, image.indirect_mapping_offset,
+	                  image.indirect_search_iterations, image.table, image.table_capacity, image.table_mapping_offset,
+	                  image.table_entry_mask);
+}
+
+static bool DenseCandidates(const std::vector<ResourceSpecialization::Image>& images, uint32_t root,
+                            std::vector<uint32_t>& slots) {
+	if (!DenseRoot(images[root], root)) return false;
+	slots.clear();
+	for (uint32_t index = 0; index < images.size(); ++index) {
+		if (index != root && images[index].indirect_root == root) slots.push_back(index);
+	}
+	return slots.size() > 1u;
+}
+
+static void TakeCandidateClass(ResourceSpecialization::Image& root, const ResourceSpecialization::Image& kind) {
+	root.numeric_class     = kind.numeric_class;
+	root.dimension         = kind.dimension;
+	root.mip_count         = kind.mip_count;
+	root.conversion_format = kind.conversion_format;
+	root.shader_swizzle    = kind.shader_swizzle;
+	root.cube              = kind.cube;
+}
+
+void OrderDenseCandidates(ResourceSpecialization& specialization) {
+	auto&                                      images = specialization.images;
+	std::vector<uint32_t>                      slots;
+	std::vector<ResourceSpecialization::Image> ordered;
+	for (uint32_t root = 0; root < images.size(); ++root) {
+		if (!DenseCandidates(images, root, slots)) continue;
+		ordered.clear();
+		for (const auto slot: slots) ordered.push_back(images[slot]);
+		std::ranges::stable_sort(ordered, {}, CandidateOrder);
+		if (ordered.front() == ordered.back()) continue;
+		size_t most = 0;
+		size_t run  = 0;
+		for (size_t begin = 0; begin < ordered.size();) {
+			size_t end = begin + 1u;
+			while (end < ordered.size() && ordered[end] == ordered[begin]) ++end;
+			if (end - begin > run) {
+				run  = end - begin;
+				most = begin;
+			}
+			begin = end;
+		}
+		TakeCandidateClass(images[root], ordered[most]);
+		for (size_t at = 0; at < slots.size(); ++at) images[slots[at]] = ordered[at];
+	}
+}
+
+static void OrderDenseCandidates(ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	auto& images = specialization.images;
+	auto& flat   = snapshot.flattened_srt;
+	if (snapshot.images.size() != images.size()) return;
+	constexpr uint32_t                         Empty = UINT32_MAX;
+	std::vector<uint32_t>                      slots, kind_of, order, cursor, remap;
+	std::vector<ResourceSpecialization::Image> kinds, ordered;
+	std::vector<DescriptorValue>               values;
+	for (uint32_t root = 0; root < images.size(); ++root) {
+		if (!DenseCandidates(images, root, slots)) continue;
+		const size_t mapping = images[root].indirect_mapping_offset;
+		if (mapping >= flat.size() || flat[mapping] > flat.size() - mapping - 1u) continue;
+		const auto entries = std::span(flat).subspan(mapping + 1u, flat[mapping]);
+		uint32_t   used    = 0;
+		for (const auto ordinal: entries) used = std::max(used, ordinal);
+		if (used == 0u || used > slots.size()) continue;
+		const auto padded = [&] {
+			for (size_t at = used; at < slots.size(); ++at) {
+				if (!(images[slots[at]] == images[slots[used - 1u]])) return false;
+			}
+			return true;
+		};
+		if (!padded()) continue;
+		kinds.clear();
+		cursor.clear();
+		kind_of.assign(used, Empty);
+		bool empty = NullImageDescriptor(snapshot.images[root]);
+		for (uint32_t child = 0; child < used; ++child) {
+			if (NullImageDescriptor(snapshot.images[slots[child]])) {
+				empty = true;
+				continue;
+			}
+			const auto& image = images[slots[child]];
+			uint32_t    kind  = 0;
+			while (kind < kinds.size() && !(kinds[kind] == image)) ++kind;
+			if (kind == kinds.size()) {
+				kinds.push_back(image);
+				cursor.push_back(0u);
+			}
+			kind_of[child] = kind;
+			++cursor[kind];
+		}
+		if (kinds.size() < 2u) continue;
+		order.resize(kinds.size());
+		std::iota(order.begin(), order.end(), 0u);
+		std::ranges::sort(order, {}, [&](uint32_t kind) { return CandidateOrder(kinds[kind]); });
+		uint32_t most = order.front();
+		for (const auto kind: order) {
+			if (cursor[kind] > cursor[most]) most = kind;
+		}
+		if (empty) {
+			for (uint32_t child = 0; child < used; ++child) {
+				if (kind_of[child] != Empty) continue;
+				kind_of[child] = most;
+				++cursor[most];
+			}
+			TakeCandidateClass(images[root], kinds[most]);
+		}
+		const auto padding = static_cast<uint32_t>(slots.size() - used);
+		uint32_t   next    = 0;
+		for (const auto kind: order) {
+			const auto count = cursor[kind];
+			cursor[kind]     = next;
+			next += count + (kind == most ? padding : 0u);
+		}
+		ordered.assign(slots.size(), {});
+		values.assign(slots.size(), {});
+		remap.assign(used + 1u, 0u);
+		for (uint32_t child = 0; child < used; ++child) {
+			const auto at     = cursor[kind_of[child]]++;
+			ordered[at]       = kinds[kind_of[child]];
+			values[at]        = snapshot.images[slots[child]];
+			remap[child + 1u] = at + 1u;
+		}
+		for (uint32_t pad = 0; pad < padding; ++pad) {
+			const auto at = cursor[most] + pad;
+			ordered[at]   = ordered[at - 1u];
+			values[at]    = values[at - 1u];
+		}
+		for (size_t at = 0; at < slots.size(); ++at) {
+			images[slots[at]]          = ordered[at];
+			snapshot.images[slots[at]] = values[at];
+		}
+		for (auto& ordinal: entries) ordinal = remap[ordinal];
+	}
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -1851,6 +1994,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
+	if (program.stage == ShaderType::Compute) OrderDenseCandidates(snapshot, specialization);
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
 }
