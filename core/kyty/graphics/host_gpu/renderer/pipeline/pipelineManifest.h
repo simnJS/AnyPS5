@@ -50,6 +50,7 @@ struct ManifestModule {
 	bool generic_graphics     = false;
 	std::variant<ShaderVertexInputInfo, ShaderPixelInputInfo, ShaderComputeInputInfo> input;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	std::vector<uint32_t> function_code;
 	bool from_assets = false;
 
 	[[nodiscard]] uint64_t ProgramHash() const;

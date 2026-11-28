@@ -558,6 +558,17 @@ if(NOT ANYPS5_KYTY_DLL)
     set_tests_properties(kyty_shim_variant_key_coverage PROPERTIES TIMEOUT 20
             PASS_REGULAR_EXPRESSION "kyty_shim_variant_key_coverage: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+    add_test_executable(kyty_shim_call_program_recipes_tests ${CMAKE_CURRENT_SOURCE_DIR}/CallProgramRecipes.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_call_program_recipes_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(kyty_shim_call_program_recipes_tests)
+    if(MINGW)
+        target_link_libraries(kyty_shim_call_program_recipes_tests PRIVATE stdc++ gcc_eh)
+    endif()
+    target_link_libraries(kyty_shim_call_program_recipes_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_call_program_recipes COMMAND kyty_shim_call_program_recipes_tests)
+    set_tests_properties(kyty_shim_call_program_recipes PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_call_program_recipes: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
     add_test_executable(kyty_shim_compute_recipes_tests ${CMAKE_CURRENT_SOURCE_DIR}/ComputeRecipes.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_compute_recipes_tests PRIVATE ${LIBS_INCLUDE_DIR})
     configure_host_test_executable(kyty_shim_compute_recipes_tests)
@@ -567,6 +578,17 @@ if(NOT ANYPS5_KYTY_DLL)
     target_link_libraries(kyty_shim_compute_recipes_tests PRIVATE Kyty::gpu libkernel libc)
     add_test(NAME kyty_shim_compute_recipes COMMAND kyty_shim_compute_recipes_tests)
     set_tests_properties(kyty_shim_compute_recipes PROPERTIES TIMEOUT 30)
+
+    add_test_executable(kyty_shim_wait_cause_tests ${CMAKE_CURRENT_SOURCE_DIR}/WaitCause.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_wait_cause_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(kyty_shim_wait_cause_tests)
+    if(MINGW)
+        target_link_libraries(kyty_shim_wait_cause_tests PRIVATE stdc++ gcc_eh)
+    endif()
+    target_link_libraries(kyty_shim_wait_cause_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_wait_cause COMMAND kyty_shim_wait_cause_tests)
+    set_tests_properties(kyty_shim_wait_cause PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_wait_cause: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 endif()
 
 add_test_executable(kyty_shim_gpu_control_loads_tests ${CMAKE_CURRENT_SOURCE_DIR}/GpuControlLoads.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
@@ -1104,6 +1126,18 @@ if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
     set_tests_properties(kyty_shim_rt_stats_cache_isolation PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "kyty_shim_rt_stats_cache_isolation: ok")
 endif()
+add_test_executable(kyty_shim_call_program_replay_tests ${CMAKE_CURRENT_SOURCE_DIR}/CallProgramReplay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_call_program_replay_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_call_program_replay_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_call_program_replay_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_call_program_replay_tests)
+add_dependencies(kyty_shim_call_program_replay_tests agc_frame_replay)
+if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
+    add_test(NAME kyty_shim_call_program_replay COMMAND kyty_shim_call_program_replay_tests $<TARGET_FILE:agc_frame_replay>)
+    set_tests_properties(kyty_shim_call_program_replay PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "kyty_shim_call_program_replay: ok")
+endif()
 add_test_executable(kyty_shim_packed_unorm_blend_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/PackedUnormBlend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp
@@ -1215,6 +1249,7 @@ if(WIN32)
             APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
     if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
         set_property(TEST kyty_shim_prepared_variant_first_use kyty_shim_rt_stats_cache_isolation
+                kyty_shim_call_program_replay
                 APPEND PROPERTY ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
     endif()

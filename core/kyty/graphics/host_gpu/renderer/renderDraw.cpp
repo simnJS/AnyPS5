@@ -1793,6 +1793,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
                                             DrawRenderState&    state, bool prefer_generic) {
 	m_prepared_graphics_pipeline = nullptr;
 	m_context.GetImageHeap().BeginDraw();
+#if defined(ANYPS5_KYTY)
+	if (prefer_generic) PipelineCache::NoteGenericServe(GenericServe::Served);
+#endif
 	if (!shaders_resolved) {
 		const auto begin = Common::SteadyNs();
 		Common::SkipLog::Request(0);
@@ -1875,6 +1878,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		state.indirect_offsets = offsets;
 		state.indirect_draw = indirect;
 		m_draw_resource_key = 0;
+#if defined(ANYPS5_KYTY)
+		PipelineCache::NoteGenericServe(GenericServe::PipelineMissing);
+#endif
 		return PrepareDrawRenderState(buffer, false, draw, state, false);
 	}
 	return true;

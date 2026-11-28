@@ -150,6 +150,85 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	CompileSrtWalker(source.call_targets, targets);
 }
 
+namespace {
+
+template <typename Read>
+const char* DecodeLeaf(Read&& read, std::vector<Decoder::Instruction>& function) {
+	function.clear();
+	for (uint32_t index = 0;;) {
+		std::array<uint32_t, Decoder::MaxInstructionRawWords> words {};
+		if (index > UINT32_MAX / sizeof(uint32_t) - words.size()) return "leaf code is too long";
+		uint32_t count = 1;
+		Decoder::Instruction inst;
+		for (;;) {
+			if (!read(index, std::span(words).first(count))) return "cannot read leaf code";
+			inst = {};
+			Decoder::DecodeInstruction(words, 0u, inst);
+			if (inst.word_count <= count) break;
+			if (inst.word_count > words.size()) return "leaf instruction is too long";
+			count = inst.word_count;
+		}
+		inst.pc = index * sizeof(uint32_t);
+		if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
+		index += inst.word_count;
+		if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 || inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+		    inst.opcode == Decoder::Opcode::S_ENDPGM) return "leaf code calls, reads its address or ends the program";
+		function.push_back(inst);
+		if (inst.opcode == Decoder::Opcode::S_SETPC_B64) return nullptr;
+	}
+}
+
+template <typename Leaf>
+const char* LinkCalls(ShaderSource& source, uint32_t& failed_pc, Leaf&& leaf) {
+	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
+	const auto& last = source.decoded.instructions.back();
+	EXIT_NOT_IMPLEMENTED(last.opcode != Decoder::Opcode::S_ENDPGM);
+	uint32_t function_pc = last.pc + last.word_count * sizeof(uint32_t);
+	std::vector<Decoder::Instruction> function;
+	for (size_t i = 0; i < source.calls.size(); ++i) {
+		const auto& site = source.calls[i];
+		const auto& call = source.decoded.instructions[site.instruction];
+		failed_pc = call.pc;
+		if (const char* unread = leaf(i, function)) return unread;
+		const uint32_t function_size = function.back().pc + function.back().word_count * sizeof(uint32_t);
+		if (function_pc > UINT32_MAX - function_size) return "linked code is too long";
+		const auto function_offset = static_cast<uint32_t>(linked.code.size());
+		for (auto inst: function) {
+			if (CFG::MayWriteScalarRegister(inst, call.dst.reg, source.wave_size) ||
+			    CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u, source.wave_size))
+				return "leaf code writes its return address";
+			for (uint32_t code = 0; code < site.preserved_registers.size(); ++code) {
+				if (site.preserved_registers[code] &&
+				    CFG::MayWriteScalarRegister(inst, code, source.wave_size))
+					return "leaf code clobbers a scalar target dependency";
+			}
+			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
+			if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+				if (inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg)
+					return "leaf code returns through another register";
+				inst.opcode = Decoder::Opcode::S_BRANCH;
+				inst.branch_target = call.pc + call.word_count * sizeof(uint32_t);
+			} else if (Decoder::IsDirectBranch(inst.opcode)) {
+				if (inst.branch_target >= function_size) return "leaf code branches outside itself";
+				inst.branch_target += function_pc;
+			}
+			inst.pc += function_pc;
+			linked.decoded.instructions.push_back(std::move(inst));
+		}
+		linked.functions.push_back({function_offset, function_size / 4u});
+		linked.decoded.instructions[site.instruction].branch_target = function_pc;
+		function_pc += function_size;
+	}
+	linked.decoded.code = linked.code;
+	linked.observed_function.resize(std::ranges::max_element(linked.functions, {},
+	    &ShaderSource::Linked::Function::size)->size);
+	source.linked = std::move(linked);
+	++source.revision;
+	return nullptr;
+}
+
+}
+
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
 	EXIT_IF(source.unsupported_call_pc != UINT32_MAX && !source.expand_calls);
 	auto& reads = source.reads;
@@ -228,82 +307,55 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		if (unchanged) return linked.decoded;
 		reads.resize(query_reads);
 	}
-	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
-	const auto& last = source.decoded.instructions.back();
-	EXIT_NOT_IMPLEMENTED(last.opcode != Decoder::Opcode::S_ENDPGM);
-	uint32_t function_pc = last.pc + last.word_count * sizeof(uint32_t);
 	std::map<uint64_t, std::vector<Decoder::Instruction>> functions;
-	for (size_t i = 0; i < source.calls.size(); ++i) {
-		const auto& site = source.calls[i];
-		const auto& call = source.decoded.instructions[site.instruction];
+	uint32_t failed_pc = 0;
+	const char* failure = LinkCalls(source, failed_pc, [&](size_t i, std::vector<Decoder::Instruction>& function) -> const char* {
 		const auto address = source.calls[i].address;
 		auto [entry, inserted] = functions.try_emplace(address);
-		auto& function = entry->second;
 		if (inserted) {
-			for (uint32_t index = 0;;) {
-				std::array<uint32_t, Decoder::MaxInstructionRawWords> words {};
-				EXIT_IF(index > UINT32_MAX / sizeof(uint32_t) - words.size() ||
-				        address > UINT64_MAX - (uint64_t {index} + words.size()) * sizeof(uint32_t));
-				uint32_t count = 1;
-				Decoder::Instruction inst;
-				for (;;) {
-					if (!read_code(address + uint64_t {index} * sizeof(uint32_t), std::span(words).first(count)))
-						EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
-					inst = {};
-					Decoder::DecodeInstruction(words, 0u, inst);
-					if (inst.word_count <= count) break;
-					count = inst.word_count;
-				}
-				inst.pc = index * sizeof(uint32_t);
-				if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
-				index += inst.word_count;
-				EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
-				                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
-				                     inst.opcode == Decoder::Opcode::S_ENDPGM);
-				function.push_back(inst);
-				if (inst.opcode == Decoder::Opcode::S_SETPC_B64) break;
-			}
+			const char* unread = DecodeLeaf([&](uint32_t index, std::span<uint32_t> words) {
+				EXIT_IF(address > UINT64_MAX - (uint64_t {index} + Decoder::MaxInstructionRawWords) * sizeof(uint32_t));
+				return read_code(address + uint64_t {index} * sizeof(uint32_t), words);
+			}, entry->second);
+			if (unread != nullptr) return unread;
 		}
-		const uint32_t function_size = function.back().pc + function.back().word_count * sizeof(uint32_t);
-		EXIT_IF(function_pc > UINT32_MAX - function_size);
-		const auto function_offset = static_cast<uint32_t>(linked.code.size());
-		for (auto inst: function) {
-			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg, source.wave_size) ||
-			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u, source.wave_size));
-			for (uint32_t code = 0; code < site.preserved_registers.size(); ++code) {
-				if (site.preserved_registers[code] &&
-				    CFG::MayWriteScalarRegister(inst, code, source.wave_size))
-					EXIT("shader call at pc 0x%08x clobbers scalar target dependency s%u", call.pc, code);
-			}
-			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
-			if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
-				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
-				inst.opcode = Decoder::Opcode::S_BRANCH;
-				inst.branch_target = call.pc + call.word_count * sizeof(uint32_t);
-			} else if (Decoder::IsDirectBranch(inst.opcode)) {
-				EXIT_IF(inst.branch_target >= function_size);
-				inst.branch_target += function_pc;
-			}
-			inst.pc += function_pc;
-			linked.decoded.instructions.push_back(std::move(inst));
-		}
-		linked.functions.push_back({function_offset, function_size / 4u});
-		linked.decoded.instructions[site.instruction].branch_target = function_pc;
-		function_pc += function_size;
-	}
+		function = entry->second;
+		return nullptr;
+	});
+	if (failure != nullptr) EXIT("shader call at pc 0x%08x: %s", failed_pc, failure);
 	reads.resize(query_reads);
 	for (size_t i = 0; i < source.calls.size(); ++i) {
 		const auto preceding = std::span(source.calls).first(i);
 		if (std::ranges::find(preceding, source.calls[i].address, &ShaderSource::Call::address) == preceding.end())
-			reads.emplace_back(source.calls[i].address, linked.functions[i].size * sizeof(uint32_t));
+			reads.emplace_back(source.calls[i].address, source.linked->functions[i].size * sizeof(uint32_t));
 	}
-	linked.decoded.code = linked.code;
-	linked.observed_function.resize(std::ranges::max_element(linked.functions, {},
-	    &ShaderSource::Linked::Function::size)->size);
-
-	source.linked = std::move(linked);
-	++source.revision;
 	return source.linked->decoded;
+}
+
+bool LinkShaderSource(ShaderSource& source, std::span<const uint32_t> function_code) {
+	if (source.calls.empty() || source.expand_calls || source.unsupported_call_pc != UINT32_MAX ||
+	    source.decoded.instructions.empty() ||
+	    source.decoded.instructions.back().opcode != Decoder::Opcode::S_ENDPGM) return false;
+	size_t offset = 0;
+	uint32_t failed_pc = 0;
+	const auto revision = source.revision;
+	const char* failure = LinkCalls(source, failed_pc, [&](size_t, std::vector<Decoder::Instruction>& function) -> const char* {
+		const auto leaf = function_code.subspan(offset);
+		const char* unread = DecodeLeaf([&](uint32_t index, std::span<uint32_t> words) {
+			if (index > leaf.size() || words.size() > leaf.size() - index) return false;
+			std::copy_n(leaf.begin() + index, words.size(), words.begin());
+			return true;
+		}, function);
+		if (unread != nullptr) return unread;
+		offset += function.back().pc / sizeof(uint32_t) + function.back().word_count;
+		return nullptr;
+	});
+	if (failure != nullptr || offset != function_code.size()) {
+		source.linked.reset();
+		source.revision = revision;
+		return false;
+	}
+	return true;
 }
 
 }

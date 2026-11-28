@@ -1002,6 +1002,9 @@ if(BUILD_TESTING)
         add_test(NAME kyty_precook_audit COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_precook_audit.py)
         set_tests_properties(kyty_precook_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME kyty_stall_report COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_stall_report.py)
+        set_tests_properties(kyty_stall_report PROPERTIES TIMEOUT 30)
         add_test(NAME kyty_precache_selection COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_precache_selection.py)
         set_tests_properties(kyty_precache_selection PROPERTIES TIMEOUT 30)

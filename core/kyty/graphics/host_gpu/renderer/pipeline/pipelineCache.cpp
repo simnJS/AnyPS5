@@ -1281,7 +1281,12 @@ void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
 	if (program.call_source == nullptr) {
 		StoreModule(key, program, module, spirv, plain_spirv);
 		RecordModule(key, options, code, push_data_cursor, module);
+	} else if (!program.call_source->expand_calls) {
+		RecordModule(key, options, code, push_data_cursor, module);
 	}
+#if defined(ANYPS5_KYTY)
+	NoteWaitCause(key, program, module);
+#endif
 }
 
 void PipelineCache::DestroyModule(const ShaderModule& module) const {
@@ -1657,6 +1662,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 					module->info.bindings.AdvancePushData(push_data_cursor);
 					return module;
 				}
+#if defined(ANYPS5_KYTY)
+				NoteGenericServe(module != nullptr ? GenericServe::Unbound : GenericServe::NoModule, params.hash);
+			} else {
+				NoteGenericServe(GenericServe::NoModule, params.hash);
+#endif
 			}
 		}
 	}
@@ -1799,20 +1809,27 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 #if defined(ANYPS5_KYTY)
 	struct TranslateScope {
 		uint64_t                              hash;
+		const bool&                           retry_buffers;
+		const bool&                           retry_samplers;
 		std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 		~TranslateScope() {
 			static const auto threshold = std::chrono::milliseconds([] {
 				const char* value = std::getenv("KYTY_PIPELINE_STALL_LOG_MS");
 				return value != nullptr ? std::strtoll(value, nullptr, 10) : 100;
 			}());
-			const auto now = std::chrono::steady_clock::now();
+			const auto now   = std::chrono::steady_clock::now();
+			auto       cause = TakeAddedCause();
+			if (cause.empty() && (retry_samplers || retry_buffers)) {
+				cause = retry_samplers ? " cause=other-key:rs" : " cause=other-key:rb";
+			}
 			if (now - started >= threshold) {
-				PipelineCacheLog("[kyty-gpl] translate {:.3f} s 0x{:016x} @{}",
-				                 std::chrono::duration<double>(now - started).count(), hash,
+				PipelineCacheLog("[kyty-gpl] translate {:.3f} s 0x{:016x}{} @{}",
+				                 std::chrono::duration<double>(now - started).count(), hash, cause,
 				                 now.time_since_epoch().count());
 			}
 		}
-	} const translate_scope {params.hash};
+	} const translate_scope {params.hash, retry_runtime_buffers, retry_runtime_samplers};
+	(void)TakeAddedCause();
 #endif
 	if (m_queue_only) {
 		if (!m_in_flight.contains(m_lookup_key)) {
@@ -4459,6 +4476,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			if (!stall) {
 #if defined(ANYPS5_KYTY)
 				stall.emplace(*this, "graphics-wait", stall_hash, sync_why);
+				stall->Stages(stages);
 #else
 				stall.emplace(*this);
 #endif
@@ -4483,6 +4501,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (!stall) {
 #if defined(ANYPS5_KYTY)
 			stall.emplace(*this, "graphics-sync", stall_hash, sync_why);
+			stall->Stages(stages);
 #else
 			stall.emplace(*this);
 #endif

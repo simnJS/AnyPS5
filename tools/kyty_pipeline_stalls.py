@@ -18,7 +18,8 @@ END = r" @(?P<end>[0-9]{1,19})"
 PIPELINE_ROWS = {
     "stall": re.compile(r"(?P<duration>[0-9]{1,10}\.[0-9]{3}) s (?P<stall_type>\S+) "
                         + SHADER + r"(?: (?P<route>.*?))?" + END),
-    "translate": re.compile(r"(?P<duration>[0-9]{1,10}\.[0-9]{3}) s " + SHADER + END),
+    "translate": re.compile(r"(?P<duration>[0-9]{1,10}\.[0-9]{3}) s " + SHADER
+                            + r"(?: cause=(?P<cause>\S+))?(?: variant=(?P<variant>[0-9a-f]{16}))?" + END),
     "compute-driver": re.compile(r"(?P<duration>[0-9]{1,10}\.[0-9]{6}) s " + SHADER
                                  + r" module=(?P<module>[0-9]{1,20}) spirv_words=(?P<spirv_words>[0-9]{1,10})"
                                  + r" mode=(?P<mode>lookup|create) result=(?P<result>\S(?:.*\S)?)" + END),
@@ -78,6 +79,8 @@ def read_kyty_pipeline_events(path):
 
         if kind == "stall":
             fields["route"] = fields["route"] or ""
+        elif kind == "translate":
+            fields = {name: value for name, value in fields.items() if value is not None}
         elif kind == "compute-driver":
             fields["module"] = benchmark_integer(int(fields["module"]), f"{location} module")
             fields["spirv_words"] = benchmark_integer(int(fields["spirv_words"]), f"{location} spirv_words", (1 << 32) - 1)

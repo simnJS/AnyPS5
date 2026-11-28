@@ -108,6 +108,8 @@ Numbers are taken with the default settings, warm caches (play the scene once, t
 
 **Stutters**: `KYTY_SESSION_LOG=<file>` with the flip telemetry, then `python3 tools/kyty_pipeline_stalls.py videoout.jsonl <file> --top 10`.
 
+**Shader waits**: `python3 tools/stall-report.py <session directory>` classifies every `[kyty-gpl] stall` and `translate` of a session by the reason no prepared form served it: the `cause=` the build writes on the line, or one inferred from the manifests of the session. `--variants` ranks the fields of the variant key by the variants they make.
+
 You do not need every game: the maintainers run one title per engine family (Unity, Unreal Engine 4, an in-house engine designed for the PS5, an in-house engine of the PS4 era) on each integration.
 
 ## Rules

@@ -44,6 +44,9 @@ class KytyPipelineStallTests(unittest.TestCase):
             "[kyty-gpl] stall 0.250 s graphics-sync 0x0123456789abcdef linked fs=queued pr=building @1234567890\n"
             "[kyty-gpl] stall 0.002 s compute-sync 0x23456789abcdef01  @1235000000\n"
             "[kyty-gpl] translate 0.123 s 0x3456789abcdef012 @1236000000\n"
+            "[kyty-gpl] translate 0.004 s 0x456789abcdef0123 cause=generic-unbound:image-count(3->4) "
+            "variant=0f1e2d3c4b5a6978 @1237000000\n"
+            "[kyty-gpl] translate 0.700 s 0x456789abcdef0123 cause=other-key:rs @1237500000\n"
             "[kyty-gpl] compute-driver 0.037411 s 0x456789abcdef0123 module=42 spirv_words=4370 mode=create result=Success @1237000000\n"
             "[kyty-gpl] compute-driver 0.000007 s 0x56789abcdef01234 module=9 spirv_words=815 mode=lookup result=PipelineCompileRequired @1238000000\n"
         )
@@ -52,13 +55,18 @@ class KytyPipelineStallTests(unittest.TestCase):
             ("stall", "0123456789abcdef", 1_234_567_890, 250_000_000),
             ("stall", "23456789abcdef01", 1_235_000_000, 2_000_000),
             ("translate", "3456789abcdef012", 1_236_000_000, 123_000_000),
+            ("translate", "456789abcdef0123", 1_237_000_000, 4_000_000),
+            ("translate", "456789abcdef0123", 1_237_500_000, 700_000_000),
             ("compute-create", "456789abcdef0123", 1_237_000_000, 37_411_000),
             ("compute-lookup", "56789abcdef01234", 1_238_000_000, 7_000),
         ])
         self.assertEqual(events[0].details, {"stall_type": "graphics-sync", "route": "linked fs=queued pr=building"})
         self.assertEqual(events[1].details, {"stall_type": "compute-sync", "route": ""})
-        self.assertEqual(events[3].details, {"module": 42, "spirv_words": 4370, "mode": "create", "result": "Success"})
-        self.assertEqual(events[4].details, {"module": 9, "spirv_words": 815, "mode": "lookup",
+        self.assertEqual(events[2].details, {})
+        self.assertEqual(events[3].details, {"cause": "generic-unbound:image-count(3->4)", "variant": "0f1e2d3c4b5a6978"})
+        self.assertEqual(events[4].details, {"cause": "other-key:rs"})
+        self.assertEqual(events[5].details, {"module": 42, "spirv_words": 4370, "mode": "create", "result": "Success"})
+        self.assertEqual(events[6].details, {"module": 9, "spirv_words": 815, "mode": "lookup",
                                              "result": "PipelineCompileRequired"})
 
     def test_accepts_headerless_stderr_with_a_complete_record(self):
