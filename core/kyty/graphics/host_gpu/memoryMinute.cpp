@@ -33,14 +33,23 @@ public:
 		m_owner = &graphics;
 		m_started = Clock::now();
 		m_thread = std::jthread([this](std::stop_token stop) {
-			auto next = m_started + std::chrono::minutes(1);
+			constexpr auto interval = std::chrono::seconds(2);
+			auto next = m_started + interval;
+			auto minute = m_started + std::chrono::minutes(1);
 			std::unique_lock lock(m_wait_mutex);
 			while (!stop.stop_requested()) {
 				m_wake.wait_until(lock, stop, next, [] { return false; });
 				if (stop.stop_requested()) return;
-				m_owner->LogMemoryMinute("minute", Elapsed());
+				if (Clock::now() >= minute) {
+					m_owner->LogMemoryMinute("minute", Elapsed());
+					do {
+						minute += std::chrono::minutes(1);
+					} while (minute <= Clock::now());
+				} else {
+					m_owner->LogMemoryMinute("pressure", Elapsed(), true);
+				}
 				do {
-					next += std::chrono::minutes(1);
+					next += interval;
 				} while (next <= Clock::now());
 			}
 		});
@@ -86,22 +95,30 @@ void GraphicContext::StopMemoryMinutes() {
 	MemoryMinutes::Instance().Stop(this);
 }
 
-void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds) const {
+void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds, bool pressure_only) const {
 	using namespace MemoryTelemetry;
 	const auto start = Clock::now();
-	const auto host = Common::ReadProcessMemory();
+	const auto host = pressure_only ? Common::ProcessMemory {} : Common::ReadProcessMemory();
+	vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget {};
+	if (memory_budget_ext_enabled) {
+		vk::PhysicalDeviceMemoryProperties2 properties {.pNext = &budget};
+		physical_device.getMemoryProperties2(&properties);
+	}
+	uint64_t local_usage = 0, local_budget = 0;
+	for (uint32_t i = 0; i < physical_device_memory_properties.memoryHeapCount; ++i) {
+		if (physical_device_memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+			local_usage += budget.heapUsage[i];
+			local_budget += budget.heapBudget[i];
+		}
+	}
+	if (pressure_only && (local_budget == 0 || local_usage < HeapImageThreshold(local_budget))) return;
 	auto line = fmt::format("[kyty-mem] reason={} seconds={} rss={} private={} malloc={} cpu_copies={} pipeline_ram={}",
 	                        reason, seconds, Value(host.rss), Value(host.private_bytes), Value(host.malloc_bytes),
 	                        cpu_copies.load(std::memory_order_relaxed), pipeline_ram.load(std::memory_order_relaxed));
 	std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> primary {}, spill {};
 	if (allocator) vmaGetHeapBudgets(allocator, primary.data());
 	if (spill_allocator) vmaGetHeapBudgets(spill_allocator, spill.data());
-	vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget {};
-	if (memory_budget_ext_enabled) {
-		vk::PhysicalDeviceMemoryProperties2 properties {.pNext = &budget};
-		physical_device.getMemoryProperties2(&properties);
-	}
-	uint64_t local_usage = 0, local_budget = 0, local_blocks = 0;
+	uint64_t local_blocks = 0;
 	for (uint32_t i = 0; i < physical_device_memory_properties.memoryHeapCount; ++i) {
 		const auto& a = primary[i].statistics;
 		const auto& b = spill[i].statistics;
@@ -112,11 +129,7 @@ void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds) const
 		                    memory_budget_ext_enabled ? std::to_string(budget.heapUsage[i]) : "na",
 		                    memory_budget_ext_enabled ? std::to_string(budget.heapBudget[i]) : "na",
 		                    blocks, allocated, blocks - allocated, uint64_t(a.allocationCount) + b.allocationCount);
-		if (local) {
-			local_usage += budget.heapUsage[i];
-			local_budget += budget.heapBudget[i];
-			local_blocks += blocks;
-		}
+		if (local) local_blocks += blocks;
 	}
 	line += fmt::format(" local_usage={} local_budget={} local_vma_blocks={} outside_vma={}",
 	                    memory_budget_ext_enabled ? std::to_string(local_usage) : "na",
@@ -132,9 +145,10 @@ void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds) const
 	const auto driver = [&](DriverMemoryReport::Category kind) {
 		return driver_memory_report ? Value(driver_memory_report->Bytes(kind)) : "na";
 	};
-	line += fmt::format(" mirror_bound={} imported_host={} driver_pipeline={} driver_descriptor_pool={} driver_command_pool={}",
-	                    resident.load(std::memory_order_relaxed), imported.load(std::memory_order_relaxed),
-	                    driver(DriverMemoryReport::Pipeline), driver(DriverMemoryReport::DescriptorPool),
+	line += fmt::format(" parked_local={} mirror_bound={} imported_host={} driver_pipeline={}"
+	                    " driver_descriptor_pool={} driver_command_pool={}",
+	                    parked_local.load(std::memory_order_relaxed), resident.load(std::memory_order_relaxed),
+	                    imported.load(std::memory_order_relaxed), driver(DriverMemoryReport::Pipeline), driver(DriverMemoryReport::DescriptorPool),
 	                    driver(DriverMemoryReport::CommandPool));
 	line += fmt::format(" pipelines={} pipeline_caches={} descriptor_pools={} command_pools={}",
 	                    live_objects<vk::Pipeline>.load(std::memory_order_relaxed),

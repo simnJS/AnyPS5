@@ -2288,16 +2288,16 @@ void TextureCache::ParkImage(ImageId id) {
 	StencilPlanesChanged(image);
 	image.binding.needs_rebind = true;
 	image.StateChanged();
-	m_parked_images.emplace_back(id, m_scheduler.CurrentTick());
+	m_parked_images.emplace_back(id, m_scheduler.CurrentTick(), image.backing.charge.local ? image.backing.charge.bytes : 0);
 	if (m_parked_images.size() > MaxParkedImages) {
-		DiscardParkedImage(m_parked_images.front().first);
+		DiscardParkedImage(m_parked_images.front().id);
 		m_parked_images.erase(m_parked_images.begin());
 	}
 }
 
 ImageId TextureCache::UnparkImage(const ImageInfo& info) {
 	for (auto it = m_parked_images.begin(); it != m_parked_images.end(); ++it) {
-		const auto id    = it->first;
+		const auto id    = it->id;
 		auto&      image = m_slot_images[id];
 		if (!SameParkedLayout(image.info, info)) {
 			continue;
@@ -2337,13 +2337,13 @@ void TextureCache::DiscardParkedImage(ImageId id) {
 
 void TextureCache::DiscardParkedImages(uint64_t address, uint64_t size) {
 	const auto tick = m_scheduler.CurrentTick();
-	std::erase_if(m_parked_images, [&](const std::pair<ImageId, uint64_t>& parked) KYTY_REQUIRES(m_lock) {
-		const auto& data = m_slot_images[parked.first].info.data;
+	std::erase_if(m_parked_images, [&](const ParkedImage& parked) KYTY_REQUIRES(m_lock) {
+		const auto& data = m_slot_images[parked.id].info.data;
 		const bool  discard =
-		    size == 0 ? tick - std::min(tick, parked.second) > ParkedImageTicks
+		    size == 0 ? tick - std::min(tick, parked.tick) > ParkedImageTicks
 		              : data.address < address + size && address < data.End();
 		if (discard) {
-			DiscardParkedImage(parked.first);
+			DiscardParkedImage(parked.id);
 		}
 		return discard;
 	});
@@ -2645,8 +2645,8 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 					}
 					const auto depth_id = image.depth_id;
 					std::erase_if(m_parked_images,
-					              [depth_id](const std::pair<ImageId, uint64_t>& parked) {
-						              return parked.first == depth_id;
+					              [depth_id](const ParkedImage& parked) {
+						              return parked.id == depth_id;
 					              });
 					DiscardParkedImage(depth_id);
 					continue;

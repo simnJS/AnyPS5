@@ -25,7 +25,7 @@ struct Totals {
 };
 
 inline constinit std::array<std::array<Totals, 2>, Names.size()> totals {};
-inline constinit std::atomic<uint64_t> resident {}, imported {}, cpu_copies {}, pipeline_ram {};
+inline constinit std::atomic<uint64_t> resident {}, imported {}, cpu_copies {}, pipeline_ram {}, parked_local {};
 
 struct Allocation {
 	uint64_t bytes = 0;
@@ -76,21 +76,29 @@ struct PipelineAllocator {
 	template <class U> bool operator==(const PipelineAllocator<U>&) const noexcept { return true; }
 };
 
-class PipelineBytes {
+template <std::atomic<uint64_t>& total>
+class ScopedBytes {
 public:
-	explicit PipelineBytes(uint64_t size = 0) { Set(size); }
-	PipelineBytes(const PipelineBytes&) = delete;
-	PipelineBytes& operator=(const PipelineBytes&) = delete;
-	PipelineBytes(PipelineBytes&& other) noexcept : m_size(std::exchange(other.m_size, 0)) {}
-	~PipelineBytes() { Set(0); }
+	explicit ScopedBytes(uint64_t size = 0) { Set(size); }
+	ScopedBytes(const ScopedBytes&) = delete;
+	ScopedBytes& operator=(const ScopedBytes&) = delete;
+	ScopedBytes(ScopedBytes&& other) noexcept : m_size(std::exchange(other.m_size, 0)) {}
+	ScopedBytes& operator=(ScopedBytes&& other) noexcept {
+		Set(0);
+		m_size = std::exchange(other.m_size, 0);
+		return *this;
+	}
+	~ScopedBytes() { Set(0); }
 
 	void Set(uint64_t size) {
-		if (size != m_size) pipeline_ram.fetch_add(size - m_size, std::memory_order_relaxed);
+		if (size != m_size) total.fetch_add(size - m_size, std::memory_order_relaxed);
 		m_size = size;
 	}
 
 private:
 	uint64_t m_size = 0;
 };
+
+using PipelineBytes = ScopedBytes<pipeline_ram>;
 
 }

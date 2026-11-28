@@ -159,7 +159,7 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
-	void               LogMemoryMinute(const char* reason, uint64_t seconds) const;
+	void               LogMemoryMinute(const char* reason, uint64_t seconds, bool pressure_only = false) const;
 	void               StartMemoryMinutes();
 	void               StopMemoryMinutes();
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept {
