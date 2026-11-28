@@ -337,6 +337,13 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_image_heap_fill PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_fill: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/StoredSpirvRecord.cpp)
+    add_test_executable(kyty_shim_stored_spirv_record_tests ${CMAKE_CURRENT_SOURCE_DIR}/StoredSpirvRecordMain.cpp)
+    configure_host_test_executable(kyty_shim_stored_spirv_record_tests)
+    target_link_libraries(kyty_shim_stored_spirv_record_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_stored_spirv_record COMMAND kyty_shim_stored_spirv_record_tests)
+    set_tests_properties(kyty_shim_stored_spirv_record PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_stored_spirv_record: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePages.cpp)
     add_test_executable(kyty_shim_buffer_cache_pages_tests ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePagesMain.cpp)
     configure_host_test_executable(kyty_shim_buffer_cache_pages_tests)
@@ -1152,6 +1159,18 @@ if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
     set_tests_properties(kyty_shim_call_program_replay PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "kyty_shim_call_program_replay: ok")
 endif()
+add_test_executable(kyty_shim_known_pipeline_first_use_tests ${CMAKE_CURRENT_SOURCE_DIR}/KnownPipelineFirstUse.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_known_pipeline_first_use_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_known_pipeline_first_use_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_known_pipeline_first_use_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_known_pipeline_first_use_tests)
+add_dependencies(kyty_shim_known_pipeline_first_use_tests agc_frame_replay)
+if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
+    add_test(NAME kyty_shim_known_pipeline_first_use COMMAND kyty_shim_known_pipeline_first_use_tests $<TARGET_FILE:agc_frame_replay>)
+    set_tests_properties(kyty_shim_known_pipeline_first_use PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "kyty_shim_known_pipeline_first_use: ok")
+endif()
 add_test_executable(kyty_shim_packed_unorm_blend_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/PackedUnormBlend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp
@@ -1263,7 +1282,7 @@ if(WIN32)
             APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
     if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
         set_property(TEST kyty_shim_prepared_variant_first_use kyty_shim_rt_stats_cache_isolation
-                kyty_shim_call_program_replay
+                kyty_shim_call_program_replay kyty_shim_known_pipeline_first_use
                 APPEND PROPERTY ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
     endif()

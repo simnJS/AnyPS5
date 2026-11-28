@@ -150,11 +150,15 @@ void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds, bool 
 	                    parked_local.load(std::memory_order_relaxed), resident.load(std::memory_order_relaxed),
 	                    imported.load(std::memory_order_relaxed), driver(DriverMemoryReport::Pipeline), driver(DriverMemoryReport::DescriptorPool),
 	                    driver(DriverMemoryReport::CommandPool));
-	line += fmt::format(" pipelines={} pipeline_caches={} descriptor_pools={} command_pools={}",
+	const auto modules = LiveShaderModules();
+	line += fmt::format(" pipelines={} pipeline_caches={} descriptor_pools={} command_pools={} shader_modules={},{}",
 	                    live_objects<vk::Pipeline>.load(std::memory_order_relaxed),
 	                    live_objects<vk::PipelineCache>.load(std::memory_order_relaxed),
 	                    live_objects<vk::DescriptorPool>.load(std::memory_order_relaxed),
-	                    live_objects<vk::CommandPool>.load(std::memory_order_relaxed));
+	                    live_objects<vk::CommandPool>.load(std::memory_order_relaxed), modules.count, modules.bytes);
+	line += fmt::format(" released_pipelines={},{},{},{}", released_pipelines.load(std::memory_order_relaxed),
+	                    released_reused.load(std::memory_order_relaxed), released_missed.load(std::memory_order_relaxed),
+	                    released_pressure.load(std::memory_order_relaxed));
 	line += fmt::format(" sample_us={}\n", std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
 	::Log::WriteToConsoleAndLog(line);
 }

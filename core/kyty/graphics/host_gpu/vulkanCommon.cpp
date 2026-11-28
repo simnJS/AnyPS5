@@ -4,6 +4,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <mutex>
+#include <unordered_map>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -39,6 +41,72 @@ vk::Result Create(vk::Device device, vk::PipelineCache cache, const vk::ComputeP
 	const auto result = device.createComputePipelines(cache, 1, &info, nullptr, &handle);
 	if (result == vk::Result::eSuccess) live_objects<vk::Pipeline>.fetch_add(1, std::memory_order_relaxed);
 	return result;
+}
+
+namespace {
+
+struct ShaderModuleCounter {
+	PFN_vkCreateShaderModule                     create  = nullptr;
+	PFN_vkDestroyShaderModule                    destroy = nullptr;
+	std::mutex                                   mutex;
+	std::unordered_map<VkShaderModule, uint64_t> bytes;
+	ShaderModuleTotals                           totals;
+};
+
+ShaderModuleCounter& ModuleCounter() {
+	static ShaderModuleCounter counter;
+	return counter;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CountedCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* info,
+                                                         const VkAllocationCallbacks* allocator, VkShaderModule* module) {
+	auto&      counter = ModuleCounter();
+	const auto result  = counter.create(device, info, allocator, module);
+	if (result == VK_SUCCESS && module != nullptr && *module != VK_NULL_HANDLE) {
+		std::scoped_lock lock(counter.mutex);
+		if (counter.bytes.try_emplace(*module, info->codeSize).second) {
+			counter.totals.count++;
+			counter.totals.bytes += info->codeSize;
+		}
+	}
+	return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL CountedDestroyShaderModule(VkDevice device, VkShaderModule module,
+                                                      const VkAllocationCallbacks* allocator) {
+	auto& counter = ModuleCounter();
+	if (module != VK_NULL_HANDLE) {
+		std::scoped_lock lock(counter.mutex);
+		if (const auto found = counter.bytes.find(module); found != counter.bytes.end()) {
+			counter.totals.count--;
+			counter.totals.bytes -= found->second;
+			counter.bytes.erase(found);
+		}
+	}
+	counter.destroy(device, module, allocator);
+}
+
+}
+
+void CountShaderModules() {
+	auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	auto& counter    = ModuleCounter();
+	if (dispatcher.vkCreateShaderModule == nullptr || dispatcher.vkDestroyShaderModule == nullptr) return;
+	std::scoped_lock lock(counter.mutex);
+	if (dispatcher.vkCreateShaderModule != &CountedCreateShaderModule) {
+		counter.create                  = dispatcher.vkCreateShaderModule;
+		dispatcher.vkCreateShaderModule = &CountedCreateShaderModule;
+	}
+	if (dispatcher.vkDestroyShaderModule != &CountedDestroyShaderModule) {
+		counter.destroy                  = dispatcher.vkDestroyShaderModule;
+		dispatcher.vkDestroyShaderModule = &CountedDestroyShaderModule;
+	}
+}
+
+ShaderModuleTotals LiveShaderModules() {
+	auto&            counter = ModuleCounter();
+	std::scoped_lock lock(counter.mutex);
+	return counter.totals;
 }
 
 }

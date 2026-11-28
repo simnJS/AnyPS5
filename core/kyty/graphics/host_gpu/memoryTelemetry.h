@@ -26,6 +26,7 @@ struct Totals {
 
 inline constinit std::array<std::array<Totals, 2>, Names.size()> totals {};
 inline constinit std::atomic<uint64_t> resident {}, imported {}, cpu_copies {}, pipeline_ram {}, parked_local {};
+inline constinit std::atomic<uint64_t> released_pipelines {}, released_reused {}, released_missed {}, released_pressure {};
 
 struct Allocation {
 	uint64_t bytes = 0;
