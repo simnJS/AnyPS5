@@ -1448,7 +1448,7 @@ void Deliver(int signum, siginfo_t*, void* context) {
 #ifdef __linux__
     auto* const self = CurrentGuestThreadForDelivery();
     if (!Outstanding(self)) return;
-    if (TimedWait::DeliveryDeferred() && !PendingExpired()) {
+    if (TimedWait::DeliveryDeferred()) {
         TimedWait::DeferDelivery(signum);
         QueueRetry();
         return;
