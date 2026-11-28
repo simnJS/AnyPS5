@@ -112,8 +112,8 @@ void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds, bool 
 		}
 	}
 	if (pressure_only && (local_budget == 0 || local_usage < HeapImageThreshold(local_budget))) return;
-	auto line = fmt::format("[kyty-mem] reason={} seconds={} rss={} private={} malloc={} cpu_copies={} pipeline_ram={}",
-	                        reason, seconds, Value(host.rss), Value(host.private_bytes), Value(host.malloc_bytes),
+	auto line = fmt::format("[kyty-mem] reason={} seconds={} rss={} private={} malloc={} malloc_free={} cpu_copies={} pipeline_ram={}",
+	                        reason, seconds, Value(host.rss), Value(host.private_bytes), Value(host.malloc_bytes), Value(host.malloc_free),
 	                        cpu_copies.load(std::memory_order_relaxed), pipeline_ram.load(std::memory_order_relaxed));
 	std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> primary {}, spill {};
 	if (allocator) vmaGetHeapBudgets(allocator, primary.data());

@@ -2082,7 +2082,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	}
 	OpenManifest();
 	for (uint32_t i = 0; i < CompileWorkers; i++) {
-		m_workers.emplace_back([this] { CompileWorker(); });
+		m_workers.emplace_back([this](const std::stop_token& stop) { CompileWorker(stop); });
 	}
 #if defined(ANYPS5_KYTY)
 	if (m_libraries != nullptr) {
@@ -2100,7 +2100,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	if (Config::AsyncPipelinesEnabled()) {
 		constexpr uint32_t AsyncThreads = 3;
 		for (uint32_t i = 0; i < AsyncThreads; i++) {
-			m_async_threads.emplace_back([this] { AsyncPipelineWorker(); });
+			m_async_threads.emplace_back([this](const std::stop_token& stop) { AsyncPipelineWorker(stop); });
 		}
 	}
 	m_async_handoff = !m_async_threads.empty() || m_manifest_warm;
@@ -3232,7 +3232,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	UnlockPrograms();
 }
 
-void PipelineCache::CompileWorker() {
+void PipelineCache::CompileWorker(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("Thread_ShaderCompile");
 	for (;;) {
 		std::unique_ptr<CompileJob> job;
@@ -3245,6 +3245,8 @@ void PipelineCache::CompileWorker() {
 			job = std::move(m_jobs.front());
 			m_jobs.pop_front();
 		}
+		const auto ticket = AdmitWorker(stop, job->params.code.size(), false);
+		if (!ticket) return;
 		if (job->table != nullptr) {
 			if (job->vertex != nullptr) {
 				RunTableJob(*job, *job->vertex);
@@ -3570,7 +3572,7 @@ void PipelineCache::StopAsyncPipelines() {
 	m_async_threads.clear();
 }
 
-void PipelineCache::AsyncPipelineWorker() {
+void PipelineCache::AsyncPipelineWorker(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("Thread_PipelineAsync");
 	for (;;) {
 		AsyncPipelineJob job;
@@ -3586,6 +3588,12 @@ void PipelineCache::AsyncPipelineWorker() {
 			job        = jobs.front();
 			jobs.pop_front();
 		}
+		size_t words = job.compute ? job.module->spirv_words : 0;
+		for (const auto* stage: job.stages) {
+			if (stage != nullptr) words += stage->spirv_words;
+		}
+		const auto ticket = AdmitWorker(stop, words, true);
+		if (!ticket) return;
 		Pipeline   pipeline;
 		pipeline.native_bindings = job.native;
 		const auto started = std::chrono::steady_clock::now();

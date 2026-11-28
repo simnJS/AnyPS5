@@ -1,8 +1,10 @@
 #include "common/emulatorConfig.h"
+#include "common/hostStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/pipeline/manifestAdmission.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/stallSnapshot.h"
@@ -398,12 +400,30 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		sleeper.wait_for(lock, stop, period, [] { return false; });
 	};
 #if defined(ANYPS5_KYTY)
+#if defined(__GLIBC__)
+	Clock::time_point next_heap_check {};
+#endif
 	Clock::time_point stats_logged = Clock::now();
 	Clock::time_point shader_wait_logged;
 #endif
 	while (!stop.stop_requested()) {
 		sleep(WatchPeriod);
 #if defined(ANYPS5_KYTY)
+#if defined(__GLIBC__)
+		if (Clock::now() >= next_heap_check) {
+			next_heap_check = Clock::now() + std::chrono::seconds(5);
+			const auto memory = Common::ReadSystemMemory();
+			if (memory && memory->available < ManifestAdmission::Reserve(memory->total)) {
+				const auto start = Clock::now();
+				if (const auto trim = Common::TrimUnusedHeap()) {
+					PrecompileLog("[kyty-heap-trim] available={} malloc_free={} rss_before={} rss_after={} elapsed_ms={}",
+					              memory->available, trim->free_bytes, trim->rss_before, trim->rss_after,
+					              std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
+				}
+				next_heap_check = Clock::now() + std::chrono::seconds(30);
+			}
+		}
+#endif
 		if (m_libraries != nullptr) {
 			m_libraries->Tick();
 		}

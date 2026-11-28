@@ -348,7 +348,7 @@ struct PipelineCache::ManifestState {
 	std::deque<std::pair<uint64_t, std::vector<uint32_t>>> code_queue;
 	std::condition_variable_any                             code_available;
 	std::jthread                                            code_thread;
-	std::atomic<bool>                                       scanning {true};
+	std::atomic<bool>                                       scanning {false};
 
 	std::condition_variable_any startup_finished;
 	uint32_t startup_total = 0;
@@ -364,30 +364,10 @@ struct PipelineCache::ManifestState {
 	bool                                  memory_refused   = false;
 	std::chrono::steady_clock::time_point next_admission_sample;
 	std::chrono::steady_clock::time_point next_admission_log;
+	std::chrono::steady_clock::time_point next_file_reclaim;
 	ManifestCpuCounters                   cpu_counters;
 	uint32_t                              logged_modules   = 0;
 	uint32_t                              logged_pipelines = 0;
-
-	class Admitted {
-	public:
-		Admitted() = default;
-		Admitted(ManifestState* state, uint64_t ticket): m_state(state), m_ticket(ticket) {}
-		Admitted(Admitted&& other) noexcept: m_state(std::exchange(other.m_state, nullptr)), m_ticket(other.m_ticket) {}
-		Admitted(const Admitted&)            = delete;
-		Admitted& operator=(const Admitted&) = delete;
-		Admitted& operator=(Admitted&&)      = delete;
-		~Admitted() {
-			if (m_state != nullptr) m_state->Release(m_ticket);
-		}
-		explicit operator bool() const { return m_state != nullptr; }
-		void Reset() {
-			if (m_state != nullptr) std::exchange(m_state, nullptr)->Release(m_ticket);
-		}
-
-	private:
-		ManifestState* m_state  = nullptr;
-		uint64_t       m_ticket = 0;
-	};
 
 	void ReleaseStartup(std::string_view reason) {
 		startup = false;
@@ -432,16 +412,26 @@ struct PipelineCache::ManifestState {
 		            finished.driver, finished.light, built - modules, created - previous);
 	}
 
-	Admitted Admit(const std::stop_token& stop, size_t words, bool driver) {
+	CompilationTicket Admit(const std::stop_token& stop, size_t words, bool driver, bool runtime = false) {
 		std::unique_lock lock(mutex);
 		const auto since = std::chrono::steady_clock::now();
-		while (!stop.stop_requested()) {
+		while (!stop.stop_requested() && (runtime || !admission_closed)) {
 			const auto now = std::chrono::steady_clock::now();
 			SampleAdmission(now);
 			if (const auto ticket = admission.Admit(now, words, driver, std::this_thread::get_id(), since)) return {this, *ticket};
 			const auto refusal = admission.LastRefusal();
 			if (refusal == ManifestAdmission::Refusal::Closed) break;
-			if (refusal == ManifestAdmission::Refusal::Memory) memory_refused = true;
+			if (refusal == ManifestAdmission::Refusal::Memory) {
+				memory_refused = true;
+				const auto needed = admission.Estimate(words, driver) + ManifestAdmission::LoneMargin;
+				if (admission.Running() == 0 && admission.LastSample().available < needed && now >= next_file_reclaim) {
+					next_file_reclaim = now + std::chrono::seconds(5);
+					lock.unlock();
+					Common::ReclaimColdGroupFiles(needed);
+					lock.lock();
+					continue;
+				}
+			}
 			const auto epoch = admission_epoch;
 			admission_changed.wait_until(lock, stop, next_admission_sample, [&] { return admission_epoch != epoch; });
 		}
@@ -457,7 +447,6 @@ struct PipelineCache::ManifestState {
 
 	void CloseAdmission() {
 		std::scoped_lock lock(mutex);
-		admission.Close();
 		admission_closed = true;
 		++admission_epoch;
 		admission_changed.notify_all();
@@ -550,6 +539,18 @@ struct PipelineCache::ManifestState {
 		    index);
 	}
 };
+
+PipelineCache::CompilationTicket::~CompilationTicket() {
+	Reset();
+}
+
+void PipelineCache::CompilationTicket::Reset() {
+	if (m_state != nullptr) std::exchange(m_state, nullptr)->Release(m_ticket);
+}
+
+PipelineCache::CompilationTicket PipelineCache::AdmitWorker(const std::stop_token& stop, size_t words, bool driver) {
+	return m_manifest->Admit(stop, words, driver, true);
+}
 
 void PipelineCache::ManifestStateDeleter::operator()(ManifestState* state) const {
 	delete state;
@@ -802,6 +803,11 @@ void PipelineCache::OpenManifest() {
 	const bool warm   = Config::PipelineManifestEnabled();
 	const bool record = Config::PipelineManifestRecord() || warm;
 	const auto title  = PipelineCacheTitleId();
+	m_manifest.reset(new ManifestState());
+	auto& state = *m_manifest;
+	const auto workers = ManifestWorkerCount();
+	state.admission.SetLimit(static_cast<uint32_t>(workers));
+	state.next_admission_log = std::chrono::steady_clock::now() + std::chrono::minutes(1);
 	if ((!warm && !record) || title.empty()) return;
 
 	const auto stem = PipelineCacheTitleStem(title);
@@ -815,8 +821,6 @@ void PipelineCache::OpenManifest() {
 	const auto files = FindManifestFiles(folders, title, stem);
 	const auto compute_name = std::filesystem::path(stem + ".compute.kpm");
 
-	m_manifest.reset(new ManifestState());
-	auto& state = *m_manifest;
 	auto& all   = state.recorded;
 	if (warm) {
 		state.shared_path = shared_path;
@@ -957,9 +961,6 @@ void PipelineCache::OpenManifest() {
 				}
 			}
 		});
-	} else if (!warm || all.modules.empty()) {
-		m_manifest.reset();
-		return;
 	}
 	if (!warm) {
 		return;
@@ -998,9 +999,6 @@ void PipelineCache::OpenManifest() {
 	state.startup_done = state.found;
 	state.scanning.store(!state.code.empty(), std::memory_order_relaxed);
 	state.startup = state.startup_total != state.startup_done && Config::StartupWaitSeconds() != 0;
-	const auto workers = ManifestWorkerCount();
-	state.admission.SetLimit(static_cast<uint32_t>(workers));
-	state.next_admission_log = state.start + std::chrono::minutes(1);
 	if (state.startup) {
 		ManifestLog("Pipeline manifest: startup with {} workers, {} jobs ({} modules restored)", workers,
 		            state.startup_total, state.found);

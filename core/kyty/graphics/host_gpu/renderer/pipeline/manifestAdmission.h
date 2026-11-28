@@ -108,6 +108,7 @@ public:
 				auto share = static_cast<uint64_t>(static_cast<double>(usage) * static_cast<double>(job.estimate) /
 				                                   static_cast<double>(committed));
 				if (const auto own = ThreadUse(job)) share = std::min(share, *own);
+				job.observed = std::min(job.estimate, share);
 				job.peak = std::max(job.peak, share);
 				++job.samples;
 			}
@@ -167,9 +168,11 @@ public:
 		return std::max(MinDriverBytes, std::min(16 * GiB, cap));
 	}
 
-	[[nodiscard]] uint64_t Reserve() const {
-		return m_sample.total != 0 ? std::clamp(m_sample.total / 5, 4 * GiB, 12 * GiB) : 4 * GiB;
+	[[nodiscard]] static uint64_t Reserve(uint64_t total) {
+		return total != 0 ? std::clamp(total / 5, 4 * GiB, 12 * GiB) : 4 * GiB;
 	}
+
+	[[nodiscard]] uint64_t Reserve() const { return Reserve(m_sample.total); }
 
 	[[nodiscard]] uint64_t Committed() const {
 		uint64_t total = 0;
@@ -180,9 +183,9 @@ public:
 	[[nodiscard]] uint64_t Usage() const { return m_sample.process > m_baseline ? m_sample.process - m_baseline : 0; }
 
 	[[nodiscard]] uint64_t Pending() const {
-		const auto committed = Committed();
-		const auto usage     = Usage();
-		return committed > usage ? committed - usage : 0;
+		uint64_t pending = 0;
+		for (const auto& job: m_jobs | std::views::values) pending += job.estimate - job.observed;
+		return pending;
 	}
 
 	[[nodiscard]] int64_t Room() const {
@@ -226,6 +229,7 @@ private:
 		int                     thread = 0;
 		std::optional<uint64_t> thread_start {};
 		uint64_t                thread_taken = 0;
+		uint64_t                observed     = 0;
 		uint64_t                peak         = 0;
 		uint32_t                samples      = 0;
 	};
@@ -254,7 +258,8 @@ private:
 		const auto reserved       = other_reserved ? static_cast<int64_t>(m_reservation->bytes) : 0;
 		if (static_cast<int64_t>(estimate) + reserved <= Room()) return Refusal::None;
 		const auto waited = now - waiting_since;
-		if (m_jobs.empty() && !other_reserved && (estimate + LoneMargin <= m_sample.available || waited >= LoneWait)) {
+		if (m_jobs.empty() && !other_reserved && (estimate + LoneMargin <= m_sample.available ||
+		                                       (waited >= LoneWait && estimate <= m_sample.available))) {
 			return Refusal::None;
 		}
 		if (waited >= StarveWait && (!m_reservation || m_reservation->caller == caller)) {

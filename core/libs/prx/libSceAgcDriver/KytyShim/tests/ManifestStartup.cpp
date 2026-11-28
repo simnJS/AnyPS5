@@ -131,9 +131,17 @@ void MemoryAdmission() {
 	Check(!admission.Admit(low + 1s, Words, true, first, low + 1s), "nothing starts when even one compilation does not fit");
 	Check(!admission.Admit(low + 30s, Words, true, first, low + 1s), "nothing starts for 30 s when even one does not fit");
 	const auto lone = admission.Admit(low + 31s, Words, true, first, low + 1s);
-	Check(lone.has_value(), "one compilation runs alone after 30 s so that work never stops");
+	Check(lone.has_value(), "a lone compilation can use its margin after 30 s");
 	Check(!admission.Admit(low + 32s, Words, true, second, low + 1s), "and only one");
 	admission.Finish(*lone);
+
+	const auto estimate = admission.Estimate(Words, true);
+	admission.Sample(low + 33s, {.total = 44 * GiB, .available = estimate - 1});
+	Check(!admission.Admit(low + 33s, Words, true, first, start), "waiting cannot spend more than available memory");
+	admission.Sample(low + 34s, {.total = 44 * GiB, .available = estimate});
+	const auto fitting = admission.Admit(low + 34s, Words, true, first, start);
+	Check(fitting.has_value(), "a lone waiting compilation resumes when its estimate fits");
+	admission.Finish(*fitting);
 
 	admission.Sample(low + 40s, {.total = 60 * GiB, .available = 30 * GiB, .process = 4 * GiB, .busy_cpus = 0.0, .cpus = 32});
 	Check(admission.Admit(low + 40s, Words, true, second, low + 40s).has_value(), "work resumes when memory comes back");
@@ -247,6 +255,27 @@ std::optional<uint64_t> SimulatedThreadBytes(int thread) {
 	const auto found = g_thread_bytes.find(thread);
 	if (found == g_thread_bytes.end()) return std::nullopt;
 	return found->second;
+}
+
+void GuestGrowthDoesNotSpendReservations() {
+	const auto now = ManifestAdmission::Clock::time_point {};
+	const auto caller = std::this_thread::get_id();
+	constexpr auto total = 44 * ManifestAdmission::GiB;
+	ManifestAdmission admission(16, SimulatedThreadBytes);
+	g_thread_bytes = {{1, 0}, {2, 0}, {3, 0}};
+	admission.Sample(now, {.total = total, .available = total, .process = ManifestAdmission::GiB});
+	const auto cost = admission.LightEstimate();
+	const auto first = admission.Admit(now, 0, false, caller, now, 1);
+	Check(first.has_value(), "one translation holds a reservation");
+	admission.Sample(now + 1s, {.total = total, .available = admission.Reserve() + 2 * cost, .process = 16 * ManifestAdmission::GiB});
+	Check(admission.Pending() == cost, "guest RSS growth leaves the worker's reservation intact");
+	Check(admission.Admit(now + 1s, 0, false, caller, now, 2).has_value(), "the second translation fits");
+	Check(!admission.Admit(now + 1s, 0, false, caller, now, 3), "new tickets cannot use RSS growth from an earlier sample");
+	g_thread_bytes[1] = cost;
+	admission.Sample(now + 2s, {.total = total, .available = admission.Reserve() + 2 * cost, .process = 16 * ManifestAdmission::GiB});
+	Check(admission.Pending() == cost, "observed memory covers only its own translation");
+	admission.Finish(*first);
+	Check(admission.Pending() == cost, "finishing a worker preserves the other reservation");
 }
 
 struct GrowthRun {
@@ -407,6 +436,7 @@ int main() {
 	LearnedEstimateFollowsMeasuredUse();
 	MemoryFloorStaysLow();
 	GameGrowthIsNotLearned();
+	GuestGrowthDoesNotSpendReservations();
 	CompilationGrowthStillLearned();
 	LargeJobsDoNotStarve();
 	GenericRefusalSkipsPipelines();
