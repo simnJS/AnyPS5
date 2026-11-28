@@ -589,7 +589,9 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const auto numeric_class =
 	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	const bool format_ok = resource.atomic
-	    ? uint_resource && Prospero::IsSupportedAtomicImageFormat(format, resource.atomic64)
+	    ? uint_resource && (ShaderRecompiler::IR::NarrowImageAtomic(resource)
+	                            ? format == resource.conversion_format
+	                            : Prospero::IsSupportedAtomicImageFormat(format, resource.atomic64))
 	    : raw_sint_storage || (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	                           numeric_class != Prospero::TextureNumericClass::Sint &&
 	                           uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint));
@@ -635,7 +637,7 @@ static vk::Format SampledViewFormat(const GraphicContext& graphics, Prospero::Bu
 static vk::Format StorageViewFormat(const ShaderRecompiler::IR::ImageResource& resource,
                                     Prospero::BufferFormat format, vk::Format pixel_format) {
 	if (resource.atomic64) return vk::Format::eR64Uint;
-	if (resource.atomic) return vk::Format::eR32Uint;
+	if (resource.atomic && !ShaderRecompiler::IR::NarrowImageAtomic(resource)) return vk::Format::eR32Uint;
 	const auto raw_sint_format = ShaderRecompiler::IR::RawSignedStorageFormat(resource, format);
 	if (raw_sint_format != Prospero::BufferFormat::kInvalid) return VulkanFormat(raw_sint_format);
 	return SrgbUnormViewFormat(pixel_format);

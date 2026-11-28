@@ -203,7 +203,8 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 			record.key.guest_traversal = module.guest_traversal;
 			const auto& info = module.info.info;
 			const bool legacy_rt = module.bvh == ShaderBvh::None && (info.bvh || info.bvh8 || info.ray_query);
-			if (legacy_rt || module.rt_mode != StoredRayTracingMode(module)) {
+			if (legacy_rt || module.rt_mode != StoredRayTracingMode(module) ||
+			    ShaderRecompiler::MarkedProgram(record.key.hash)) {
 				record.incompatible = true;
 				return true;
 			}
@@ -229,6 +230,10 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 			std::vector<uint32_t> spirv, plain_spirv;
 			reader.allocation_budget = 64u << 20;
 			if (!DecodeTableModuleRecord(reader, record.key, record.table_cursor, module, spirv, plain_spirv)) return false;
+			if (ShaderRecompiler::MarkedProgram(record.key.hash)) {
+				record.incompatible = true;
+				return true;
+			}
 			const std::array<const ShaderModule*, 1> stages {&module};
 			if (!SampledDescriptorBudgetFits(stages)) return false;
 			module.module = CompileSPV(spirv, m_graphics.device);
@@ -274,6 +279,7 @@ bool PipelineCache::AddRecord(StoreRecord& record) {
 			break;
 		}
 		case Record::TableModule: {
+			if (record.incompatible) return true;
 			auto& variants = m_table_programs[std::move(record.key)];
 			if (std::ranges::any_of(variants, [&](const TableVariant& variant) {
 				    return variant.push_data_cursor == record.table_cursor &&
@@ -308,7 +314,7 @@ bool PipelineCache::AddRecord(StoreRecord& record) {
 void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
                                 const ShaderModule& module, const std::vector<uint32_t>& spirv,
                                 const std::vector<uint32_t>& plain_spirv) {
-	if (!m_store) {
+	if (!m_store || ShaderRecompiler::MarkedProgram(key.hash)) {
 		return;
 	}
 	std::vector<uint8_t> record;
@@ -320,7 +326,7 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 
 void PipelineCache::StoreTableModule(const ProgramKey& key, uint32_t cursor, const ShaderModule& module,
                                      const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv) {
-	if (!m_store) return;
+	if (!m_store || ShaderRecompiler::MarkedProgram(key.hash)) return;
 	std::vector<uint8_t> record;
 	if (EncodeTableModuleRecord(key, cursor, module, spirv, plain_spirv, record)) {
 		m_store.Append(std::move(record));

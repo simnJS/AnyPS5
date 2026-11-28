@@ -267,6 +267,11 @@ RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format
 	return Prospero::BufferFormat::kInvalid;
 }
 
+[[nodiscard]] constexpr bool NarrowImageAtomic(const ImageResource& image) {
+	return image.resource_class == ImageResourceClass::Storage && image.atomic && !image.atomic64 &&
+	       image.conversion_format == Prospero::BufferFormat::k8UInt;
+}
+
 [[nodiscard]] constexpr bool ReadsDepthBits(const ImageResource& image) {
 	return image.conversion_format == Prospero::BufferFormat::k16UInt;
 }
@@ -570,7 +575,7 @@ DescriptorBindingForImage(const ImageResource& image) {
 			return std::nullopt;
 		}
 	} else if (image.resource_class == ImageResourceClass::Storage) {
-		if (image.atomic) {
+		if (image.atomic && !NarrowImageAtomic(image)) {
 			if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
 				return std::nullopt;
 			}

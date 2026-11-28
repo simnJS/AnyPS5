@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 
 #include <algorithm>
 #include <bit>
@@ -556,6 +557,11 @@ void DefineDescriptors(EmitterState& state) {
 				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
 				state.builder.AddName(definition.variable,
 				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				if (std::ranges::any_of(state.program.info.images, [&](const IR::ImageResource& image) {
+					    return IR::NarrowImageAtomic(image) && IR::DescriptorBindingForImage(image) == kind;
+				    })) {
+					state.builder.AddAnnotation(spv::OpDecorate, definition.variable, spv::DecorationCoherent);
+				}
 				if (image_tables[IR::ImageBindingIndex(kind)]) {
 					state.builder.RequireVersion(0x00010500u);
 					state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
@@ -681,6 +687,16 @@ void DefinePackedTargets(EmitterState& state) {
 	}
 }
 #endif
+
+void DefineMarker(EmitterState& state) {
+	if (state.program.stage != ShaderType::Pixel || !MarkedProgram(state.program.shader_hash)) return;
+	state.mark_frag_coord_variable = InputVariableForKind(state, IR::StageInputKind::FragCoord);
+	if (state.mark_frag_coord_variable != 0) return;
+	state.mark_frag_coord_variable =
+	    DefineInterfaceVariable(state, TypeF32Vector(state, 4), spv::StorageClassInput, "gl_FragCoord");
+	state.builder.AddAnnotation(spv::OpDecorate, state.mark_frag_coord_variable, spv::DecorationBuiltIn,
+	                            spv::BuiltInFragCoord);
+}
 
 namespace {
 
@@ -994,6 +1010,7 @@ void DefineModule(EmitterState& state) {
 #if defined(ANYPS5_KYTY)
 	DefinePackedTargets(state);
 #endif
+	DefineMarker(state);
 	if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();
 		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT);

@@ -729,6 +729,9 @@ set_tests_properties(kyty_shim_compute_execution PROPERTIES TIMEOUT 20 SKIP_RETU
 add_test(NAME kyty_shim_compute_sampler_spill COMMAND kyty_shim_compute_execution_tests sampler-spill)
 set_tests_properties(kyty_shim_compute_sampler_spill PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "sampler spill: 32/32 lanes sampled 1.0" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_compute_narrow_image_atomic COMMAND kyty_shim_compute_execution_tests narrow-image-atomic)
+set_tests_properties(kyty_shim_compute_narrow_image_atomic PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_compute_execution: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 add_test(NAME kyty_shim_compute_correlated_phi COMMAND kyty_shim_compute_execution_tests correlated-phi)
 set_tests_properties(kyty_shim_compute_correlated_phi PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "correlated phi execution: folded, all lane outputs checked"

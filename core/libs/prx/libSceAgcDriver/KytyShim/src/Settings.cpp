@@ -57,6 +57,7 @@ constexpr std::string_view Names[] = {
     "KYTY_LABELS_AROUND_GPU_WRITES",
     "KYTY_LOCK_STATS",
     "KYTY_LOCK_STATS_PERIOD",
+    "KYTY_MARK_PROGRAMS",
     "KYTY_MEMORY_BUDGET_MB",
     "KYTY_MIRROR_CHECK",
     "KYTY_NATIVE_RT",

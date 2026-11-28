@@ -190,12 +190,13 @@ struct HostBuffer {
 	uint64_t         bytes  = 0;
 };
 
-HostBuffer CreateHostBuffer(const Gpu& gpu, uint64_t bytes) {
+HostBuffer CreateHostBuffer(const Gpu& gpu, uint64_t bytes,
+                            vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer) {
 	HostBuffer           result;
 	vk::BufferCreateInfo info;
 	result.bytes = std::max<uint64_t>((bytes + 15u) & ~uint64_t {15u}, 16u);
 	info.size    = result.bytes;
-	info.usage   = vk::BufferUsageFlagBits::eStorageBuffer;
+	info.usage   = usage;
 	result.buffer = Checked(gpu.device.createBuffer(info), "buffer creation");
 	const auto needs = gpu.device.getBufferMemoryRequirements(result.buffer);
 	const auto flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
@@ -273,6 +274,84 @@ void ClearSampledTexture(vk::CommandBuffer command, const SampledTexture& textur
 	                        {}, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+struct StorageTexture {
+	vk::Image        image;
+	vk::DeviceMemory memory;
+	vk::ImageView    view;
+	uint32_t         width  = 0;
+	uint32_t         height = 0;
+};
+
+StorageTexture CreateStorageTexture(const Gpu& gpu, uint32_t width, uint32_t height) {
+	StorageTexture texture;
+	texture.width  = width;
+	texture.height = height;
+	vk::ImageCreateInfo image;
+	image.imageType   = vk::ImageType::e2D;
+	image.format      = vk::Format::eR8Uint;
+	image.extent      = vk::Extent3D(width, height, 1);
+	image.mipLevels   = 1;
+	image.arrayLayers = 1;
+	image.usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eStorage;
+	texture.image    = Checked(gpu.device.createImage(image), "storage image creation");
+	const auto needs = gpu.device.getImageMemoryRequirements(texture.image);
+	vk::MemoryAllocateInfo allocate;
+	allocate.allocationSize  = needs.size;
+	allocate.memoryTypeIndex = std::countr_zero(needs.memoryTypeBits);
+	texture.memory = Checked(gpu.device.allocateMemory(allocate), "storage image memory");
+	Checked(gpu.device.bindImageMemory(texture.image, texture.memory, 0), "storage image binding");
+	vk::ImageViewCreateInfo view;
+	view.image            = texture.image;
+	view.viewType         = vk::ImageViewType::e2D;
+	view.format           = image.format;
+	view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	texture.view = Checked(gpu.device.createImageView(view), "storage image view");
+	return texture;
+}
+
+void ClearStorageTexture(vk::CommandBuffer command, const StorageTexture& texture) {
+	vk::ImageMemoryBarrier barrier;
+	barrier.image               = texture.image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
+	                        {}, 0, nullptr, 0, nullptr, 1, &barrier);
+	const vk::ClearColorValue zero {};
+	command.clearColorImage(texture.image, barrier.newLayout, &zero, 1, &barrier.subresourceRange);
+	barrier.oldLayout     = barrier.newLayout;
+	barrier.newLayout     = vk::ImageLayout::eGeneral;
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+	                        {}, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+void ReadStorageTexture(vk::CommandBuffer command, const StorageTexture& texture, const HostBuffer& readback) {
+	vk::ImageMemoryBarrier barrier;
+	barrier.image               = texture.image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.oldLayout           = vk::ImageLayout::eGeneral;
+	barrier.newLayout           = vk::ImageLayout::eTransferSrcOptimal;
+	barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
+	                        {}, 0, nullptr, 0, nullptr, 1, &barrier);
+	vk::BufferImageCopy copy;
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageExtent      = vk::Extent3D(texture.width, texture.height, 1);
+	command.copyImageToBuffer(texture.image, vk::ImageLayout::eTransferSrcOptimal, readback.buffer, 1, &copy);
+	vk::MemoryBarrier host;
+	host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0,
+	                        nullptr, 0, nullptr);
+}
+
 void RequireValid(const std::vector<uint32_t>& spirv, const std::string& what) {
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
 	std::string          messages;
@@ -296,6 +375,7 @@ struct Dispatch {
 	uint32_t                           threads = 0;
 	uint32_t                           wave_size = WaveSize;
 	std::optional<uint32_t>            sampler_word;
+	std::vector<uint8_t>*              image_texels = nullptr;
 };
 
 std::optional<uint32_t> StoredWord(const Recompiler::IR::Program& program) {
@@ -357,7 +437,8 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 		return false;
 	}
 	const auto& layout = info.bindings;
-	Require(layout.UsesPushData(), what + ": the shader data does not fit the push constants");
+	Require(layout.UsesPushData() || layout.ShaderDataDwords() == 0u,
+	        what + ": the shader data does not fit the push constants");
 	const auto buffer_count = layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)];
 	std::vector<HostBuffer>      buffers(buffer_count);
 	std::vector<void*>           targets(buffer_count, nullptr);
@@ -394,8 +475,10 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 		shader_data[layout.dispatch_thread_dword + 2u] = 1u;
 	}
 	Recompiler::IR::PushData push;
-	Require(layout.push_data_start_dword + shader_data.size() <= push.dwords.size(), what + ": the push data overflows");
-	std::ranges::copy(shader_data, push.dwords.begin() + layout.push_data_start_dword);
+	if (layout.UsesPushData()) {
+		Require(layout.push_data_start_dword + shader_data.size() <= push.dwords.size(), what + ": the push data overflows");
+		std::ranges::copy(shader_data, push.dwords.begin() + layout.push_data_start_dword);
+	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> set_bindings;
 	if (buffer_count != 0) {
@@ -412,15 +495,32 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 	}
 	std::optional<SampledTexture> texture;
 	if (dispatch.sampler_word) texture = CreateSampledTexture(gpu);
+	std::optional<StorageTexture> storage;
+	HostBuffer                    readback;
+	if (dispatch.image_texels) {
+		Require(snapshot.images.size() == 1u && info.info.images.size() == 1u, what + ": expected one image");
+		Require(Recompiler::IR::NarrowImageAtomic(info.info.images.front()),
+		        what + ": the image was not specialized as an 8-bit atomic");
+		ShaderTextureResource descriptor;
+		std::copy_n(snapshot.images.front().dwords.begin(), std::size(descriptor.fields), descriptor.fields);
+		storage  = CreateStorageTexture(gpu, descriptor.Width5() + 1u, descriptor.Height5() + 1u);
+		readback = CreateHostBuffer(gpu, uint64_t {storage->width} * storage->height, vk::BufferUsageFlagBits::eTransferDst);
+	}
 	for (auto mask = layout.descriptor_mask; mask != 0; mask &= mask - 1u) {
 		const auto kind = static_cast<BindingKind>(std::countr_zero(mask));
 		if (kind == BindingKind::Buffers || kind == BindingKind::FaultBuffer) continue;
 		const bool sampler = kind == BindingKind::Samplers;
-		Require(texture && layout.descriptor_counts[static_cast<size_t>(kind)] == 1u &&
-		            (sampler || Recompiler::IR::ImageBindingResourceClass(kind) == Recompiler::IR::ImageResourceClass::Sampled),
+		const bool storage_kind =
+		    !sampler && Recompiler::IR::ImageBindingResourceClass(kind) == Recompiler::IR::ImageResourceClass::Storage;
+		Require(layout.descriptor_counts[static_cast<size_t>(kind)] == 1u &&
+		            (storage_kind ? storage.has_value()
+		                          : texture && (sampler || Recompiler::IR::ImageBindingResourceClass(kind) ==
+		                                                       Recompiler::IR::ImageResourceClass::Sampled)),
 		        what + ": unsupported descriptor binding " + std::to_string(static_cast<uint32_t>(kind)));
 		set_bindings.push_back({Recompiler::IR::NativeBinding(ShaderType::Compute, kind),
-		                        sampler ? vk::DescriptorType::eSampler : vk::DescriptorType::eSampledImage,
+		                        sampler        ? vk::DescriptorType::eSampler
+		                        : storage_kind ? vk::DescriptorType::eStorageImage
+		                                       : vk::DescriptorType::eSampledImage,
 		                        1, vk::ShaderStageFlagBits::eCompute, nullptr});
 	}
 	if (texture) {
@@ -502,7 +602,22 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 	if (texture) {
 		const vk::DescriptorImageInfo image {texture->sampler, texture->view, vk::ImageLayout::eShaderReadOnlyOptimal};
 		for (const auto& binding: set_bindings) {
-			if (binding.descriptorType == vk::DescriptorType::eStorageBuffer) continue;
+			if (binding.descriptorType == vk::DescriptorType::eStorageBuffer ||
+			    binding.descriptorType == vk::DescriptorType::eStorageImage) continue;
+			vk::WriteDescriptorSet write;
+			write.dstSet          = set;
+			write.dstBinding      = binding.binding;
+			write.descriptorCount = 1;
+			write.descriptorType  = binding.descriptorType;
+			write.pImageInfo      = &image;
+			gpu.device.updateDescriptorSets(1, &write, 0, nullptr);
+		}
+	}
+
+	if (storage) {
+		const vk::DescriptorImageInfo image {nullptr, storage->view, vk::ImageLayout::eGeneral};
+		for (const auto& binding: set_bindings) {
+			if (binding.descriptorType != vk::DescriptorType::eStorageImage) continue;
 			vk::WriteDescriptorSet write;
 			write.dstSet          = set;
 			write.dstBinding      = binding.binding;
@@ -526,6 +641,7 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	Checked(command.begin(begin), "command buffer begin");
 	if (texture) ClearSampledTexture(command, *texture);
+	if (storage) ClearStorageTexture(command, *storage);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0, nullptr);
 	command.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
@@ -535,6 +651,7 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0,
 	                        nullptr, 0, nullptr);
+	if (storage) ReadStorageTexture(command, *storage, readback);
 	Checked(command.end(), "command buffer end");
 	vk::SubmitInfo submit;
 	submit.commandBufferCount = 1;
@@ -565,6 +682,14 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 		gpu.device.destroyImageView(texture->view);
 		gpu.device.destroyImage(texture->image);
 		gpu.device.freeMemory(texture->memory);
+	}
+	if (storage) {
+		const auto* bytes = static_cast<const uint8_t*>(readback.mapped);
+		dispatch.image_texels->assign(bytes, bytes + uint64_t {storage->width} * storage->height);
+		DestroyHostBuffer(gpu, readback);
+		gpu.device.destroyImageView(storage->view);
+		gpu.device.destroyImage(storage->image);
+		gpu.device.freeMemory(storage->memory);
 	}
 	return true;
 }
@@ -1121,6 +1246,34 @@ void CorrelatedPhiExecution(const Gpu& gpu) {
 	std::printf("correlated phi execution: %s, all lane outputs checked\n", folded ? "folded" : "unfolded");
 }
 
+alignas(256) constexpr std::array<uint32_t, 8> NarrowAtomicCode {
+    0x2c020083u, 0x7e040280u, 0x36060087u, 0xd51a0003u, 0x00010303u, 0xf0640108u, 0x00000301u, 0xbf810000u};
+
+void NarrowImageAtomic(const Gpu& gpu) {
+	for (const uint32_t wave: {32u, 64u}) {
+		const std::string    test = "8-bit image atomic or, wave" + std::to_string(wave);
+		std::vector<uint8_t> texels;
+		Dispatch             dispatch;
+		dispatch.name      = test.c_str();
+		dispatch.code      = NarrowAtomicCode;
+		dispatch.threads   = Threads;
+		dispatch.wave_size = wave;
+		const std::array<uint32_t, 8> descriptor {0x1000u, (5u << 20u) | (3u << 30u), 1u, 0xfacu | (9u << 28u),
+		                                          0u,      0u,                         0u, 0u};
+		std::ranges::copy(descriptor, dispatch.user_data.begin());
+		dispatch.image_texels = &texels;
+		if (!Run(gpu, dispatch)) continue;
+		Check(texels.size() == Threads / 8u, test + ": " + std::to_string(texels.size()) + " texels read back");
+		uint32_t complete = 0;
+		for (uint32_t x = 0; x < texels.size(); x++) {
+			Check(texels[x] == 0xffu, test + ": texel " + std::to_string(x) + " holds " + Hex(texels[x]) +
+			                              ", not the or of its 8 lanes (0xff)");
+			complete += texels[x] == 0xffu;
+		}
+		std::printf("%s: %u/%zu texels hold the or of their 8 lanes\n", test.c_str(), complete, texels.size());
+	}
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1128,7 +1281,9 @@ int main(int argc, char** argv) {
 	auto        gpu = OpenGpu(why);
 	if (!gpu) return NoDevice(why);
 	const std::string_view test = argc == 2 ? argv[1] : "";
-	if (test == "sampler-spill" || test == "correlated-phi") {
+	if (test == "narrow-image-atomic") {
+		NarrowImageAtomic(*gpu);
+	} else if (test == "sampler-spill" || test == "correlated-phi") {
 		const auto* name = test == "sampler-spill" ? "sampler spill" : "correlated phi";
 		const auto subgroup32 = ComputeSubgroup32(*gpu, HostSubgroup);
 		if (subgroup32 == Subgroup32::Unavailable) {

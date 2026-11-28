@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/waveSplitCheck.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/skipLog.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -556,6 +557,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	m_context.GetImageHeap().BeginDraw();
 	const ShaderComputeInputInfo pristine = input_info;
 	const ShaderModule* compute_module = nullptr;
+	Common::SkipLog::Request(0);
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		compute_module = ResolveComputeHere(cs_regs, input_info);
 	}
@@ -564,7 +566,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		input_info     = pristine;
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info, true);
 	}
-	if (compute_module == nullptr) return;
+	if (compute_module == nullptr) {
+		Common::SkipLog::Lost(Common::SkipLog::Kind::Dispatch);
+		return;
+	}
 	const auto thread_dimensions = [&](ShaderComputeInputInfo& info) {
 		if (use_thread_dimensions) {
 			info.dispatch_threads_num[0] = thread_group_x;
@@ -997,6 +1002,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	ShaderComputeInputInfo input_info {};
 	m_context.GetImageHeap().BeginDraw();
 	const ShaderModule*    compute_module = nullptr;
+	Common::SkipLog::Request(0);
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		input_info.async_compute              = async_compute;
 		input_info.dispatch_thread_dimensions = true;
@@ -1004,6 +1010,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		compute_module = ResolveComputeHere(cs_regs, input_info);
 	}
 	if (compute_module == nullptr) {
+		Common::SkipLog::Lost(Common::SkipLog::Kind::Dispatch);
 		return;
 	}
 	const auto& program = input_info.stage.module->info;
@@ -1124,6 +1131,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	pristine.async_compute         = async_compute;
 	pristine.indirect_args_address = args_addr;
 	const ShaderModule* compute_module = nullptr;
+	Common::SkipLog::Request(0);
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		input_info     = pristine;
 		compute_module = ResolveComputeHere(cs_regs, input_info);
@@ -1133,7 +1141,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		input_info     = pristine;
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info, true);
 	}
-	if (compute_module == nullptr) return;
+	if (compute_module == nullptr) {
+		Common::SkipLog::Lost(Common::SkipLog::Kind::Dispatch);
+		return;
+	}
 	const auto record = [&](ShaderComputeInputInfo& input_info, uint32_t rt_pass) {
 		buffer.EndRendering();
 		auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);

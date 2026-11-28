@@ -576,6 +576,9 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto vector_type = MrtOutputMode(state, exp) != 0u ? MrtOutputType(state, exp.index)
 		                                                         : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, vector_type);
+		if (state.mark_frag_coord_variable != 0 && exp.kind == IR::ExportTargetKind::Mrt) {
+			value = MarkerFragment(state, vector_type);
+		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index == 0 && vector_type == TypeF32Vector(state, 4) &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {

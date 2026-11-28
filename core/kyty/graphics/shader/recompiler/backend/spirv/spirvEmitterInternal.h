@@ -277,6 +277,7 @@ struct EmitterState {
 	uint32_t                   sampler_pointer_type                  = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
+	uint32_t                   mark_frag_coord_variable              = 0;
 #if defined(ANYPS5_KYTY)
 	uint32_t                   pixel_guest_func                      = 0;
 	uint32_t                   packed_target_variable                = 0;
@@ -481,6 +482,8 @@ uint32_t VertexParameterScalarType(EmitterState& state, Format::ComponentType ki
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 uint32_t MrtOutputType(EmitterState& state, uint32_t index);
+uint32_t MarkerTexel(EmitterState& state, uint32_t x, uint32_t y, uint32_t vector_type);
+uint32_t MarkerFragment(EmitterState& state, uint32_t vector_type);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 

@@ -1,4 +1,5 @@
 #include "common/hackNotice.h"
+#include "common/skipLog.h"
 
 #ifdef KYTY_HACK_NOTICE_STDOUT
 #include <cstdio>
@@ -103,6 +104,7 @@ void Summarize() {
 bool Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t where,
             std::string_view detail) {
 	if (shader_hash == 0) shader_hash = CurrentShaderSlot();
+	SkipLog::Note(hack, shader_hash);
 	auto key = Mix(reinterpret_cast<uintptr_t>(hack));
 	key      = Mix(key ^ reinterpret_cast<uintptr_t>(site));
 	key      = Mix(key ^ shader_hash);

@@ -1651,6 +1651,10 @@ bool WaveSplitThreads(const uint32_t (&threads)[3]) {
 }
 
 bool SplitWaveAcrossSubgroups(std::vector<uint32_t>& module, std::string& refusal, const SplitHints* hints) {
+	if (hints != nullptr && hints->refusal != nullptr) {
+		refusal = hints->refusal;
+		return false;
+	}
 	std::vector<uint32_t> out;
 	WaveSplit             split(module, hints);
 	if (!split.Run(out, refusal)) {
