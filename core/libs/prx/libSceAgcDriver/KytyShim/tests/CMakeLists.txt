@@ -346,6 +346,7 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
             ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_buffer_cache_pages: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     add_test_executable(kyty_shim_memory_telemetry_tests ${CMAKE_CURRENT_SOURCE_DIR}/MemoryTelemetry.cpp)
+    configure_host_test_executable(kyty_shim_memory_telemetry_tests)
     target_include_directories(kyty_shim_memory_telemetry_tests PRIVATE
             ${CMAKE_SOURCE_DIR}/core/kyty ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
     add_test(NAME kyty_shim_memory_telemetry COMMAND kyty_shim_memory_telemetry_tests)
