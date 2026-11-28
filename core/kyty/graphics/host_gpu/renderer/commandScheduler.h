@@ -67,7 +67,10 @@ public:
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	[[nodiscard]] bool Recording() const noexcept { return !m_command.IsInvalid(); }
 	void                           CheckActive() const;
-	CommandBuffer&                 Current();
+	CommandBuffer& Current() {
+		EXIT_IF(m_command.IsInvalid());
+		return m_command;
+	}
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
