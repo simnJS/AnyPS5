@@ -11,7 +11,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -58,8 +57,7 @@ public:
 
 	using Optimized = OptimizedGraphicsPipeline;
 
-	PipelineLibraries(GraphicContext& graphics, vk::PipelineCache driver_cache,
-	                  std::function<void(std::chrono::steady_clock::time_point)> on_optimized);
+	explicit PipelineLibraries(PipelineCache& cache);
 	~PipelineLibraries();
 	KYTY_CLASS_NO_COPY(PipelineLibraries);
 
@@ -99,11 +97,10 @@ private:
 	vk::PipelineLayout       LibraryLayout(const std::string& key, const GraphicsPipelineKey& pipeline_key,
 	                                       const Stages& stages, bool native);
 	void                     Worker();
-	void                     OptimizedWorker();
+	void                     OptimizedWorker(const std::stop_token& stop);
 
-	GraphicContext&                                            m_graphics;
-	vk::PipelineCache                                          m_driver_cache;
-	std::function<void(std::chrono::steady_clock::time_point)> m_on_optimized;
+	PipelineCache&  m_cache;
+	GraphicContext& m_graphics;
 
 	std::mutex                                                              m_mutex;
 	std::condition_variable                                                 m_available;

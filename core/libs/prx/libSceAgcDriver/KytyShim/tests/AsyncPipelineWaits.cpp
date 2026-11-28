@@ -44,6 +44,9 @@ struct PipelineCacheTestAccess {
 	using Clock = std::chrono::steady_clock;
 
 	static auto HoldCompilationSlot(PipelineCache& cache) { return cache.AdmitWorker({}, 0, false); }
+	static bool WaitForOptimization(PipelineCache& cache, std::stop_token stop) {
+		return static_cast<bool>(cache.AdmitOptimization(stop, 100'000));
+	}
 	static bool AsyncWorkersRunning(const PipelineCache& cache) { return !cache.m_async_threads.empty(); }
 	static void QueueComputeAhead(PipelineCache& cache, const ShaderModule& module) {
 		cache.CreateComputePipelineAhead(module);
@@ -321,6 +324,14 @@ void StopWakesEveryWait(PipelineCache& cache, GraphicContext& graphics, const st
 	key.stage_ids = {0x9b0001u, 0, 0, 0x9b0002u};
 	Access::MarkGraphicsPending(cache, key);
 	auto held = Access::HoldCompilationSlot(cache);
+	std::stop_source optimization_stop;
+	auto optimizer = std::async(std::launch::async, [&] {
+		return Access::WaitForOptimization(cache, optimization_stop.get_token());
+	});
+	Check(optimizer.wait_for(Asleep) == std::future_status::timeout, "the optimizer bypassed the occupied compilation slot");
+	optimization_stop.request_stop();
+	Require(optimizer.wait_for(Woken) == std::future_status::ready, "the stopped optimizer did not wake");
+	Check(!optimizer.get(), "the stopped optimizer acquired a ticket");
 	Access::QueueComputeAhead(cache, module.module);
 	auto graphics_waiter = WaitGraphics(cache, key);
 	auto compute_waiter  = WaitCompute(cache, module);

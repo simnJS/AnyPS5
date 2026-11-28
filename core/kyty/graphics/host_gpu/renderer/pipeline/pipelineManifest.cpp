@@ -415,16 +415,20 @@ struct PipelineCache::ManifestState {
 		            finished.driver, finished.light, built - modules, created - previous);
 	}
 
-	CompilationTicket Admit(const std::stop_token& stop, size_t words, bool driver, bool runtime = false) {
+	enum class Source { Manifest, Runtime, Optimization };
+
+	CompilationTicket Admit(const std::stop_token& stop, size_t words, bool driver, Source source = Source::Manifest) {
 		std::unique_lock lock(mutex);
 		const auto since = std::chrono::steady_clock::now();
-		while (!stop.stop_requested() && (runtime || !admission_closed)) {
+		while (!stop.stop_requested() && (source != Source::Manifest || !admission_closed)) {
 			const auto now = std::chrono::steady_clock::now();
 			SampleAdmission(now);
-			if (const auto ticket = admission.Admit(now, words, driver, std::this_thread::get_id(), since)) return {this, *ticket};
+			const auto ticket = source == Source::Optimization ? admission.AdmitOptimization(now, words) :
+			                    admission.Admit(now, words, driver, std::this_thread::get_id(), since);
+			if (ticket) return {this, *ticket};
 			const auto refusal = admission.LastRefusal();
 			if (refusal == ManifestAdmission::Refusal::Closed) break;
-			if (refusal == ManifestAdmission::Refusal::Memory) {
+			if (refusal == ManifestAdmission::Refusal::Memory && source != Source::Optimization) {
 				memory_refused = true;
 				const auto needed = admission.Estimate(words, driver) + ManifestAdmission::LoneMargin;
 				if (admission.Running() == 0 && admission.LastSample().available < needed && now >= next_file_reclaim) {
@@ -552,7 +556,11 @@ void PipelineCache::CompilationTicket::Reset() {
 }
 
 PipelineCache::CompilationTicket PipelineCache::AdmitWorker(const std::stop_token& stop, size_t words, bool driver) {
-	return m_manifest->Admit(stop, words, driver, true);
+	return m_manifest->Admit(stop, words, driver, ManifestState::Source::Runtime);
+}
+
+PipelineCache::CompilationTicket PipelineCache::AdmitOptimization(const std::stop_token& stop, size_t words) {
+	return m_manifest->Admit(stop, words, true, ManifestState::Source::Optimization);
 }
 
 void PipelineCache::ManifestStateDeleter::operator()(ManifestState* state) const {

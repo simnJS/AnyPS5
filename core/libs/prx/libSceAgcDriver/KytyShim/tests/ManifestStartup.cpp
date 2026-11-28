@@ -150,6 +150,29 @@ void MemoryAdmission() {
 	      "a closed admission takes no new work");
 }
 
+void OptimizationAdmission() {
+	constexpr size_t Words = 200'000;
+	const auto now = ManifestAdmission::Clock::time_point {};
+	const auto caller = std::this_thread::get_id();
+	ManifestAdmission admission(2, nullptr);
+	ManifestAdmissionSample sample {.total = 44 * ManifestAdmission::GiB};
+	admission.Sample(now, sample);
+	const auto estimate = admission.Estimate(Words, true);
+	sample.available = admission.Reserve() + estimate - 1;
+	admission.Sample(now, sample);
+	Check(!admission.AdmitOptimization(now, Words), "a replacement pipeline leaves the full reserve for rendering");
+	Check(!admission.AdmitOptimization(now + 90s, Words), "an optional replacement never borrows the lone worker margin");
+	Check(!admission.Reserved(), "optional work does not reserve the next slot from a required pipeline");
+	++sample.available;
+	admission.Sample(now + 91s, sample);
+	const auto replacement = admission.AdmitOptimization(now + 91s, Words);
+	Check(replacement && admission.Pending() == estimate, "the optimization charges every SPIR-V word to the shared budget");
+	Check(!admission.Admit(now + 91s, Words, true, caller, now), "required work sees the optimization's reservation");
+	admission.Finish(*replacement);
+	Check(admission.Admit(now + 92s, Words, true, caller, now).has_value(), "finishing the optimization releases its bytes");
+	Check(!admission.AdmitOptimization(now + 92s, Words), "the optimizer sees the required pipeline's reservation");
+}
+
 void CpuAdmission() {
 	constexpr uint64_t GiB = ManifestAdmission::GiB;
 	const auto now = ManifestAdmission::Clock::time_point {};
@@ -431,6 +454,7 @@ int main() {
 	ModuleScheduling();
 	VideoWait();
 	MemoryAdmission();
+	OptimizationAdmission();
 	CpuAdmission();
 	LearnedEstimate();
 	LearnedEstimateFollowsMeasuredUse();

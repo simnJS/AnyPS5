@@ -129,6 +129,14 @@ public:
 		return ticket;
 	}
 
+	[[nodiscard]] std::optional<uint64_t> AdmitOptimization(Clock::time_point now, size_t words) {
+		if (!m_closed && m_sampled && static_cast<int64_t>(Estimate(words, true)) > Room()) {
+			m_refusal = Refusal::Memory;
+			return std::nullopt;
+		}
+		return Admit(now, words, true, std::this_thread::get_id(), now);
+	}
+
 	void Finish(uint64_t ticket) {
 		const auto found = m_jobs.find(ticket);
 		if (found == m_jobs.end()) return;

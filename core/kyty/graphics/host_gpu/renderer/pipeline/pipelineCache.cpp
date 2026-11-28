@@ -2079,9 +2079,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	const bool driver_cache_restored = InitializeDriverCache();
 #if defined(ANYPS5_KYTY)
 	if (m_graphics.pipeline_library_enabled) {
-		m_libraries = std::make_unique<PipelineLibraries>(
-		    m_graphics, m_driver_cache,
-		    [this](std::chrono::steady_clock::time_point started) { NoteCreatedPipeline(started); });
+		m_libraries = std::make_unique<PipelineLibraries>(*this);
 	}
 #endif
 	if (Config::PipelineManifestRecord() && !shader_store.empty()) {
