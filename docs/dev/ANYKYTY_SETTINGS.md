@@ -75,6 +75,7 @@ With the Kyty backend the host report (OS, CPU, memory, GPU and driver) prints o
 | `KYTY_SHADER_VARIANT_LOG` | `1` enables it | Logs shader builds with a module ID and cache-key fingerprints. Compare records for the same stage and shader hash across repeated runs |
 | `KYTY_VULKAN_VALIDATION` | `0`, `1` | Turns the Khronos validation layer on |
 | `KYTY_LOCK_STATS` | `0`, `1` | Prints how long threads wait on the program-cache lock |
+| `KYTY_HANG_SNAPSHOT_DIR` | directory | When the GPU has not reached a tick in 10 s, writes a report there first: the last submissions and the semaphores they wait for, the mirror's binds, the guest operations of the unfinished ticks and, on Linux, what each thread is doing |
 
 ## What AnyKyty does not read
 

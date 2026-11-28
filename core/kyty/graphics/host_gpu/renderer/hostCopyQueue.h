@@ -6,6 +6,7 @@
 #include "common/spscQueue.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -67,10 +68,13 @@ public:
 			m_queued += m_pending.count;
 			m_batches.Push(std::move(m_pending));
 			m_pending.count = 0;
+			m_published.store(m_queued, std::memory_order_relaxed);
 		}
 		return m_queued;
 	}
 	void WaitFor(uint64_t count) noexcept { m_completed.WaitFor(count); }
+	[[nodiscard]] uint64_t Published() const noexcept { return m_published.load(std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t Completed() const noexcept { return m_completed.Load(); }
 	void Drain() {
 		if (m_completed.Load() >= m_source_copies) {
 			return;
@@ -140,6 +144,7 @@ private:
 	Common::ProgressCounter  m_completed;
 	alignas(64) Batch m_pending;
 	uint64_t    m_queued = 0;
+	std::atomic<uint64_t> m_published {0};
 	uint64_t    m_source_copies = 0;
 	std::unique_ptr<std::byte[]>     m_ring = std::make_unique<std::byte[]>(RingChunkSize * RingChunks);
 	std::array<uint64_t, RingChunks> m_ring_users {};

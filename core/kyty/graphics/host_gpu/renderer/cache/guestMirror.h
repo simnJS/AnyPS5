@@ -13,6 +13,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -143,6 +144,7 @@ private:
 		uint64_t count = 0;
 	};
 	enum class Kind : uint8_t { Bind, Unbind };
+	enum class Stage : uint32_t { Idle, Allocating, Binding, Fence, AfterTick, Bookkeeping };
 	struct Command {
 		Kind             kind = Kind::Bind;
 		std::vector<Run> runs;
@@ -174,6 +176,8 @@ private:
 	void               Bind(const Command& command);
 	void               Unbind(const Command& command);
 	void               Execute(std::vector<vk::SparseMemoryBind>& binds, const char* what, uint64_t signal);
+	void               Enter(Stage stage) noexcept;
+	static void        WriteSnapshot(void* self, std::FILE* file) KYTY_NO_THREAD_SAFETY_ANALYSIS;
 	[[nodiscard]] Grant Allocate(uint64_t wanted);
 	void               Free(Slot slot);
 	void               Post(Command&& command);
@@ -227,10 +231,10 @@ private:
 	UsageBitmap                              m_used;
 	std::vector<uint64_t>                    m_device;
 	std::vector<Run>                         m_pending;
-	uint64_t                                 m_pending_blocks = 0;
-	uint64_t                                 m_first_pending  = 0;
+	std::atomic<uint64_t>                    m_pending_blocks {0};
+	std::atomic<uint64_t>                    m_first_pending {0};
 	uint64_t                                 m_outside_blocks = 0;
-	uint64_t                                 m_bind_posted    = 0;
+	std::atomic<uint64_t>                    m_bind_posted {0};
 	std::atomic<uint64_t>                    m_bind_signaled {0};
 
 	vk::Buffer                         m_buffer    = nullptr;
@@ -261,6 +265,14 @@ private:
 	std::atomic<uint64_t> m_request_longest_ns {0};
 	std::atomic<uint64_t> m_waits {0};
 	std::atomic<uint64_t> m_unbound_reads {0};
+	std::atomic<uint32_t> m_run_kind {0};
+	std::atomic<uint32_t> m_run_stage {0};
+	std::atomic<uint64_t> m_run_value {0};
+	std::atomic<uint64_t> m_run_blocks {0};
+	std::atomic<uint64_t> m_run_ranges {0};
+	std::atomic<uint64_t> m_run_since {0};
+	std::atomic<uint64_t> m_stage_since {0};
+	std::atomic<uint64_t> m_commands_done {0};
 	Stats                 m_taken;
 
 	std::jthread m_binder;

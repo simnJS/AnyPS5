@@ -23,6 +23,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -799,8 +801,22 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWr
 	return Emit(std::move(operation));
 }
 
+static const char* OperationName(GpuOperationKind kind) {
+	switch (kind) {
+		case GpuOperationKind::DrawIndex: return "draw";
+		case GpuOperationKind::DrawAuto: return "draw-auto";
+		case GpuOperationKind::DrawIndirect: return "draw-indirect";
+		case GpuOperationKind::DispatchDirect: return "dispatch";
+		case GpuOperationKind::DispatchIndirect: return "dispatch-indirect";
+		case GpuOperationKind::Callback: return "callback";
+	}
+	return "other";
+}
+
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
+	StallSnapshot::NoteOperation(GetScheduler().CurrentTick(), OperationName(operation.kind),
+	                             static_cast<uint32_t>(m_interrupt_event_id), operation.submit_id);
 	if (operation.scout_sequence != 0 && Scout::Running()) Scout::EnterSubmission(operation.scout_sequence);
 	BindState(operation.state);
 	m_renderer.GetRenderExecutor().SetTableTicket(operation.table_ticket);
@@ -831,6 +847,11 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		BufferCache& buffers;
 		~CommitWriteTicks() { buffers.CommitWriteTicks(); }
 	} commit_write_ticks {m_renderer.GetBufferCache()};
+	uint32_t crumb = 0;
+	if (GpuBreadcrumbs::PerOperation() && GetScheduler().Recording()) {
+		crumb = GpuBreadcrumbs::BeginOperation(m_renderer.GetGraphics(), GetScheduler().Current().Handle(),
+		                                       GetScheduler().CurrentTick(), OperationName(operation.kind), operation.submit_id);
+	}
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:
 		case GpuOperationKind::DrawAuto: {
@@ -881,6 +902,9 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 				operation.callback();
 			}
 			break;
+	}
+	if (crumb != 0 && GetScheduler().Recording()) {
+		GpuBreadcrumbs::EndOperation(GetScheduler().Current().Handle(), crumb);
 	}
 	if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
 		(void)copies->Flush();

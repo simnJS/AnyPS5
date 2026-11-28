@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #endif
@@ -462,6 +463,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
 	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
+	if (GpuBreadcrumbs::Requested()) {
+		graphics.buffer_marker_enabled = add(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+		LOGF("Vulkan GPU markers: VK_AMD_buffer_marker %s\n", graphics.buffer_marker_enabled ? "true" : "false");
+	}
 	vk::PhysicalDeviceDeviceMemoryReportFeaturesEXT report_feature {};
 	if (HasExtension(available_extensions, VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME)) {
 		vk::PhysicalDeviceFeatures2 query {.pNext = &report_feature};

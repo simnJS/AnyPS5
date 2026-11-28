@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
 
 #include <fmt/format.h>
 
@@ -271,10 +272,14 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 		dispatch.vkCmdUpdateBuffer = UpdateOutsideMirror;
 	}
 	g_mirror_buffer.store(static_cast<VkBuffer>(m_buffer), std::memory_order_relaxed);
+	StallSnapshot::Name(m_semaphore, "the mirror's sparse binds", true);
+	StallSnapshot::Register(this, "mirror", &GuestMirror::WriteSnapshot);
 	m_binder = std::jthread([this](std::stop_token stop) { BinderThread(stop); });
 }
 
 GuestMirror::~GuestMirror() {
+	StallSnapshot::Unregister(this);
+	StallSnapshot::Forget(m_semaphore);
 	if (m_binder.joinable()) {
 		m_binder.request_stop();
 		m_changed.notify_all();
@@ -564,8 +569,8 @@ void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size, Runs* fresh) {
 				fresh->emplace_back(begin, begin + BlockSize());
 			}
 		}
-		if (m_pending.empty()) m_first_pending = Now();
-		m_pending_blocks++;
+		if (m_pending.empty()) m_first_pending.store(Now(), std::memory_order_relaxed);
+		m_pending_blocks.fetch_add(1, std::memory_order_relaxed);
 		if (!m_pending.empty() && m_pending.back().first + m_pending.back().count == block) {
 			m_pending.back().count++;
 		} else {
@@ -592,19 +597,23 @@ void GuestMirror::Post(Command&& command) {
 GuestMirror::Wait GuestMirror::Submit() {
 	if (m_size == 0) return {};
 	Flush();
-	if (m_bind_signaled.load(std::memory_order_acquire) >= m_bind_posted) return {};
+	const auto posted = m_bind_posted.load(std::memory_order_relaxed);
+	if (m_bind_signaled.load(std::memory_order_acquire) >= posted) return {};
 	m_waits.fetch_add(1, std::memory_order_relaxed);
 	if (m_shared_queue) {
-		WaitBound(m_bind_posted);
+		WaitBound(posted);
 		return {};
 	}
-	return {m_semaphore, m_bind_posted};
+	return {m_semaphore, posted};
 }
 
 void GuestMirror::Flush() {
 	if (m_pending.empty()) return;
-	m_pending_blocks = 0;
-	Post({.kind = Kind::Bind, .runs = std::move(m_pending), .value = ++m_bind_posted, .requested = m_first_pending});
+	m_pending_blocks.store(0, std::memory_order_relaxed);
+	Post({.kind  = Kind::Bind,
+	      .runs  = std::move(m_pending),
+	      .value = m_bind_posted.fetch_add(1, std::memory_order_relaxed) + 1,
+	      .requested = m_first_pending.load(std::memory_order_relaxed)});
 	m_pending.clear();
 }
 
@@ -634,10 +643,20 @@ void GuestMirror::BinderThread(std::stop_token stop) {
 			m_commands.pop_front();
 			m_busy = true;
 		}
+		uint64_t blocks = 0;
+		for (const auto& run: command.runs) blocks += run.count;
+		m_run_value.store(command.value, std::memory_order_relaxed);
+		m_run_blocks.store(blocks, std::memory_order_relaxed);
+		m_run_ranges.store(command.runs.size(), std::memory_order_relaxed);
+		m_run_since.store(Now(), std::memory_order_relaxed);
+		m_run_kind.store(command.kind == Kind::Bind ? 1u : 2u, std::memory_order_release);
 		switch (command.kind) {
 			case Kind::Bind: Bind(command); break;
 			case Kind::Unbind: Unbind(command); break;
 		}
+		m_run_kind.store(0, std::memory_order_release);
+		Enter(Stage::Idle);
+		m_commands_done.fetch_add(1, std::memory_order_relaxed);
 		{
 			Common::ScopedLock lock(m_mutex);
 			if (command.kind == Kind::Bind) m_bind_signaled.store(command.value, std::memory_order_release);
@@ -695,7 +714,13 @@ GuestMirror::Grant GuestMirror::Allocate(uint64_t wanted) {
 	return Allocate(wanted);
 }
 
+void GuestMirror::Enter(Stage stage) noexcept {
+	m_stage_since.store(Now(), std::memory_order_relaxed);
+	m_run_stage.store(static_cast<uint32_t>(stage), std::memory_order_release);
+}
+
 void GuestMirror::Bind(const Command& command) {
+	Enter(Stage::Allocating);
 	m_binds.clear();
 	uint64_t blocks = 0;
 	for (const auto& run: command.runs) {
@@ -723,6 +748,7 @@ void GuestMirror::Bind(const Command& command) {
 		}
 	}
 	Execute(m_binds, "bind", command.value);
+	Enter(Stage::Bookkeeping);
 	for (const auto& run: command.runs) {
 		for (auto block = run.first; block < run.first + run.count; block++) {
 			if (m_bound[block / 64].load(std::memory_order_relaxed) & (uint64_t {1} << (block % 64))) {
@@ -755,6 +781,7 @@ void GuestMirror::Unbind(const Command& command) {
 		}
 	}
 	if (command.after.semaphore) {
+		Enter(Stage::AfterTick);
 		const vk::SemaphoreWaitInfo wait {
 		    .semaphoreCount = 1, .pSemaphores = &command.after.semaphore, .pValues = &command.after.value};
 		if (const auto waited = m_graphics.device.waitSemaphores(&wait, UINT64_MAX); waited != vk::Result::eSuccess) {
@@ -763,6 +790,7 @@ void GuestMirror::Unbind(const Command& command) {
 		}
 	}
 	Execute(m_binds, "unbind", 0);
+	Enter(Stage::Bookkeeping);
 	for (const auto& run: command.runs) {
 		for (auto block = run.first; block < run.first + run.count; block++) {
 			const auto found = m_block_slots.find(block);
@@ -813,6 +841,7 @@ void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* 
 		                               .signalSemaphoreCount = signals ? 1u : 0u,
 		                               .pSignalSemaphores    = &m_semaphore};
 		const auto start = Now();
+		Enter(Stage::Binding);
 		vk::Result result;
 		if (m_shared_queue) {
 			Common::LockGuard lock(m_graphics.queue_mutex);
@@ -821,8 +850,20 @@ void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* 
 			result = m_graphics.sparse_queue.bindSparse(1, &info, m_fence);
 		}
 		const auto called = Now();
+		Enter(Stage::Fence);
 		if (result == vk::Result::eSuccess) {
-			result = device.waitForFences(1, &m_fence, VK_TRUE, UINT64_MAX);
+			constexpr uint64_t StallNs = 10'000'000'000ull;
+			result = device.waitForFences(1, &m_fence, VK_TRUE, StallNs);
+			if (result == vk::Result::eTimeout) {
+				static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+				if (!reported.test_and_set()) {
+					std::fprintf(stderr,
+					             "[kyty-mirror] a sparse %s of %zu ranges at 0x%" PRIx64
+					             " has not finished in 10 s (it signals bind %" PRIu64 "): the submissions that wait for it wait too\n",
+					             what, count, count != 0 ? binds[begin].resourceOffset : 0, signals ? signal : 0);
+				}
+				result = device.waitForFences(1, &m_fence, VK_TRUE, UINT64_MAX);
+			}
 		}
 		if (result != vk::Result::eSuccess) {
 			EXIT("[kyty-mirror] vkQueueBindSparse (%s of %zu ranges at 0x%" PRIx64 ") failed: %s\n", what, count,
@@ -873,6 +914,70 @@ GuestMirror::Stats GuestMirror::TakeStats() {
 	delta.longest_ns         = m_longest_ns.exchange(0, std::memory_order_relaxed);
 	delta.request_longest_ns = m_request_longest_ns.exchange(0, std::memory_order_relaxed);
 	return delta;
+}
+
+void GuestMirror::WriteSnapshot(void* self, std::FILE* file) {
+	auto&      mirror = *static_cast<GuestMirror*>(self);
+	const auto now    = Now();
+	const auto ago    = [now](uint64_t then) { return then == 0 || then > now ? 0.0 : static_cast<double>(now - then) / 1e9; };
+	uint64_t   counter = 0;
+	const auto read    = mirror.m_graphics.device.getSemaphoreCounterValue(mirror.m_semaphore, &counter);
+	std::fprintf(file, "%s\n", mirror.m_description.c_str());
+	std::fprintf(file,
+	             "binds posted %" PRIu64 ", finished by the binder %" PRIu64 ", the bind semaphore is at %s; %" PRIu64
+	             " blocks requested and not posted yet (first %.3f s ago); %" PRIu64 " commands done\n",
+	             mirror.m_bind_posted.load(std::memory_order_relaxed), mirror.m_bind_signaled.load(std::memory_order_acquire),
+	             read == vk::Result::eSuccess ? std::to_string(counter).c_str() : vk::to_string(read).c_str(),
+	             mirror.m_pending_blocks.load(std::memory_order_relaxed),
+	             mirror.m_pending_blocks.load(std::memory_order_relaxed) != 0 ? ago(mirror.m_first_pending.load(std::memory_order_relaxed))
+	                                                                            : 0.0,
+	             mirror.m_commands_done.load(std::memory_order_relaxed));
+	static constexpr const char* Stages[] {"idle",
+	                                       "allocating the memory of its blocks",
+	                                       "in vkQueueBindSparse",
+	                                       "waiting for the fence of vkQueueBindSparse",
+	                                       "waiting for a tick before an unbind",
+	                                       "updating its tables or freeing emptied chunks"};
+	const auto kind  = mirror.m_run_kind.load(std::memory_order_acquire);
+	const auto stage = std::min<uint32_t>(mirror.m_run_stage.load(std::memory_order_acquire), std::size(Stages) - 1);
+	if (kind == 0) {
+		std::fprintf(file, "binder: no command in hand\n");
+	} else {
+		std::fprintf(file,
+		             "binder: %s of %" PRIu64 " blocks in %" PRIu64 " ranges (bind %" PRIu64 "), started %.3f s ago, %s for %.3f s\n",
+		             kind == 1 ? "bind" : "unbind", mirror.m_run_blocks.load(std::memory_order_relaxed),
+		             mirror.m_run_ranges.load(std::memory_order_relaxed), mirror.m_run_value.load(std::memory_order_relaxed),
+		             ago(mirror.m_run_since.load(std::memory_order_relaxed)), Stages[stage],
+		             ago(mirror.m_stage_since.load(std::memory_order_relaxed)));
+	}
+	std::unique_lock<Common::AnnotatedMutex> lock(mirror.m_mutex, std::defer_lock);
+	for (int attempt = 0; attempt < 100 && !lock.try_lock(); attempt++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	if (!lock.owns_lock()) {
+		std::fprintf(file, "queued commands: their lock is held, not read\n");
+	} else {
+		std::fprintf(file, "queued commands: %zu, binder %s\n", mirror.m_commands.size(), mirror.m_busy ? "busy" : "free");
+		size_t shown = 0;
+		for (const auto& command: mirror.m_commands) {
+			if (shown++ == 16) {
+				std::fprintf(file, "...\n");
+				break;
+			}
+			uint64_t blocks = 0;
+			for (const auto& run: command.runs) blocks += run.count;
+			std::fprintf(file, "  %s of %" PRIu64 " blocks in %zu ranges, bind %" PRIu64 ", requested %.3f s ago\n",
+			             command.kind == Kind::Bind ? "bind" : "unbind", blocks, command.runs.size(), command.value,
+			             ago(command.requested));
+		}
+		lock.unlock();
+	}
+	const auto totals = mirror.Totals();
+	std::fprintf(file,
+	             "totals: %" PRIu64 " blocks bound, %" PRIu64 " chunks, %" PRIu64 " vkQueueBindSparse calls, longest since the last "
+	             "summary %.3f ms, %" PRIu64 " submissions waited for a bind, %" PRIu64 " blocks unbound\n",
+	             totals.bound_blocks, totals.chunks, totals.calls, static_cast<double>(totals.longest_ns) / 1e6, totals.waits,
+	             totals.unbound_blocks);
 }
 
 }
