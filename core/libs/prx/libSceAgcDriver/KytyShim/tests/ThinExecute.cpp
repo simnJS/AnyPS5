@@ -106,6 +106,7 @@ void Classification() {
 	};
 	const Case cases[] = {
 	    {"specialization reads", [](auto& f) { f.specialization_reads = true; }, Thin::Bit(Refusal::Specialized), Thin::Owner::B},
+	    {"descriptor specialization", [](auto& f) { f.descriptor_specialization = true; }, Thin::Bit(Refusal::Specialized), Thin::Owner::B},
 	    {"pipeline wait", [](auto& f) { f.pipeline_ready = false; }, Thin::Bit(Refusal::PipelineWait), Thin::Owner::B},
 	    {"buffers", [](auto& f) { f.buffers = true; }, Thin::Bit(Refusal::CpuBuffers), Thin::Owner::A},
 	    {"flattened SRT", [](auto& f) { f.flattened_srt = true; }, Thin::Bit(Refusal::CpuSrt), Thin::Owner::A},
@@ -174,6 +175,76 @@ void Classification() {
 	Check(with_kind(BindingKind::FaultBuffer) == Thin::Bit(Refusal::Instrumentation), "loop guard fault buffer");
 	Check(with_kind(BindingKind::FaultBuffer, true) == Thin::Bit(Refusal::MemorySync), "fault buffer with memory");
 	Check(with_kind(BindingKind::FaultBuffer, true, true) == 0, "fault buffer once memory is ready");
+	auto heap_pipeline = Ready();
+	Thin::NotePipeline(heap_pipeline, true, true);
+	Check(Thin::Classify(heap_pipeline) == Thin::Bit(Refusal::ImageHeap),
+	      "a ready pipeline that reads the image heap waits for E, not for a pipeline");
+	auto missing = Ready();
+	Thin::NotePipeline(missing, false, false);
+	Check(Thin::Classify(missing) == Thin::Bit(Refusal::PipelineWait), "a missing pipeline is a pipeline wait");
+	auto bound_heap       = Ready();
+	bound_heap.image_heap = true;
+	Thin::NotePipeline(bound_heap, true, false);
+	Check(bound_heap.image_heap && Thin::Classify(bound_heap) == Thin::Bit(Refusal::ImageHeap),
+	      "a heap image seen in the program stays a heap access");
+	struct CpuDescriptor {
+		const char* what;
+		void (*change)(Thin::ProgramFacts&);
+		Refusal     refusal;
+	};
+	const CpuDescriptor cpu_descriptors[] = {
+	    {"buffers", [](auto& f) { f.buffers = true; }, Refusal::CpuBuffers},
+	    {"flattened SRT", [](auto& f) { f.flattened_srt = true; }, Refusal::CpuSrt},
+	    {"images", [](auto& f) { f.images = true; }, Refusal::CpuImages},
+	    {"image tables", [](auto& f) { f.image_tables = true; }, Refusal::ImageTables},
+	    {"image heap", [](auto& f) { f.image_heap = true; }, Refusal::ImageHeap},
+	    {"samplers", [](auto& f) { f.samplers = true; }, Refusal::CpuSamplers},
+	};
+	for (const auto& cpu: cpu_descriptors) {
+		for (const bool reads: {false, true}) {
+			auto facts                      = Ready();
+			facts.specialization_reads      = reads;
+			facts.descriptor_specialization = !reads;
+			cpu.change(facts);
+			Check(Thin::Classify(facts) == (Thin::Bit(cpu.refusal) | Thin::Bit(Refusal::SpecializedBehind)),
+			      std::string("a specialization on ") + cpu.what + " the CPU binds is behind their owner");
+		}
+	}
+	struct Visible {
+		const char* what;
+		void (*change)(Thin::ProgramFacts&);
+		Refusal     refusal;
+	};
+	const Visible visible[] = {
+	    {"memory access", [](auto& f) { f.memory_access = true; }, Refusal::MemorySync},
+	    {"GPU flat loads", [](auto& f) { f.gpu_flat_loads = true; }, Refusal::GpuFlatLoads},
+	    {"indirect args", [](auto& f) { f.indirect_args_on_cpu = true; }, Refusal::IndirectArgs},
+	    {"push layout", [](auto& f) { f.push_layout = false; }, Refusal::PushLayout},
+	    {"pipeline wait", [](auto& f) { f.pipeline_ready = false; }, Refusal::PipelineWait},
+	};
+	for (const auto& other: visible) {
+		auto facts                 = Ready();
+		facts.specialization_reads = true;
+		other.change(facts);
+		Check(Thin::Classify(facts) == (Thin::Bit(other.refusal) | Thin::Bit(Refusal::Specialized)),
+		      std::string("a specialization next to ") + other.what + " stays a refusal of B");
+	}
+	uint32_t specialized_shapes = 0;
+	for (uint32_t shape = 0; shape < (1u << 8u); ++shape) {
+		auto facts                      = Ready();
+		facts.specialization_reads      = (shape & 1u) != 0;
+		facts.descriptor_specialization = (shape & 2u) != 0;
+		for (uint32_t index = 0; index < std::size(cpu_descriptors); ++index) {
+			if ((shape >> (index + 2u)) & 1u) cpu_descriptors[index].change(facts);
+		}
+		if (!facts.specialization_reads && !facts.descriptor_specialization) continue;
+		specialized_shapes++;
+		const auto refusals = Thin::Classify(facts);
+		const auto b        = refusals & (Thin::Bit(Refusal::Specialized) | Thin::Bit(Refusal::SpecializedBehind));
+		Check(refusals != 0 && (b == Thin::Bit(Refusal::Specialized) || b == Thin::Bit(Refusal::SpecializedBehind)),
+		      "a specialized program is never thin and is counted once by B (shape " + std::to_string(shape) + ")");
+	}
+	Check(specialized_shapes == 192, "every specialized shape was classified");
 	auto many            = Ready();
 	many.buffers         = true;
 	many.images          = true;
@@ -188,6 +259,9 @@ void Classification() {
 	for (uint32_t index = 0; index < Thin::RefusalCount; ++index) {
 		Check(Thin::RefusalName(static_cast<Refusal>(index)) != "?", "refusal " + std::to_string(index) + " is named");
 	}
+	Check(Thin::RefusalOwner(Refusal::SpecializedBehind) == Thin::Owner::B &&
+	          Thin::RefusalName(Refusal::SpecializedBehind) == "specialized behind A or E",
+	      "a specialization behind A or E is still B's");
 	Check(Thin::RefusalOwner(Refusal::VertexBuffers) == Thin::Owner::A &&
 	          Thin::RefusalOwner(Refusal::IndexBuffer) == Thin::Owner::A &&
 	          Thin::RefusalOwner(Refusal::Targets) == Thin::Owner::C &&
@@ -199,44 +273,58 @@ void Classification() {
 }
 
 void Description() {
-	IR::CompiledShaderInfo program;
-	IR::ResourceSnapshot   snapshot;
-	auto facts = Thin::DescribeProgram(program, snapshot);
+	IR::CompiledShaderInfo       program;
+	IR::ResourceSnapshot         snapshot;
+	IR::ResourceSpecialization   specialization;
+	auto facts = Thin::DescribeProgram(program, snapshot, specialization);
 	Check(!facts.buffers && !facts.images && !facts.samplers && !facts.memory_access && !facts.image_heap &&
 	          !facts.flattened_srt && !facts.specialization_reads && !facts.gpu_flat_loads && !facts.uniform_fill &&
-	          !facts.gds && !facts.ray_tracing && !facts.write_targets && !facts.image_tables,
+	          !facts.gds && !facts.ray_tracing && !facts.write_targets && !facts.image_tables &&
+	          !facts.descriptor_specialization,
 	      "an empty program has no resources");
+	specialization.buffers.emplace_back();
+	Check(Thin::DescribeProgram(program, snapshot, specialization).descriptor_specialization,
+	      "a module specialized on a buffer descriptor is seen");
+	specialization = {};
+	specialization.images.emplace_back();
+	Check(Thin::DescribeProgram(program, snapshot, specialization).descriptor_specialization,
+	      "a module specialized on an image descriptor is seen");
+	specialization = {};
+	specialization.samplers.emplace_back();
+	Check(Thin::DescribeProgram(program, snapshot, specialization).descriptor_specialization,
+	      "a module specialized on a sampler descriptor is seen");
+	specialization = {};
 	program.info.buffers.emplace_back();
-	Check(Thin::DescribeProgram(program, snapshot).buffers, "a buffer is seen");
+	Check(Thin::DescribeProgram(program, snapshot, specialization).buffers, "a buffer is seen");
 	program.info.buffers.back().indirect_write_table = true;
-	Check(Thin::DescribeProgram(program, snapshot).write_targets, "an indirect write table is a write target");
+	Check(Thin::DescribeProgram(program, snapshot, specialization).write_targets, "an indirect write table is a write target");
 	program.info.buffers.clear();
 	program.info.images.emplace_back();
 	program.info.images.back().heap = true;
-	facts = Thin::DescribeProgram(program, snapshot);
+	facts = Thin::DescribeProgram(program, snapshot, specialization);
 	Check(facts.image_heap && !facts.images, "a heap image is a heap access, not a bound image");
 	program.info.images.back().heap           = false;
 	program.info.images.back().table_capacity = 4;
-	facts = Thin::DescribeProgram(program, snapshot);
+	facts = Thin::DescribeProgram(program, snapshot, specialization);
 	Check(facts.images && facts.image_tables, "a table image is a bound image in a table");
 	program.info.images.clear();
 	program.info.uses_dma = true;
-	Check(Thin::DescribeProgram(program, snapshot).memory_access, "DMA is memory access");
+	Check(Thin::DescribeProgram(program, snapshot, specialization).memory_access, "DMA is memory access");
 	program.info.uses_dma = false;
 	program.has_address_writes = true;
-	Check(Thin::DescribeProgram(program, snapshot).memory_access, "address writes are memory access");
+	Check(Thin::DescribeProgram(program, snapshot, specialization).memory_access, "address writes are memory access");
 	program.has_address_writes = false;
 	program.info.self_sized_buffers.emplace_back();
-	Check(Thin::DescribeProgram(program, snapshot).write_targets, "a self-sized buffer is a write target");
+	Check(Thin::DescribeProgram(program, snapshot, specialization).write_targets, "a self-sized buffer is a write target");
 	program.info.self_sized_buffers.clear();
 	program.info.ray_query = true;
-	Check(Thin::DescribeProgram(program, snapshot).ray_tracing, "ray queries are ray tracing");
+	Check(Thin::DescribeProgram(program, snapshot, specialization).ray_tracing, "ray queries are ray tracing");
 	program.info.ray_query = false;
 	snapshot.flattened_srt.push_back(1);
 	snapshot.specialization_reads.emplace_back(0x1000, 4);
 	snapshot.gpu_flat_loads.push_back({});
 	snapshot.uniform_fill.kind = IR::UniformFillKind::Buffer;
-	facts = Thin::DescribeProgram(program, snapshot);
+	facts = Thin::DescribeProgram(program, snapshot, specialization);
 	Check(facts.flattened_srt && facts.specialization_reads && facts.gpu_flat_loads && facts.uniform_fill,
 	      "snapshot contents are seen");
 }
@@ -376,16 +464,20 @@ void Counting() {
 	counters.NoteServed(Thin::OperationKind::Direct);
 	counters.NoteRefused(Thin::OperationKind::Direct, Thin::Bit(Refusal::CpuImages) | Thin::Bit(Refusal::CpuBuffers));
 	counters.NoteRefused(Thin::OperationKind::Direct, Thin::Bit(Refusal::Gds));
+	counters.NoteRefused(Thin::OperationKind::Direct,
+	                     Thin::Bit(Refusal::CpuBuffers) | Thin::Bit(Refusal::SpecializedBehind));
 	counters.NoteRefused(Thin::OperationKind::Indirect, Thin::Bit(Refusal::IndirectArgs));
 	counters.NoteRefused(Thin::OperationKind::Draw, Thin::Bit(Refusal::VertexBuffers) | Thin::Bit(Refusal::IndexBuffer));
 	counters.NoteRefused(Thin::OperationKind::Draw, Thin::Bit(Refusal::VertexBuffers) | Thin::Bit(Refusal::Targets));
 	counters.NoteTime(Thin::OperationKind::Direct, true, 2000);
 	counters.NoteTime(Thin::OperationKind::Direct, false, 600000);
 	const auto& direct = counters.kinds[0];
-	Check(direct.operations == 4 && direct.served == 2, "direct operations and thin ones are counted");
-	Check(direct.without_c == 3 && direct.without_cd == 3, "a GDS refusal is C's");
+	Check(direct.operations == 5 && direct.served == 2, "direct operations and thin ones are counted");
+	Check(direct.without_c == 4 && direct.without_cd == 4, "a GDS refusal is C's");
 	Check(counters.kinds[1].without_c == 1 && counters.kinds[1].without_cd == 0, "indirect arguments are D's");
-	Check(direct.first[static_cast<size_t>(Refusal::CpuBuffers)] == 1 &&
+	Check(direct.first[static_cast<size_t>(Refusal::CpuBuffers)] == 2 &&
+	          direct.first[static_cast<size_t>(Refusal::SpecializedBehind)] == 0 &&
+	          direct.refused[static_cast<size_t>(Refusal::SpecializedBehind)] == 1 &&
 	          direct.first[static_cast<size_t>(Refusal::CpuImages)] == 0 &&
 	          direct.refused[static_cast<size_t>(Refusal::CpuImages)] == 1,
 	      "the first refusal follows the dependency order");
@@ -394,7 +486,9 @@ void Counting() {
 	const auto line = counters.Summary(10.0, 2);
 	std::printf("%s", line.c_str());
 	Check(line.find("[kyty-thin]") == 0, "summary prefix");
-	Check(line.find("direct dispatches: 4 (2.0 per frame), thin 2 (50.0 %)") != std::string::npos, "direct summary");
+	Check(line.find("direct dispatches: 5 (2.5 per frame), thin 2 (40.0 %)") != std::string::npos, "direct summary");
+	Check(line.find("specialized behind A or E (B) 1 (first 0)") != std::string::npos,
+	      "a specialization behind A or E is named in the summary");
 	Check(line.find("us per operation thin 2.00 full 600.00") != std::string::npos, "timing summary");
 	Check(line.find("CPU images (E) 1 (first 0)") != std::string::npos, "refusal owner in the summary");
 	Check(line.find("indirect args (D) 1 (first 1)") != std::string::npos, "indirect refusal in the summary");

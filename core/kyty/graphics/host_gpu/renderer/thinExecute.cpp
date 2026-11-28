@@ -46,7 +46,7 @@ constexpr std::array<std::string_view, RefusalCount> RefusalNames {
     "GPU flat loads", "vertex buffers", "index buffer",  "CPU images",    "image tables",  "image heap",
     "CPU samplers",   "indirect args", "shared memory",  "GDS",           "ray tracing",   "write targets",
     "CPU consumed",   "ordered append", "checks",        "push layout",   "instrumentation", "targets",
-    "mesh draw",
+    "mesh draw",      "specialized behind A or E",
 };
 
 constexpr std::array<std::string_view, static_cast<size_t>(Owner::Count)> OwnerNames {"A", "B", "C", "D", "E"};
@@ -94,8 +94,13 @@ size_t DispatchKeyHash::operator()(const DispatchKey& key) const noexcept {
 	return static_cast<size_t>(hash);
 }
 
-ProgramFacts DescribeProgram(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                             const ShaderRecompiler::IR::ResourceSnapshot&  snapshot) {
+bool SpecializedOnDescriptors(const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	return !specialization.buffers.empty() || !specialization.images.empty() || !specialization.samplers.empty();
+}
+
+ProgramFacts DescribeProgram(const ShaderRecompiler::IR::CompiledShaderInfo&     program,
+                             const ShaderRecompiler::IR::ResourceSnapshot&      snapshot,
+                             const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
 	const auto&  info = program.info;
 	ProgramFacts facts;
 	facts.descriptor_mask = program.bindings.descriptor_mask;
@@ -108,6 +113,7 @@ ProgramFacts DescribeProgram(const ShaderRecompiler::IR::CompiledShaderInfo& pro
 	facts.samplers             = !info.samplers.empty() || !snapshot.samplers.empty();
 	facts.flattened_srt        = info.uses_flattened_srt || !snapshot.flattened_srt.empty();
 	facts.specialization_reads = !snapshot.specialization_reads.empty();
+	facts.descriptor_specialization = SpecializedOnDescriptors(specialization);
 	facts.gpu_flat_loads       = !snapshot.gpu_flat_loads.empty();
 	facts.uniform_fill         = snapshot.uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::None;
 	facts.memory_access = info.uses_dma || info.uses_device_address || program.has_address_writes ||
@@ -120,6 +126,11 @@ ProgramFacts DescribeProgram(const ShaderRecompiler::IR::CompiledShaderInfo& pro
 	return facts;
 }
 
+void NotePipeline(ProgramFacts& facts, bool pipeline, bool uses_image_heap) {
+	facts.pipeline_ready = pipeline;
+	facts.image_heap     = facts.image_heap || uses_image_heap;
+}
+
 RefusalMask Classify(const ProgramFacts& facts) {
 	const auto  has      = [&](BindingKind kind) { return (facts.descriptor_mask & KindBit(kind)) != 0; };
 	RefusalMask refusals = 0;
@@ -128,7 +139,6 @@ RefusalMask Classify(const ProgramFacts& facts) {
 	};
 	const bool memory_bindings = (facts.descriptor_mask & ~NamedKinds()) != 0 ||
 	                             (has(BindingKind::FaultBuffer) && facts.memory_access);
-	refuse(facts.specialization_reads, Refusal::Specialized);
 	refuse(!facts.pipeline_ready, Refusal::PipelineWait);
 	refuse(facts.buffers || has(BindingKind::Buffers) || has(BindingKind::UniformBuffers), Refusal::CpuBuffers);
 	refuse(facts.flattened_srt || has(BindingKind::FlattenedSrt), Refusal::CpuSrt);
@@ -151,6 +161,13 @@ RefusalMask Classify(const ProgramFacts& facts) {
 #if defined(ANYPS5_KYTY)
 	refuse(has(BindingKind::PackedTargets), Refusal::Instrumentation);
 #endif
+	constexpr RefusalMask CpuDescriptors = Bit(Refusal::CpuBuffers) | Bit(Refusal::CpuSrt) | Bit(Refusal::CpuImages) |
+	                                       Bit(Refusal::ImageTables) | Bit(Refusal::ImageHeap) |
+	                                       Bit(Refusal::CpuSamplers);
+	const bool specialized = facts.specialization_reads || facts.descriptor_specialization;
+	const bool behind      = (refusals & CpuDescriptors) != 0;
+	refuse(specialized && !behind, Refusal::Specialized);
+	refuse(specialized && behind, Refusal::SpecializedBehind);
 	return refusals;
 }
 

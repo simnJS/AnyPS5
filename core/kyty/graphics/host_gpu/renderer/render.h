@@ -204,6 +204,7 @@ public:
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 	void DispatchIndirectThreads(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
 	                             bool async_compute);
+	void ReportThin();
 	class ThinOperation {
 	public:
 		ThinOperation(RenderExecutor& executor, Thin::OperationKind kind);
