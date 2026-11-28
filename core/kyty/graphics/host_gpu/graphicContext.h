@@ -21,6 +21,10 @@
 
 namespace Libs::Graphics {
 
+namespace ShaderRecompiler::Spirv {
+enum class FloatMinMax : uint8_t;
+}
+
 struct VulkanImage;
 
 enum class ImageAllocation : uint8_t { PreferDevice, Texture, HeapTexture };
@@ -93,6 +97,8 @@ struct GraphicContext {
 	uint32_t                           device_clock_period_ps                = 0;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	mutable Common::Mutex              queue_mutex;
+	mutable std::once_flag              float_min_max_once;
+	mutable ShaderRecompiler::Spirv::FloatMinMax float_min_max {};
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
 	vk::Queue                          readback_queue  = nullptr;

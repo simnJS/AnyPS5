@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/floatMinMaxProbe.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
@@ -8,7 +9,6 @@
 #include <array>
 #include <bit>
 #include <cstring>
-#include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
 
@@ -105,31 +105,31 @@ ShaderRecompiler::Spirv::FloatMinMax RunProbe(const GraphicContext& graphics) {
 	using ShaderRecompiler::Spirv::FloatMinMax;
 	constexpr uint32_t byte_size = sizeof(uint32_t) * kProbePairs.size();
 
+	const auto alignment = graphics.physical_device.getProperties().limits.minStorageBufferOffsetAlignment;
+	const auto result_offset = Common::AlignUp<vk::DeviceSize>(byte_size, alignment);
+	const vk::BufferCreateInfo buffer_info {.size = result_offset + byte_size, .usage = vk::BufferUsageFlagBits::eStorageBuffer};
+	vk::Buffer buffer;
+	RequireVulkanSuccess(graphics.device.createBuffer(&buffer_info, nullptr, &buffer), "create min/max probe buffer");
+	const auto requirements = graphics.device.getBufferMemoryRequirements(buffer);
+	const auto properties = graphics.physical_device.getMemoryProperties();
+	constexpr auto flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+	uint32_t type = 0;
+	while (type < properties.memoryTypeCount &&
+	       (!(requirements.memoryTypeBits & (1u << type)) || (properties.memoryTypes[type].propertyFlags & flags) != flags)) {
+		++type;
+	}
+	if (type == properties.memoryTypeCount) {
+		graphics.device.destroyBuffer(buffer, nullptr);
+		return FloatMinMax::Cascade;
+	}
+	const vk::MemoryAllocateInfo alloc {.allocationSize = requirements.size, .memoryTypeIndex = type};
+	vk::DeviceMemory memory;
+	RequireVulkanSuccess(graphics.device.allocateMemory(&alloc, nullptr, &memory), "allocate min/max probe memory");
+	RequireVulkanSuccess(graphics.device.bindBufferMemory(buffer, memory, 0), "bind min/max probe buffer");
+	void* mapped = nullptr;
+	RequireVulkanSuccess(graphics.device.mapMemory(memory, 0, VK_WHOLE_SIZE, {}, &mapped), "map min/max probe memory");
+	std::memcpy(mapped, kProbePairs.data(), byte_size);
 	const auto module = CompileSPV(kProbeModule, graphics.device);
-
-	vk::BufferCreateInfo buffer_info {};
-	buffer_info.size  = byte_size;
-	buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer;
-
-	VmaAllocationCreateInfo write_info {};
-	write_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-	write_info.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-	VkBuffer          source_buffer     = nullptr;
-	VmaAllocation     source_allocation = nullptr;
-	VmaAllocationInfo source_info {};
-	EXIT_IF(vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &write_info,
-	                        &source_buffer, &source_allocation, &source_info) != VK_SUCCESS);
-	std::memcpy(source_info.pMappedData, kProbePairs.data(), byte_size);
-	vmaFlushAllocation(graphics.allocator, source_allocation, 0, byte_size);
-
-	VmaAllocationCreateInfo read_info {};
-	read_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-	read_info.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-	VkBuffer          result_buffer     = nullptr;
-	VmaAllocation     result_allocation = nullptr;
-	VmaAllocationInfo result_info {};
-	EXIT_IF(vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &read_info,
-	                        &result_buffer, &result_allocation, &result_info) != VK_SUCCESS);
 
 	std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
@@ -159,8 +159,8 @@ ShaderRecompiler::Spirv::FloatMinMax RunProbe(const GraphicContext& graphics) {
 	RequireVulkanSuccess(graphics.device.allocateDescriptorSets(&set_info, &set), "allocate min/max probe descriptor set");
 
 	std::array<vk::DescriptorBufferInfo, 2> buffer_descriptors = {{
-	    {static_cast<vk::Buffer>(source_buffer), 0, byte_size},
-	    {static_cast<vk::Buffer>(result_buffer), 0, byte_size},
+	    {buffer, 0, byte_size},
+	    {buffer, result_offset, byte_size},
 	}};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t binding = 0; binding < writes.size(); ++binding) {
@@ -224,16 +224,16 @@ ShaderRecompiler::Spirv::FloatMinMax RunProbe(const GraphicContext& graphics) {
 	submit_info.pCommandBuffers    = &command;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		RequireVulkanSuccess(graphics.queue.submit(1, &submit_info, fence), "submit min/max probe commands");
+		const auto queue = graphics.device.getQueue(graphics.queue_family, 0);
+		RequireVulkanSuccess(queue.submit(1, &submit_info, fence), "submit min/max probe commands");
 	}
 
 	if (graphics.device.waitForFences(1, &fence, VK_TRUE, 10000000000ull) != vk::Result::eSuccess) {
 		LOGF("[kyty-minmax] min/max probe timed out: compare and select lowering\n");
 		return FloatMinMax::Cascade;
 	}
-	vmaInvalidateAllocation(graphics.allocator, result_allocation, 0, byte_size);
 	std::array<uint32_t, 2 * kProbePairCount> results {};
-	std::memcpy(results.data(), result_info.pMappedData, byte_size);
+	std::memcpy(results.data(), static_cast<uint8_t*>(mapped) + result_offset, byte_size);
 	const auto level = FloatMinMaxLevel(kProbePairs.data(), results.data(), kProbePairCount);
 
 	graphics.device.destroyFence(fence, nullptr);
@@ -244,8 +244,9 @@ ShaderRecompiler::Spirv::FloatMinMax RunProbe(const GraphicContext& graphics) {
 	graphics.device.destroyDescriptorPool(pool, nullptr);
 	graphics.device.destroyDescriptorSetLayout(layout, nullptr);
 	graphics.device.destroyShaderModule(module, nullptr);
-	vmaDestroyBuffer(graphics.allocator, source_buffer, source_allocation);
-	vmaDestroyBuffer(graphics.allocator, result_buffer, result_allocation);
+	graphics.device.unmapMemory(memory);
+	graphics.device.destroyBuffer(buffer, nullptr);
+	graphics.device.freeMemory(memory, nullptr);
 
 	static constexpr const char* names[] = {"compare and select", "NMin/NMax with a NaN-pair select", "NMin/NMax"};
 	LOGF("[kyty-minmax] float min/max lowering: %s\n", names[static_cast<int>(level)]);
@@ -276,8 +277,11 @@ ShaderRecompiler::Spirv::FloatMinMax FloatMinMaxLevel(const uint32_t* pairs, con
 }
 
 ShaderRecompiler::Spirv::FloatMinMax ProbeFloatMinMax(const GraphicContext& graphics) {
-	static const ShaderRecompiler::Spirv::FloatMinMax level = RunProbe(graphics);
-	return level;
+	if (!graphics.device || !graphics.physical_device || graphics.queue_family == UINT32_MAX) {
+		return ShaderRecompiler::Spirv::FloatMinMax::Cascade;
+	}
+	std::call_once(graphics.float_min_max_once, [&] { graphics.float_min_max = RunProbe(graphics); });
+	return graphics.float_min_max;
 }
 
 }
