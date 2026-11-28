@@ -303,6 +303,11 @@ void CandidateOrder(const Plan& program) {
 		Check(IR::RebindComputeImages(plan, runtime, on_heap.snapshot, on_heap.specialization, first.specialization, rebound) &&
 		          rebound.images == first.snapshot.images && rebound.flattened_srt == first.snapshot.flattened_srt,
 		      "a dispatch that reads the heap binds the variant prepared with one slot per candidate");
+		Candidates fallback;
+		fallback.ok = IR::MaterializeFallbackResources(plan, runtime, fallback.snapshot, fallback.specialization);
+		Check(fallback.ok && fallback.specialization == first.specialization &&
+		          fallback.snapshot.images == first.snapshot.images && fallback.snapshot.flattened_srt == first.snapshot.flattened_srt,
+		      "a materialization that avoids the heap takes one slot per candidate while the heap accepts the view");
 
 		const std::array<uint32_t, TableEntries> few {TextureAddress(0), TextureAddress(0), TextureAddress(1),
 		                                             TextureAddress(1), TextureAddress(0), TextureAddress(1)};
@@ -327,6 +332,12 @@ void CandidateOrder(const Plan& program) {
 			                              rebound) &&
 			          rebound.images.size() == 8u && rebound.flattened_srt == narrow.snapshot.flattened_srt,
 			      "a table with fewer textures fills the slots of the prepared variant");
+			Check(IR::CanRebindComputeImages(plan, narrow.specialization, wide.specialization) &&
+			          IR::RebindComputeImages(plan, no_heap, narrow.snapshot, narrow.specialization, wide.specialization, rebound) &&
+			          rebound.images.size() == 8u && rebound.flattened_srt == narrow.snapshot.flattened_srt,
+			      "a variant with more slots than the dispatch has candidates serves it without the heap");
+			Check(!IR::CanRebindComputeImages(plan, wide.specialization, narrow.specialization),
+			      "a variant with fewer slots than the dispatch has candidates is refused");
 			FillTable(every, plain);
 			Candidates all_on_heap;
 			all_on_heap.ok = IR::MaterializeResources(plan, runtime, all_on_heap.snapshot, all_on_heap.specialization);
