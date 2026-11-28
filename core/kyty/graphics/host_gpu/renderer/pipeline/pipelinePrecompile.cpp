@@ -149,7 +149,10 @@ std::string SpecializationDifference(const ShaderRecompiler::IR::ResourceSpecial
 }
 
 std::string DescribeProgramWait(const ProgramWaitFacts& facts) {
-	const auto unbound = [&] { return "generic-unbound:" + (facts.difference.empty() ? std::string("push-data-start") : facts.difference); };
+	const auto unbound = [&] {
+		if (facts.compute && !facts.serve_refusal.empty()) return "generic-unbound:" + facts.serve_refusal;
+		return "generic-unbound:" + (facts.difference.empty() ? std::string("push-data-start") : facts.difference);
+	};
 	if (!facts.compute) {
 		if (facts.draw == GenericServe::PipelineMissing) return "library-missing:generic-pipeline";
 		if (facts.generic_prepared) return facts.other_variant ? unbound() : "generic-unbound:no-exact-recipe";
@@ -167,6 +170,7 @@ std::string DescribeProgramWait(const ProgramWaitFacts& facts) {
 
 std::string DescribeStallWait(const StallWaitFacts& facts) {
 	if (!facts.module_cause.empty()) return facts.module_cause;
+	if (facts.compute && !facts.serve_refusal.empty()) return "generic-unbound:" + facts.serve_refusal;
 	if (facts.compute) return "other:prepared-module-without-driver-pipeline";
 	const auto  route = facts.route;
 	std::string parts;

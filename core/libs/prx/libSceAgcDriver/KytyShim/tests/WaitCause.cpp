@@ -89,6 +89,12 @@ void ProgramWaits() {
 	     "generic-unbound:image-heap+image-table", "a prepared variant that does not bind is named by its difference");
 	Same(DescribeProgramWait({.compute = true, .other_variant = true, .known = 1}), "generic-unbound:push-data-start",
 	     "the same specialization at another push data start");
+	Same(DescribeProgramWait({.compute = true, .other_variant = true, .difference = "image-heap+image-table",
+	                          .serve_refusal = "image-addressing:37", .known = 1}),
+	     "generic-unbound:image-addressing:37", "the refusal of the compute service names the wait when it gave one");
+	Same(DescribeProgramWait({.draw = GenericServe::Unbound, .generic_prepared = true, .other_variant = true,
+	                          .difference = "buffer-bounds-bits", .serve_refusal = "no-candidate", .known = 1}),
+	     "generic-unbound:buffer-bounds-bits", "a refusal of the compute service does not name a draw");
 
 	Same(DescribeProgramWait({.draw = GenericServe::PipelineMissing, .generic_prepared = true, .other_variant = true,
 	                          .difference = "buffer-bounds-bits", .known = 1}),
@@ -112,6 +118,10 @@ void StallWaits() {
 	     "the cause of a module compiled in the game comes first");
 	Same(DescribeStallWait({.compute = true}), "other:prepared-module-without-driver-pipeline",
 	     "a prepared compute module without its pipeline");
+	Same(DescribeStallWait({.compute = true, .serve_refusal = "pipeline-not-ready"}), "generic-unbound:pipeline-not-ready",
+	     "a prepared compute module whose pipeline is not ready and that no variant could serve");
+	Same(DescribeStallWait({.compute = true, .module_cause = "unknown-program", .serve_refusal = "no-candidate"}),
+	     "unknown-program", "the cause of the module still comes first");
 	Same(DescribeStallWait({.route = "linked fs=queued pr=ready"}), "library-missing:fs", "the fragment library alone");
 	Same(DescribeStallWait({.route = "linked fs=building pr=queued"}), "library-missing:pr+fs", "both shader libraries");
 	Same(DescribeStallWait({.route = "linked fs=ready pr=ready"}), "library-missing:vi+fo", "the state libraries");

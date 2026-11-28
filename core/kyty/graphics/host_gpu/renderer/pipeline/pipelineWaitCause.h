@@ -20,6 +20,7 @@ struct ProgramWaitFacts {
 	std::string  recipe_refusal;
 	bool         other_variant = false;
 	std::string  difference;
+	std::string  serve_refusal;
 	std::string  other_keys;
 	int          known = -1;
 	bool         calls = false;
@@ -30,6 +31,7 @@ struct StallWaitFacts {
 	GenericServe     draw    = GenericServe::Served;
 	std::string      module_cause;
 	std::string      generic_refusal;
+	std::string      serve_refusal;
 	std::string_view route;
 };
 
