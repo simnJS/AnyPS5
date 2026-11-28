@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <unordered_set>
 #include <utility>
 
@@ -350,7 +351,17 @@ public:
 	                          bool wave_uniform = false)
 	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform) {}
 
-	bool Run(Value value) { return Validate(value); }
+	bool Run(Value value) {
+		m_inserted.clear();
+		const bool valid = Validate(value);
+		if (!valid) {
+			for (const auto& [uniform, inst]: m_inserted) {
+				(uniform ? m_validated_uniform : m_validated_dependencies).erase(inst);
+			}
+		}
+		m_inserted.clear();
+		return valid;
+	}
 
 private:
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
@@ -380,13 +391,19 @@ private:
 			}
 		}
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
-		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
+		auto&      validated = require_uniform ? m_validated_uniform : m_validated_dependencies;
+		const bool cacheable = !require_uniform || m_active_mask.IsEmpty();
+		if (cacheable && validated.contains(inst)) return true;
 		if (!m_visiting.insert(inst).second) {
 			return !require_uniform;
 		}
-		const auto finish = [&](bool valid) {
+		const auto lane_reads = m_lane_reads;
+		const auto finish     = [&](bool valid) {
 			m_visiting.erase(inst);
-			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			if (valid && cacheable && (!require_uniform || lane_reads == m_lane_reads) &&
+			    validated.insert(inst).second) {
+				m_inserted.emplace_back(require_uniform, inst);
+			}
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -459,6 +476,7 @@ private:
 			return finish(Validate(invariant));
 		}
 		if (op == ValueOpcode::ReadFirstLane) {
+			++m_lane_reads;
 			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
 			    inst->Arg(1).GetType() != Type::U1) {
 				return finish(false);
@@ -527,8 +545,11 @@ private:
 	RuntimeValueType                m_type;
 	bool                            m_wave_uniform;
 	Value                           m_active_mask;
-	std::unordered_set<const Inst*> m_visiting;
-	std::unordered_set<const Inst*> m_validated_dependencies;
+	std::unordered_set<const Inst*>            m_visiting;
+	std::unordered_set<const Inst*>            m_validated_dependencies;
+	std::unordered_set<const Inst*>            m_validated_uniform;
+	std::vector<std::pair<bool, const Inst*>>  m_inserted;
+	size_t                                     m_lane_reads = 0;
 };
 
 
@@ -1958,7 +1979,11 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (end == nullptr || t_walker_faulted) return false;
 	const auto* first = scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
-		for (auto* read = first; read != end; read += 2) reads->emplace_back(*read, sizeof(uint32_t));
+		const auto count = static_cast<size_t>(end - first) / 2u;
+		const auto at    = reads->size();
+		reads->resize(at + count);
+		auto* out = reads->data() + at;
+		for (size_t index = 0; index < count; ++index) out[index] = {first[2u * index], uint64_t {sizeof(uint32_t)}};
 	}
 	if (runtime.record_loads != nullptr) {
 		runtime.record_loads(runtime.userdata, std::span<const uint64_t>(first, end));
@@ -2009,6 +2034,23 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image) {
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
+}
+
+struct RuntimeValueValidator::Impl {
+	explicit Impl(const ResourcePlan& program)
+	    : validators {RuntimeValidator(program, RuntimeValueType::Any),
+	                  RuntimeValidator(program, RuntimeValueType::Integer),
+	                  RuntimeValidator(program, RuntimeValueType::ImmutableInteger)} {}
+	std::array<RuntimeValidator, 3> validators;
+};
+
+RuntimeValueValidator::RuntimeValueValidator(const ResourcePlan& program)
+    : m_impl(std::make_unique<Impl>(program)) {}
+
+RuntimeValueValidator::~RuntimeValueValidator() = default;
+
+bool RuntimeValueValidator::Validate(Value value, RuntimeValueType type) {
+	return m_impl->validators[static_cast<size_t>(type)].Run(value);
 }
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
