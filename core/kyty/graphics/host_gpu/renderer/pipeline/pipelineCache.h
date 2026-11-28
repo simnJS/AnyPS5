@@ -429,6 +429,14 @@ private:
 
 class LinkedComputeStore;
 
+struct ComputeServeMiss {
+	uint64_t                           shader = 0;
+	ShaderRecompiler::IR::ServeRefusal align;
+	ShaderRecompiler::IR::ServeRefusal rebind;
+};
+[[nodiscard]] ComputeServeMiss LastComputeServeMiss();
+[[nodiscard]] std::string      DescribeComputeServeMiss(const ComputeServeMiss& miss);
+
 class PipelineCache {
 public:
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
@@ -564,6 +572,7 @@ private:
 		std::vector<FailedVariant> speculative_failures;
 		size_t                     served_module = SIZE_MAX;
 		uint64_t                   served_logged = 0;
+		std::vector<uint64_t>      unserved_logged;
 
 		[[nodiscard]] bool Failed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
 		                          uint32_t push_data_cursor) const;

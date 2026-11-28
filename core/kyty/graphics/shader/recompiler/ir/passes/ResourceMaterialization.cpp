@@ -51,6 +51,10 @@ struct RecordBlocks {
 };
 thread_local std::vector<RecordBlocks> t_record_blocks;
 
+bool DenseRoot(const ResourceSpecialization::Image& image, uint32_t root) {
+	return image.indirect_root == root && !image.heap && image.table_capacity == 0u && image.indirect_search_iterations == 0u;
+}
+
 void FlushRecordBlocks(std::vector<uint32_t>& flattened_srt) {
 	for (auto& record: t_record_blocks) {
 		const auto base = static_cast<uint32_t>(flattened_srt.size());
@@ -1604,6 +1608,145 @@ static bool MemoryImageCandidates(const ResourcePlan& program, const ImageResour
 	       source->indirect_descriptor->sources.empty();
 }
 
+static auto CandidateOrder(const ResourceSpecialization::Image& image) {
+	return std::tuple(image.numeric_class, image.dimension, image.mip_count, image.conversion_format, image.shader_swizzle,
+	                  image.srgb_decode, image.cube, image.skip_degamma, image.fmask, image.heap, image.indirect_mapping_offset,
+	                  image.indirect_search_iterations, image.table, image.table_capacity, image.table_mapping_offset,
+	                  image.table_entry_mask);
+}
+
+static bool DenseCandidates(const std::vector<ResourceSpecialization::Image>& images, uint32_t root,
+                            std::vector<uint32_t>& slots) {
+	if (!DenseRoot(images[root], root)) return false;
+	slots.clear();
+	for (uint32_t index = 0; index < images.size(); ++index) {
+		if (index != root && images[index].indirect_root == root) slots.push_back(index);
+	}
+	return slots.size() > 1u;
+}
+
+static void TakeCandidateClass(ResourceSpecialization::Image& root, const ResourceSpecialization::Image& kind) {
+	root.numeric_class     = kind.numeric_class;
+	root.dimension         = kind.dimension;
+	root.mip_count         = kind.mip_count;
+	root.conversion_format = kind.conversion_format;
+	root.shader_swizzle    = kind.shader_swizzle;
+	root.cube              = kind.cube;
+}
+
+void OrderDenseCandidates(ResourceSpecialization& specialization) {
+	auto&                                      images = specialization.images;
+	std::vector<uint32_t>                      slots;
+	std::vector<ResourceSpecialization::Image> ordered;
+	for (uint32_t root = 0; root < images.size(); ++root) {
+		if (!DenseCandidates(images, root, slots)) continue;
+		ordered.clear();
+		for (const auto slot: slots) ordered.push_back(images[slot]);
+		std::ranges::stable_sort(ordered, {}, CandidateOrder);
+		if (ordered.front() == ordered.back()) continue;
+		size_t most = 0;
+		size_t run  = 0;
+		for (size_t begin = 0; begin < ordered.size();) {
+			size_t end = begin + 1u;
+			while (end < ordered.size() && ordered[end] == ordered[begin]) ++end;
+			if (end - begin > run) {
+				run  = end - begin;
+				most = begin;
+			}
+			begin = end;
+		}
+		TakeCandidateClass(images[root], ordered[most]);
+		for (size_t at = 0; at < slots.size(); ++at) images[slots[at]] = ordered[at];
+	}
+}
+
+static void OrderDenseCandidates(ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	auto& images = specialization.images;
+	auto& flat   = snapshot.flattened_srt;
+	if (snapshot.images.size() != images.size()) return;
+	constexpr uint32_t                         Empty = UINT32_MAX;
+	std::vector<uint32_t>                      slots, kind_of, order, cursor, remap;
+	std::vector<ResourceSpecialization::Image> kinds, ordered;
+	std::vector<DescriptorValue>               values;
+	for (uint32_t root = 0; root < images.size(); ++root) {
+		if (!DenseCandidates(images, root, slots)) continue;
+		const size_t mapping = images[root].indirect_mapping_offset;
+		if (mapping >= flat.size() || flat[mapping] > flat.size() - mapping - 1u) continue;
+		const auto entries = std::span(flat).subspan(mapping + 1u, flat[mapping]);
+		uint32_t   used    = 0;
+		for (const auto ordinal: entries) used = std::max(used, ordinal);
+		if (used == 0u || used > slots.size()) continue;
+		const auto padded = [&] {
+			for (size_t at = used; at < slots.size(); ++at) {
+				if (!(images[slots[at]] == images[slots[used - 1u]])) return false;
+			}
+			return true;
+		};
+		if (!padded()) continue;
+		kinds.clear();
+		cursor.clear();
+		kind_of.assign(used, Empty);
+		bool empty = NullImageDescriptor(snapshot.images[root]);
+		for (uint32_t child = 0; child < used; ++child) {
+			if (NullImageDescriptor(snapshot.images[slots[child]])) {
+				empty = true;
+				continue;
+			}
+			const auto& image = images[slots[child]];
+			uint32_t    kind  = 0;
+			while (kind < kinds.size() && !(kinds[kind] == image)) ++kind;
+			if (kind == kinds.size()) {
+				kinds.push_back(image);
+				cursor.push_back(0u);
+			}
+			kind_of[child] = kind;
+			++cursor[kind];
+		}
+		if (kinds.size() < 2u) continue;
+		order.resize(kinds.size());
+		std::iota(order.begin(), order.end(), 0u);
+		std::ranges::sort(order, {}, [&](uint32_t kind) { return CandidateOrder(kinds[kind]); });
+		uint32_t most = order.front();
+		for (const auto kind: order) {
+			if (cursor[kind] > cursor[most]) most = kind;
+		}
+		if (empty) {
+			for (uint32_t child = 0; child < used; ++child) {
+				if (kind_of[child] != Empty) continue;
+				kind_of[child] = most;
+				++cursor[most];
+			}
+			TakeCandidateClass(images[root], kinds[most]);
+		}
+		const auto padding = static_cast<uint32_t>(slots.size() - used);
+		uint32_t   next    = 0;
+		for (const auto kind: order) {
+			const auto count = cursor[kind];
+			cursor[kind]     = next;
+			next += count + (kind == most ? padding : 0u);
+		}
+		ordered.assign(slots.size(), {});
+		values.assign(slots.size(), {});
+		remap.assign(used + 1u, 0u);
+		for (uint32_t child = 0; child < used; ++child) {
+			const auto at     = cursor[kind_of[child]]++;
+			ordered[at]       = kinds[kind_of[child]];
+			values[at]        = snapshot.images[slots[child]];
+			remap[child + 1u] = at + 1u;
+		}
+		for (uint32_t pad = 0; pad < padding; ++pad) {
+			const auto at = cursor[most] + pad;
+			ordered[at]   = ordered[at - 1u];
+			values[at]    = values[at - 1u];
+		}
+		for (size_t at = 0; at < slots.size(); ++at) {
+			images[slots[at]]          = ordered[at];
+			snapshot.images[slots[at]] = values[at];
+		}
+		for (auto& ordinal: entries) ordinal = remap[ordinal];
+	}
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -1851,6 +1994,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
+	if (program.stage == ShaderType::Compute) OrderDenseCandidates(snapshot, specialization);
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
 }
@@ -3903,6 +4047,56 @@ bool CompatibleComputeBuffer(const ResourcePlan& plan, uint32_t index, ResourceS
 
 }
 
+static thread_local ServeRefusal t_serve_refusal;
+static thread_local bool         t_serve_rebound = false;
+
+static bool RefuseServe(ServeRefusal::Step step, uint32_t index = UINT32_MAX) {
+	if (t_serve_refusal.step == ServeRefusal::Step::None || t_serve_rebound > t_serve_refusal.rebound ||
+	    (t_serve_rebound == t_serve_refusal.rebound && step >= t_serve_refusal.step)) {
+		t_serve_refusal = {.step = step, .index = index, .rebound = t_serve_rebound};
+	}
+	return false;
+}
+
+void ClearServeRefusal() {
+	t_serve_refusal = {};
+}
+
+void NoteServeRefusal(ServeRefusal::Step step) {
+	RefuseServe(step);
+}
+
+ServeRefusal ClosestServeRefusal() {
+	return t_serve_refusal;
+}
+
+const char* ServeRefusalName(ServeRefusal::Step step) {
+	switch (step) {
+		case ServeRefusal::Step::None: return "none";
+		case ServeRefusal::Step::Disabled: return "disabled";
+		case ServeRefusal::Step::Calls: return "calls";
+		case ServeRefusal::Step::NoCandidate: return "no-candidate";
+		case ServeRefusal::Step::PushLayout: return "push-layout";
+		case ServeRefusal::Step::PipelineNotReady: return "pipeline-not-ready";
+		case ServeRefusal::Step::ResourceCount: return "resource-count";
+		case ServeRefusal::Step::Buffer: return "buffer";
+		case ServeRefusal::Step::Sampler: return "sampler";
+		case ServeRefusal::Step::ImageView: return "image-view";
+		case ServeRefusal::Step::ImageAddressing: return "image-addressing";
+		case ServeRefusal::Step::TableConversion: return "table-conversion";
+		case ServeRefusal::Step::HeapKinds: return "heap-kinds";
+		case ServeRefusal::Step::SameAddressing: return "same-addressing";
+		case ServeRefusal::Step::TableView: return "table-view";
+		case ServeRefusal::Step::TableViewCount: return "table-view-count";
+		case ServeRefusal::Step::UnstableLayout: return "unstable-layout";
+		case ServeRefusal::Step::RootShapes: return "root-shapes";
+		case ServeRefusal::Step::Layout: return "layout";
+		case ServeRefusal::Step::Placement: return "placement";
+		case ServeRefusal::Step::Rematerialize: return "rematerialize";
+	}
+	return "unknown";
+}
+
 bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                     const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                     ResourceSnapshot* aligned) {
@@ -3911,7 +4105,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	    snapshot.buffers.size() != specialization.buffers.size() ||
 	    snapshot.images.size() != specialization.images.size() ||
 	    snapshot.samplers.size() != specialization.samplers.size()) {
-		return false;
+		return RefuseServe(ServeRefusal::Step::ResourceCount);
 	}
 	for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
 		const auto& wanted = specialization.buffers[index];
@@ -3919,7 +4113,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 		if (!CompatibleComputeBuffer(program, index, wanted, served) &&
 		    (wanted.indirect_root != BufferResource::NoIndirectBuffer || served.indirect_root != BufferResource::NoIndirectBuffer ||
 		     !EmptyBufferServes(program, snapshot, index, wanted, served))) {
-			return false;
+			return RefuseServe(ServeRefusal::Step::Buffer, index);
 		}
 	}
 	if (specialization.images == target.images && specialization.samplers == target.samplers) {
@@ -3928,29 +4122,34 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	}
 	if (!snapshot.image_tables.empty() && specialization.images.size() == target.images.size() &&
 	    specialization.samplers == target.samplers) {
-		bool fits = true;
-		for (size_t index = 0; fits && index < specialization.images.size(); ++index) {
+		uint32_t mismatch = UINT32_MAX;
+		for (uint32_t index = 0; mismatch == UINT32_MAX && index < specialization.images.size(); ++index) {
 			auto view = specialization.images[index];
 			const auto& served = target.images[index];
 			if (view.table_capacity != 0 && view.table < snapshot.image_tables.size() &&
 			    served.table_capacity >= snapshot.image_tables[view.table]->slots.size()) {
 				view.table_capacity = served.table_capacity;
 			}
-			fits = view == served;
+			if (!(view == served)) mismatch = index;
 		}
-		if (fits) {
+		if (mismatch == UINT32_MAX) {
 			if (aligned != nullptr && aligned != &snapshot) *aligned = snapshot;
 			return true;
 		}
+		return RefuseServe(ServeRefusal::Step::TableView, mismatch);
 	}
-	if (!g_stable_indirect_layouts.load(std::memory_order_relaxed) || !snapshot.image_tables.empty()) return false;
+	if (!snapshot.image_tables.empty()) {
+		return RefuseServe(specialization.samplers == target.samplers ? ServeRefusal::Step::TableViewCount
+		                                                             : ServeRefusal::Step::Sampler);
+	}
+	if (!g_stable_indirect_layouts.load(std::memory_order_relaxed)) return RefuseServe(ServeRefusal::Step::UnstableLayout);
 	std::vector<RootShape> images_from, images_to, samplers_from, samplers_to;
 	std::vector<uint8_t>   deferred_from, deferred_to;
 	if (!ImageShapes(program, specialization.images, images_from, deferred_from) ||
 	    !ImageShapes(program, target.images, images_to, deferred_to) || deferred_from != deferred_to ||
 	    !SamplerShapes(program, specialization.samplers, samplers_from) ||
 	    !SamplerShapes(program, target.samplers, samplers_to)) {
-		return false;
+		return RefuseServe(ServeRefusal::Step::RootShapes);
 	}
 	std::vector<SrtRegion> regions_from, regions_to;
 	AddRegions(images_from, regions_from);
@@ -3964,7 +4163,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	    std::ranges::any_of(snapshot.gpu_flat_loads, [&](const GpuFlatLoad& load) {
 		    return size_t {load.slot} + load.count > prefix;
 	    })) {
-		return false;
+		return RefuseServe(ServeRefusal::Step::Layout);
 	}
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
@@ -3982,7 +4181,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	    !PlaceRoots(samplers_from, samplers_to, specialization.samplers, target.samplers,
 	                std::span<const DescriptorValue>(snapshot.samplers), source,
 	                aligned != nullptr ? &samplers : nullptr, aligned != nullptr ? &flat : nullptr)) {
-		return false;
+		return RefuseServe(ServeRefusal::Step::Placement);
 	}
 	if (aligned != nullptr) {
 		aligned->buffers              = snapshot.buffers;
@@ -4025,36 +4224,39 @@ bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecializ
 	const auto roots = program.info.images.size();
 	if (!GenericComputeVariants() || program.stage != ShaderType::Compute ||
 	    specialization.images.size() < roots || target.images.size() < roots ||
-	    specialization.buffers.size() != target.buffers.size() || specialization.samplers != target.samplers) return false;
+	    specialization.buffers.size() != target.buffers.size()) return RefuseServe(ServeRefusal::Step::ResourceCount);
+	if (specialization.samplers != target.samplers) return RefuseServe(ServeRefusal::Step::Sampler);
 	for (uint32_t i = 0; i < specialization.buffers.size(); ++i) {
-		if (!CompatibleComputeBuffer(program, i, specialization.buffers[i], target.buffers[i])) return false;
+		if (!CompatibleComputeBuffer(program, i, specialization.buffers[i], target.buffers[i]))
+			return RefuseServe(ServeRefusal::Step::Buffer, i);
 	}
 	bool changes_addressing = false;
-	for (size_t index = 0; index < roots; ++index) {
+	for (uint32_t index = 0; index < roots; ++index) {
 		const auto& live = specialization.images[index];
 		const auto& served = target.images[index];
-		if (ImageViewForm(live) != ImageViewForm(served)) return false;
+		if (ImageViewForm(live) != ImageViewForm(served)) return RefuseServe(ServeRefusal::Step::ImageView, index);
 		const auto from = Addressing(live);
 		const auto to = Addressing(served);
 		if (from == to) continue;
 		const bool to_table = to == ImageAddressing::Table && from == ImageAddressing::Heap;
 		const bool to_heap = from == ImageAddressing::Table && to == ImageAddressing::Heap;
-		if (!to_table && !to_heap) return false;
+		if (!to_table && !to_heap) return RefuseServe(ServeRefusal::Step::ImageAddressing, index);
 		const auto* source = Source(program, program.info.images[index].source);
 		if (source == nullptr || !source->indirect_descriptor || !source->indirect_descriptor->table_array ||
 		    program.info.images[index].resource_class != ImageResourceClass::Sampled ||
 		    program.info.images[index].mip_mode == ImageMipMode::Dynamic ||
-		    (to_table ? served : live).table_entry_mask != (source->indirect_descriptor->table_mask >> 5u)) return false;
+		    (to_table ? served : live).table_entry_mask != (source->indirect_descriptor->table_mask >> 5u))
+			return RefuseServe(ServeRefusal::Step::TableConversion, index);
 		const auto& heap = to_table ? specialization.images : target.images;
 		const auto children = std::span(heap).subspan(roots);
 		const auto child = std::ranges::find(children, index, &ResourceSpecialization::Image::indirect_root);
 		if (child == children.end() || ImageViewForm(*child) != ImageViewForm(to_table ? served : live) ||
 		    std::find_if(std::next(child), children.end(), [&](const auto& other) {
 			    return other.indirect_root == index;
-		    }) != children.end()) return false;
+		    }) != children.end()) return RefuseServe(ServeRefusal::Step::HeapKinds, index);
 		changes_addressing = true;
 	}
-	return changes_addressing;
+	return changes_addressing || RefuseServe(ServeRefusal::Step::SameAddressing);
 }
 
 bool RebindComputeImages(const ResourcePlan& program, const SrtRuntime& runtime, const ResourceSnapshot& snapshot,
@@ -4063,10 +4265,13 @@ bool RebindComputeImages(const ResourcePlan& program, const SrtRuntime& runtime,
 	if (!CanRebindComputeImages(program, specialization, target)) return false;
 	ResourceSnapshot rebound;
 	ResourceSpecialization shape;
-	if (!MaterializeResourcesForViews(program, runtime, rebound, shape, target.images, &snapshot, &specialization) ||
-	    !AlignResources(program, rebound, shape, target, &rebound)) {
-		return false;
+	if (!MaterializeResourcesForViews(program, runtime, rebound, shape, target.images, &snapshot, &specialization)) {
+		return RefuseServe(ServeRefusal::Step::Rematerialize);
 	}
+	t_serve_rebound = true;
+	const bool fits = AlignResources(program, rebound, shape, target, &rebound);
+	t_serve_rebound = false;
+	if (!fits) return false;
 	aligned = std::move(rebound);
 	return true;
 }

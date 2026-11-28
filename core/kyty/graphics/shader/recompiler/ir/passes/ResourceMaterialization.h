@@ -75,6 +75,7 @@ bool DecodeResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
 void SetComputeIndirectFloors(size_t keys, size_t images);
+void OrderDenseCandidates(ResourceSpecialization& specialization);
 
 bool HasIndirectBuffers(const ResourcePlan& program);
 bool IndirectBufferMaterializationFailed();
@@ -109,6 +110,38 @@ bool PopulatedBuffersCoverEmptySpecialization(const ResourcePlan& program, const
 bool SameModuleCode(const ResourcePlan& program, const ResourceSpecialization& requested,
                     const ResourceSpecialization& candidate);
 bool GenericComputeVariants();
+struct ServeRefusal {
+	enum class Step : uint8_t {
+		None,
+		Disabled,
+		Calls,
+		NoCandidate,
+		PushLayout,
+		PipelineNotReady,
+		ResourceCount,
+		Buffer,
+		Sampler,
+		ImageView,
+		ImageAddressing,
+		TableConversion,
+		HeapKinds,
+		SameAddressing,
+		TableView,
+		TableViewCount,
+		UnstableLayout,
+		RootShapes,
+		Layout,
+		Placement,
+		Rematerialize,
+	};
+	Step     step    = Step::None;
+	uint32_t index   = UINT32_MAX;
+	bool     rebound = false;
+};
+void ClearServeRefusal();
+void NoteServeRefusal(ServeRefusal::Step step);
+[[nodiscard]] ServeRefusal ClosestServeRefusal();
+[[nodiscard]] const char*  ServeRefusalName(ServeRefusal::Step step);
 bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                     const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                     ResourceSnapshot* aligned);

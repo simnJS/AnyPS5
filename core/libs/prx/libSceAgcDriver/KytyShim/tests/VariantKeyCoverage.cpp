@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -127,6 +128,162 @@ std::vector<ManifestModule> Reload(const std::vector<ManifestModule>& recipes, s
 	uint32_t         skipped = 0;
 	Check(LoadManifest(bytes, loaded, &skipped) && skipped == 0, "the manifest reads back");
 	return loaded.modules;
+}
+
+constexpr uint64_t TableAddress = 0x200000000ull;
+constexpr uint32_t TableEntries = 6u;
+
+std::array<uint32_t, TableEntries * 8u> g_table {};
+
+bool ReadTable(void*, uint64_t address, std::span<uint32_t> values) {
+	for (size_t index = 0; index < values.size(); ++index) {
+		const auto at = address + index * 4u;
+		values[index] = at >= TableAddress && at + 4u <= TableAddress + g_table.size() * 4u ? g_table[(at - TableAddress) / 4u] : 0u;
+	}
+	return true;
+}
+
+IR::ResourcePlan CandidatePlan(ShaderType stage) {
+	IR::ResourcePlan plan;
+	plan.stage                      = stage;
+	plan.resource_tracking_complete = true;
+	plan.srt_plan_complete          = true;
+	const auto immediate = [](std::span<const uint32_t> words) {
+		IR::DescriptorSource source;
+		source.dword_count = static_cast<uint32_t>(words.size());
+		for (size_t index = 0; index < words.size(); ++index) source.dwords[index] = IR::Value(words[index]);
+		return source;
+	};
+	const std::array<uint32_t, 2> table {static_cast<uint32_t>(TableAddress), static_cast<uint32_t>(TableAddress >> 32u)};
+	const std::array<uint32_t, 4> sampler_words {0x80000012u, 0u, 0u, 0u};
+	IR::DescriptorSource          chosen;
+	chosen.dword_count         = 8u;
+	chosen.indirect_descriptor = IR::DescriptorSource::IndirectDescriptor {
+	    .table_maximum = TableEntries - 1u,
+	    .table_source  = 0u,
+	    .table_offset  = 0u,
+	    .table_stride  = 32u,
+	    .table_scalar  = true,
+	};
+	plan.descriptor_sources.push_back(immediate(table));
+	plan.descriptor_sources.push_back(std::move(chosen));
+	plan.descriptor_sources.push_back(immediate(sampler_words));
+	IR::ImageResource image;
+	image.resource_class = IR::ImageResourceClass::Sampled;
+	image.read           = true;
+	image.dimension      = Recompiler::Decoder::ImageDimension::Dim2D;
+	image.source         = 1u;
+	plan.info.images.push_back(image);
+	IR::SamplerResource sampler;
+	sampler.source = 2u;
+	plan.info.samplers.push_back(sampler);
+	plan.info.sampled_pairs.push_back({.image = 0u, .sampler = 0u});
+	IR::CompileSrtWalker(plan);
+	return plan;
+}
+
+struct Candidates {
+	bool                       ok = false;
+	IR::ResourceSnapshot       snapshot;
+	IR::ResourceSpecialization specialization;
+};
+
+uint32_t TextureAddress(uint32_t entry) {
+	return 0x1000u * (entry + 1u);
+}
+
+IR::DescriptorValue TextureAt(uint32_t address, bool integer) {
+	const auto          format = integer ? Prospero::BufferFormat::k8UInt : Prospero::BufferFormat::k8UNorm;
+	IR::DescriptorValue value {.dword_count = 8u};
+	value.dwords[0] = address;
+	value.dwords[1] = (static_cast<uint32_t>(format) << 20u) | (3u << 30u);
+	value.dwords[2] = 15u;
+	value.dwords[3] = SwizzleXyzw | (9u << 28u);
+	return value;
+}
+
+void FillTable(const std::array<uint32_t, TableEntries>& textures, const std::array<bool, TableEntries>& integer) {
+	for (uint32_t entry = 0; entry < TableEntries; ++entry) {
+		const auto value = TextureAt(textures[entry], integer[entry]);
+		std::copy(value.dwords.begin(), value.dwords.end(), g_table.begin() + size_t {entry} * 8u);
+	}
+}
+
+Candidates Choose(const IR::ResourcePlan& plan, const std::array<bool, TableEntries>& integer) {
+	std::array<uint32_t, TableEntries> textures {};
+	for (uint32_t entry = 0; entry < TableEntries; ++entry) textures[entry] = TextureAddress(entry);
+	FillTable(textures, integer);
+	const IR::SrtRuntime runtime {.read_specialization_memory = ReadTable};
+	Candidates           result;
+	result.ok = IR::MaterializeResources(plan, runtime, result.snapshot, result.specialization);
+	return result;
+}
+
+bool Follows(const Candidates& chosen, const std::array<bool, TableEntries>& integer) {
+	const auto& images  = chosen.specialization.images;
+	const auto& flat    = chosen.snapshot.flattened_srt;
+	const auto  mapping = images[0].indirect_mapping_offset;
+	if (mapping >= flat.size() || flat[mapping] < (TableEntries - 1u) * 8u + 1u || mapping + 1u + flat[mapping] > flat.size()) return false;
+	for (uint32_t entry = 0; entry < TableEntries; ++entry) {
+		const auto ordinal = flat[mapping + 1u + entry * 8u];
+		if (ordinal == 0u || ordinal >= images.size() || ordinal >= chosen.snapshot.images.size()) return false;
+		const bool is_integer = images[ordinal].numeric_class == Prospero::TextureNumericClass::Uint;
+		if (chosen.snapshot.images[ordinal].dwords[0] != TextureAddress(entry) || is_integer != integer[entry]) return false;
+	}
+	return true;
+}
+
+void CandidateOrder(const Plan& program) {
+	IR::SetComputeIndirectFloors(1u, 1u);
+	const auto plan = CandidatePlan(ShaderType::Compute);
+	const std::array<bool, TableEntries> first_order {false, true, false, false, true, false};
+	const std::array<bool, TableEntries> second_order {true, false, false, true, false, false};
+	const std::array<bool, TableEntries> integer_last {false, false, true, false, false, true};
+	const auto first  = Choose(plan, first_order);
+	const auto second = Choose(plan, second_order);
+	const auto last   = Choose(plan, integer_last);
+	Check(first.ok && second.ok && last.ok, "the three tables of candidates materialize");
+	if (!first.ok || !second.ok || !last.ok) return;
+	const auto& images = first.specialization.images;
+	Check(images.size() == 8u && images[0].indirect_root == 0u && !images[0].heap && images[0].indirect_search_iterations == 0u,
+	      "a table without an image heap takes one slot per candidate, padded to a power of two");
+	if (images.size() != 8u) return;
+	const auto integers = std::ranges::count(images | std::views::drop(1), Prospero::TextureNumericClass::Uint,
+	                                         &IR::ResourceSpecialization::Image::numeric_class);
+	Check(integers == 2, "the unused slot takes the kind most candidates have");
+	uint32_t changes = 0;
+	for (size_t index = 2; index < images.size(); ++index) changes += images[index].numeric_class != images[index - 1u].numeric_class;
+	Check(changes == 1u, "the candidates of one kind are next to each other");
+	Check(first.specialization == second.specialization, "the order of the candidates in memory does not change the variant");
+	Check(first.specialization == last.specialization, "the kind of the last candidate in memory does not change the variant");
+	Check(Follows(first, first_order) && Follows(second, second_order) && Follows(last, integer_last),
+	      "each table entry still selects its own texture");
+
+	auto recorded = first.specialization;
+	std::swap(recorded.images[1], recorded.images[6]);
+	auto other = first.specialization;
+	std::ranges::reverse(other.images | std::views::drop(1));
+	Check(!(recorded == first.specialization) && !(other == first.specialization) && !(recorded == other),
+	      "the recipes of earlier sessions list the candidates in other orders");
+	const auto loaded = Reload({Recipe(program, recorded), Recipe(program, other), Recipe(program, first.specialization)});
+	Check(loaded.size() == 3u, "the three recipes read back");
+	if (loaded.size() == 3u) {
+		Check(loaded[0].specialization == first.specialization && loaded[1].specialization == first.specialization &&
+		          loaded[2].specialization == first.specialization,
+		      "a recipe recorded in another candidate order loads as the variant a dispatch requests");
+		Check(Identity(loaded[0]) == Identity(loaded[2]) && Identity(loaded[1]) == Identity(loaded[2]),
+		      "the recipes of several sessions are one prepared variant");
+		Check(Identity(Recipe(program, second.specialization)) == Identity(loaded[0]) &&
+		          Identity(Recipe(program, last.specialization)) == Identity(loaded[1]),
+		      "a dispatch whose candidates have their kinds at other positions requests the variant the manifest prepared");
+	}
+
+	const auto pixel_plan   = CandidatePlan(ShaderType::Pixel);
+	const auto pixel_first  = Choose(pixel_plan, first_order);
+	const auto pixel_second = Choose(pixel_plan, second_order);
+	Check(pixel_first.ok && pixel_second.ok && !(pixel_first.specialization == pixel_second.specialization) &&
+	          Follows(pixel_first, first_order) && Follows(pixel_second, second_order),
+	      "a graphics stage keeps the candidates in their order in memory");
 }
 
 void GenericGraphics() {
@@ -270,6 +427,8 @@ int main() {
 		Check((baked_exact.specialization.buffers[slot].packed_stride & BoundsBits) == IR::ExactBufferBounds,
 		      "a fixed stride keeps exact bounds in the key");
 	}
+
+	CandidateOrder(program);
 
 	std::printf("variant key coverage: %u of %zu requests are the prepared variant\n", covered, bound.size());
 	if (g_failures != 0) {
