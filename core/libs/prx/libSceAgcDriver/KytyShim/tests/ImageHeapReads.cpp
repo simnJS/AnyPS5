@@ -342,6 +342,7 @@ OpDecorate %Words Block
 OpMemberDecorate %Push 0 Offset 0
 OpMemberDecorate %Push 1 Offset 4
 OpMemberDecorate %Push 2 Offset 8
+OpMemberDecorate %Push 3 Offset 12
 OpDecorate %Push Block
 @DECOR@
 %void = OpTypeVoid
@@ -386,7 +387,7 @@ OpDecorate %Push Block
 %ptr_word = OpTypePointer StorageBuffer %u32
 %reads = OpVariable %ptr_words StorageBuffer
 %out = OpVariable %ptr_words StorageBuffer
-%Push = OpTypeStruct %u32 %u32 %u32
+%Push = OpTypeStruct %u32 %u32 %u32 %u32
 %ptr_push = OpTypePointer PushConstant %Push
 %ptr_push_u32 = OpTypePointer PushConstant %u32
 %push = OpVariable %ptr_push PushConstant
@@ -407,7 +408,9 @@ OpStore %iter %c0
 %index1 = OpLoad %u32 %p1
 %p2 = OpAccessChain %ptr_push_u32 %push %c2
 %count = OpLoad %u32 %p2
-%odd_bit = OpBitwiseAnd %u32 %lid_x %c1
+%p3 = OpAccessChain %ptr_push_u32 %push %c3
+%lane_mask = OpLoad %u32 %p3
+%odd_bit = OpBitwiseAnd %u32 %lid_x %lane_mask
 %odd = OpINotEqual %bool %odd_bit %c0
 %selected = OpSelect %u32 %odd %index1 %index0
 )";
@@ -440,10 +443,9 @@ OpBranch %header
 %done = OpLabel
 )";
 	} else {
+		text += "%alternate = OpSelect %u32 %odd %index0 %index1\n";
 		for (uint32_t k = 0; k < StraightAccesses; ++k) {
-			const auto n = std::to_string(k);
-			text += "%index_" + n + " = OpIAdd %u32 %selected %k" + std::to_string(k & 1u) + "\n";
-			text += CostAccess(mark, k, ("%index_" + n).c_str(), "%gid_x");
+			text += CostAccess(mark, k, (k & 1u) ? "%alternate" : "%selected", "%gid_x");
 		}
 	}
 	text += R"(
@@ -520,7 +522,7 @@ bool MakeKernel(GraphicContext& graphics, CommandScheduler& scheduler, Kernel& k
 	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute};
 	kernel.out_layout = graphics.device.createDescriptorSetLayout({.bindingCount = 1, .pBindings = &binding}).value;
 	const std::array set_layouts {kernel.out_layout, graphics.image_heap_layout};
-	const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, 12};
+	const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, 4 * sizeof(uint32_t)};
 	kernel.layout = graphics.device
 	                    .createPipelineLayout({.setLayoutCount         = static_cast<uint32_t>(set_layouts.size()),
 	                                           .pSetLayouts            = set_layouts.data(),
@@ -552,11 +554,11 @@ bool MakeKernel(GraphicContext& graphics, CommandScheduler& scheduler, Kernel& k
 }
 
 void Run(ImageHeap& heap, CommandScheduler& scheduler, Kernel& kernel, vk::Pipeline pipeline, uint32_t index0,
-         uint32_t index1, uint32_t iterations, uint32_t groups, bool timed = false) {
+         uint32_t index1, uint32_t iterations, uint32_t groups, uint32_t lane_mask = 1u, bool timed = false) {
 	auto& command = scheduler.Current();
 	command.EndRendering();
 	heap.Commit(command, vk::PipelineBindPoint::eCompute, kernel.layout);
-	const std::array<uint32_t, 3> push {index0, index1, iterations};
+	const std::array<uint32_t, 4> push {index0, index1, iterations, lane_mask};
 	const auto layout = kernel.layout;
 	const auto set    = kernel.out_set;
 	const auto pool   = kernel.queries;
@@ -845,6 +847,10 @@ void MeasureCost(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	heap.Rebind(executor);
 	const auto a = Access::Slot(heap, values[0]);
 	const auto b = Access::Slot(heap, values[1]);
+	if (a == 0u || b == 0u || std::max(a, b) - std::min(a, b) != 1u) {
+		Check(false, "the cost table acquired two consecutive live heap slots");
+		return;
+	}
 	constexpr uint32_t Groups     = 16384;
 	constexpr uint32_t Iterations = 64;
 	Kernel kernel;
@@ -853,10 +859,10 @@ void MeasureCost(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 		return;
 	}
 	const auto period = graphics.physical_device.getProperties().limits.timestampPeriod;
-	const auto time   = [&](vk::Pipeline pipeline, uint32_t first, uint32_t second) {
+	const auto time   = [&](vk::Pipeline pipeline, bool divergent) {
 		double best = 1e30;
 		for (uint32_t repeat = 0; repeat < 7u; ++repeat) {
-			Run(heap, scheduler, kernel, pipeline, first, second, Iterations, Groups, true);
+			Run(heap, scheduler, kernel, pipeline, a, b, Iterations, Groups, divergent ? 1u : 0u, true);
 			Wait(scheduler);
 			std::array<uint64_t, 2> stamps {};
 			if (graphics.device.getQueryPoolResults(kernel.queries, 0, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
@@ -887,9 +893,8 @@ void MeasureCost(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 			return;
 		}
 		for (const bool divergent: {false, true}) {
-			const auto second = divergent ? b : a;
 			std::array<double, marks.size()> times {};
-			for (size_t mark = 0; mark < marks.size(); ++mark) times[mark] = time(pipelines[mark], a, second);
+			for (size_t mark = 0; mark < marks.size(); ++mark) times[mark] = time(pipelines[mark], divergent);
 			std::printf("%s: %s, %s index, %.0f fetches:", g_name, loop ? "loop of 64 fetches" : "8 straight fetches",
 			            divergent ? "two-way divergent" : "wave-uniform", accesses);
 			for (size_t mark = 0; mark < marks.size(); ++mark) {
