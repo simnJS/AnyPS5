@@ -982,8 +982,9 @@ private:
 	                            const ModuleMap& modules);
 
 	std::unordered_set<uint64_t> m_baked_stride_programs;
-	[[nodiscard]] bool RuntimeStride(uint64_t program_hash) const {
-		return !m_baked_stride_programs.contains(program_hash);
+	[[nodiscard]] bool RuntimeStride(ShaderType stage, uint64_t program_hash) const {
+		return stage == ShaderType::Vertex || stage == ShaderType::Mesh || stage == ShaderType::Pixel ||
+		       (stage == ShaderType::Compute && !m_baked_stride_programs.contains(program_hash));
 	}
 	void DecideRuntimeStrides(std::span<PipelineManifest*> manifests);
 

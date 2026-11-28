@@ -83,7 +83,7 @@ struct Request {
 	IR::ResourceSpecialization specialization;
 };
 
-Request Dispatch(const IR::ResourcePlan& plan, const Sharp& source, bool runtime_stride) {
+Request Dispatch(const IR::ResourcePlan& plan, const Sharp& source, bool runtime_stride, bool fallback = false) {
 	const auto               target = MakeSharp(TargetAddress, Records * 4u, 3);
 	std::array<uint32_t, 16> user_data {};
 	std::copy(source.begin(), source.end(), user_data.begin());
@@ -91,7 +91,8 @@ Request Dispatch(const IR::ResourcePlan& plan, const Sharp& source, bool runtime
 	const IR::SrtRuntime runtime {.user_data = user_data, .runtime_stride = runtime_stride};
 	IR::ResourceSnapshot snapshot;
 	Request              result;
-	result.ok = IR::MaterializeResources(plan, runtime, snapshot, result.specialization);
+	result.ok = fallback ? IR::MaterializeFallbackResources(plan, runtime, snapshot, result.specialization)
+	                     : IR::MaterializeResources(plan, runtime, snapshot, result.specialization);
 	return result;
 }
 
@@ -481,6 +482,9 @@ int main() {
 		const auto request = Dispatch(program.plan, entry.sharp, true);
 		Check(request.ok, std::string(entry.name) + ": the dispatch materializes");
 		if (!request.ok) continue;
+		const auto fallback = Dispatch(program.plan, entry.sharp, false, true);
+		Check(fallback.ok && fallback.specialization == request.specialization,
+		      std::string(entry.name) + ": the fallback covers a dispatch with baked strides");
 		const auto stride = request.specialization.buffers[slot].packed_stride;
 		Check(IR::HasRuntimeStride(stride) && (stride & BoundsBits) == 0u,
 		      std::string(entry.name) + ": the bounds stay out of the key");

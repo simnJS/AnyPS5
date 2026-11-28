@@ -1089,9 +1089,17 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 			const bool native = RayTracing::NativeTraversals();
 			for (const auto i: new_modules) {
 				const auto& record = loaded.modules[i];
-				const auto* hit = FindCompiledModule(ManifestProgramKey(record, false),
-				                                     record.specialization, record.push_data_cursor, record.generic_graphics,
-				                                     record.function_code);
+				const auto key = ManifestProgramKey(record, false);
+				const auto* hit = FindCompiledModule(key, record.specialization, record.push_data_cursor,
+				                                     record.generic_graphics, record.function_code);
+				if (!hit && !record.generic_graphics && record.stage != ShaderType::Compute &&
+				    RuntimeStride(record.stage, key.hash) && !record.specialization.buffers.empty()) {
+					if (const auto entry = m_program_cache.find(key); entry != m_program_cache.end()) {
+						auto shape = record.specialization;
+						ShaderRecompiler::IR::ReadStridesAtRunTime(entry->second.resource_plan, shape);
+						hit = FindCompiledModule(key, shape, record.push_data_cursor, false, record.function_code);
+					}
+				}
 				if (hit && native && record.stage == ShaderType::Compute && hit->info.info.ray_query &&
 				    !FindCompiledModule(ManifestProgramKey(record, true), record.specialization, record.push_data_cursor,
 				                        false, record.function_code)) {
@@ -3422,7 +3430,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			refusal = "specialization_does_not_fit";
 			return;
 		}
-		if (record.stage == ShaderType::Compute && RuntimeStride(key.hash)) {
+		if (RuntimeStride(record.stage, key.hash)) {
 			ShaderRecompiler::IR::ReadStridesAtRunTime(*plan, specialization);
 			LockPrograms();
 			compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics,
@@ -3434,9 +3442,9 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		}
 #if defined(ANYPS5_KYTY)
 		const auto recorded = specialization;
-		if (!record.generic_graphics) {
+		if (!record.generic_graphics && record.stage == ShaderType::Compute) {
 			ShaderRecompiler::IR::ShareNullBufferVariants(
-			    *plan, specialization, record.stage == ShaderType::Compute && RuntimeStride(key.hash));
+			    *plan, specialization, RuntimeStride(record.stage, key.hash));
 		}
 		if (specialization != recorded) {
 			LockPrograms();

@@ -3411,7 +3411,9 @@ bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime&
 	const bool buffer_failure  = t_indirect_buffer_failure;
 	const bool sampler_failure = t_indirect_sampler_failure;
 	const FallbackForms fallback;
-	const bool          ok     = MaterializeResourcesForViews(program, runtime, snapshot, specialization, {});
+	auto fallback_runtime = runtime;
+	fallback_runtime.runtime_stride = true;
+	const bool ok = MaterializeResourcesForViews(program, fallback_runtime, snapshot, specialization, {});
 	t_indirect_buffer_failure  = buffer_failure;
 	t_indirect_sampler_failure = sampler_failure;
 	return ok;

@@ -1686,8 +1686,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
-		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
+	runtime.runtime_stride = RuntimeStride(options.stage, params.hash);
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
@@ -2911,8 +2911,8 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
-		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
+	runtime.runtime_stride = RuntimeStride(key.stage, params.hash);
 	t_ahead_unread_load = false;
 #if defined(ANYPS5_KYTY)
 	runtime.defer_flat_loads  = true;
@@ -3159,8 +3159,8 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				runtime.workgroup_counts      = input_info.workgroup_counts;
 				runtime.indirect_args_address = input_info.indirect_args_address;
-				runtime.runtime_stride        = RuntimeStride(job.params.hash);
 			}
+			runtime.runtime_stride = RuntimeStride(options.stage, job.params.hash);
 			if (!ShaderRecompiler::IR::MaterializeResources(*plan, runtime, resources,
 			                                                *specialization)) {
 				specialization.reset();
