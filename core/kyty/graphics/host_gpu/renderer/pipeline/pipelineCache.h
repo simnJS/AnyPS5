@@ -740,7 +740,7 @@ private:
 	bool WaitForCompile(const ProgramKey& key) KYTY_REQUIRES(m_program_lock);
 	template <typename InputInfo>
 	void RunCompileJob(CompileJob& job, InputInfo& input_info);
-	void CompileWorker();
+	void CompileWorker(const std::stop_token& stop);
 	void StopWorkers();
 #if defined(ANYPS5_KYTY)
 	bool ComputePipelineReady(const ShaderModule& module, bool ahead = false);
@@ -944,7 +944,7 @@ private:
 	void QueueAsyncPipeline(const AsyncPipelineJob& job);
 	template <typename Matches>
 	bool TakeQueuedAsyncPipeline(Matches&& matches);
-	void AsyncPipelineWorker();
+	void AsyncPipelineWorker(const std::stop_token& stop);
 	void StopAsyncPipelines();
 	bool WaitGraphicsPipeline(std::unique_lock<std::mutex>& lock, const GraphicsPipelineKey& key,
 	                          std::optional<std::chrono::steady_clock::time_point> until);
@@ -988,6 +988,23 @@ private:
 	void DecideRuntimeStrides(std::span<PipelineManifest*> manifests);
 
 	struct ManifestState;
+
+	class CompilationTicket {
+	public:
+		CompilationTicket() = default;
+		CompilationTicket(ManifestState* state, uint64_t ticket): m_state(state), m_ticket(ticket) {}
+		CompilationTicket(const CompilationTicket&) = delete;
+		CompilationTicket& operator=(const CompilationTicket&) = delete;
+		~CompilationTicket();
+		explicit operator bool() const { return m_state != nullptr; }
+		void Reset();
+
+	private:
+		ManifestState* m_state = nullptr;
+		uint64_t m_ticket = 0;
+	};
+
+	CompilationTicket AdmitWorker(const std::stop_token& stop, size_t words, bool driver);
 	struct ManifestStateDeleter {
 		void operator()(ManifestState* state) const;
 	};

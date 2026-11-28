@@ -40,6 +40,7 @@ namespace Libs::Graphics {
 struct PipelineCacheTestAccess {
 	using Clock = std::chrono::steady_clock;
 
+	static auto HoldCompilationSlot(PipelineCache& cache) { return cache.AdmitWorker({}, 0, false); }
 	static bool AsyncWorkersRunning(const PipelineCache& cache) { return !cache.m_async_threads.empty(); }
 	static void QueueComputeAhead(PipelineCache& cache, const ShaderModule& module) {
 		cache.CreateComputePipelineAhead(module);
@@ -47,10 +48,6 @@ struct PipelineCacheTestAccess {
 	static void MarkGraphicsPending(PipelineCache& cache, const GraphicsPipelineKey& key) {
 		std::lock_guard lock(cache.m_async_mutex);
 		cache.m_async_pending_graphics.insert(key);
-	}
-	static void MarkComputePending(PipelineCache& cache, uint64_t module_id) {
-		std::lock_guard lock(cache.m_async_mutex);
-		cache.m_async_pending_compute.insert(module_id);
 	}
 	static void FinishGraphics(PipelineCache& cache, const GraphicsPipelineKey& key) {
 		{
@@ -226,7 +223,15 @@ void ComputeWaitWokenByWorker(PipelineCache& cache, GraphicContext& graphics, co
 		std::lock_guard lock(g_gate.mutex);
 		entered = g_gate.entered;
 	}
+	auto held = Access::HoldCompilationSlot(cache);
+	Require(static_cast<bool>(held), "could not reserve the compilation slot");
 	Access::QueueComputeAhead(cache, module.module);
+	{
+		std::unique_lock lock(g_gate.mutex);
+		Check(!g_gate.changed.wait_for(lock, Asleep, [&] { return g_gate.entered > entered; }),
+		      "a queued compute pipeline bypassed the occupied compilation slot");
+	}
+	held.Reset();
 	{
 		std::unique_lock lock(g_gate.mutex);
 		Require(g_gate.changed.wait_for(lock, Woken, [&] { return g_gate.entered > entered; }),
@@ -270,7 +275,8 @@ void StopWakesEveryWait(PipelineCache& cache, GraphicContext& graphics, const st
 	GraphicsPipelineKey key {};
 	key.stage_ids = {0x9b0001u, 0, 0, 0x9b0002u};
 	Access::MarkGraphicsPending(cache, key);
-	Access::MarkComputePending(cache, module.module.id);
+	auto held = Access::HoldCompilationSlot(cache);
+	Access::QueueComputeAhead(cache, module.module);
 	auto graphics_waiter = WaitGraphics(cache, key);
 	auto compute_waiter  = WaitCompute(cache, module);
 	Check(graphics_waiter.wait_for(Asleep) == std::future_status::timeout,
@@ -311,7 +317,7 @@ int Run(GraphicContext& graphics) {
 	VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateComputePipelines = GatedCreateComputePipelines;
 	{
 		NoImageHeap   heap;
-		PipelineCache cache(graphics, &heap);
+		PipelineCache cache(graphics, &heap, {}, true, 1, 1);
 		Require(Access::AsyncWorkersRunning(cache), "the pipeline cache started no async workers");
 		ComputeWaitWokenByWorker(cache, graphics, code);
 		GraphicsWaitWokenAtTheEnd(cache);
