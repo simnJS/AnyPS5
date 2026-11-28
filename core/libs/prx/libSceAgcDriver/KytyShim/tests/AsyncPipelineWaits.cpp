@@ -239,6 +239,7 @@ void ComputeWaitWokenByWorker(PipelineCache& cache, GraphicContext& graphics, co
 	uint32_t entered = 0;
 	{
 		std::lock_guard lock(g_gate.mutex);
+		g_gate.creators.clear();
 		entered = g_gate.entered;
 	}
 	auto held = Access::HoldCompilationSlot(cache);
