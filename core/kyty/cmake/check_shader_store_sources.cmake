@@ -36,6 +36,43 @@ foreach(source IN LISTS candidates)
     endif()
 endforeach()
 
+set(translator "${ROOT}/graphics/shader")
+set(translator_inputs
+    "${ROOT}/graphics/guest_gpu/graphicsRun.h"
+    "${ROOT}/graphics/guest_gpu/hardwareContext.h"
+    "${ROOT}/graphics/host_gpu/regionDefinitions.h"
+    "${ROOT}/graphics/host_gpu/renderer/cache/bufferCache.h"
+    "${ROOT}/graphics/host_gpu/renderer/cache/guestHostView.h"
+    "${ROOT}/graphics/host_gpu/renderer/renderContext.h"
+    "${ROOT}/libs/errno.h")
+foreach(source IN LISTS stamped)
+    cmake_path(IS_PREFIX translator "${source}" NORMALIZE inside)
+    if(NOT inside OR NOT EXISTS "${source}")
+        continue()
+    endif()
+    cmake_path(GET source PARENT_PATH directory)
+    file(STRINGS "${source}" includes REGEX "^[ \t]*#[ \t]*include[ \t]+\"")
+    foreach(line IN LISTS includes)
+        string(REGEX MATCH "\"([^\"]+)\"" unused "${line}")
+        set(header "${CMAKE_MATCH_1}")
+        if(EXISTS "${directory}/${header}")
+            cmake_path(ABSOLUTE_PATH header BASE_DIRECTORY "${directory}" NORMALIZE OUTPUT_VARIABLE dependency)
+        else()
+            cmake_path(ABSOLUTE_PATH header BASE_DIRECTORY "${ROOT}" NORMALIZE OUTPUT_VARIABLE dependency)
+        endif()
+        cmake_path(IS_PREFIX translator "${dependency}" NORMALIZE local)
+        cmake_path(IS_PREFIX ROOT "${dependency}" NORMALIZE project)
+        if(local OR NOT project OR header MATCHES "^common/" OR dependency IN_LIST stamped
+           OR dependency IN_LIST translator_inputs)
+            continue()
+        endif()
+        message(FATAL_ERROR "The shader translator includes ${header}, which the shader store stamp does not cover: "
+                            "pin what the translator reads from it in "
+                            "graphics/shader/recompiler/backend/spirv/spirvEmitterHostLayout.cpp, then allow it in "
+                            "check_shader_store_sources.cmake (${source})")
+    endforeach()
+endforeach()
+
 set(schemas "${pipeline}/pipelineStoreFormat.h" "${pipeline}/pipelineStoreTypes.h")
 while(schemas)
     list(POP_BACK schemas schema)
