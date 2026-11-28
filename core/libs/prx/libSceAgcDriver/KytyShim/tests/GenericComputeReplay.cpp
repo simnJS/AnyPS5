@@ -50,6 +50,10 @@ constexpr std::array<std::uint32_t, 31> LoopWords{
     0x3a14050a, 0x3a16070b, 0x80038103, 0xbf82fff1, 0xe0781000, 0x80010806, 0xbf810000,
 };
 
+constexpr std::array<std::uint32_t, 7> FormattedWords{
+    0x34020082u, 0xe0001000u, 0x80000201u, 0xbf8c0000u, 0xe0701000u, 0x80010201u, 0xbf810000u,
+};
+
 enum Texture : std::uint32_t { FloatA, FloatB, UintC };
 
 struct Dispatch {
@@ -101,7 +105,7 @@ void append(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::initia
     words.insert(words.end(), payload);
 }
 
-std::vector<std::uint32_t> dispatchWords(std::span<const Dispatch> dispatches) {
+std::vector<std::uint32_t> dispatchWords(std::span<const Dispatch> dispatches, int buffer_format) {
     std::vector<std::uint32_t> words;
     for (std::uint32_t row = 0; row < dispatches.size(); ++row) {
         const auto table = Tables + row * 0x200u;
@@ -110,9 +114,15 @@ std::vector<std::uint32_t> dispatchWords(std::span<const Dispatch> dispatches) {
         append(words, 0x76, {0x212, 0u});
         append(words, 0x76, {0x213, 8u << 1u});
         append(words, 0x76, {0x207, Lanes, 1u, 1u});
-        append(words, 0x76,
-               {0x240, static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(table >> 32u),
-                dispatches[row].count, 0u, target[0], target[1], target[2], target[3]});
+        std::array<std::uint32_t, 4> source{
+            static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(table >> 32u), dispatches[row].count, 0u};
+        if (buffer_format >= 0) {
+            const auto address = textureAddress(FloatA);
+            source = buffer_format == 0 ? std::array<std::uint32_t, 4>{} :
+                std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u),
+                    Lanes * 4u, 0xfacu | (static_cast<std::uint32_t>(buffer_format) << 12u) | (1u << 24u) | (3u << 28u)};
+        }
+        append(words, 0x76, {0x240, source[0], source[1], source[2], source[3], target[0], target[1], target[2], target[3]});
         append(words, 0x15, {1u, 1u, 1u, 0x41u});
     }
     return words;
@@ -127,7 +137,7 @@ void write(std::span<std::byte> memory, std::uint64_t address, std::span<const T
     std::memcpy(memory.data() + offset, items.data(), items.size_bytes());
 }
 
-void writeShader(std::span<std::byte> memory) {
+void writeShader(std::span<std::byte> memory, std::span<const std::uint32_t> code) {
     struct ShaderHeader {
         Shader shader{};
         ShaderUserData user{};
@@ -136,19 +146,19 @@ void writeShader(std::span<std::byte> memory) {
     header.shader.file_header = 0x34333231;
     header.shader.version = 0x18;
     header.shader.header_size = sizeof(ShaderHeader);
-    header.shader.shader_size = static_cast<std::uint32_t>(sizeof(LoopWords));
+    header.shader.shader_size = static_cast<std::uint32_t>(code.size_bytes());
     header.shader.code = reinterpret_cast<const void*>(Code);
     header.shader.type = 0;
     header.shader.user_data = reinterpret_cast<ShaderUserData*>(Header + offsetof(ShaderHeader, user));
     write(memory, Header, std::span<const ShaderHeader>(&header, 1));
-    write(memory, Code, std::span<const std::uint32_t>(LoopWords));
+    write(memory, Code, code);
 }
 
-void makeCapture(const std::filesystem::path& path, std::span<const Dispatch> dispatches) {
+void makeCapture(const std::filesystem::path& path, std::span<const Dispatch> dispatches, int buffer_format = -1) {
     using AgcDriver::FrameCallKind;
     auto memory = std::vector<std::byte>(GuestBytes);
-    const auto commands = dispatchWords(dispatches);
-    writeShader(memory);
+    const auto commands = dispatchWords(dispatches, buffer_format);
+    writeShader(memory, buffer_format < 0 ? std::span<const std::uint32_t>(LoopWords) : std::span<const std::uint32_t>(FormattedWords));
     write(memory, Commands, std::span(commands));
     for (std::uint32_t row = 0; row < dispatches.size(); ++row) {
         const std::array<std::uint32_t, 4> sampler{0x12u, 0u, 0u, 0u};
@@ -261,7 +271,7 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
 
 Replay preparedReplay(const std::filesystem::path& tool, const std::filesystem::path& root,
                       const char* scenario, const char* phase, std::span<const Dispatch> dispatches,
-                      bool wait_manifest, bool cold_pipelines = true) {
+                      bool wait_manifest, bool cold_pipelines = true, int buffer_format = -1) {
     const auto directory = root / scenario;
     const auto run = directory / phase;
     std::filesystem::create_directories(directory / "app0" / "sce_sys");
@@ -271,7 +281,7 @@ Replay preparedReplay(const std::filesystem::path& tool, const std::filesystem::
         param << "{\"titleId\":\"PREP00001\",\"appVersion\":\"01.00\"}\n";
         if (!param) throw std::runtime_error("could not write synthetic title metadata");
     }
-    makeCapture(run / "capture", dispatches);
+    makeCapture(run / "capture", dispatches, buffer_format);
     const auto log = run / "replay.log";
     const auto frames = run / "frames";
     const auto dump = run / "output.bin";
@@ -462,6 +472,20 @@ int prepared(const std::filesystem::path& tool, const std::filesystem::path& roo
             "a pipeline prepared from a recipe with other bounds must be the variant its first dispatch requests", served);
     require(served.log.find("compute-sync") == std::string::npos && served.log.find("compute-wait") == std::string::npos,
             "a pipeline prepared from a recipe with other bounds must not wait on its first dispatch", served);
+
+    const auto formatted_control = preparedReplay(tool, root, "format-control", "run", only_a, false, true, Format8888);
+    const auto integer_control = preparedReplay(tool, root, "integer-control", "run", only_a, false, true, Format32UInt);
+    require(formatted_control.completed && integer_control.completed && formatted_control.dump != integer_control.dump,
+            "normalized and integer buffer reads must return different values", formatted_control);
+    setVariable("KYTY_GENERIC_COMPUTE_VARIANT", "1");
+    const auto empty = preparedReplay(tool, root, "formats", "empty", only_a, false, true, 0);
+    require(empty.completed && empty.dump.substr(0, Lanes * 4u) == std::string(Lanes * 4u, '\0'),
+            "the empty formatted buffer must read zero for each lane", empty);
+    const auto normalized = preparedReplay(tool, root, "formats", "normalized", only_a, true, true, Format8888);
+    const auto integer = preparedReplay(tool, root, "formats", "integer", only_a, true, true, Format32UInt);
+    require(normalized.completed && normalized.dump == formatted_control.dump && count(normalized.log, ServeLine) != 0 &&
+                integer.completed && integer.dump == integer_control.dump && count(integer.log, ServeLine) != 0,
+            "the fallback recorded with an empty buffer must serve both populated formats", normalized);
 
     if (std::getenv("APS5_REPLAY_KEEP_ARTIFACTS") == nullptr) {
         std::filesystem::remove_all(root);

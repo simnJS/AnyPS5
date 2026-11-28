@@ -2142,7 +2142,9 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 }
 
 bool UsesRuntimeFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
-	if (state.program.generic_graphics)
+	if (state.program.generic_graphics ||
+	    (mem.kind == IR::ResourceKind::Buffer && mem.resource < state.program.info.buffers.size() &&
+	     (state.program.info.buffers[mem.resource].packed_stride & IR::RuntimeBufferFormat) != 0u))
 		return mem.kind == IR::ResourceKind::Buffer && mem.formatted && !mem.typed;
 	return state.program.table_mode && mem.kind == IR::ResourceKind::Buffer && mem.formatted && !mem.typed &&
 	       mem.resource < 32u && ((state.program.table_plan.runtime_formats >> mem.resource) & 1u) != 0 &&
@@ -2153,7 +2155,7 @@ uint32_t LoadRuntimeFormatted(ValueEmitContext& ctx, const IR::Inst& inst, const
                               const MemoryResourceAccess& resource, uint32_t components) {
 	auto&      state = ctx.state;
 	const auto u32   = TypeU32(state);
-	const auto word  = state.program.generic_graphics
+	const auto word  = !state.program.table_mode
 	    ? EmitShaderDataDwordLoad(state, state.program.bindings.FormatDword() +
 	                                   state.program.info.buffers[mem.resource].descriptor_index)
 	    : state.table_buffer_words[mem.resource];
@@ -2532,7 +2534,7 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address, uint32_t extent) {
 
 void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
-	if (state.program.generic_graphics && std::ranges::any_of(state.program.info.buffers, &IR::BufferResource::formatted)) {
+	if (state.program.bindings.format_count != 0u) {
 		DefineIndirectBufferFormats(ctx);
 	}
 	if (state.program.table_mode && state.indirect_format_function == 0u) {

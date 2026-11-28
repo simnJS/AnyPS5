@@ -376,9 +376,22 @@ void RebindTableAndHeap(bool on) {
 	if (!table.ok || !native_heap.ok) return;
 	Materialized fallback;
 	fallback.ok = IR::MaterializeFallbackResources(plan, runtime, fallback.snapshot, fallback.specialization);
-	Check(fallback.ok && fallback.specialization == table.specialization &&
+	auto dynamic_table = table.specialization;
+	IR::ReadStridesAtRunTime(plan, dynamic_table);
+	dynamic_table.images[0].table_mapping_offset = IR::RuntimeTableMapping;
+	Check(fallback.ok && fallback.specialization == dynamic_table &&
+	          !fallback.snapshot.graphics_image_banks.empty() &&
+	          fallback.snapshot.graphics_image_banks[0] == table.specialization.images[0].table_mapping_offset &&
 	          fallback.snapshot.flattened_srt == table.snapshot.flattened_srt && fallback.snapshot.image_tables.size() == 1,
 	      "a materialization that avoids the heap takes the table form while the heap accepts the view");
+	auto shifted = table;
+	shifted.specialization.images[0].table_mapping_offset += 4;
+	shifted.snapshot.flattened_srt.insert(shifted.snapshot.flattened_srt.begin(), 4, 0);
+	IR::ResourceSnapshot bound;
+	Check(IR::AlignResources(plan, shifted.snapshot, shifted.specialization, dynamic_table, &bound) == on &&
+	          (!on || (bound.graphics_image_banks.at(0) == shifted.specialization.images[0].table_mapping_offset &&
+	                   bound.flattened_srt == shifted.snapshot.flattened_srt)),
+	      "the prepared table binds the current mapping offset");
 	Check(table.snapshot.image_tables.size() == 1 && native_heap.snapshot.image_tables.empty(),
 	      "table and heap use distinct address representations");
 	if (table.snapshot.image_tables.size() != 1 || !native_heap.snapshot.image_tables.empty()) return;

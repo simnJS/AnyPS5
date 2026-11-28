@@ -299,10 +299,11 @@ uint32_t ImageTableSlot(EmitterState& state, uint32_t resource, uint32_t key) {
 	};
 	const auto entry    = Binary(state, spv::OpBitwiseAnd, TypeU32(state), key,
 	                             ConstantU32(state, image.table_entry_mask));
-	const auto base = state.program.generic_graphics
+	const bool dynamic_mapping = state.program.generic_graphics || image.table_mapping_offset == IR::RuntimeTableMapping;
+	const auto base = dynamic_mapping
 	                      ? EmitShaderDataDwordLoad(state, state.program.bindings.ImageBankDword() + resource)
 	                      : ConstantU32(state, image.table_mapping_offset);
-	const auto first = state.program.generic_graphics ? EmitAddU32(state, base, ConstantU32(state, 1u))
+	const auto first = dynamic_mapping ? EmitAddU32(state, base, ConstantU32(state, 1u))
 	                                                 : ConstantU32(state, image.table_mapping_offset + 1u);
 	const auto count    = LoadTableMapping(base);
 	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), entry, count);

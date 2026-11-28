@@ -83,7 +83,7 @@ struct Request {
 	IR::ResourceSpecialization specialization;
 };
 
-Request Dispatch(const IR::ResourcePlan& plan, const Sharp& source, bool runtime_stride) {
+Request Dispatch(const IR::ResourcePlan& plan, const Sharp& source, bool runtime_stride, bool fallback = false) {
 	const auto               target = MakeSharp(TargetAddress, Records * 4u, 3);
 	std::array<uint32_t, 16> user_data {};
 	std::copy(source.begin(), source.end(), user_data.begin());
@@ -91,7 +91,8 @@ Request Dispatch(const IR::ResourcePlan& plan, const Sharp& source, bool runtime
 	const IR::SrtRuntime runtime {.user_data = user_data, .runtime_stride = runtime_stride};
 	IR::ResourceSnapshot snapshot;
 	Request              result;
-	result.ok = IR::MaterializeResources(plan, runtime, snapshot, result.specialization);
+	result.ok = fallback ? IR::MaterializeFallbackResources(plan, runtime, snapshot, result.specialization)
+	                     : IR::MaterializeResources(plan, runtime, snapshot, result.specialization);
 	return result;
 }
 
@@ -316,6 +317,21 @@ void CandidateOrder(const Plan& program) {
 		Candidates narrow;
 		const IR::SrtRuntime no_heap {.read_specialization_memory = ReadTable};
 		narrow.ok = IR::MaterializeResources(plan, no_heap, narrow.snapshot, narrow.specialization);
+		auto mixed_target = first.specialization;
+		mixed_target.images[1].dimension = Recompiler::Decoder::ImageDimension::Dim3D;
+		IR::ResourceSnapshot mixed_slots;
+		const bool mixed_ok = IR::RebindComputeImages(plan, no_heap, narrow.snapshot, narrow.specialization,
+		                                               mixed_target, mixed_slots);
+		Check(narrow.ok && mixed_ok, "a prepared table with spare typed slots serves fewer live view classes");
+		if (mixed_ok) {
+			Check(mixed_slots.images[1].dwords[0] == 0u, "an unused 3D slot remains unbound for 2D candidates");
+			const auto mapping = mixed_target.images[0].indirect_mapping_offset + 1u;
+			for (uint32_t i = 0; i < TableEntries; ++i) {
+				const auto ordinal = mixed_slots.flattened_srt[mapping + i * 8u];
+				Check(ordinal < mixed_slots.images.size() && mixed_slots.images[ordinal].dwords[0] == few[i],
+				      "the live selector maps to its texture inside the prepared view class");
+			}
+		}
 		std::array<uint32_t, TableEntries> every {};
 		for (uint32_t entry = 0; entry < TableEntries; ++entry) every[entry] = TextureAddress(entry);
 		FillTable(every, plain);
@@ -481,6 +497,9 @@ int main() {
 		const auto request = Dispatch(program.plan, entry.sharp, true);
 		Check(request.ok, std::string(entry.name) + ": the dispatch materializes");
 		if (!request.ok) continue;
+		const auto fallback = Dispatch(program.plan, entry.sharp, false, true);
+		Check(fallback.ok && fallback.specialization == request.specialization,
+		      std::string(entry.name) + ": the fallback covers a dispatch with baked strides");
 		const auto stride = request.specialization.buffers[slot].packed_stride;
 		Check(IR::HasRuntimeStride(stride) && (stride & BoundsBits) == 0u,
 		      std::string(entry.name) + ": the bounds stay out of the key");

@@ -13,6 +13,7 @@
 #include <iostream>
 #include <iterator>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -53,6 +54,11 @@ constexpr std::array<std::uint32_t, 16> PixelWords{
     EndProgram, EndProgram, EndProgram, EndProgram, EndProgram, EndProgram, EndProgram, EndProgram,
 };
 
+constexpr std::array<std::uint32_t, 16> MixedPixelWords{
+    0x7e020290, 0xe0301000, 0x80000201, 0xe0301000, 0x80010301, 0xbf8c0000, 0xf800180f, 0x02020302,
+    EndProgram, EndProgram, EndProgram, EndProgram, EndProgram, EndProgram, EndProgram, EndProgram,
+};
+
 enum class Bounds : std::uint32_t { Structured = 0, ByCount = 1 };
 
 std::uint32_t low(std::uint64_t address) {
@@ -72,7 +78,7 @@ void append(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::initia
     words.insert(words.end(), payload);
 }
 
-std::vector<std::uint32_t> drawWords(Bounds bounds) {
+std::vector<std::uint32_t> drawWords(Bounds bounds, bool mixed) {
     std::vector<std::uint32_t> words;
     const std::pair<std::uint32_t, std::uint32_t> context[]{
         {0x2d5, 0x2000},
@@ -110,6 +116,12 @@ std::vector<std::uint32_t> drawWords(Bounds bounds) {
     user[1] = static_cast<std::uint32_t>((Records >> 32u) & 0xffffu) | (RecordBytes << 16u);
     user[2] = RecordCount;
     user[3] = SwizzleXyzw | (Format32UInt << 12u) | (1u << 24u) | (static_cast<std::uint32_t>(bounds) << 28u);
+    if (mixed) {
+        user[4] = user[0];
+        user[5] = (Records >> 32u) & 0xffffu;
+        user[6] = RecordCount;
+        user[7] = SwizzleXyzw | (Format32UInt << 12u) | (1u << 24u);
+    }
     append(words, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) append(words, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) append(words, 0x76, {offset, value});
@@ -151,12 +163,12 @@ void writeShader(std::span<std::byte> memory, std::uint64_t address, std::uint64
     write(memory, code, words);
 }
 
-void makeCapture(const std::filesystem::path& path, Bounds bounds) {
+void makeCapture(const std::filesystem::path& path, Bounds bounds, bool mixed) {
     using AgcDriver::FrameCallKind;
     auto memory = std::vector<std::byte>(GuestBytes);
-    const auto commands = drawWords(bounds);
+    const auto commands = drawWords(bounds, mixed);
     writeShader(memory, VertexHeader, VertexCode, 2, VertexWords);
-    writeShader(memory, PixelHeader, PixelCode, 1, PixelWords);
+    writeShader(memory, PixelHeader, PixelCode, 1, mixed ? MixedPixelWords : PixelWords);
     write(memory, Commands, std::span(commands));
     std::vector<std::uint32_t> depth((5 * Block) / sizeof(std::uint32_t), bits(0.75f));
     write(memory, Depth, std::span<const std::uint32_t>(depth));
@@ -195,6 +207,29 @@ std::string readFile(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
 }
 
+bool hasMixedPipeline(const std::filesystem::path& manifest) {
+    std::istringstream lines(readFile(manifest));
+    std::string generic_vertex;
+    std::string exact_pixel;
+    std::vector<std::string> pipelines;
+    for (std::string line; std::getline(lines, line);) {
+        std::istringstream fields(line);
+        std::string kind, id, stage;
+        fields >> kind >> id >> stage;
+        if (kind == "P") pipelines.push_back(" " + line + " ");
+        if (kind != "M") continue;
+        const bool generic = (" " + line + " ").find(" gg ") != std::string::npos;
+        if (stage == "vs" && generic) generic_vertex = id;
+        if (stage == "ps" && !generic) exact_pixel = id;
+    }
+    if (generic_vertex.empty() || exact_pixel.empty()) return false;
+    for (const auto& pipeline : pipelines) {
+        if (pipeline.find(" v=" + generic_vertex + " ") != std::string::npos &&
+            pipeline.find(" p=" + exact_pixel + " ") != std::string::npos) return true;
+    }
+    return false;
+}
+
 std::string quote(const std::filesystem::path& path) {
     return "\"" + path.string() + "\"";
 }
@@ -214,7 +249,7 @@ struct Replay {
 };
 
 Replay replay(const std::filesystem::path& tool, const std::filesystem::path& root, const char* scenario,
-              const char* phase, Bounds bounds, bool wait_manifest) {
+              const char* phase, Bounds bounds, bool wait_manifest, bool mixed = false) {
     const auto directory = root / scenario;
     const auto run = directory / phase;
     std::filesystem::create_directories(directory / "app0" / "sce_sys");
@@ -224,7 +259,7 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
         param << "{\"titleId\":\"GGFX00001\",\"appVersion\":\"01.00\"}\n";
         if (!param) throw std::runtime_error("could not write synthetic title metadata");
     }
-    makeCapture(run / "capture", bounds);
+    makeCapture(run / "capture", bounds, mixed);
     const auto log = run / "replay.log";
     const auto frames = run / "frames";
     const auto command = quote(tool) + " " + quote(run / "capture") + " --strict --no-synthesize --repeat 1 --cold-pipelines" +
@@ -297,6 +332,31 @@ int main(int argc, char** argv) {
         require(first_draw != std::string::npos && served.log.find(BuildLine, first_draw) == std::string::npos &&
                     served.log.find(PipelineLine) == std::string::npos,
                 "the generic pipeline must draw without building a stage or a pipeline at the first draw", served);
+
+        const auto mixed_seed = replay(tool, root, "mixed", "seed", Bounds::ByCount, false, true);
+        require(mixed_seed.completed, "the mixed-stage seed must draw", mixed_seed);
+        const auto mixed_control = replay(tool, root, "mixed-control", "run", Bounds::Structured, false, true);
+        require(mixed_control.completed && mixed_control.frame != mixed_seed.frame,
+                "the mixed-stage control must observe the change in bounds", mixed_control);
+        const auto mixed_manifest = root / "mixed" / "_PipelineCache" / manifest.filename();
+        auto recipe = readFile(mixed_manifest);
+        const auto stride = recipe.find("st:16383");
+        require(stride != std::string::npos, "the exact pixel recipe must read the direct buffer bounds at run time", mixed_seed);
+        recipe.replace(stride, std::string_view("st:16383").size(), "st:16");
+        std::ofstream(mixed_manifest, std::ios::binary | std::ios::trunc) << recipe;
+        const auto mixed = replay(tool, root, "mixed", "first-use", Bounds::Structured, true, true);
+        const auto mixed_draw = mixed.log.find(FirstDraw);
+        require(mixed.completed && mixed.frame == mixed_control.frame && mixed_draw != std::string::npos &&
+                    mixed.log.find(BuildLine, mixed_draw) == std::string::npos && mixed.log.find(PipelineLine) == std::string::npos,
+                "a legacy exact recipe must serve live bounds when the generic pixel module cannot bind", mixed);
+
+        require(hasMixedPipeline(mixed_manifest),
+                "the first draw must record the missing generic vertex and exact pixel combination", mixed);
+        const auto warmed = replay(tool, root, "mixed", "warmed", Bounds::Structured, true, true);
+        const auto warmed_draw = warmed.log.find(FirstDraw);
+        require(warmed.completed && warmed.frame == mixed_control.frame && warmed_draw != std::string::npos &&
+                    warmed.log.find(BuildLine, warmed_draw) == std::string::npos && warmed.log.find(PipelineLine) == std::string::npos,
+                "the recorded mixed pipeline must replay the reference frame without compiling", warmed);
 
         if (std::getenv("APS5_REPLAY_KEEP_ARTIFACTS") == nullptr) {
             std::filesystem::remove_all(root);

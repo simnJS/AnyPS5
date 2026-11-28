@@ -982,8 +982,9 @@ private:
 	                            const ModuleMap& modules);
 
 	std::unordered_set<uint64_t> m_baked_stride_programs;
-	[[nodiscard]] bool RuntimeStride(uint64_t program_hash) const {
-		return !m_baked_stride_programs.contains(program_hash);
+	[[nodiscard]] bool RuntimeStride(ShaderType stage, uint64_t program_hash) const {
+		return stage == ShaderType::Vertex || stage == ShaderType::Mesh || stage == ShaderType::Pixel ||
+		       (stage == ShaderType::Compute && !m_baked_stride_programs.contains(program_hash));
 	}
 	void DecideRuntimeStrides(std::span<PipelineManifest*> manifests);
 
@@ -1016,12 +1017,14 @@ private:
 	void RecordModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
 	                  std::span<const uint32_t> code, uint32_t push_data_cursor,
 	                  const ShaderModule& module);
+	void NoteMissingGraphicsPipeline(const GraphicsPipelineKey& key, const HW::Shader& shaders);
 	bool RecordPipeline(const GraphicsPipelineKey& key, const ManifestFloatModes& float_modes);
 	void CaptureQueuedPipeline(const GraphicsPipelineKey& key, const HW::Shader& shaders);
 	void NoteFloatModes(Pipeline& pipeline, const GraphicsPipelineKey& key, const HW::Shader& shaders);
 	void RecordLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
 	static void OnShaderMapped(void* userdata, uint64_t hash, std::span<const uint32_t> code);
 	bool ProvideCode(uint64_t hash, std::span<const uint32_t> code, bool from_guest);
+	void PrepareSamplerCandidatePlan(uint32_t index, std::span<const uint32_t> code, const std::stop_token& stop);
 	void CodeStoreThread(const std::stop_token& stop);
 	bool ScanGameFiles(const std::stop_token&                                          stop,
 	                   const std::function<void(uint64_t, std::span<const uint32_t>)>& append);

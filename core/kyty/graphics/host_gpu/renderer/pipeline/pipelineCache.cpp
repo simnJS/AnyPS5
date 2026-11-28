@@ -1458,7 +1458,7 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 		if (runtime != nullptr)
 			return ShaderRecompiler::IR::RebindComputeImages(plan, *runtime, resources, specialization,
 			                                                 candidate.specialization, resources);
-		return rematerialize ? ShaderRecompiler::IR::CanRebindComputeImages(plan, specialization, candidate.specialization)
+		return rematerialize ? ShaderRecompiler::IR::CanRebindComputeImages(plan, specialization, candidate.specialization, &resources)
 		                     : ShaderRecompiler::IR::AlignResources(plan, resources, specialization, candidate.specialization, nullptr);
 	};
 	if (program.served_module < program.modules.size() && compatible(program.modules[program.served_module])) {
@@ -1602,7 +1602,10 @@ bool PipelineCache::FallbackComputeVariant(const ProgramKey& key, Program& progr
                                                                    ShaderRecompiler::IR::ResourceSnapshot>>* natural) {
 	using Image = ShaderRecompiler::IR::ResourceSpecialization::Image;
 	if (program.call_source != nullptr || !ShaderRecompiler::IR::GenericComputeVariants() ||
-	    std::ranges::none_of(program.specialization.images, &Image::heap)) {
+	    (std::ranges::none_of(program.specialization.images, &Image::heap) &&
+	     std::ranges::none_of(program.resource_plan.info.buffers, [](const auto& buffer) {
+		     return buffer.formatted && !buffer.written && !buffer.atomic && !buffer.scalar;
+	     }))) {
 		return true;
 	}
 	if (natural == nullptr) {
@@ -1686,8 +1689,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
-		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
+	runtime.runtime_stride = RuntimeStride(options.stage, params.hash);
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
@@ -2911,8 +2914,8 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
-		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
+	runtime.runtime_stride = RuntimeStride(key.stage, params.hash);
 	t_ahead_unread_load = false;
 #if defined(ANYPS5_KYTY)
 	runtime.defer_flat_loads  = true;
@@ -3159,8 +3162,8 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				runtime.workgroup_counts      = input_info.workgroup_counts;
 				runtime.indirect_args_address = input_info.indirect_args_address;
-				runtime.runtime_stride        = RuntimeStride(job.params.hash);
 			}
+			runtime.runtime_stride = RuntimeStride(options.stage, job.params.hash);
 			if (!ShaderRecompiler::IR::MaterializeResources(*plan, runtime, resources,
 			                                                *specialization)) {
 				specialization.reset();
@@ -4448,7 +4451,11 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				NoteFloatModes(ready, key, command.GetShaders());
 				return &ready;
 			}
-			if (ready_only) return nullptr;
+			if (ready_only) {
+				lock.unlock();
+				NoteMissingGraphicsPipeline(key, command.GetShaders());
+				return nullptr;
+			}
 			if (m_async_stopping) {
 				break;
 			}

@@ -2174,8 +2174,23 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			              static_cast<unsigned long long>(state.ps_active ? state.ps_input_info.stage.module->id : 0));
 			return refuse(why, "no resource plan");
 		}
-		const auto portable = [](const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t mask) {
-			auto result = specialization;
+		const auto has_snapshot = [](const ShaderStageRuntime& stage) {
+			return stage.resources != nullptr && stage.module->specialization.buffers.size() == stage.resources->buffers.size();
+		};
+		if (!has_snapshot(state.vertex_info[0].stage) || (state.ps_active && !has_snapshot(state.ps_input_info.stage)))
+			return refuse("missing buffer descriptors", "no resource plan");
+		const auto portable = [](const ShaderStageRuntime& stage, uint32_t mask) {
+			using namespace ShaderRecompiler::IR;
+			auto result = stage.module->specialization;
+			for (size_t i = 0; i < result.buffers.size(); ++i) {
+				auto& stride = result.buffers[i].packed_stride;
+				if (!HasRuntimeStride(stride) || (stride & (1u << 14u)) != 0u ||
+				    result.buffers[i].indirect_root != BufferResource::NoIndirectBuffer) continue;
+				ShaderBufferResource descriptor;
+				std::copy_n(stage.resources->buffers[i].dwords.begin(), 4, descriptor.fields);
+				stride = (stride & ~(BufferStrideMask | StructuredBufferBounds | ExactBufferBounds)) |
+				         RuntimeStrideData(descriptor);
+			}
 			for (size_t i = 0; i < result.buffers.size() && i < 32; ++i) {
 				if (((mask >> i) & 1u) == 0) continue;
 				result.buffers[i].descriptor_format  = Prospero::BufferFormat::kInvalid;
@@ -2183,8 +2198,8 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			}
 			return result;
 		};
-		const auto vertex_portable = portable(*vertex_specialization, pair->portable[0]);
-		const auto pixel_portable  = state.ps_active ? portable(*pixel_specialization, pair->portable[1])
+		const auto vertex_portable = portable(state.vertex_info[0].stage, pair->portable[0]);
+		const auto pixel_portable  = state.ps_active ? portable(state.ps_input_info.stage, pair->portable[1])
 		                                             : ShaderRecompiler::IR::ResourceSpecialization {};
 		using ShaderRecompiler::IR::PushData;
 		auto pixel_cursor = PushData::GraphicsStageCursor(ShaderType::Pixel);
