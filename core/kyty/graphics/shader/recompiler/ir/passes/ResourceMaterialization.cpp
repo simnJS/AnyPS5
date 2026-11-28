@@ -3129,7 +3129,8 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
                                          [[maybe_unused]] std::span<const ResourceSpecialization::Image> views,
                                          [[maybe_unused]] const ResourceSnapshot* original = nullptr,
                                          [[maybe_unused]] const ResourceSpecialization* natural = nullptr,
-                                         const ResourceSpecialization* fixed_layout = nullptr) {
+                                         const ResourceSpecialization* fixed_layout = nullptr,
+                                         [[maybe_unused]] uint32_t* unavailable_heap = nullptr) {
 	t_indirect_buffer_failure = false;
 	t_indirect_sampler_failure = false;
 	t_record_blocks.clear();
@@ -3451,11 +3452,15 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 		    natural->images[i].table < original->image_tables.size()) {
 			captured = original->image_tables[natural->images[i].table].get();
 		}
-		if ((use_table || !MaterializeImageTableHeap(program, indirect, table, i, observed, snapshot, specialization, captured)) &&
-		    !MaterializeImageTable(program, indirect, table, i, observed, snapshot, specialization,
-		                           previous_tables, table_mappings)) {
-			return false;
+		if (!use_table) {
+			if (MaterializeImageTableHeap(program, indirect, table, i, observed, snapshot, specialization, captured)) continue;
+			if (unavailable_heap != nullptr && i < views.size() && views[i].heap) {
+				*unavailable_heap = i;
+				return false;
+			}
 		}
+		if (!MaterializeImageTable(program, indirect, table, i, observed, snapshot, specialization,
+		                           previous_tables, table_mappings)) return false;
 	}
 #endif
 	FlushRecordBlocks(snapshot.flattened_srt);
@@ -4379,6 +4384,7 @@ const char* ServeRefusalName(ServeRefusal::Step step) {
 		case ServeRefusal::Step::ImageAddressing: return "image-addressing";
 		case ServeRefusal::Step::TableConversion: return "table-conversion";
 		case ServeRefusal::Step::HeapKinds: return "heap-kinds";
+		case ServeRefusal::Step::HeapUnavailable: return "heap-view-unavailable";
 		case ServeRefusal::Step::SameAddressing: return "same-addressing";
 		case ServeRefusal::Step::TableView: return "table-view";
 		case ServeRefusal::Step::TableViewCount: return "table-view-count";
@@ -4591,7 +4597,10 @@ bool RebindComputeImages(const ResourcePlan& program, const SrtRuntime& runtime,
 	if (!CanRebindComputeImages(program, specialization, target, &snapshot)) return false;
 	ResourceSnapshot rebound;
 	ResourceSpecialization shape;
-	if (!MaterializeResourcesForViews(program, runtime, rebound, shape, target.images, &snapshot, &specialization)) {
+	uint32_t unavailable_heap = UINT32_MAX;
+	if (!MaterializeResourcesForViews(program, runtime, rebound, shape, target.images, &snapshot, &specialization,
+	                                  nullptr, &unavailable_heap)) {
+		if (unavailable_heap != UINT32_MAX) return RefuseServe(ServeRefusal::Step::HeapUnavailable, unavailable_heap);
 		return RefuseServe(ServeRefusal::Step::Rematerialize);
 	}
 	t_serve_rebound = true;

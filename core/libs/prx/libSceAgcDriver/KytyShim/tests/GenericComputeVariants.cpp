@@ -438,10 +438,17 @@ void RebindTableAndHeap(bool on) {
 	Check(!IR::CanRebindComputeImages(plan, native_heap.specialization, invalid), "table bridge rejects different masks");
 	Check(refused(Step::TableConversion, 0), "a table with another mask is named as the refusal");
 	heap.allow_rebind = false;
-	Check(!IR::RebindComputeImages(plan, runtime, table.snapshot, table.specialization, native_heap.specialization, rebound),
+	uint32_t table_reads = 0;
+	auto refused_runtime = runtime;
+	refused_runtime.userdata = &table_reads;
+	refused_runtime.read_specialization_memory = [](void* data, uint64_t address, std::span<uint32_t> words) {
+		if (address == TableAddress) ++*static_cast<uint32_t*>(data);
+		return ReadMemory(nullptr, address, words);
+	};
+	Check(!IR::RebindComputeImages(plan, refused_runtime, table.snapshot, table.specialization, native_heap.specialization, rebound),
 	      "heap allocation rejection never installs an incompatible snapshot");
-	Check(refused(Step::TableViewCount, UINT32_MAX, true),
-	      "a heap that refuses the rebound views leaves a table of another view count, named as the refusal after the rebind");
+	Check(table_reads == 0, "an unavailable heap candidate does not rebuild the local descriptor table");
+	Check(refused(Step::HeapUnavailable, 0), "a failed heap acquisition names the root that needs a heap view");
 	Check(!IR::AlignResources(plan, table.snapshot, table.specialization, native_heap.specialization, nullptr),
 	      "a table dispatch does not align with a heap variant of another view count");
 	Check(refused(Step::TableViewCount), "a table dispatch with another view count is named as the refusal");

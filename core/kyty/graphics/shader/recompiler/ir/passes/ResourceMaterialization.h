@@ -128,6 +128,7 @@ struct ServeRefusal {
 		ImageAddressing,
 		TableConversion,
 		HeapKinds,
+		HeapUnavailable,
 		SameAddressing,
 		TableView,
 		TableViewCount,
