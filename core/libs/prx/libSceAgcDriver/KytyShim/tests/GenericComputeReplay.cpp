@@ -41,6 +41,7 @@ constexpr std::string_view BuildLine = "[kyty-variant] build stage=CS";
 constexpr std::string_view ServeLine = "[kyty-variant] serve stage=CS";
 constexpr std::string_view WidenLine = "[kyty-variant] widen stage=CS";
 constexpr std::string_view ReadyLine = "[kyty-variant] ready-pipeline stage=CS module=";
+constexpr std::string_view UnservedLine = "[kyty-gpl] unserved compute 0x";
 
 constexpr std::array<std::uint32_t, 31> LoopWords{
     0xf4080600, 0xfa000100, 0x7e080d00, 0x060808f0, 0x100808ff, 0x3c800000, 0x7e0a02f0, 0x340c0084,
@@ -422,6 +423,20 @@ int prepared(const std::filesystem::path& tool, const std::filesystem::path& roo
                 control.log.find("\"dispatches\":1.0") != std::string::npos &&
                 control.log.find("\"unfinished\":0") != std::string::npos,
             "omitting the second variant did not expose its first-use pipeline miss", control);
+
+    const auto refused_seed = preparedReplay(tool, root, "refused", "seed", only_a, false);
+    require(refused_seed.completed && count(refused_seed.log, UnservedLine) == 0,
+            "the seed of the refused variant did not complete", refused_seed);
+    setVariable("KYTY_GENERIC_COMPUTE_VARIANT", "1");
+    const auto refused = preparedReplay(tool, root, "refused", "missing", only_b, true);
+    setVariable("KYTY_GENERIC_COMPUTE_VARIANT", "0");
+    require(refused.completed && refused.dump.substr(0, RowBytes) == seed.dump.substr(RowBytes, RowBytes) &&
+                readyPipelineIds(refused.log).empty() && count(refused.log, ServeLine) == 0 &&
+                count(refused.log, "compute-sync") == 1,
+            "a prepared variant of another table must not serve the dispatch", refused);
+    require(count(refused.log, UnservedLine) == 1 &&
+                refused.log.find(" variants 1 align placement rebind same-addressing @") != std::string::npos,
+            "a dispatch that no prepared variant serves must name the rule that refused the closest one", refused);
 
     const std::array<Dispatch, 1> unstructured{{{only_a[0].table, only_a[0].count, 16u, 1u}}};
     auto structured = unstructured;

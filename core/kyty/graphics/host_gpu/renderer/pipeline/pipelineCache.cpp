@@ -1412,17 +1412,32 @@ ComputeServeMiss LastComputeServeMiss() {
 	return t_compute_serve_miss;
 }
 
+std::string DescribeComputeServeMiss(const ComputeServeMiss& miss) {
+	const auto describe = [](const char* route, const ShaderRecompiler::IR::ServeRefusal& refusal) {
+		auto text = fmt::format("{} {}", route, ShaderRecompiler::IR::ServeRefusalName(refusal.step));
+		if (refusal.index != UINT32_MAX) text += fmt::format(" slot {}", refusal.index);
+		if (refusal.rebound) text += " after-rebind";
+		return text;
+	};
+	auto text = describe("align", miss.align);
+	if (miss.rebind.step != ShaderRecompiler::IR::ServeRefusal::Step::None) text += ' ' + describe("rebind", miss.rebind);
+	return text;
+}
+
 size_t PipelineCache::FindReadyComputeVariant(const Program& program,
                                               ShaderRecompiler::IR::ResourceSnapshot& resources,
                                               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                                               uint32_t push_data_cursor, const ShaderModule* exact, bool ahead,
                                               bool rematerialize, const ShaderRecompiler::IR::SrtRuntime* runtime) {
-	if (program.call_source != nullptr || !ShaderRecompiler::IR::GenericComputeVariants()) return SIZE_MAX;
+	using Step = ShaderRecompiler::IR::ServeRefusal::Step;
+	if (program.call_source != nullptr || !ShaderRecompiler::IR::GenericComputeVariants()) {
+		ShaderRecompiler::IR::NoteServeRefusal(program.call_source != nullptr ? Step::Calls : Step::Disabled);
+		return SIZE_MAX;
+	}
 	const auto& plan = program.resource_plan;
 	const auto compatible = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		if (&candidate == exact || candidate.shared_variant || !candidate.module) return false;
-		using Step = ShaderRecompiler::IR::ServeRefusal::Step;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords())) {
 			ShaderRecompiler::IR::NoteServeRefusal(Step::PushLayout);
 			return false;
@@ -1459,30 +1474,32 @@ ShaderModule* PipelineCache::ServeComputeVariant(Program& program, const ShaderR
 	auto best_index = FindReadyComputeVariant(program, program.resources, program.specialization,
 	                                          push_data_cursor, exact, false);
 	const auto& plan = program.resource_plan;
-	const auto unserved = [&]() -> ShaderModule* {
+	using Refusal = ShaderRecompiler::IR::ServeRefusal;
+	const auto closest = [] {
 		auto refusal = ShaderRecompiler::IR::ClosestServeRefusal();
-		if (refusal.step == ShaderRecompiler::IR::ServeRefusal::Step::None) {
-			refusal.step = ShaderRecompiler::IR::ServeRefusal::Step::NoCandidate;
-		}
-		t_compute_serve_miss = {.shader = plan.shader_hash, .refusal = refusal};
+		if (refusal.step == Refusal::Step::None) refusal.step = Refusal::Step::NoCandidate;
+		return refusal;
+	};
+	const auto unserved = [&](const Refusal& align, const Refusal& rebind) -> ShaderModule* {
+		t_compute_serve_miss = {.shader = plan.shader_hash, .align = align, .rebind = rebind};
 		const auto natural = ResourceShapeFingerprint(program.specialization);
-		if (program.unserved_logged != natural) {
-			program.unserved_logged = natural;
-			PipelineCacheLog("[kyty-gpl] unserved compute 0x{:016x} variants {} closest {}{}{} @{}", plan.shader_hash,
-			                 program.modules.size(), ShaderRecompiler::IR::ServeRefusalName(refusal.step),
-			                 refusal.index != UINT32_MAX ? fmt::format(" slot {}", refusal.index) : std::string {},
-			                 refusal.rebound ? " after-rebind" : "",
+		if (program.unserved_logged.size() < 64 && std::ranges::find(program.unserved_logged, natural) == program.unserved_logged.end()) {
+			program.unserved_logged.push_back(natural);
+			PipelineCacheLog("[kyty-gpl] unserved compute 0x{:016x} variants {} {} @{}", plan.shader_hash, program.modules.size(),
+			                 DescribeComputeServeMiss(t_compute_serve_miss),
 			                 std::chrono::steady_clock::now().time_since_epoch().count());
 		}
 		return nullptr;
 	};
 	if (best_index == SIZE_MAX) {
+		const auto align = closest();
+		ShaderRecompiler::IR::ClearServeRefusal();
 		best_index = FindReadyComputeVariant(program, program.resources, program.specialization,
 		                                    push_data_cursor, exact, false, true, &runtime);
-		if (best_index == SIZE_MAX) return unserved();
+		if (best_index == SIZE_MAX) return unserved(align, closest());
 	} else if (!ShaderRecompiler::IR::AlignResources(plan, program.resources, program.specialization,
 	                                                 program.modules[best_index].specialization, &program.resources)) {
-		return unserved();
+		return unserved(closest(), {});
 	}
 	auto* best = &program.modules[best_index];
 	program.served_module = best_index;

@@ -3929,6 +3929,8 @@ ServeRefusal ClosestServeRefusal() {
 const char* ServeRefusalName(ServeRefusal::Step step) {
 	switch (step) {
 		case ServeRefusal::Step::None: return "none";
+		case ServeRefusal::Step::Disabled: return "disabled";
+		case ServeRefusal::Step::Calls: return "calls";
 		case ServeRefusal::Step::NoCandidate: return "no-candidate";
 		case ServeRefusal::Step::PushLayout: return "push-layout";
 		case ServeRefusal::Step::PipelineNotReady: return "pipeline-not-ready";

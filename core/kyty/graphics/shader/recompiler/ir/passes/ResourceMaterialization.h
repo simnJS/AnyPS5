@@ -112,6 +112,8 @@ bool GenericComputeVariants();
 struct ServeRefusal {
 	enum class Step : uint8_t {
 		None,
+		Disabled,
+		Calls,
 		NoCandidate,
 		PushLayout,
 		PipelineNotReady,
