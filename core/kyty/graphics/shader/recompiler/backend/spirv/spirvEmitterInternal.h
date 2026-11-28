@@ -191,6 +191,10 @@ struct EmitterState {
 	struct BufferBounds {
 		uint32_t structured = 0;
 		uint32_t relaxed = 0;
+		struct Records { uint32_t last, available; };
+		std::map<std::pair<uint32_t, uint32_t>, Records> records;
+		std::map<std::pair<uint32_t, uint64_t>, uint32_t> offsets;
+		std::array<uint32_t, 4> elements {};
 	};
 	std::vector<BufferBounds>                       memory_bounds;
 	uint32_t                                         fault_buffer_variable   = 0;

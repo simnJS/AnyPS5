@@ -200,10 +200,12 @@ std::vector<uint32_t> Builder::Build() const {
 	EXIT_IF(m_unpatched_phi_incomings != 0);
 
 	std::vector<uint32_t> module;
+	size_t prologue_words = 0;
+	for (const auto& prologue: m_prologues) prologue_words += prologue.second.size();
 	module.reserve(5u + m_capabilities.size() + m_extensions.size() + m_ext_inst_imports.size() +
 	               m_memory_model.size() + m_entry_points.size() + m_execution_modes.size() +
 	               m_debug.size() + m_annotations.size() + m_declarations.size() +
-	               m_functions.size());
+	               m_functions.size() + prologue_words);
 
 	module.push_back(spv::MagicNumber);
 	module.push_back(m_version);
@@ -220,7 +222,14 @@ std::vector<uint32_t> Builder::Build() const {
 	module.insert(module.end(), m_debug.begin(), m_debug.end());
 	module.insert(module.end(), m_annotations.begin(), m_annotations.end());
 	module.insert(module.end(), m_declarations.begin(), m_declarations.end());
-	module.insert(module.end(), m_functions.begin(), m_functions.end());
+	auto begin = m_functions.begin();
+	for (const auto& [offset, words]: m_prologues) {
+		const auto end = m_functions.begin() + offset;
+		module.insert(module.end(), begin, end);
+		module.insert(module.end(), words.begin(), words.end());
+		begin = end;
+	}
+	module.insert(module.end(), begin, m_functions.end());
 
 	return module;
 }

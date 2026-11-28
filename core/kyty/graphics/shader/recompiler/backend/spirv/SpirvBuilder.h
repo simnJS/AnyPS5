@@ -83,6 +83,18 @@ public:
 	}
 
 	void        AddFunction(std::span<const uint32_t> words);
+	void BeginFunctionPrologue() { m_prologues.emplace_back(m_functions.size(), std::vector<uint32_t>{}); }
+
+	template <typename Fn>
+	auto InFunctionPrologue(Fn emit) {
+		const auto start = m_functions.size();
+		auto result = emit();
+		auto& words = m_prologues.back().second;
+		words.insert(words.end(), m_functions.begin() + start, m_functions.end());
+		m_functions.resize(start);
+		return result;
+	}
+
 	DeferredPhi AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count);
 	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
 
@@ -147,6 +159,7 @@ private:
 	std::vector<uint32_t>                     m_annotations;
 	std::vector<uint32_t>                     m_declarations;
 	std::vector<uint32_t>                     m_functions;
+	std::vector<std::pair<size_t, std::vector<uint32_t>>> m_prologues;
 	std::set<spv::Capability>                 m_required_capabilities;
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;

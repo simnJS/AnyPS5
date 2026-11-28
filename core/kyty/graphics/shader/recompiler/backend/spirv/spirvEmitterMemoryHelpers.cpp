@@ -249,6 +249,7 @@ void EmitMemoryBindings(EmitterState& state) {
 			    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySizeDword() + i + lane);
 		}
 	}
+	state.builder.BeginFunctionPrologue();
 }
 
 constexpr uint32_t FUNCTION_LDS_DWORDS = 1024u;
