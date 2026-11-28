@@ -1616,6 +1616,7 @@ struct LaneMaskWalk {
 	Inst*                 exit_ref  = nullptr;
 	Value                 lanes;
 	Value                 lanes_without;
+	Value                 entry_mask;
 	std::array<Value, 7>  ray {};
 	std::array<Value, 2>  tlas {};
 	uint32_t              cull_mask = 0xff;
@@ -1805,15 +1806,21 @@ std::optional<Value> Hoist(const Program& program, Value value, const Block* hea
 using LinearForm           = std::array<uint32_t, 7>;
 constexpr uint32_t NoDword = 0xffffffffu;
 
+bool SameLoad(const Program& program, Value a, Value b) {
+	const auto first = LoadOf(program, a), second = LoadOf(program, b);
+	return first && second && first->low == second->low && first->high == second->high && first->offset == second->offset &&
+	       first->scalar == second->scalar;
+}
+
 template <typename Record>
 bool Expand(Value value, const std::array<Value, 6>& world, const Record& record, LinearForm& form,
-            uint32_t depth = 0) {
+            const Program* reloads = nullptr, uint32_t depth = 0) {
 	if (depth > 16) return false;
 	const auto canonical = Canonical(value);
 	const auto term      = [&](Value v) -> std::optional<uint32_t> {
 		const auto t = Term(v);
 		for (uint32_t k = 0; k < 6; ++k) {
-			if (t == world[k]) return k < 3 ? k : k + 1;
+			if (t == world[k] || (reloads != nullptr && SameLoad(*reloads, t, world[k]))) return k < 3 ? k : k + 1;
 		}
 		return std::nullopt;
 	};
@@ -1833,14 +1840,14 @@ bool Expand(Value value, const std::array<Value, 6>& world, const Record& record
 	const auto* inst = canonical.TryInstruction();
 	if (inst == nullptr) return false;
 	switch (inst->GetOpcode()) {
-		case ValueOpcode::FPNeg32: return Expand(inst->Arg(0), world, record, form, depth + 1);
+		case ValueOpcode::FPNeg32: return Expand(inst->Arg(0), world, record, form, reloads, depth + 1);
 		case ValueOpcode::FPAdd32:
-			return Expand(inst->Arg(0), world, record, form, depth + 1) &&
-			       Expand(inst->Arg(1), world, record, form, depth + 1);
+			return Expand(inst->Arg(0), world, record, form, reloads, depth + 1) &&
+			       Expand(inst->Arg(1), world, record, form, reloads, depth + 1);
 		case ValueOpcode::FPMul32: return product(inst->Arg(0), inst->Arg(1));
 		case ValueOpcode::FPMad32:
 			return product(inst->Arg(0), inst->Arg(1)) &&
-			       Expand(inst->Arg(2), world, record, form, depth + 1);
+			       Expand(inst->Arg(2), world, record, form, reloads, depth + 1);
 		default: return false;
 	}
 }
@@ -1991,12 +1998,19 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	std::array<Value, 6> world {};
 	for (uint32_t k = 0; k < 6; ++k)
 		world[k] = Term(w.ray[k]);
+	const bool stored = std::ranges::any_of(program.blocks, [](const Block* block) {
+		return std::ranges::any_of(*block, [](const Inst& inst) {
+			const auto op = inst.GetOpcode();
+			return op == ValueOpcode::StoreAddressU8 || op == ValueOpcode::StoreAddressU16 || op == ValueOpcode::StoreAddressU32;
+		});
+	});
+	const Program* reloads = stored ? nullptr : &program;
 	for (uint32_t row = 0; row < 3; ++row) {
 		LinearForm origin, direction;
 		origin.fill(NoDword);
 		direction.fill(NoDword);
-		if (!Expand(intersect->Arg(2 + row), world, record, origin) ||
-		    !Expand(intersect->Arg(5 + row), world, record, direction)) {
+		if (!Expand(intersect->Arg(2 + row), world, record, origin, reloads) ||
+		    !Expand(intersect->Arg(5 + row), world, record, direction, reloads)) {
 			return false;
 		}
 		for (uint32_t c = 0; c < 3; ++c) {
@@ -2376,9 +2390,14 @@ bool MatchLaneMaskWalk(Program& program, Inst& bvh, LaneMaskWalk& w) {
 	const auto* minus   = both ? Producer(both->Arg(1), ValueOpcode::BitwiseNot32) : nullptr;
 	const auto* ballot  = BallotOf(minus != nullptr ? both->Arg(0) : initial);
 	const auto* without = minus != nullptr ? BallotOf(minus->Arg(0)) : nullptr;
-	if (ballot == nullptr || (minus != nullptr && without == nullptr)) return false;
-	w.lanes         = ballot->Arg(0).Resolve();
-	w.lanes_without = without != nullptr ? without->Arg(0).Resolve() : Value {};
+	if (ballot == nullptr || (minus != nullptr && without == nullptr)) {
+		const auto mask = initial.Resolve();
+		if (mask.IsEmpty() || mask.IsImmediate() || mask.GetType() != Type::U32) return false;
+		w.entry_mask = mask;
+	} else {
+		w.lanes         = ballot->Arg(0).Resolve();
+		w.lanes_without = without != nullptr ? without->Arg(0).Resolve() : Value {};
+	}
 
 	const auto first = BlockIndex(program, w.header), last = BlockIndex(program, w.latch);
 	for (auto at = first; at <= last; ++at) {
@@ -2471,7 +2490,11 @@ void RewriteLaneMaskWalk(Program& program, LaneMaskWalk& w, uint32_t site) {
 	const auto key = w.blases.empty() ? flags(0u) : flags(RayQueryKeyLaneLeaf);
 
 	const Inserter entry {w.preheader, w.preheader->end()};
-	if (!w.lanes_without.IsEmpty()) {
+	if (w.lanes.IsEmpty()) {
+		const auto lane = entry(Op::BitwiseAnd32, {entry(Op::LaneId, {}), Value(31u)});
+		const auto bit  = entry(Op::BitwiseAnd32, {entry(Op::ShiftRightLogical32, {w.entry_mask, lane}), Value(1u)});
+		w.lanes         = entry(Op::INotEqual32, {bit, Value(0u)});
+	} else if (!w.lanes_without.IsEmpty()) {
 		w.lanes = entry(Op::LogicalAnd, {w.lanes, entry(Op::LogicalNot, {w.lanes_without})});
 	}
 	std::array<Value, 7> ray {};
