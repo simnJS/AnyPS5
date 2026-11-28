@@ -41,10 +41,15 @@ vk::Result CreateGraphicsPipelineWhole(GraphicContext& graphics, const PipelineC
                                        const std::array<const ShaderModule*, 4>& stages,
                                        vk::PipelineCache cache, vk::PipelineCreateFlags flags,
                                        vk::Pipeline& out);
-vk::Pipeline CreateGraphicsPipelineLibrary(GraphicContext& graphics, vk::PipelineLayout layout,
-                                           bool native_bindings, const GraphicsPipelineKey& key,
-                                           const std::array<const ShaderModule*, 4>& stages,
-                                           PipelineLibraryPart                         part);
+struct BuiltGraphicsPipelineLibrary {
+	vk::Pipeline                    pipeline = nullptr;
+	std::array<vk::ShaderModule, 3> owned_modules {};
+};
+
+BuiltGraphicsPipelineLibrary CreateGraphicsPipelineLibrary(GraphicContext& graphics, vk::PipelineLayout layout,
+                                                           bool native_bindings, const GraphicsPipelineKey& key,
+                                                           const std::array<const ShaderModule*, 4>& stages,
+                                                           PipelineLibraryPart                       part);
 vk::Pipeline LinkGraphicsPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
                                   const GraphicsPipelineKey& key, std::span<const vk::Pipeline> libraries);
 

@@ -37,6 +37,7 @@
 #include <fmt/format.h>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -595,6 +596,14 @@ public:
 	}
 	KYTY_CLASS_NO_COPY(GraphicsPipelineState);
 
+	std::array<vk::ShaderModule, 3> ReleaseGeneratedModules() {
+		return {
+		    std::exchange(task_module, nullptr),
+		    std::exchange(tess_control_shader_module, nullptr),
+		    std::exchange(tess_eval_shader_module, nullptr),
+		};
+	}
+
 	void ApplyLayout(PipelineCache::Pipeline& pipeline) {
 		GraphicsLayoutBindings(m_stages, pipeline.native_bindings).Apply(m_graphics, pipeline);
 	}
@@ -767,13 +776,16 @@ vk::Result CreateGraphicsPipelineWhole(GraphicContext& graphics, const PipelineC
 	return state.Create(cache, layout.pipeline_layout, flags, out);
 }
 
-vk::Pipeline CreateGraphicsPipelineLibrary(GraphicContext& graphics, vk::PipelineLayout layout,
-                                           bool, const GraphicsPipelineKey& key,
-                                           const std::array<const ShaderModule*, 4>& stages,
-                                           PipelineLibraryPart                         part) {
-	GraphicsPipelineState state(graphics, key, stages,
-	                            part == PipelineLibraryPart::PreRasterization);
-	return state.CreateLibrary(layout, part);
+BuiltGraphicsPipelineLibrary CreateGraphicsPipelineLibrary(GraphicContext& graphics, vk::PipelineLayout layout,
+                                                           bool, const GraphicsPipelineKey& key,
+                                                           const std::array<const ShaderModule*, 4>& stages,
+                                                           PipelineLibraryPart                       part) {
+	GraphicsPipelineState state(graphics, key, stages, part == PipelineLibraryPart::PreRasterization);
+	const auto            pipeline = state.CreateLibrary(layout, part);
+	if (!pipeline) {
+		return {};
+	}
+	return {.pipeline = pipeline, .owned_modules = state.ReleaseGeneratedModules()};
 }
 
 vk::Pipeline LinkGraphicsPipeline(GraphicContext& graphics, vk::PipelineLayout layout,

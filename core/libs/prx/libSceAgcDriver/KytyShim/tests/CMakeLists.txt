@@ -614,6 +614,19 @@ if(NOT ANYPS5_KYTY_DLL)
     add_test(NAME kyty_shim_mesh_lds_wgp_pad_draw COMMAND kyty_shim_mesh_lds_wgp_pad_tests draw)
     set_tests_properties(kyty_shim_mesh_lds_wgp_pad_draw PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "kyty_shim_mesh_lds_wgp_pad_draw: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/GplGeneratedModuleLifetime.cpp)
+    if(WIN32)
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/GplGeneratedModuleLifetime.cpp
+                TARGET_DIRECTORY libSceAgcDriver PROPERTIES
+                COMPILE_OPTIONS "-fno-extern-tls-init")
+    endif()
+    add_test_executable(kyty_shim_gpl_generated_module_lifetime_tests ${CMAKE_CURRENT_SOURCE_DIR}/GplGeneratedModuleLifetimeMain.cpp)
+    configure_host_test_executable(kyty_shim_gpl_generated_module_lifetime_tests)
+    target_link_libraries(kyty_shim_gpl_generated_module_lifetime_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_gpl_generated_module_lifetime_draw COMMAND kyty_shim_gpl_generated_module_lifetime_tests)
+    set_tests_properties(kyty_shim_gpl_generated_module_lifetime_draw PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "kyty_shim_gpl_generated_module_lifetime_draw: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 endif()
 
 if(NOT ANYPS5_KYTY_DLL)

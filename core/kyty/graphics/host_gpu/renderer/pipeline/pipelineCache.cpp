@@ -1945,6 +1945,9 @@ PipelineCache::~PipelineCache() {
 		m_graphics.device.destroyPipelineLayout(native.pipeline.pipeline_layout, nullptr);
 		m_graphics.device.destroyDescriptorSetLayout(native.pipeline.descriptor_set_layout, nullptr);
 	}
+#if defined(ANYPS5_KYTY)
+	m_libraries.reset();
+#endif
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
 #if defined(ANYPS5_KYTY)
@@ -1960,9 +1963,6 @@ PipelineCache::~PipelineCache() {
 			}
 		}
 	}
-#if defined(ANYPS5_KYTY)
-	m_libraries.reset();
-#endif
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 }
 

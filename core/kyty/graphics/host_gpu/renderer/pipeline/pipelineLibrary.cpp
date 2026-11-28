@@ -151,14 +151,15 @@ void PlaceBackgroundCompileThread(bool low_priority) {
 struct PipelineLibraries::Library {
 	enum class State : uint8_t { Queued, Building, Ready, Failed };
 
-	PipelineLibraryPart part = PipelineLibraryPart::VertexInput;
-	GraphicsPipelineKey key {};
-	Stages              stages {};
-	bool                native = false;
-	vk::PipelineLayout  layout = nullptr;
-	State               state  = State::Queued;
-	bool                ahead  = false;
-	vk::Pipeline        handle = nullptr;
+	PipelineLibraryPart             part = PipelineLibraryPart::VertexInput;
+	GraphicsPipelineKey             key {};
+	Stages                          stages {};
+	bool                            native = false;
+	vk::PipelineLayout              layout = nullptr;
+	State                           state  = State::Queued;
+	bool                            ahead  = false;
+	vk::Pipeline                    handle = nullptr;
+	std::array<vk::ShaderModule, 3> owned_modules {};
 };
 
 PipelineLibraries::PipelineLibraries(GraphicContext& graphics, vk::PipelineCache driver_cache,
@@ -184,6 +185,9 @@ PipelineLibraries::~PipelineLibraries() {
 	for (auto& part: m_parts) {
 		for (const auto& library: part | std::views::values) {
 			m_graphics.device.destroyPipeline(library->handle, nullptr);
+			for (const auto module: library->owned_modules) {
+				m_graphics.device.destroyShaderModule(module, nullptr);
+			}
 		}
 	}
 	for (const auto& layout: m_layouts | std::views::values) {
@@ -281,15 +285,16 @@ std::shared_ptr<PipelineLibraries::Library> PipelineLibraries::Request(
 
 void PipelineLibraries::Build(const std::shared_ptr<Library>& library) {
 	const auto started = std::chrono::steady_clock::now();
-	const auto handle  = CreateGraphicsPipelineLibrary(m_graphics, library->layout, library->native, library->key,
+	const auto built   = CreateGraphicsPipelineLibrary(m_graphics, library->layout, library->native, library->key,
 	                                                   library->stages, library->part);
 	const auto index   = static_cast<uint32_t>(library->part);
 	m_build_ns[index].fetch_add(Elapsed(started), std::memory_order_relaxed);
 	m_built[index].fetch_add(1, std::memory_order_relaxed);
 	{
 		std::lock_guard lock(m_mutex);
-		library->handle = handle;
-		library->state  = handle ? Library::State::Ready : Library::State::Failed;
+		library->handle        = built.pipeline;
+		library->owned_modules = built.owned_modules;
+		library->state         = built.pipeline ? Library::State::Ready : Library::State::Failed;
 	}
 	m_done.notify_all();
 }
