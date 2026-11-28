@@ -51,6 +51,14 @@ struct RecordBlocks {
 };
 thread_local std::vector<RecordBlocks> t_record_blocks;
 thread_local std::span<const ResourceSpecialization::Image> t_slot_views;
+thread_local bool t_fallback_forms = false;
+
+struct FallbackForms {
+	FallbackForms() { t_fallback_forms = true; }
+	~FallbackForms() { t_fallback_forms = false; }
+	FallbackForms(const FallbackForms&)            = delete;
+	FallbackForms& operator=(const FallbackForms&) = delete;
+};
 
 struct SlotViews {
 	explicit SlotViews(std::span<const ResourceSpecialization::Image> views) { t_slot_views = views; }
@@ -777,7 +785,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		bool heap_list = false;
 		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 			const auto& image = program.info.images[resource_index];
-			heap_list = runtime.image_heap != nullptr && dword_count == 8u &&
+			heap_list = !t_fallback_forms && runtime.image_heap != nullptr && dword_count == 8u &&
 			            image.resource_class == ImageResourceClass::Sampled &&
 			            image.mip_mode != ImageMipMode::Dynamic;
 		}
@@ -996,6 +1004,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 				forced_slots = ForcedSlots(resource_index);
 			}
+			const bool avoid_heap = t_fallback_forms || forced_slots != 0u;
 			const uint64_t step = indexed_pointer ? table.Stride()
 			    : indirect.table_maximum ? indirect.table_stride
 			    : affine ? std::max(uint64_t {1} << std::countr_zero(indirect.table_stride), uint64_t {4})
@@ -1012,7 +1021,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 				const auto& image = program.info.images[resource_index];
 				ImageHeapView view;
-				if (image_heap && forced_slots == 0u && runtime.image_heap != nullptr &&
+				if (image_heap && !avoid_heap && runtime.image_heap != nullptr &&
 				    image.resource_class == ImageResourceClass::Sampled &&
 				    image.mip_mode != ImageMipMode::Dynamic &&
 				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
@@ -1036,7 +1045,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 #if defined(ANYPS5_KYTY)
 			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 				const auto& image = program.info.images[resource_index];
-				if (pointer != nullptr && forced_slots == 0u && dword_count == 8u && runtime.image_heap != nullptr && child_count != 0u &&
+				if (pointer != nullptr && !avoid_heap && dword_count == 8u && runtime.image_heap != nullptr && child_count != 0u &&
 				    image.resource_class == ImageResourceClass::Sampled && image.mip_mode != ImageMipMode::Dynamic &&
 				    count * child_count <= MaxIndirectDescriptorProbes) {
 					std::vector<DescriptorValue> values(count * child_count, DescriptorValue {.dword_count = dword_count});
@@ -3359,7 +3368,7 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 		if (!WalkedDescriptor(program, indirect.table_source, table)) {
 			return false;
 		}
-		const bool use_table = i < views.size() && views[i].table_capacity != 0;
+		const bool use_table = t_fallback_forms || (i < views.size() && views[i].table_capacity != 0);
 		const ImageTableSnapshot* captured = nullptr;
 		if (natural != nullptr && original != nullptr && i < views.size() && views[i].heap &&
 		    natural->images[i].table < original->image_tables.size()) {
@@ -3395,6 +3404,17 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	return MaterializeResourcesForViews(program, runtime, snapshot, specialization, {});
+}
+
+bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                  ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	const bool buffer_failure  = t_indirect_buffer_failure;
+	const bool sampler_failure = t_indirect_sampler_failure;
+	const FallbackForms fallback;
+	const bool          ok     = MaterializeResourcesForViews(program, runtime, snapshot, specialization, {});
+	t_indirect_buffer_failure  = buffer_failure;
+	t_indirect_sampler_failure = sampler_failure;
+	return ok;
 }
 
 bool MaterializeGenericGraphics(const ResourcePlan& plan, const SrtRuntime& runtime, ResourceSnapshot& snapshot,
@@ -4394,7 +4414,13 @@ bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecializ
 		const auto to = Addressing(served);
 		const bool to_slots = from == ImageAddressing::Heap && DenseRoot(served, index);
 		if (!to_slots && ImageViewForm(live) != ImageViewForm(served)) return RefuseServe(ServeRefusal::Step::ImageView, index);
-		if (from == to) continue;
+		if (from == to) {
+			const auto slots = [&](const ResourceSpecialization& shape) {
+				return std::ranges::count(std::span(shape.images).subspan(roots), index, &ResourceSpecialization::Image::indirect_root);
+			};
+			changes_addressing = changes_addressing || (DenseRoot(served, index) && slots(specialization) < slots(target));
+			continue;
+		}
 		const auto* source = Source(program, program.info.images[index].source);
 		if (to_slots) {
 			if (source == nullptr || !source->indirect_descriptor || source->indirect_descriptor->table_array) {

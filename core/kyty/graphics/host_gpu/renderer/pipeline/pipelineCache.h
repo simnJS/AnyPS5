@@ -587,6 +587,8 @@ private:
 		size_t                     served_module = SIZE_MAX;
 		uint64_t                   served_logged = 0;
 		std::vector<uint64_t>      unserved_logged;
+		uint32_t                   fallback_wait  = 0;
+		bool                       fallback_known = false;
 
 		[[nodiscard]] bool Failed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
 		                          uint32_t push_data_cursor) const;
@@ -758,6 +760,12 @@ private:
 	                                  const ShaderComputeInputInfo& input_info, uint32_t push_data_cursor,
 	                                  std::optional<std::pair<ShaderRecompiler::IR::ResourceSpecialization,
 	                                                          ShaderRecompiler::IR::ResourceSnapshot>>& natural)
+	    KYTY_REQUIRES(m_program_lock);
+	bool          FallbackComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,
+	                                     const ShaderComputeInputInfo&           input_info,
+	                                     const ShaderRecompiler::IR::SrtRuntime& runtime, uint32_t push_data_cursor,
+	                                     std::optional<std::pair<ShaderRecompiler::IR::ResourceSpecialization,
+	                                                             ShaderRecompiler::IR::ResourceSnapshot>>* natural)
 	    KYTY_REQUIRES(m_program_lock);
 #endif
 

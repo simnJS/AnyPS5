@@ -1466,13 +1466,22 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 	}
 	size_t best_index = SIZE_MAX;
 	size_t best_slots = SIZE_MAX;
-	for (size_t index = 0; index < program.modules.size(); ++index) {
-		const auto& candidate = program.modules[index];
-		const auto slots = candidate.specialization.images.size() + candidate.specialization.samplers.size();
-		if (index == program.served_module || slots >= best_slots || !compatible(candidate)) continue;
-		if (runtime != nullptr) return index;
-		best_index = index;
-		best_slots = slots;
+	for (const bool heap_free: {true, false}) {
+		if (runtime == nullptr && heap_free) continue;
+		for (size_t index = 0; index < program.modules.size(); ++index) {
+			const auto& candidate = program.modules[index];
+			const auto slots = candidate.specialization.images.size() + candidate.specialization.samplers.size();
+			if (index == program.served_module || slots >= best_slots) continue;
+			if (runtime != nullptr &&
+			    std::ranges::none_of(candidate.specialization.images,
+			                         &ShaderRecompiler::IR::ResourceSpecialization::Image::heap) != heap_free) {
+				continue;
+			}
+			if (!compatible(candidate)) continue;
+			if (runtime != nullptr) return index;
+			best_index = index;
+			best_slots = slots;
+		}
 	}
 	return best_index;
 }
@@ -1584,6 +1593,54 @@ void PipelineCache::WidenComputeVariant(const ProgramKey& key, Program& program,
 		                 std::chrono::steady_clock::now().time_since_epoch().count());
 	}
 	SpecializeComputeVariant(key, program, params, input_info, natural->first, push_data_cursor);
+}
+
+bool PipelineCache::FallbackComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,
+                                           const ShaderComputeInputInfo&           input_info,
+                                           const ShaderRecompiler::IR::SrtRuntime& runtime, uint32_t push_data_cursor,
+                                           std::optional<std::pair<ShaderRecompiler::IR::ResourceSpecialization,
+                                                                   ShaderRecompiler::IR::ResourceSnapshot>>* natural) {
+	using Image = ShaderRecompiler::IR::ResourceSpecialization::Image;
+	if (program.call_source != nullptr || !ShaderRecompiler::IR::GenericComputeVariants() ||
+	    std::ranges::none_of(program.specialization.images, &Image::heap)) {
+		return true;
+	}
+	if (natural == nullptr) {
+		if (!SpecializesComputeInBackground()) return true;
+		if (!m_in_flight.empty()) return false;
+	}
+	ShaderRecompiler::IR::ResourceSpecialization fallback;
+	ShaderRecompiler::IR::ResourceSnapshot       resources;
+	if (!ShaderRecompiler::IR::MaterializeFallbackResources(program.resource_plan, runtime, resources, fallback) ||
+	    fallback == program.specialization || program.Failed(fallback, push_data_cursor)) {
+		return true;
+	}
+	const bool known = std::ranges::any_of(program.modules, [&](const ShaderModule& module) {
+		const auto& layout = module.info.bindings;
+		return !module.shared_variant && module.specialization == fallback &&
+		       layout.push_data_start_dword ==
+		           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords());
+	});
+	if (known) return true;
+	const auto log = [&](const char* how) {
+		if (!ShaderVariantLog()) return;
+		PipelineCacheLog("[kyty-variant] fallback stage=CS shader={:016x} natural={:016x} images={}/{} {} @{}", params.hash,
+		                 ResourceShapeFingerprint(natural != nullptr ? (*natural)->first : program.specialization),
+		                 (natural != nullptr ? (*natural)->first : program.specialization).images.size(),
+		                 (natural != nullptr ? program.specialization : fallback).images.size(), how,
+		                 std::chrono::steady_clock::now().time_since_epoch().count());
+	};
+	if (natural != nullptr) {
+		natural->emplace(std::move(program.specialization), std::move(program.resources));
+		program.specialization = std::move(fallback);
+		program.resources      = std::move(resources);
+		log("built");
+		SpecializeComputeVariant(key, program, params, input_info, (*natural)->first, push_data_cursor);
+		return true;
+	}
+	QueueCompile(key, params, input_info, push_data_cursor, &fallback, m_guest_traversal, false, m_lane_pairs, true);
+	log("queued");
+	return true;
 }
 #endif
 
@@ -1777,6 +1834,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 #if defined(ANYPS5_KYTY)
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			const bool generic = specialized && !m_queue_only && ShaderRecompiler::IR::GenericComputeVariants();
+			if (generic && !cached.fallback_known) {
+				if (cached.fallback_wait != 0u) {
+					--cached.fallback_wait;
+				} else if (FallbackComputeVariant(entry->first, cached, params, input_info, runtime, push_data_cursor, nullptr)) {
+					cached.fallback_known = true;
+				} else {
+					cached.fallback_wait = 64u;
+				}
+			}
 			if (generic && module != nullptr && !ComputePipelineReady(*module)) {
 				if (auto* served = ServeComputeVariant(cached, runtime, push_data_cursor, module)) {
 					if (SpecializesComputeInBackground() && !CanCoverEmptyComputePipeline(*module, *served)) {
@@ -1936,7 +2002,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	entry->second.PromoteEmptyBuffers(entry->second.resources, entry->second.specialization, push_data_cursor);
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-		WidenComputeVariant(entry->first, entry->second, params, input_info, push_data_cursor, natural);
+		FallbackComputeVariant(entry->first, entry->second, params, input_info, runtime, push_data_cursor, &natural);
+		if (!natural) WidenComputeVariant(entry->first, entry->second, params, input_info, push_data_cursor, natural);
 	}
 #endif
 	const auto* module = CompileModule(entry->second, entry->first, options, std::move(translated),

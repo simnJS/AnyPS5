@@ -374,6 +374,11 @@ void RebindTableAndHeap(bool on) {
 	native_heap.ok = IR::MaterializeResources(plan, runtime, native_heap.snapshot, native_heap.specialization);
 	Check(table.ok && native_heap.ok, "the fixture materializes both table and heap addressing");
 	if (!table.ok || !native_heap.ok) return;
+	Materialized fallback;
+	fallback.ok = IR::MaterializeFallbackResources(plan, runtime, fallback.snapshot, fallback.specialization);
+	Check(fallback.ok && fallback.specialization == table.specialization &&
+	          fallback.snapshot.flattened_srt == table.snapshot.flattened_srt && fallback.snapshot.image_tables.size() == 1,
+	      "a materialization that avoids the heap takes the table form while the heap accepts the view");
 	Check(table.snapshot.image_tables.size() == 1 && native_heap.snapshot.image_tables.empty(),
 	      "table and heap use distinct address representations");
 	if (table.snapshot.image_tables.size() != 1 || !native_heap.snapshot.image_tables.empty()) return;
