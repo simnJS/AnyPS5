@@ -599,6 +599,32 @@ void FallbackBufferForms() {
 	      "buffer forms: the fallback built while the written buffer is unbound is the one built while it is bound");
 	Check(Serves(plan, bound, from_unbound.specialization) && Serves(plan, unbound, from_unbound.specialization),
 	      "buffer forms: the fallback serves the written buffer bound and unbound");
+
+	const auto           odd_index = MakeSharp(SourceAddress, Records - 1u, 3, 2, Format16UInt);
+	const BufferDispatch odd_bound(odd_index, written);
+	const BufferDispatch odd_unbound(odd_index, Sharp {});
+	const auto&          narrow = from_unbound.specialization.buffers[0];
+	Check((narrow.packed_stride & IR::RuntimeBufferFormat) == 0u && narrow.descriptor_format == Prospero::BufferFormat::k16UInt &&
+	          IR::HasRuntimeStride(narrow.packed_stride),
+	      "buffer forms: a 16-bit buffer the program always binds in one format keeps it, with its stride read at run time");
+	const auto from_odd = Fallback(plan, odd_bound, known);
+	Check(from_odd.ok && from_odd.specialization == from_unbound.specialization,
+	      "buffer forms: the fallback built for an odd number of 16-bit elements is the one built for an even number");
+	Check(Serves(plan, odd_bound, from_unbound.specialization) && Serves(plan, odd_unbound, from_unbound.specialization),
+	      "buffer forms: the fallback serves a 16-bit buffer that ends inside a dword");
+
+	const BufferDispatch floats(MakeSharp(SourceAddress, Records, 3, 4, static_cast<uint32_t>(Prospero::BufferFormat::k32Float)),
+	                            written);
+	const auto           other_format = Natural(plan, floats);
+	Check(other_format.ok, "buffer forms: a dispatch that binds the read buffer in another format is recorded");
+	if (!other_format.ok) return;
+	const std::array<const IR::ResourceSpecialization*, 2> formats {&recorded.specialization, &other_format.specialization};
+	const auto                                             dynamic = Fallback(plan, bound, formats);
+	Check(dynamic.ok && (dynamic.specialization.buffers[0].packed_stride & IR::RuntimeBufferFormat) != 0u &&
+	          Serves(plan, bound, dynamic.specialization) && Serves(plan, floats, dynamic.specialization),
+	      "buffer forms: a buffer the program binds in several formats keeps its format read at run time");
+	Check(dynamic.ok && !Serves(plan, odd_bound, dynamic.specialization) && RefusedAt(IR::ServeRefusal::Step::Buffer, 0),
+	      "buffer forms: the format read at run time refuses a 16-bit buffer that ends inside a dword, at buffer slot 0");
 }
 
 }

@@ -3548,6 +3548,32 @@ static void TakeKnownPopulatedBuffer(const ResourcePlan& plan, const ResourceSna
 	}
 	if (const auto best = std::ranges::max_element(forms, {}, &Form::second); best != forms.end()) buffer = best->first;
 }
+
+static bool OneNarrowFormat(const ResourcePlan& plan, uint32_t index, std::span<const ResourceSpecialization* const> known,
+                            const ResourceSpecialization::Buffer& live) {
+	std::optional<Prospero::BufferFormat> format;
+	bool                                  single = true;
+	const auto note = [&](ResourceSpecialization::Buffer form) {
+		if (!RecordedPopulatedBuffer(plan, index, form) ||
+		    Format::GetFormatInfo(form.descriptor_format).type == Format::ComponentType::Unknown) {
+			return;
+		}
+		single = single && (!format || *format == form.descriptor_format);
+		format = form.descriptor_format;
+	};
+	note(live);
+	for (const auto* other: known) {
+		if (other != nullptr && index < other->buffers.size()) note(other->buffers[index]);
+	}
+	return single && format && (Format::GetFormatInfo(*format).byte_size & 3u) != 0u;
+}
+
+static void ChooseFallbackBuffer(const ResourcePlan& plan, const ResourceSnapshot& snapshot, uint32_t index,
+                                 std::span<const ResourceSpecialization* const> known,
+                                 ResourceSpecialization::Buffer&                buffer) {
+	if (!OneNarrowFormat(plan, index, known, buffer) && ReadFallbackBufferFormat(plan, snapshot, index, buffer)) return;
+	if (buffer.zero_stride_oob || buffer.scalar_empty) TakeKnownPopulatedBuffer(plan, snapshot, index, known, buffer);
+}
 #endif
 
 bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -3561,12 +3587,11 @@ bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime&
 	const bool ok = MaterializeResourcesForViews(program, fallback_runtime, snapshot, specialization, {});
 	if (ok) {
 		for (uint32_t i = 0; i < specialization.buffers.size(); ++i) {
-			auto& buffer = specialization.buffers[i];
-			if (!ReadFallbackBufferFormat(program, snapshot, i, buffer) && (buffer.zero_stride_oob || buffer.scalar_empty)) {
 #if defined(ANYPS5_KYTY)
-				TakeKnownPopulatedBuffer(program, snapshot, i, known, buffer);
+			ChooseFallbackBuffer(program, snapshot, i, known, specialization.buffers[i]);
+#else
+			ReadFallbackBufferFormat(program, snapshot, i, specialization.buffers[i]);
 #endif
-			}
 		}
 		ReadTableMappingsAtRunTime(specialization, &snapshot);
 	}
