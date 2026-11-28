@@ -593,6 +593,21 @@ add_test(NAME kyty_shim_mesh_per_primitive_block_draw COMMAND kyty_shim_mesh_per
 set_tests_properties(kyty_shim_mesh_per_primitive_block_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_mesh_per_primitive_block_draw: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+add_test_executable(kyty_shim_mesh_lds_atomic_load_tests ${CMAKE_CURRENT_SOURCE_DIR}/MeshLdsAtomicLoad.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_mesh_lds_atomic_load_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_include_directories(kyty_shim_mesh_lds_atomic_load_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+configure_host_test_executable(kyty_shim_mesh_lds_atomic_load_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_mesh_lds_atomic_load_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_mesh_lds_atomic_load_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_mesh_lds_atomic_load COMMAND kyty_shim_mesh_lds_atomic_load_tests)
+set_tests_properties(kyty_shim_mesh_lds_atomic_load PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_mesh_lds_atomic_load: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_mesh_lds_atomic_load_draw COMMAND kyty_shim_mesh_lds_atomic_load_tests draw)
+set_tests_properties(kyty_shim_mesh_lds_atomic_load_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_mesh_lds_atomic_load_draw: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 if(NOT ANYPS5_KYTY_DLL)
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/MeshLdsWgpPad.cpp)
     if(WIN32)

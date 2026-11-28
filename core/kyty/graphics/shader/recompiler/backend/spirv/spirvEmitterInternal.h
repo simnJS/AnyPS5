@@ -834,7 +834,11 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 		state.builder.AddFunction(spv::OpStore, pointer, desired(old));
 		return old;
 	}
-	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+	const auto scope = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+	const auto load_semantics =
+	    kind == IR::ResourceKind::Lds && state.lds_storage_class == spv::StorageClassWorkgroup
+	        ? spv::MemorySemanticsAcquireMask | spv::MemorySemanticsWorkgroupMemoryMask
+	        : spv::MemorySemanticsMaskNone;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();
 	const auto cont      = state.builder.AllocateId();
@@ -845,8 +849,7 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	state.builder.AddFunction(spv::OpBranch, preheader);
 	EmitLabel(state, preheader);
 	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), initial, pointer,
-	                          ConstantU32(state, scope),
-	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+	                          ConstantU32(state, scope), ConstantU32(state, load_semantics));
 	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, header);
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), observed, initial, preheader, exchanged,
