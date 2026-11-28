@@ -532,7 +532,20 @@ bool CheckScheduledPoolTrim(RenderContext& renderer, CommandProcessor& producer,
 	return std::memcmp(output.Mapped().data(), expected, sizeof(expected)) == 0;
 }
 
+bool CheckLocalMemoryTarget() {
+	constexpr uint64_t MiB = 1ull << 20;
+	constexpr uint64_t size = 16 * GiB;
+	const auto target = [&](uint64_t used) {
+		return LocalMemoryBudget::Target(13 * GiB, 10 * GiB, size, BoardMemory {size, used});
+	};
+	return target(10 * GiB) == 13 * GiB && target(13 * GiB) == 11776 * MiB &&
+	       target(14 * GiB) == 10752 * MiB && target(9 * GiB) == 13 * GiB &&
+	       LocalMemoryBudget::Target(13 * GiB, 0, size, BoardMemory {size, size}) == 0 &&
+	       LocalMemoryBudget::Target(13 * GiB, 10 * GiB, size, std::nullopt) == 11776 * MiB;
+}
+
 const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool acceleration_storage, bool spill_content) {
+	if (!CheckLocalMemoryTarget()) return "incorrect pressure target for shared device memory";
 	if (graphics.memory_budget_ext_enabled && graphics.GetLocalMemoryUsage().budget == 0) {
 		return "the driver reported an empty device-local memory budget";
 	}

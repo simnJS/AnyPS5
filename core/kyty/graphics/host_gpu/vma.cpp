@@ -235,6 +235,7 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+	if (memory_budget_ext_enabled) m_local_memory_budget.Initialize(physical_device, physical_device_properties, MemoryBudgetCap());
 	if (std::any_of(heap_limits.begin(), heap_limits.end(), [](VkDeviceSize limit) { return limit != VK_WHOLE_SIZE; })) {
 		info.pHeapSizeLimit = nullptr;
 		const auto spill    = static_cast<vk::Result>(vmaCreateAllocator(&info, &spill_allocator));
@@ -319,24 +320,11 @@ uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> 
 	return count;
 }
 
-GraphicContext::HeapUsage GraphicContext::GetLocalMemoryUsage() const {
+LocalMemorySample GraphicContext::GetLocalMemoryUsage() const {
 	if (m_memory_override_enabled) {
-		return {.usage = m_memory_usage_override, .budget = m_memory_budget_override};
+		return {.usage = m_memory_usage_override, .budget = m_memory_budget_override, .target = m_memory_budget_override};
 	}
-	HeapUsage local {};
-	if (memory_budget_ext_enabled) {
-		vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget {};
-		vk::PhysicalDeviceMemoryProperties2 properties {.pNext = &budget};
-		physical_device.getMemoryProperties2(&properties);
-		for (uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
-			if (properties.memoryProperties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
-				local.usage += budget.heapUsage[i];
-				local.budget += budget.heapBudget[i];
-			}
-		}
-		local.budget = std::min(local.budget, MemoryBudgetCap());
-	}
-	return local;
+	return memory_budget_ext_enabled ? m_local_memory_budget.Read(physical_device) : LocalMemorySample {};
 }
 
 uint64_t GraphicContext::LocalBlockSpace() const {
@@ -362,24 +350,13 @@ uint64_t GraphicContext::LocalBlockSpace() const {
 }
 
 bool GraphicContext::LocalMemoryCrowded() const {
-	const auto space = LocalBlockSpace();
-	if (!m_memory_override_enabled && allocator != nullptr) {
-		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-		vmaGetHeapBudgets(allocator, budgets);
-		uint64_t usage  = 0;
-		uint64_t budget = 0;
-		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
-			if (physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
-				usage += budgets[heap].usage;
-				budget += budgets[heap].budget;
-			}
-		}
-		if (usage - std::min(usage, space) < HeapImageThreshold(budget)) {
-			return false;
-		}
+	auto local = GetLocalMemoryUsage();
+	if (!local.budget) return false;
+	if (physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		local.usage = std::max(local.usage, GetDeviceMemoryUsage());
 	}
-	const auto local = GetLocalMemoryUsage();
-	return local.budget != 0 && local.usage - std::min(local.usage, space) >= HeapImageThreshold(local.budget);
+	const auto space = LocalBlockSpace();
+	return local.usage - std::min(local.usage, space) >= HeapImageThreshold(local.target);
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {

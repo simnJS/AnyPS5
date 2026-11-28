@@ -164,7 +164,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	m_readback_storage_images = write_back_value != "0";
 #endif
 	if (m_graphics.CanReportMemoryUsage()) {
-		UpdateMemoryThresholds(m_graphics.GetLocalMemoryUsage().budget);
+		UpdateMemoryThresholds(m_graphics.GetLocalMemoryUsage().target);
 	}
 }
 
@@ -4229,8 +4229,8 @@ void TextureCache::RunGarbageCollector() {
 		return;
 	}
 	if (local.budget != 0) {
-		if (local.budget != m_memory_budget) {
-			UpdateMemoryThresholds(local.budget);
+		if (local.target != m_memory_budget) {
+			UpdateMemoryThresholds(local.target);
 		}
 		used = local.usage;
 		m_collecting = m_collecting ? used > m_stop_gc_memory : used >= m_pressure_gc_memory;
