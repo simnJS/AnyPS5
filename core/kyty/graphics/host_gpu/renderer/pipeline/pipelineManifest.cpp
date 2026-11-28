@@ -789,7 +789,10 @@ void PipelineCache::OpenManifest() {
 	state.startup_done = state.found;
 	state.scanning.store(!state.code.empty(), std::memory_order_relaxed);
 	state.startup = state.startup_total != state.startup_done && Config::StartupWaitSeconds() != 0;
-	const auto workers = Common::ParallelThreads();
+	const auto memory_sample = Common::ReadSystemMemory();
+	const auto [workers, large_workers] =
+	    ManifestWorkerLimits(Common::ParallelThreads(), memory_sample ? memory_sample->total : 0,
+	                         m_large_manifest_workers);
 	if (state.startup) {
 		ManifestLog("Pipeline manifest: startup with {} workers, {} jobs ({} modules restored)", workers,
 		            state.startup_total, state.found);
@@ -798,8 +801,8 @@ void PipelineCache::OpenManifest() {
 		state.ReleaseStartup(state.startup_total == state.startup_done ? result : "skipped");
 	}
 	for (size_t i = 0; i < workers; i++) {
-		state.threads.emplace_back([this, i](const std::stop_token& stop) {
-			ManifestWorker(stop, i < m_large_manifest_workers);
+		state.threads.emplace_back([this, i, workers, large_workers](const std::stop_token& stop) {
+			ManifestWorker(stop, i < large_workers, i < large_workers && workers > large_workers);
 		});
 	}
 	state.code_path   = folders.back() / (stem + ".code");
@@ -2916,11 +2919,10 @@ bool PipelineCache::WaitForStartupManifest(std::chrono::milliseconds timeout, ui
 	return !state.startup;
 }
 
-void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large) {
+void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large, bool prefer_large) {
 	KYTY_PROFILER_THREAD("Thread_PipelineManifest");
 	Common::Thread::LowerCurrentPriority();
 	auto& state = *m_manifest;
-	const bool prefer_large = allow_large && Common::ParallelThreads() > m_large_manifest_workers;
 	for (;;) {
 		std::shared_ptr<const std::vector<uint32_t>> code;
 		std::shared_ptr<const std::vector<uint32_t>> back_code;

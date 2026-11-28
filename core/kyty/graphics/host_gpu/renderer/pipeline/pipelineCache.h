@@ -946,7 +946,7 @@ private:
 	void CodeStoreThread(const std::stop_token& stop);
 	bool ScanGameFiles(const std::stop_token&                                          stop,
 	                   const std::function<void(uint64_t, std::span<const uint32_t>)>& append);
-	void ManifestWorker(const std::stop_token& stop, bool allow_large);
+	void ManifestWorker(const std::stop_token& stop, bool allow_large, bool prefer_large);
 	std::pair<uint32_t, uint32_t> AddManifestRecords(PipelineManifest& loaded);
 	void ReloadSharedManifest();
 	void BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
