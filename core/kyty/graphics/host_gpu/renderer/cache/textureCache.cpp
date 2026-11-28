@@ -56,7 +56,8 @@ struct TextureCache::WriteBack {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 16;
-constexpr size_t   MaxParkedImages  = 8;
+constexpr size_t   MaxParkedImages  = 256;
+constexpr uint64_t MaxParkedBytes   = uint64_t {128} << 20;
 constexpr uint64_t ParkedImageTicks = 2048;
 constexpr uint64_t LazyReadbackBytes = 256 * 1024;
 constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
@@ -1422,7 +1423,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           cached.backing.samples, replacement.backing.samples);
 	}
 	if (cached.depth_id || cached.backing.samples != 1 || replacement.backing.samples != 1 ||
-	    outgrown) {
+	    outgrown || cached.AccountedSize() > MaxParkedBytes) {
 		FreeImage(cached_id);
 	} else {
 		ParkImage(cached_id);
@@ -2288,20 +2289,24 @@ void TextureCache::ParkImage(ImageId id) {
 	StencilPlanesChanged(image);
 	image.binding.needs_rebind = true;
 	image.StateChanged();
-	m_parked_images.emplace_back(id, m_scheduler.CurrentTick());
-	if (m_parked_images.size() > MaxParkedImages) {
-		DiscardParkedImage(m_parked_images.front().first);
+	const auto bytes = image.AccountedSize();
+	m_parked_images.push_back({id, m_scheduler.CurrentTick(), bytes});
+	m_parked_bytes += bytes;
+	while (m_parked_images.size() > MaxParkedImages || m_parked_bytes > MaxParkedBytes) {
+		const auto oldest = m_parked_images.front();
 		m_parked_images.erase(m_parked_images.begin());
+		DiscardParkedImage(oldest.id);
 	}
 }
 
 ImageId TextureCache::UnparkImage(const ImageInfo& info) {
 	for (auto it = m_parked_images.begin(); it != m_parked_images.end(); ++it) {
-		const auto id    = it->first;
+		const auto id    = it->id;
 		auto&      image = m_slot_images[id];
 		if (!SameParkedLayout(image.info, info)) {
 			continue;
 		}
+		m_parked_bytes -= it->bytes;
 		m_parked_images.erase(it);
 		image.info    = info;
 		image.binding = {};
@@ -2337,13 +2342,14 @@ void TextureCache::DiscardParkedImage(ImageId id) {
 
 void TextureCache::DiscardParkedImages(uint64_t address, uint64_t size) {
 	const auto tick = m_scheduler.CurrentTick();
-	std::erase_if(m_parked_images, [&](const std::pair<ImageId, uint64_t>& parked) KYTY_REQUIRES(m_lock) {
-		const auto& data = m_slot_images[parked.first].info.data;
+	std::erase_if(m_parked_images, [&](const ParkedImage& parked) KYTY_REQUIRES(m_lock) {
+		const auto& data = m_slot_images[parked.id].info.data;
 		const bool  discard =
-		    size == 0 ? tick - std::min(tick, parked.second) > ParkedImageTicks
+		    size == 0 ? tick - std::min(tick, parked.tick) > ParkedImageTicks
 		              : data.address < address + size && address < data.End();
 		if (discard) {
-			DiscardParkedImage(parked.first);
+			m_parked_bytes -= parked.bytes;
+			DiscardParkedImage(parked.id);
 		}
 		return discard;
 	});
@@ -2644,10 +2650,13 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 						break;
 					}
 					const auto depth_id = image.depth_id;
-					std::erase_if(m_parked_images,
-					              [depth_id](const std::pair<ImageId, uint64_t>& parked) {
-						              return parked.first == depth_id;
-					              });
+					std::erase_if(m_parked_images, [&](const ParkedImage& parked) {
+						if (parked.id != depth_id) {
+							return false;
+						}
+						m_parked_bytes -= parked.bytes;
+						return true;
+					});
 					DiscardParkedImage(depth_id);
 					continue;
 				}
