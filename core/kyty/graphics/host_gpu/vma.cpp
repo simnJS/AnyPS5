@@ -336,6 +336,26 @@ GraphicContext::HeapUsage GraphicContext::GetLocalMemoryUsage() const {
 	return local;
 }
 
+bool GraphicContext::LocalMemoryCrowded() const {
+	if (!m_memory_override_enabled && allocator != nullptr) {
+		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(allocator, budgets);
+		uint64_t usage  = 0;
+		uint64_t budget = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			if (physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				usage += budgets[heap].usage;
+				budget += budgets[heap].budget;
+			}
+		}
+		if (usage < BudgetShare(budget, CrowdedPercent)) {
+			return false;
+		}
+	}
+	const auto local = GetLocalMemoryUsage();
+	return local.budget != 0 && local.usage >= BudgetShare(local.budget, CrowdedPercent);
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (m_memory_override_enabled) {
 		return m_memory_budget_override;
@@ -393,7 +413,7 @@ static uint32_t BindlessImageSpillTypes(const GraphicContext& graphics) {
 			break;
 		}
 	}
-	if (!pressure) {
+	if (!pressure && !graphics.LocalMemoryCrowded()) {
 		return 0;
 	}
 	uint32_t types = 0;

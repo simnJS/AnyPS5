@@ -171,7 +171,13 @@ struct GraphicContext {
 		uint32_t allocations  = 0;
 		bool     device_local = false;
 	};
+	static constexpr uint64_t CrowdedPercent     = 85;
+	static constexpr uint64_t CrowdedStopPercent = 80;
+	[[nodiscard]] static uint64_t BudgetShare(uint64_t budget, uint64_t percent) noexcept {
+		return budget / 100u * percent + budget % 100u * percent / 100u;
+	}
 	[[nodiscard]] HeapUsage GetLocalMemoryUsage() const;
+	[[nodiscard]] bool      LocalMemoryCrowded() const;
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
