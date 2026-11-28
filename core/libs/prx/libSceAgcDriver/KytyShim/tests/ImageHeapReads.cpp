@@ -647,7 +647,10 @@ bool SameTexel(uint32_t bits, uint8_t expected) {
 
 void CheckReads(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	RenderContext renderer(graphics);
-	renderer.MapMemory(address, bytes);
+	if (!renderer.MapMemory(address, bytes)) {
+		Check(false, "map the texture table into the GPU mirror");
+		return;
+	}
 	CommandProcessor processor(renderer, 0);
 	processor.Reset();
 	auto& scheduler = renderer.GetCommandScheduler();
@@ -805,7 +808,10 @@ void CheckReads(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 
 void MeasureCost(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	RenderContext renderer(graphics);
-	renderer.MapMemory(address, bytes);
+	if (!renderer.MapMemory(address, bytes)) {
+		Check(false, "map the texture table into the GPU mirror");
+		return;
+	}
 	CommandProcessor processor(renderer, 0);
 	processor.Reset();
 	auto& scheduler = renderer.GetCommandScheduler();
@@ -919,6 +925,14 @@ extern "C" int RunKytyImageHeapReadsTest(int argc, char** argv) {
 		return Finish();
 	}
 	const auto address = reinterpret_cast<uint64_t>(guest);
+	if (ClassifyGuestMapping(address, bytes) == GuestMappingSpace::CpuOnly) {
+		if (sceKernelMunmap(address, bytes) != 0) {
+			Check(false, "release the CPU-only guest allocation");
+			return Finish();
+		}
+		std::fprintf(stderr, "%s: guest allocation at %p lies outside the GPU address ranges\n", g_name, guest);
+		return 77;
+	}
 	if (cost) {
 		MeasureCost(gpu.graphics, address, bytes);
 	} else {
