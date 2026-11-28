@@ -821,7 +821,7 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 	for (auto& buffer: buffers) {
 		if (ShaderRecompiler::IR::HasRuntimeStride(buffer.packed_stride) &&
 		    buffer.indirect_root == ResourceSpecialization::Buffer {}.indirect_root) {
-			buffer.packed_stride = ShaderRecompiler::IR::RuntimeStrideKey(stage, buffer.packed_stride);
+			buffer.packed_stride = ShaderRecompiler::IR::RuntimeStrideKey(buffer.packed_stride);
 		}
 	}
 	ReadElements(r, "si", images);

@@ -215,7 +215,7 @@ void EmitMemoryBindings(EmitterState& state) {
 			const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.StrideDword() + binding);
 			state.memory_strides[binding] = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word,
 			                                       ConstantU32(state, IR::BufferStrideMask));
-			if (state.program.stage == ShaderType::Compute && (buffer.packed_stride & (1u << 14u)) == 0u &&
+			if ((buffer.packed_stride & (1u << 14u)) == 0u &&
 			    buffer.source < state.program.descriptor_sources.size() &&
 			    !state.program.descriptor_sources[buffer.source].indirect_descriptor) {
 				const auto flag = [&](uint32_t mask, spv::Op compare) {

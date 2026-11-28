@@ -2376,7 +2376,7 @@ bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
 void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization) {
 	for (uint32_t i = 0; i < specialization.buffers.size(); i++) {
 		if (ReadsStrideAtRunTime(program, i, specialization.buffers[i])) {
-			specialization.buffers[i].packed_stride = RuntimeStrideKey(program.stage, specialization.buffers[i].packed_stride);
+			specialization.buffers[i].packed_stride = RuntimeStrideKey(specialization.buffers[i].packed_stride);
 		}
 	}
 }
@@ -2493,7 +2493,7 @@ bool BindGenericGraphics(const ResourcePlan& plan, ResourceSnapshot& snapshot,
 		if (!DecodeBufferDescriptor(snapshot.buffers[i], descriptor)) return false;
 		if ((resource.written || resource.atomic) && (!descriptor.Base48() || !descriptor.GetSize())) return false;
 		if (HasRuntimeStride(generic.buffers[i].packed_stride) && ReadsStrideAtRunTime(plan, i, buffer))
-			buffer.packed_stride |= RuntimeBufferStride;
+			buffer.packed_stride = RuntimeStrideKey(buffer.packed_stride);
 		if (resource.formatted) {
 			if (((descriptor.Base48() | descriptor.GetSize()) & 3u) != 0u) return false;
 			const auto components = FormattedReadComponents(plan, i);
@@ -2562,7 +2562,7 @@ static void ShareEmptyBuffer(const ResourcePlan& program, uint32_t index, bool r
 	if (!vector) {
 		buffer.scalar_empty = false;
 	} else if (runtime_stride && !program.info.buffers[index].formatted) {
-		buffer.packed_stride   = RuntimeStrideKey(program.stage, ExactBufferBounds);
+		buffer.packed_stride   = RuntimeBufferStride;
 		buffer.zero_stride_oob = false;
 		buffer.scalar_empty    = false;
 	} else {
@@ -2922,7 +2922,7 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 			buffer.scalar_empty = false;
 		}
 		if (runtime.runtime_stride && ReadsStrideAtRunTime(program, i, buffer)) {
-			buffer.packed_stride = RuntimeStrideKey(program.stage, buffer.packed_stride);
+			buffer.packed_stride = RuntimeStrideKey(buffer.packed_stride);
 		}
 #if defined(ANYPS5_KYTY)
 		if (descriptor.NumRecords() == 0u && SharesEmptyBuffers()) {
