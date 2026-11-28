@@ -7,6 +7,7 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Pthread/Posix/Common.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include "prx/libkernel/System/include/GuestFpState.hpp"
 #include "prx/libkernel/System/include/TimerSignals.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
@@ -372,7 +373,10 @@ void RunHandler(int guest, GuestHandler handler) {
         releases[held] = holdReleases[held];
         epochs[held] = static_cast<std::uint32_t>(self.holds[held].fetch_add(1) >> 32);
     }
-    handler(guest);
+    {
+        const GuestFpState::Scope guestFp;
+        handler(guest);
+    }
     std::uint32_t replaced[4]{};
     for (int held = 1; held <= MaxSignal; ++held) {
         if ((mask[SignalWord(held)] & SignalBit(held)) == 0) continue;
