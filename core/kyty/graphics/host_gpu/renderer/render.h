@@ -241,6 +241,10 @@ public:
 	                                                         const HW::Shader&  shaders,
 	                                                         uint32_t           mode, uint64_t args_addr,
 	                                                         bool               async_compute);
+	void TranslateDrawAhead(const HW::Context& context, const HW::UserConfig& user_config, const HW::Shader& shaders,
+	                        const ShaderIndirectOffsets& indirect_offsets, bool indirect_draw);
+	void TranslateDispatchAhead(const HW::Shader& shaders, const uint32_t (&groups)[3], uint32_t mode, bool indirect,
+	                            uint64_t args_addr, bool async_compute);
 	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, const ShaderModule*& module);
 	void UseResolvedDraw(ResolvedDraw* resolved) noexcept {
 		m_resolved_draw = resolved != nullptr ? WaitResolvedDraw(resolved) : nullptr;
@@ -523,6 +527,7 @@ private:
 	                         const HW::Shader& shaders, const ShaderIndirectOffsets& indirect_offsets,
 	                         bool indirect_draw, uint64_t context_id, uint64_t user_config_id);
 	ResolvedDraw& NextResolvedDraw();
+	ResolvedDraw& TranslateScratch();
 	[[nodiscard]] static bool DrawTemplateEligible(std::span<const ShaderStageRuntime* const> stages);
 	[[nodiscard]] DrawTemplate* FindDrawTemplate(uint64_t key,
 	                                             std::span<const ShaderStageRuntime* const> stages);
@@ -701,6 +706,7 @@ private:
 	                                                                               nullptr};
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
+	std::unique_ptr<ResolvedDraw, void (*)(ResolvedDraw*)> m_translate_scratch {nullptr, nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	[[nodiscard]] ExecuteCause MissingAheadCause() const noexcept;
 	[[nodiscard]] bool         RevalidateAhead(ResolvedDraw& resolved, bool dispatch);

@@ -206,6 +206,7 @@ struct ProgramResolution {
 	GuestReadLog                                                        reads;
 	uint32_t                                                            stages = 0;
 	bool                                                                refreshed_words = false;
+	bool                                                                translate_only  = false;
 
 	void Reset() {
 		reads.Clear();
@@ -487,6 +488,13 @@ public:
 	static void SyncAheadWrites(uint64_t sequence);
 	static void BeginAheadThread(uint32_t slot);
 #if defined(ANYPS5_KYTY)
+	struct SubmitAheadCounts {
+		uint64_t requested_graphics = 0, requested_compute = 0, finished = 0, used_ready = 0, used_compiling = 0,
+		         known = 0, refused = 0, dropped = 0;
+	};
+	[[nodiscard]] SubmitAheadCounts GetSubmitAheadCounts() const;
+#endif
+#if defined(ANYPS5_KYTY)
 	[[nodiscard]] static bool NarrowProgramLock();
 	static void BeginExecuteThread();
 #endif
@@ -575,6 +583,7 @@ private:
 		bool                                         skip_dispatch = false;
 		bool                                         serve_runtime_samplers = false;
 		Common::SkipLog::Cause                               skip_cause = Common::SkipLog::Cause::Unknown;
+		bool                                         submit_ahead = false;
 		std::array<size_t, 2>                        last_module {SIZE_MAX, SIZE_MAX};
 #if defined(ANYPS5_KYTY)
 		struct FailedVariant {
@@ -670,6 +679,16 @@ private:
 	std::unordered_set<ProgramKey, ProgramKeyHash> m_speculative_failed_programs KYTY_GUARDED_BY(m_program_lock);
 	std::atomic<uint64_t> m_speculative_failed {0}, m_speculative_refused {0}, m_speculative_skipped {0};
 	std::array<uint64_t, 3> m_speculative_logged {};
+	std::unordered_set<ProgramKey, ProgramKeyHash> m_submit_ahead_pending KYTY_GUARDED_BY(m_program_lock);
+	struct SubmitAheadStats {
+		std::atomic<uint64_t> requested_graphics {0}, requested_compute {0}, known {0}, refused {0};
+		std::atomic<uint64_t> finished {0}, used_ready {0}, used_compiling {0}, dropped {0};
+	};
+	SubmitAheadStats        m_submit_ahead;
+	std::array<uint64_t, 8> m_submit_ahead_logged {};
+	void NoteSubmitAheadRequest(const ProgramKey& key) KYTY_REQUIRES(m_program_lock);
+	void NoteSubmitAheadLookup(const ProgramKey& key, Program* program) KYTY_REQUIRES(m_program_lock);
+	void NoteSubmitAheadDone(const ProgramKey& key, Program* program) KYTY_REQUIRES(m_program_lock);
 	[[nodiscard]] bool TakesSpeculativeCompile(Program& program, const ProgramKey& key,
 	                                           const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                                           uint32_t push_data_cursor, bool unread) KYTY_REQUIRES(m_program_lock);

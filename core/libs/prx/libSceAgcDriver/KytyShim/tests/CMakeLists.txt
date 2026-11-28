@@ -386,6 +386,13 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
         set_tests_properties(kyty_shim_indirect_dispatch_dimensions PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
                 ENVIRONMENT "KYTY_GPU_PIPELINE=0"
                 PASS_REGULAR_EXPRESSION "kyty_shim_indirect_dispatch_dimensions: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+        target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/SubmitAhead.cpp)
+        add_test_executable(kyty_shim_submit_ahead_tests ${CMAKE_CURRENT_SOURCE_DIR}/SubmitAheadMain.cpp)
+        configure_host_test_executable(kyty_shim_submit_ahead_tests)
+        target_link_libraries(kyty_shim_submit_ahead_tests PRIVATE libSceAgcDriver libkernel libc)
+        add_test(NAME kyty_shim_submit_ahead COMMAND kyty_shim_submit_ahead_tests)
+        set_tests_properties(kyty_shim_submit_ahead PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "kyty_shim_submit_ahead: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     endif()
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ImageHeapLayoutLimits.cpp)
     add_test_executable(kyty_shim_image_heap_layout_limits_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageHeapLayoutLimitsMain.cpp)

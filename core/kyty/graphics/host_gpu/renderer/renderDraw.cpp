@@ -1703,6 +1703,68 @@ bool RenderExecutor::ResolveDrawPrograms(ResolvedDraw& draw, const HW::Context& 
 	return true;
 }
 
+namespace {
+void DirectDispatchInput(ShaderComputeInputInfo& compute, const HW::CsStageRegisters& cs, const uint32_t (&groups)[3],
+                         uint32_t mode, bool async_compute) {
+	ValueInitialize(compute);
+	compute.async_compute              = async_compute;
+	compute.dispatch_thread_dimensions = (mode & (1u << 5u)) != 0;
+	const uint32_t group_sizes[]       = {cs.num_thread_x, cs.num_thread_y, cs.num_thread_z};
+	for (uint32_t axis = 0; axis < 3u; ++axis) {
+		const auto size = compute.dispatch_thread_dimensions ? std::max(group_sizes[axis], 1u) : 1u;
+		compute.workgroup_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
+	}
+}
+
+void IndirectDispatchInput(ShaderComputeInputInfo& compute, uint32_t mode, uint64_t args_addr, bool async_compute) {
+	ValueInitialize(compute);
+	compute.async_compute = async_compute;
+	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		compute.dispatch_thread_dimensions = true;
+		compute.dispatch_indirect_threads  = true;
+	} else {
+		compute.indirect_args_address = args_addr;
+	}
+}
+}
+
+RenderExecutor::ResolvedDraw& RenderExecutor::TranslateScratch() {
+	if (m_translate_scratch == nullptr) {
+		m_translate_scratch = {new ResolvedDraw {}, [](ResolvedDraw* draw) { delete draw; }};
+	}
+	return *m_translate_scratch;
+}
+
+void RenderExecutor::TranslateDrawAhead(const HW::Context& context, const HW::UserConfig& user_config,
+                                        const HW::Shader& shaders, const ShaderIndirectOffsets& indirect_offsets,
+                                        bool indirect_draw) {
+	if (!DrawHasValidVertexShader(shaders)) {
+		return;
+	}
+	auto& draw                   = TranslateScratch();
+	draw.programs.translate_only = true;
+	(void)ResolveDrawPrograms(draw, context, user_config, shaders, indirect_offsets, indirect_draw, 0, 0);
+	draw.ReleaseLargeReadLog();
+}
+
+void RenderExecutor::TranslateDispatchAhead(const HW::Shader& shaders, const uint32_t (&groups)[3], uint32_t mode,
+                                            bool indirect, uint64_t args_addr, bool async_compute) {
+	const auto& cs_regs = shaders.GetCs();
+	if (cs_regs.cs_regs.data_addr == 0) {
+		return;
+	}
+	auto& slot = TranslateScratch();
+	slot.programs.Reset();
+	slot.programs.translate_only = true;
+	if (indirect) {
+		IndirectDispatchInput(slot.compute, mode, args_addr, async_compute);
+	} else {
+		DirectDispatchInput(slot.compute, cs_regs.cs_regs, groups, mode, async_compute);
+	}
+	(void)m_context.GetPipelineCache().GetComputeProgramAhead(cs_regs, slot.compute, slot.programs);
+	slot.ReleaseLargeReadLog();
+}
+
 RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Context& context,
                                                                    const HW::Shader&  shaders,
                                                                    const uint32_t (&groups)[3],
@@ -1716,15 +1778,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Con
 	auto& slot = NextResolvedDraw();
 	slot.state.store(ResolvedDraw::Ready, std::memory_order_relaxed);
 	slot.programs.Reset();
-	ValueInitialize(slot.compute);
-	slot.compute.async_compute = async_compute;
-	slot.compute.dispatch_thread_dimensions = (mode & (1u << 5u)) != 0;
-	const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
-	                                cs_regs.cs_regs.num_thread_z};
-	for (uint32_t axis = 0; axis < 3u; ++axis) {
-		const auto size = slot.compute.dispatch_thread_dimensions ? std::max(group_sizes[axis], 1u) : 1u;
-		slot.compute.workgroup_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
-	}
+	DirectDispatchInput(slot.compute, cs_regs.cs_regs, groups, mode, async_compute);
 	slot.compute_module =
 	    m_context.GetPipelineCache().GetComputeProgramAhead(cs_regs, slot.compute, slot.programs);
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
@@ -1748,14 +1802,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	auto& slot = NextResolvedDraw();
 	slot.state.store(ResolvedDraw::Ready, std::memory_order_relaxed);
 	slot.programs.Reset();
-	ValueInitialize(slot.compute);
-	slot.compute.async_compute = async_compute;
-	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		slot.compute.dispatch_thread_dimensions = true;
-		slot.compute.dispatch_indirect_threads  = true;
-	} else {
-		slot.compute.indirect_args_address = args_addr;
-	}
+	IndirectDispatchInput(slot.compute, mode, args_addr, async_compute);
 	slot.compute_module =
 	    m_context.GetPipelineCache().GetComputeProgramAhead(cs_regs, slot.compute, slot.programs);
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
