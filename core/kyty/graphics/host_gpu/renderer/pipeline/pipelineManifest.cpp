@@ -295,6 +295,10 @@ struct PipelineCache::ManifestState {
 	std::vector<const ShaderModule*>   modules;
 	std::vector<uint8_t>               module_failed;
 	std::vector<std::string>           module_failure;
+	std::unordered_map<uint64_t, std::string> refused_generics;
+	std::unordered_map<uint64_t, std::string> refused_recipes;
+	std::unordered_set<uint64_t>       known_code;
+	bool                               known_code_read = false;
 	std::vector<uint8_t>               module_refused;
 	std::vector<std::vector<uint32_t>> module_pipelines;
 	std::vector<uint8_t>               missing_modules;
@@ -723,6 +727,28 @@ const ShaderModule* PipelineCache::FindCompiledModule(
 	}
 	return nullptr;
 }
+
+#if defined(ANYPS5_KYTY)
+std::string PipelineCache::StartupRefusal(uint64_t program, bool generic) const {
+	if (m_manifest == nullptr) return {};
+	auto&            state = *m_manifest;
+	std::scoped_lock lock(state.mutex);
+	const auto&      refusals = generic ? state.refused_generics : state.refused_recipes;
+	const auto       found    = refusals.find(program);
+	return found != refusals.end() ? found->second : std::string {};
+}
+
+int PipelineCache::KnownProgram(uint64_t program) const {
+	if (m_manifest == nullptr) return -1;
+	auto&            state = *m_manifest;
+	std::scoped_lock lock(state.mutex);
+	if (state.known_code.contains(program) ||
+	    std::ranges::any_of(state.warm_modules, [&](const ManifestModule& module) { return module.ProgramHash() == program; })) {
+		return 1;
+	}
+	return state.known_code_read ? 0 : -1;
+}
+#endif
 
 PipelineCache::ProgramKey PipelineCache::ManifestProgramKey(const ManifestModule& record, bool guest_traversal,
                                                           const ShaderComputeInputInfo* compute_input) {
@@ -2974,6 +3000,9 @@ void PipelineCache::CodeStoreThread(const std::stop_token& stop) {
 			ManifestLog("Pipeline manifest: the code of {} shaders comes from {} ({} shaders)", provided,
 			            Common::PathToString(state.code_path), stored.size());
 		}
+		std::scoped_lock lock(state.mutex);
+		state.known_code      = stored;
+		state.known_code_read = true;
 	}
 	Common::File file;
 	bool         opened = false;
@@ -3299,10 +3328,13 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 				state.module_refused[index] = 1;
 				state.module_failure[index] = refusal;
 				state.generic_refused++;
+				state.refused_generics.insert_or_assign(record.ProgramHash(), refusal);
 			} else if (module == nullptr) {
 				state.module_failed[index] = 1;
 				state.module_failure[index] = refusal.empty() ? "unknown" : refusal;
 				state.failed++;
+				(record.generic_graphics ? state.refused_generics : state.refused_recipes)
+				    .insert_or_assign(record.ProgramHash(), state.module_failure[index]);
 			} else {
 				(built ? state.built : state.found)++;
 				state.build_ns += built ? elapsed : 0u;

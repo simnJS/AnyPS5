@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStoreTypes.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineWaitCause.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -816,6 +817,7 @@ private:
 		StallScope(PipelineCache& cache, const char* what, uint64_t hash, const char* why = nullptr,
 		           bool hold_clock = true);
 		StallScope(PipelineCache& cache, const char* what, const ShaderModule& module);
+		void Stages(const std::array<const ShaderModule*, 4>& stages);
 #endif
 		~StallScope();
 		KYTY_CLASS_NO_COPY(StallScope);
@@ -829,6 +831,9 @@ private:
 		const char*                           m_what = nullptr;
 		uint64_t                              m_hash = 0;
 		const char*                           m_why  = nullptr;
+		std::array<uint64_t, 4>               m_variants {};
+		std::array<uint64_t, 4>               m_programs {};
+		bool                                  m_compute = false;
 #endif
 	};
 	mutable std::mutex m_stall_mutex;
@@ -853,6 +858,21 @@ private:
 	StallStats            m_stall_logged;
 	std::atomic<uint64_t> m_pipelines_created {0};
 	void                  LogStallStats(bool force);
+	std::unordered_map<uint64_t, std::string> m_wait_causes;
+	void NoteWaitCause(const ProgramKey& key, const Program& program, const ShaderModule& module)
+	    KYTY_NO_THREAD_SAFETY_ANALYSIS;
+	[[nodiscard]] std::string ProgramWaitCause(const ProgramKey& key, const Program& program,
+	                                           const ShaderModule& module) const KYTY_NO_THREAD_SAFETY_ANALYSIS;
+	[[nodiscard]] std::string StallCause(std::span<const uint64_t> variants, std::span<const uint64_t> programs,
+	                                     bool compute, const char* route) const;
+	[[nodiscard]] static std::string TakeAddedCause();
+	[[nodiscard]] std::string StartupRefusal(uint64_t program, bool generic) const;
+	[[nodiscard]] int KnownProgram(uint64_t program) const;
+
+public:
+	static void NoteGenericServe(GenericServe state, uint64_t program = 0);
+
+private:
 #endif
 
 #if defined(ANYPS5_KYTY)

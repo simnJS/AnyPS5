@@ -1280,6 +1280,9 @@ void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
 		StoreModule(key, program, module, spirv, plain_spirv);
 		RecordModule(key, options, code, push_data_cursor, module);
 	}
+#if defined(ANYPS5_KYTY)
+	NoteWaitCause(key, program, module);
+#endif
 }
 
 void PipelineCache::DestroyModule(const ShaderModule& module) const {
@@ -1603,6 +1606,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 					module->info.bindings.AdvancePushData(push_data_cursor);
 					return module;
 				}
+#if defined(ANYPS5_KYTY)
+				NoteGenericServe(module != nullptr ? GenericServe::Unbound : GenericServe::NoModule, params.hash);
+			} else {
+				NoteGenericServe(GenericServe::NoModule, params.hash);
+#endif
 			}
 		}
 	}
@@ -1746,14 +1754,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				const char* value = std::getenv("KYTY_PIPELINE_STALL_LOG_MS");
 				return value != nullptr ? std::strtoll(value, nullptr, 10) : 100;
 			}());
-			const auto now = std::chrono::steady_clock::now();
+			const auto now   = std::chrono::steady_clock::now();
+			const auto cause = TakeAddedCause();
 			if (now - started >= threshold) {
-				PipelineCacheLog("[kyty-gpl] translate {:.3f} s 0x{:016x} @{}",
-				                 std::chrono::duration<double>(now - started).count(), hash,
+				PipelineCacheLog("[kyty-gpl] translate {:.3f} s 0x{:016x}{} @{}",
+				                 std::chrono::duration<double>(now - started).count(), hash, cause,
 				                 now.time_since_epoch().count());
 			}
 		}
 	} const translate_scope {params.hash};
+	(void)TakeAddedCause();
 #endif
 	if (m_queue_only) {
 		if (!m_in_flight.contains(m_lookup_key)) {
@@ -4363,6 +4373,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			if (!stall) {
 #if defined(ANYPS5_KYTY)
 				stall.emplace(*this, "graphics-wait", stall_hash, sync_why);
+				stall->Stages(stages);
 #else
 				stall.emplace(*this);
 #endif
@@ -4387,6 +4398,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (!stall) {
 #if defined(ANYPS5_KYTY)
 			stall.emplace(*this, "graphics-sync", stall_hash, sync_why);
+			stall->Stages(stages);
 #else
 			stall.emplace(*this);
 #endif
