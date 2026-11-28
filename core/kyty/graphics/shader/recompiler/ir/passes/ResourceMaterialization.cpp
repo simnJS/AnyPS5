@@ -1698,10 +1698,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 		const bool depth_bits =
-		    !storage && base.unfiltered_access_only && format == Prospero::BufferFormat::k16UInt &&
+		    !image.heap && !storage && base.unfiltered_access_only && format == Prospero::BufferFormat::k16UInt &&
 		    static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu) ==
 		        Prospero::TileMode::kDepth;
-		image.conversion_format = depth_bits ? format : ImageConversionFormat(format);
+		image.conversion_format =
+		    image.heap ? Prospero::BufferFormat::kInvalid : (depth_bits ? format : ImageConversionFormat(format));
 		image.skip_degamma = ((base.paired_view != ImageResource::NoIndirectImage && image.table_capacity != 0u) ||
 		                      (!image.heap && Prospero::IsSrgbFormat(format))) &&
 		                     SamplerSkipsDegamma(program, snapshot, base_index);
@@ -1710,7 +1711,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (format == Prospero::BufferFormat::k8Srgb || format == Prospero::BufferFormat::k8_8Srgb)) {
 			image.srgb_decode = format;
 		}
-		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
+		if (!image.heap && (storage || image.conversion_format != Prospero::BufferFormat::kInvalid)) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
 		const auto raw_sint_format = RawSignedStorageFormat(base, format);

@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -114,6 +115,7 @@ private:
 	};
 
 	struct Memory {
+		ListKey                            list_owner {};
 		uint64_t                           base = 0;
 		uint64_t                           size = 0;
 		std::vector<uint32_t>              words;
@@ -151,7 +153,8 @@ private:
 	void Unlink(Owner& owner, size_t slot, uint32_t entry);
 	void     Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots, Buffer& device,
 	                size_t& dirty_begin, size_t& dirty_end);
-	uint32_t Intern(View& view, uint32_t kind, const Key& key);
+	uint32_t Intern(View& view, uint32_t kind, const Key& key, std::span<uint32_t> pending = {});
+	void     ShiftArms(View& view, uint32_t arm, std::span<uint32_t> pending);
 	uint32_t Profile(const ShaderRecompiler::IR::ImageResource& root, bool table);
 	void     Release(uint32_t entry);
 	void     Retire();

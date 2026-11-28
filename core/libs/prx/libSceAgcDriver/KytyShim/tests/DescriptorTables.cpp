@@ -86,6 +86,94 @@ struct ImageHeapTestAccess {
 		}
 		return true;
 	}
+
+	static bool CheckKindOrder(ImageHeap& heap, uint64_t address, const ShaderRecompiler::IR::ImageResource& root,
+	                           const ShaderRecompiler::IR::DescriptorValue& float_tex,
+	                           const ShaderRecompiler::IR::DescriptorValue& uint_tex,
+	                           CommandBuffer& cmd, vk::PipelineLayout layout) {
+		const auto write_tex = [](uint64_t dst, const ShaderRecompiler::IR::DescriptorValue& value) {
+			Libs::LibKernel::Memory::WriteBacking(dst, value.dwords.data(), sizeof(value.dwords));
+		};
+		const auto base_a = address + 0x1000u;
+		const auto base_b = address + 0x2000u;
+		const ShaderRecompiler::IR::DescriptorValue zeros {};
+		write_tex(base_a, uint_tex);
+		write_tex(base_a + 32u, zeros);
+		ShaderRecompiler::IR::ImageHeapView view_a {};
+		if (!heap.Acquire({.base = base_a, .size = 64u, .step = 32u, .first = 0u, .count = 2u, .root = &root},
+		                  view_a)) {
+			return false;
+		}
+		if (view_a.kinds.size() != 1u) return false;
+		write_tex(base_a + 32u, float_tex);
+		(void)heap.InvalidateMemory(base_a + 32u, 32u);
+		heap.BeginDraw();
+		if (!heap.Acquire({.base = base_a, .size = 64u, .step = 32u, .first = 0u, .count = 2u, .root = &root},
+		                  view_a)) {
+			return false;
+		}
+		write_tex(base_b, float_tex);
+		write_tex(base_b + 32u, uint_tex);
+		ShaderRecompiler::IR::ImageHeapView view_b {};
+		if (!heap.Acquire({.base = base_b, .size = 64u, .step = 32u, .first = 0u, .count = 2u, .root = &root},
+		                  view_b)) {
+			return false;
+		}
+		const auto find_view = [&](uint64_t base) -> const ImageHeap::View* {
+			for (const auto& memory: heap.m_memories) {
+				if (memory->base == base && !memory->views.empty()) return memory->views.front().get();
+			}
+			return nullptr;
+		};
+		const auto* va = find_view(base_a);
+		const auto* vb = find_view(base_b);
+		if (va == nullptr || vb == nullptr || va->kind_keys != vb->kind_keys || va->kind_keys.size() != 2u ||
+		    va->kind_keys[0] >= va->kind_keys[1]) {
+			return false;
+		}
+		if ((va->slots[0] >> ShaderRecompiler::IR::ImageHeapKindShift) != 1u ||
+		    (va->slots[8] >> ShaderRecompiler::IR::ImageHeapKindShift) != 0u ||
+		    (vb->slots[0] >> ShaderRecompiler::IR::ImageHeapKindShift) != 0u ||
+		    (vb->slots[8] >> ShaderRecompiler::IR::ImageHeapKindShift) != 1u) {
+			return false;
+		}
+
+		ShaderRecompiler::IR::ImageHeapView list_view_a {};
+		const std::array list_a_values {uint_tex};
+		if (!heap.AcquireList({.owner = &base_a, .resource = 0u, .root = &root, .values = list_a_values}, list_view_a) ||
+		    list_view_a.kinds.size() != 1u) {
+			return false;
+		}
+		heap.Commit(cmd, vk::PipelineBindPoint::eCompute, layout);
+		ShaderRecompiler::IR::ImageHeapView list_view_b {};
+		const std::array list_b_values {float_tex, uint_tex};
+		if (!heap.AcquireList({.owner = &base_b, .resource = 0u, .root = &root, .values = list_b_values}, list_view_b) ||
+		    list_view_b.kinds.size() != 2u) {
+			return false;
+		}
+		const auto it_a = heap.m_lists.find({.owner = &base_a, .resource = 0u});
+		const auto it_b = heap.m_lists.find({.owner = &base_b, .resource = 0u});
+		if (it_a == heap.m_lists.end() || it_b == heap.m_lists.end()) return false;
+		const auto& list_a = it_a->second;
+		const auto& list_b = it_b->second;
+		if (list_a.view == list_b.view ||
+		    (list_a.slots[1] >> ShaderRecompiler::IR::ImageHeapKindShift) != 0u ||
+		    std::ranges::find(heap.m_active_lists, &list_a) != heap.m_active_lists.end() ||
+		    (list_b.slots[1] >> ShaderRecompiler::IR::ImageHeapKindShift) != 0u ||
+		    (list_b.slots[2] >> ShaderRecompiler::IR::ImageHeapKindShift) != 1u) {
+			return false;
+		}
+		const std::array list_a_next {uint_tex, float_tex};
+		if (!heap.AcquireList({.owner = &base_a, .resource = 0u, .root = &root, .values = list_a_next}, list_view_a) ||
+		    !std::ranges::equal(list_view_a.kinds, list_view_b.kinds) ||
+		    (list_a.slots[1] >> ShaderRecompiler::IR::ImageHeapKindShift) != 1u ||
+		    (list_a.slots[2] >> ShaderRecompiler::IR::ImageHeapKindShift) != 0u || list_a.dirty_begin > 1u ||
+		    list_a.dirty_end < 3u ||
+		    std::ranges::find(heap.m_active_lists, &list_a) == heap.m_active_lists.end()) {
+			return false;
+		}
+		return true;
+	}
 };
 
 }
@@ -424,6 +512,29 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	Check(old_slot != 0u && old_slot == ImageHeapTestAccess::LiveSlot(heap, next) &&
 	      next_image && next_image != fallback_images[2] && ImageHeapTestAccess::Matches(heap, mapped, expected, next_images),
 	      "a recycled slot resolves the replacement image at every ordinal");
+	{
+		auto uint_tex = HeapTexture(address + 0x40000u);
+		uint_tex.dwords[1] = (uint_tex.dwords[1] & ~(0x1ffu << 20u)) |
+		                     (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u);
+		const auto float_tex = HeapTexture(address + 0x42000u);
+		const auto empty_set = graphics.device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo {});
+		if (empty_set.result == vk::Result::eSuccess) {
+			const std::array layouts {empty_set.value, graphics.image_heap_layout};
+			const auto kind_layout = graphics.device.createPipelineLayout(
+			    {.setLayoutCount = static_cast<uint32_t>(layouts.size()), .pSetLayouts = layouts.data()});
+			if (kind_layout.result == vk::Result::eSuccess) {
+				Check(ImageHeapTestAccess::CheckKindOrder(heap, address + 0x50000u, root, float_tex, uint_tex,
+				                                          scheduler.Current(), kind_layout.value),
+				      "heap kind order stays canonical and shifts existing slots");
+				graphics.device.destroyPipelineLayout(kind_layout.value);
+			} else {
+				Check(false, "kind order pipeline layout");
+			}
+			graphics.device.destroyDescriptorSetLayout(empty_set.value);
+		} else {
+			Check(false, "kind order set layout");
+		}
+	}
 	scheduler.Finish();
 	renderer.UnmapMemory(address, bytes);
 	if (memory_budget) {
