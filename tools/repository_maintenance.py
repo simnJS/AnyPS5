@@ -16,6 +16,7 @@ TARGET_BRANCH = "AnyKyty"
 STAGE_PREFIX = "test/integrate-"
 PR_WORKFLOWS = ("anykyty.yml", "offline-checks.yml")
 BOT = "github-actions[bot]"
+REVIEWED_LABEL = "reviewed"
 MARKER = "repository-maintenance"
 SCAN = Path(__file__).with_name("public-scan.sh")
 
@@ -461,6 +462,9 @@ def merge(number, words):
     head, base = pull["head"]["sha"], branch_head(target)
     if not all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in (head, base)):
         raise RuntimeError("GitHub returned an invalid commit SHA")
+    if REVIEWED_LABEL not in {label["name"] for label in pull["labels"]}:
+        note(f"- #{number} is waiting for the maintainers' review label.")
+        return
     if not approved(number, head):
         note(f"- #{number} is waiting for the owner's label and approval of the current revision.")
         return
