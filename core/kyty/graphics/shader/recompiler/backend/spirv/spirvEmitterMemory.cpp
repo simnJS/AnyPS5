@@ -724,7 +724,10 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	const bool indexed = buffer.source < sources.size() &&
 	    sources[buffer.source].indirect_descriptor &&
 	    sources[buffer.source].indirect_descriptor->indexed;
-	if (!structured && !indexed) return payload_in_bounds;
+	const auto binding = buffer.descriptor_index;
+	const auto live_bounds = !indexed && binding < state.memory_bounds.size()
+	    ? state.memory_bounds[binding].structured : 0u;
+	if (!structured && !indexed && live_bounds == 0u) return payload_in_bounds;
 	const auto stride = BufferStrideValue(state, mem, buffer.packed_stride);
 	const auto bytes = Binary(state, spv::OpIMul, TypeU32(state), resource.length,
 	                          ConstantU32(state, resource.element_bits / 8u));
@@ -751,7 +754,7 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	    AndCondition(state,
 	        Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, resource.byte_offset),
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), index, last_record)));
-	if (!structured) return in_bounds;
+	if (!structured && live_bounds == 0u) return in_bounds;
 	const auto offset_in_bounds = payload_bytes == 0u
 	    ? Binary(state, spv::OpULessThan, TypeBool(state), offset, stride)
 	    : AndCondition(state,
@@ -759,14 +762,22 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), offset,
 	               Binary(state, spv::OpISub, TypeU32(state), stride, payload_bytes)));
 	in_bounds = AndCondition(state, in_bounds, offset_in_bounds);
-	return in_bounds;
+	if (live_bounds == 0u) return in_bounds;
+	return Select(state, TypeBool(state), live_bounds, in_bounds,
+	              payload_in_bounds != 0u ? payload_in_bounds : ConstantBool(state, true));
 }
 
 uint32_t StorageBufferElementInBounds(EmitterState& state, const IR::MemoryInfo& mem,
                                       const MemoryResourceAccess& resource, uint32_t index) {
-	if (mem.kind == IR::ResourceKind::Buffer &&
-	    (state.program.info.buffers[mem.resource].packed_stride & IR::ExactBufferBounds) != 0u) {
-		return EmitMemoryElementInBounds(state, resource, index);
+	if (mem.kind == IR::ResourceKind::Buffer) {
+		const auto& buffer = state.program.info.buffers[mem.resource];
+		const auto binding = buffer.descriptor_index;
+		if (binding < state.memory_bounds.size() && state.memory_bounds[binding].relaxed != 0u && !resource.physical) {
+			return Binary(state, spv::OpLogicalOr, TypeBool(state), state.memory_bounds[binding].relaxed,
+			              EmitMemoryElementInBounds(state, resource, index));
+		}
+		if ((buffer.packed_stride & IR::ExactBufferBounds) != 0u)
+			return EmitMemoryElementInBounds(state, resource, index);
 	}
 	return EmitStorageElementInBounds(state, resource, index);
 }

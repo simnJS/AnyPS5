@@ -381,7 +381,7 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 		std::memcpy(buffers[index].mapped, host, bytes);
 		shader_data[layout.MemorySizeDword() + index] = static_cast<uint32_t>(bytes);
 		if (index < layout.stride_count && Recompiler::IR::HasRuntimeStride(resource.packed_stride)) {
-			shader_data[layout.StrideDword() + index] = descriptor.PackedStride() & Recompiler::IR::BufferStrideMask;
+			shader_data[layout.StrideDword() + index] = Recompiler::IR::RuntimeStrideData(descriptor);
 		}
 	}
 	for (uint32_t index = 0; index < buffer_count; index++) {

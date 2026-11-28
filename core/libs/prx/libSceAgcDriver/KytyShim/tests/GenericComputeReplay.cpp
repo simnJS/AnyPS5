@@ -54,6 +54,8 @@ enum Texture : std::uint32_t { FloatA, FloatB, UintC };
 struct Dispatch {
     std::array<Texture, 3> table;
     std::uint32_t count;
+    std::uint32_t stride = 0;
+    std::uint32_t bounds = 3;
 };
 
 constexpr std::array<Dispatch, 7> Dispatches{{
@@ -86,10 +88,11 @@ std::array<std::uint32_t, 8> tsharp(Texture texture) {
             15u, 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
 }
 
-std::array<std::uint32_t, 4> output(std::uint32_t row) {
+std::array<std::uint32_t, 4> output(std::uint32_t row, const Dispatch& dispatch) {
     const auto address = Output + row * RowBytes;
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), RowBytes,
-            0xfacu | (Format32UInt << 12u) | (1u << 24u) | (3u << 28u)};
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (dispatch.stride << 16u),
+            dispatch.stride ? RowBytes / dispatch.stride : RowBytes,
+            0xfacu | (Format32UInt << 12u) | (1u << 24u) | (dispatch.bounds << 28u)};
 }
 
 void append(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload) {
@@ -101,7 +104,7 @@ std::vector<std::uint32_t> dispatchWords(std::span<const Dispatch> dispatches) {
     std::vector<std::uint32_t> words;
     for (std::uint32_t row = 0; row < dispatches.size(); ++row) {
         const auto table = Tables + row * 0x200u;
-        const auto target = output(row);
+        const auto target = output(row, dispatches[row]);
         append(words, 0x76, {0x20c, static_cast<std::uint32_t>(Code >> 8u), static_cast<std::uint32_t>(Code >> 40u)});
         append(words, 0x76, {0x212, 0u});
         append(words, 0x76, {0x213, 8u << 1u});
@@ -419,6 +422,25 @@ int prepared(const std::filesystem::path& tool, const std::filesystem::path& roo
                 control.log.find("\"dispatches\":1.0") != std::string::npos &&
                 control.log.find("\"unfinished\":0") != std::string::npos,
             "omitting the second variant did not expose its first-use pipeline miss", control);
+
+    const std::array<Dispatch, 1> unstructured{{{only_a[0].table, only_a[0].count, 16u, 1u}}};
+    auto structured = unstructured;
+    structured[0].bounds = 0;
+    const auto bounds_seed = preparedReplay(tool, root, "bounds", "seed", unstructured, false);
+    const auto exact = preparedReplay(tool, root, "exact-bounds", "control", structured, false);
+    require(bounds_seed.completed && exact.completed && bounds_seed.dump != exact.dump &&
+                changedOutput(std::string_view(bounds_seed.dump).substr(0, RowBytes)),
+            "the two bounds modes must produce different results for writes past the first record", exact);
+    setVariable("KYTY_GENERIC_COMPUTE_VARIANT", "1");
+    setVariable("KYTY_GENERIC_COMPUTE_SPECIALIZE", "1");
+    setVariable("KYTY_ASYNC_PIPELINES", "1");
+    const auto served = preparedReplay(tool, root, "bounds", "first-use", structured, true);
+    require(served.completed && served.dump == exact.dump && served.frame == exact.frame &&
+                manifestCompute(served.log) == 1 && count(served.log, ServeLine) == 1 &&
+                served.log.find("[kyty-variant] specialize stage=CS") != std::string::npos &&
+                served.log.find("compute-sync") == std::string::npos && served.log.find("compute-wait") == std::string::npos &&
+                served.log.find("\"dispatches\":1.0") != std::string::npos,
+            "a prepared pipeline must enforce the live record bounds while specializing the first dispatch", served);
 
     if (std::getenv("APS5_REPLAY_KEEP_ARTIFACTS") == nullptr) {
         std::filesystem::remove_all(root);

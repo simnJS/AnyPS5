@@ -143,7 +143,8 @@ struct Materialized {
 	IR::ResourceSpecialization specialization;
 };
 
-Materialized Materialize(const IR::ResourcePlan& plan, const std::vector<Texture>& table) {
+Materialized Materialize(const IR::ResourcePlan& plan, const std::vector<Texture>& table,
+                         uint32_t stride = 0, uint32_t bounds = 3) {
 	std::fill_n(g_guest, GuestBytes / 4u, 0u);
 	for (uint32_t entry = 0; entry < table.size(); ++entry) {
 		for (uint32_t word = 0; word < 8u; ++word) Poke(TableAddress + entry * 32u + word * 4u, table[entry][word]);
@@ -155,9 +156,9 @@ Materialized Materialize(const IR::ResourcePlan& plan, const std::vector<Texture
 	user_data[1] = static_cast<uint32_t>(TableAddress >> 32u);
 	user_data[2] = static_cast<uint32_t>(table.size());
 	user_data[4] = static_cast<uint32_t>(OutputAddress);
-	user_data[5] = static_cast<uint32_t>(OutputAddress >> 32u);
-	user_data[6] = 64u * 16u;
-	user_data[7] = 0xfacu | (Format32UInt << 12u) | (1u << 24u) | (3u << 28u);
+	user_data[5] = static_cast<uint32_t>(OutputAddress >> 32u) | (stride << 16u);
+	user_data[6] = stride ? 64u : 64u * 16u;
+	user_data[7] = 0xfacu | (Format32UInt << 12u) | (1u << 24u) | (bounds << 28u);
 	const IR::SrtRuntime runtime {.user_data = user_data, .read_specialization_memory = ReadMemory};
 	Materialized         result;
 	result.ok = IR::MaterializeResources(plan, runtime, result.snapshot, result.specialization);
@@ -396,6 +397,13 @@ void RebindTableAndHeap(bool on) {
 		          rebound.flattened_srt == table.snapshot.flattened_srt,
 		      "table bridge preserves original descriptor lookup");
 	}
+	auto dynamic_heap = native_heap.specialization;
+	IR::ReadStridesAtRunTime(plan, dynamic_heap);
+	auto& output = dynamic_heap.buffers.front();
+	Check(IR::HasRuntimeStride(output.packed_stride), "the output buffer can read its live bounds");
+	output.packed_stride ^= IR::ExactBufferBounds;
+	Check(IR::RebindComputeImages(plan, runtime, table.snapshot, table.specialization, dynamic_heap, rebound) == on,
+	      "a table dispatch can bind a ready heap with a different dynamic output bound");
 	auto invalid = native_heap.specialization;
 	invalid.images.back().numeric_class = Prospero::TextureNumericClass::Uint;
 	Check(!IR::CanRebindComputeImages(plan, table.specialization, invalid), "heap bridge rejects different child types");
@@ -416,6 +424,34 @@ void RebindTableAndHeap(bool on) {
 	CheckImageTableWidths(plan, runtime, heap, on);
 }
 
+void CheckBufferBounds(const IR::ResourcePlan& plan, const Texture& texture, bool on) {
+	for (const auto mode: {0u, 1u}) {
+		const auto live = Materialize(plan, {texture}, 16, mode);
+		const auto previous = Materialize(plan, {texture}, 16, 1u - mode);
+		Check(live.ok && previous.ok && live.specialization != previous.specialization,
+		      "the two live descriptors require different buffer bounds");
+		if (!live.ok || !previous.ok) return;
+		auto ready = previous.specialization;
+		IR::ReadStridesAtRunTime(plan, ready);
+		IR::ResourceSnapshot aligned;
+		const bool fits = IR::AlignResources(plan, live.snapshot, live.specialization, ready, &aligned);
+		Check(fits == on && (!fits || aligned.buffers == live.snapshot.buffers),
+		      "a runtime stride pipeline binds the current descriptor in either bounds mode");
+		Check(!IR::AlignResources(plan, live.snapshot, live.specialization, previous.specialization, nullptr),
+		      "a baked stride pipeline keeps its own bounds mode");
+		const auto exact = Materialize(plan, {texture}, 16, 3);
+		Check(exact.ok && IR::AlignResources(plan, exact.snapshot, exact.specialization, ready, nullptr) == on,
+		      "runtime stride pipelines accept exact byte range checks");
+		auto swizzled = ready;
+		swizzled.buffers.front().packed_stride ^= 1u << 14u;
+		Check(!IR::AlignResources(plan, live.snapshot, live.specialization, swizzled, nullptr),
+		      "swizzled addressing keeps its own pipeline");
+		const auto zero = Materialize(plan, {texture}, 0, 0);
+		Check(zero.ok && !IR::AlignResources(plan, zero.snapshot, zero.specialization, ready, nullptr),
+		      "zero stride out-of-bounds accesses keep their own pipeline");
+	}
+}
+
 void Generic(bool on) {
 	const auto program = Translate();
 	const auto& plan   = program.plan;
@@ -430,6 +466,7 @@ void Generic(bool on) {
 	const auto b = MakeTexture(TextureB, Format8888);
 	const auto c = MakeTexture(TextureC, Format32UInt);
 
+	CheckBufferBounds(plan, a, on);
 	const auto floats = Materialize(plan, {a, b});
 	const auto plain  = Materialize(plan, {a, a});
 	const auto mixed  = Materialize(plan, {a, c});

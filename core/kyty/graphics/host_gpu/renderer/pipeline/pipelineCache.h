@@ -718,10 +718,10 @@ private:
 	bool ComputePipelineReady(const ShaderModule& module, bool ahead = false);
 	static bool CanCoverEmptyComputePipeline(const ShaderModule& empty, const ShaderModule& populated);
 	void NoteInstalledComputeReady(uint64_t module_id, const Pipeline& pipeline);
-	size_t FindReadyComputeVariant(const Program& program, const ShaderRecompiler::IR::ResourceSnapshot& resources,
+	size_t FindReadyComputeVariant(const Program& program, ShaderRecompiler::IR::ResourceSnapshot& resources,
 	                               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                               uint32_t push_data_cursor, const ShaderModule* exact, bool ahead,
-	                               bool rematerialize = false);
+	                               bool rematerialize = false, const ShaderRecompiler::IR::SrtRuntime* runtime = nullptr);
 	ShaderModule* ServeComputeVariant(Program& program, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                                  uint32_t push_data_cursor, const ShaderModule* exact);
 	void          SpecializeComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,

@@ -188,6 +188,11 @@ struct EmitterState {
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	std::vector<uint32_t>                           memory_strides;
+	struct BufferBounds {
+		uint32_t structured = 0;
+		uint32_t relaxed = 0;
+	};
+	std::vector<BufferBounds>                       memory_bounds;
 	uint32_t                                         fault_buffer_variable   = 0;
 	std::array<uint32_t, 4>                          mirror_metadata {};
 	uint32_t                                         bda_pointer_function    = 0;

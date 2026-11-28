@@ -207,11 +207,25 @@ void EmitMemoryBindings(EmitterState& state) {
 	state.memory_byte_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
 	state.memory_strides.assign(count, 0u);
+	state.memory_bounds.assign(count, {});
 	for (const auto& buffer: state.program.info.buffers) {
 		if (buffer.descriptor_index < count && IR::HasRuntimeStride(buffer.packed_stride) &&
 		    state.memory_strides[buffer.descriptor_index] == 0u) {
-			state.memory_strides[buffer.descriptor_index] = EmitShaderDataDwordLoad(
-			    state, state.program.bindings.StrideDword() + buffer.descriptor_index);
+			const auto binding = buffer.descriptor_index;
+			const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.StrideDword() + binding);
+			state.memory_strides[binding] = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word,
+			                                       ConstantU32(state, IR::BufferStrideMask));
+			if (state.program.stage == ShaderType::Compute && (buffer.packed_stride & (1u << 14u)) == 0u &&
+			    buffer.source < state.program.descriptor_sources.size() &&
+			    !state.program.descriptor_sources[buffer.source].indirect_descriptor) {
+				const auto flag = [&](uint32_t mask, spv::Op compare) {
+					const auto value = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word, ConstantU32(state, mask));
+					return Binary(state, compare, TypeBool(state), value, ConstantU32(state, 0u));
+				};
+				state.memory_bounds[binding].structured = flag(IR::StructuredBufferBounds, spv::OpINotEqual);
+				if (state.profile.robust_buffer_access)
+					state.memory_bounds[binding].relaxed = flag(IR::ExactBufferBounds, spv::OpIEqual);
+			}
 		}
 	}
 	std::vector<bool> dynamic_offsets(count);

@@ -3883,6 +3883,15 @@ void PlaceRoot(uint32_t root, const RootPlan<Slot>& plan, const Slot& form, std:
 	}
 }
 
+bool CompatibleComputeBuffer(const ResourcePlan& plan, uint32_t index, ResourceSpecialization::Buffer live,
+                             const ResourceSpecialization::Buffer& served) {
+	if (HasRuntimeStride(served.packed_stride) && ReadsStrideAtRunTime(plan, index, live)) {
+		constexpr uint32_t runtime = BufferStrideMask | StructuredBufferBounds | ExactBufferBounds;
+		live.packed_stride = (live.packed_stride & ~runtime) | (served.packed_stride & runtime);
+	}
+	return live == served;
+}
+
 }
 
 bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
@@ -3898,11 +3907,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
 		const auto& wanted = specialization.buffers[index];
 		const auto& served = target.buffers[index];
-		auto compatible = wanted;
-		if (HasRuntimeStride(served.packed_stride) && ReadsStrideAtRunTime(program, index, wanted)) {
-			compatible.packed_stride |= RuntimeBufferStride;
-		}
-		if (!(compatible == served) &&
+		if (!CompatibleComputeBuffer(program, index, wanted, served) &&
 		    (wanted.indirect_root != BufferResource::NoIndirectBuffer || served.indirect_root != BufferResource::NoIndirectBuffer ||
 		     !EmptyBufferServes(program, snapshot, index, wanted, served))) {
 			return false;
@@ -4011,7 +4016,10 @@ bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecializ
 	const auto roots = program.info.images.size();
 	if (!GenericComputeVariants() || program.stage != ShaderType::Compute ||
 	    specialization.images.size() < roots || target.images.size() < roots ||
-	    specialization.buffers != target.buffers || specialization.samplers != target.samplers) return false;
+	    specialization.buffers.size() != target.buffers.size() || specialization.samplers != target.samplers) return false;
+	for (uint32_t i = 0; i < specialization.buffers.size(); ++i) {
+		if (!CompatibleComputeBuffer(program, i, specialization.buffers[i], target.buffers[i])) return false;
+	}
 	bool changes_addressing = false;
 	for (size_t index = 0; index < roots; ++index) {
 		const auto& live = specialization.images[index];

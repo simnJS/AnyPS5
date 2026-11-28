@@ -1407,21 +1407,22 @@ void PipelineCache::NoteInstalledComputeReady(uint64_t module_id, const Pipeline
 }
 
 size_t PipelineCache::FindReadyComputeVariant(const Program& program,
-                                              const ShaderRecompiler::IR::ResourceSnapshot& resources,
+                                              ShaderRecompiler::IR::ResourceSnapshot& resources,
                                               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                                               uint32_t push_data_cursor, const ShaderModule* exact, bool ahead,
-                                              bool rematerialize) {
+                                              bool rematerialize, const ShaderRecompiler::IR::SrtRuntime* runtime) {
 	if (program.call_source != nullptr || !ShaderRecompiler::IR::GenericComputeVariants()) return SIZE_MAX;
 	const auto& plan = program.resource_plan;
 	const auto compatible = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
-		return &candidate != exact && !candidate.shared_variant && candidate.module != nullptr &&
-		       layout.push_data_start_dword ==
-		           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) &&
-		       ComputePipelineReady(candidate, ahead) &&
-		       (rematerialize ? ShaderRecompiler::IR::CanRebindComputeImages(plan, specialization, candidate.specialization)
-		                      : ShaderRecompiler::IR::AlignResources(plan, resources, specialization, candidate.specialization,
-		                                                              nullptr));
+		if (&candidate == exact || candidate.shared_variant || !candidate.module ||
+		    layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) ||
+		    !ComputePipelineReady(candidate, ahead)) return false;
+		if (runtime != nullptr)
+			return ShaderRecompiler::IR::RebindComputeImages(plan, *runtime, resources, specialization,
+			                                                 candidate.specialization, resources);
+		return rematerialize ? ShaderRecompiler::IR::CanRebindComputeImages(plan, specialization, candidate.specialization)
+		                     : ShaderRecompiler::IR::AlignResources(plan, resources, specialization, candidate.specialization, nullptr);
 	};
 	if (program.served_module < program.modules.size() && compatible(program.modules[program.served_module])) {
 		return program.served_module;
@@ -1431,7 +1432,8 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 	for (size_t index = 0; index < program.modules.size(); ++index) {
 		const auto& candidate = program.modules[index];
 		const auto slots = candidate.specialization.images.size() + candidate.specialization.samplers.size();
-		if (slots >= best_slots || !compatible(candidate)) continue;
+		if (index == program.served_module || slots >= best_slots || !compatible(candidate)) continue;
+		if (runtime != nullptr) return index;
 		best_index = index;
 		best_slots = slots;
 	}
@@ -1442,22 +1444,16 @@ ShaderModule* PipelineCache::ServeComputeVariant(Program& program, const ShaderR
                                                  uint32_t push_data_cursor, const ShaderModule* exact) {
 	auto best_index = FindReadyComputeVariant(program, program.resources, program.specialization,
 	                                          push_data_cursor, exact, false);
-	const bool rematerialize = best_index == SIZE_MAX;
-	if (rematerialize) {
-		best_index = FindReadyComputeVariant(program, program.resources, program.specialization,
-		                                    push_data_cursor, exact, false, true);
-	}
-	if (best_index == SIZE_MAX) return nullptr;
-	auto* best = &program.modules[best_index];
 	const auto& plan = program.resource_plan;
-	const bool bound = rematerialize
-	    ? ShaderRecompiler::IR::RebindComputeImages(plan, runtime, program.resources, program.specialization,
-	                                               best->specialization, program.resources)
-	    : ShaderRecompiler::IR::AlignResources(plan, program.resources, program.specialization, best->specialization,
-	                                          &program.resources);
-	if (!bound) {
+	if (best_index == SIZE_MAX) {
+		best_index = FindReadyComputeVariant(program, program.resources, program.specialization,
+		                                    push_data_cursor, exact, false, true, &runtime);
+		if (best_index == SIZE_MAX) return nullptr;
+	} else if (!ShaderRecompiler::IR::AlignResources(plan, program.resources, program.specialization,
+	                                                 program.modules[best_index].specialization, &program.resources)) {
 		return nullptr;
 	}
+	auto* best = &program.modules[best_index];
 	program.served_module = best_index;
 	if (ShaderVariantLog()) {
 		const auto natural = ResourceShapeFingerprint(program.specialization);
@@ -1482,7 +1478,7 @@ void PipelineCache::SpecializeComputeVariant(const ProgramKey& key, Program& pro
 	    program.Failed(specialization, push_data_cursor)) {
 		return;
 	}
-	QueueCompile(key, params, input_info, push_data_cursor, &specialization, m_guest_traversal, false, false, true);
+	QueueCompile(key, params, input_info, push_data_cursor, &specialization, m_guest_traversal, false, m_lane_pairs, true);
 	if (ShaderVariantLog()) {
 		PipelineCacheLog("[kyty-variant] specialize stage=CS shader={:016x} natural={:016x} @{}", params.hash,
 		                 ResourceShapeFingerprint(specialization),

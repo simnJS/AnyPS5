@@ -3069,7 +3069,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocati
 			ShaderBufferResource descriptor;
 			std::copy_n(snapshot.buffers[i].dwords.begin(), std::size(descriptor.fields), descriptor.fields);
 			prepared.shader_data[layout.StrideDword() + index] =
-			    descriptor.PackedStride() & ShaderRecompiler::IR::BufferStrideMask;
+			    ShaderRecompiler::IR::RuntimeStrideData(descriptor);
 		}
 	}
 	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
