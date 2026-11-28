@@ -69,6 +69,17 @@ int main() {
 	      "a later tick behind a submission stuck in the driver is held by the driver");
 	Check(Snapshot::Classify(14420, 14421, 14419, 14418, 12.0) == Holder::Recording,
 	      "a stale submission note does not blame the driver");
+	constexpr uint64_t second = 1'000'000'000;
+	Snapshot::StallWatch watch;
+	Check(!watch.GpuStallSeconds(20 * second, 14'971'000'000), "a tick submitted 5.029 s ago can keep running");
+	Check(!watch.GpuStallSeconds(24'970'999'999, 14'971'000'000), "the guard allows the full ten seconds");
+	Check(watch.GpuStallSeconds(24'971'000'000, 14'971'000'000) == 10.0, "ten seconds since submission can report a stall");
+	Snapshot::StallWatch wrapped;
+	Check(!wrapped.GpuStallSeconds(20 * second, 0), "a missing submission timestamp starts observation");
+	Check(!wrapped.GpuStallSeconds(30 * second - 1, 0), "a missing timestamp cannot shorten the grace period");
+	Check(wrapped.GpuStallSeconds(30 * second, 0) == 10.0, "an evicted submission can still be reported");
+	Check(watch.GpuStallSeconds(34'971'000'000, 0) == 20.0, "evicting a known submission keeps its age");
+
 	Snapshot::CompileWait none;
 	Snapshot::CompileWait one;
 	one.count = 1;
