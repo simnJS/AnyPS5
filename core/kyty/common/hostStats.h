@@ -81,6 +81,7 @@ struct SystemMemory {
 };
 
 [[nodiscard]] std::optional<SystemMemory> ReadSystemMemory();
+void ReclaimColdGroupFiles(uint64_t target_available);
 
 class HostStatsSampler final {
 public:

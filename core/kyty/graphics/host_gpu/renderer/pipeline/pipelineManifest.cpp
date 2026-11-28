@@ -364,6 +364,7 @@ struct PipelineCache::ManifestState {
 	bool                                  memory_refused   = false;
 	std::chrono::steady_clock::time_point next_admission_sample;
 	std::chrono::steady_clock::time_point next_admission_log;
+	std::chrono::steady_clock::time_point next_file_reclaim;
 	ManifestCpuCounters                   cpu_counters;
 	uint32_t                              logged_modules   = 0;
 	uint32_t                              logged_pipelines = 0;
@@ -411,16 +412,26 @@ struct PipelineCache::ManifestState {
 		            finished.driver, finished.light, built - modules, created - previous);
 	}
 
-	CompilationTicket Admit(const std::stop_token& stop, size_t words, bool driver) {
+	CompilationTicket Admit(const std::stop_token& stop, size_t words, bool driver, bool runtime = false) {
 		std::unique_lock lock(mutex);
 		const auto since = std::chrono::steady_clock::now();
-		while (!stop.stop_requested()) {
+		while (!stop.stop_requested() && (runtime || !admission_closed)) {
 			const auto now = std::chrono::steady_clock::now();
 			SampleAdmission(now);
 			if (const auto ticket = admission.Admit(now, words, driver, std::this_thread::get_id(), since)) return {this, *ticket};
 			const auto refusal = admission.LastRefusal();
 			if (refusal == ManifestAdmission::Refusal::Closed) break;
-			if (refusal == ManifestAdmission::Refusal::Memory) memory_refused = true;
+			if (refusal == ManifestAdmission::Refusal::Memory) {
+				memory_refused = true;
+				const auto needed = admission.Estimate(words, driver) + ManifestAdmission::LoneMargin;
+				if (admission.Running() == 0 && admission.LastSample().available < needed && now >= next_file_reclaim) {
+					next_file_reclaim = now + std::chrono::seconds(5);
+					lock.unlock();
+					Common::ReclaimColdGroupFiles(needed);
+					lock.lock();
+					continue;
+				}
+			}
 			const auto epoch = admission_epoch;
 			admission_changed.wait_until(lock, stop, next_admission_sample, [&] { return admission_epoch != epoch; });
 		}
@@ -436,7 +447,6 @@ struct PipelineCache::ManifestState {
 
 	void CloseAdmission() {
 		std::scoped_lock lock(mutex);
-		admission.Close();
 		admission_closed = true;
 		++admission_epoch;
 		admission_changed.notify_all();
@@ -539,7 +549,7 @@ void PipelineCache::CompilationTicket::Reset() {
 }
 
 PipelineCache::CompilationTicket PipelineCache::AdmitWorker(const std::stop_token& stop, size_t words, bool driver) {
-	return m_manifest->Admit(stop, words, driver);
+	return m_manifest->Admit(stop, words, driver, true);
 }
 
 void PipelineCache::ManifestStateDeleter::operator()(ManifestState* state) const {

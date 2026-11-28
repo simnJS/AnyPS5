@@ -384,6 +384,7 @@ std::optional<uint64_t> Find(const ProcValues& values, const char* key) {
 struct MemoryControlGroup {
 	std::filesystem::path directory;
 	bool unified;
+	bool member;
 };
 
 std::vector<MemoryControlGroup> MemoryControlGroups() {
@@ -403,18 +404,24 @@ std::vector<MemoryControlGroup> MemoryControlGroups() {
 		auto directory = (root / member).lexically_normal();
 		const auto limit = unified ? "memory.max" : "memory.limit_in_bytes";
 		std::error_code error;
-		if (!std::filesystem::is_regular_file(directory / limit, error)) directory = root;
+		const bool valid_leaf = !member.empty() && *member.begin() != ".." && std::filesystem::is_regular_file(directory / limit, error);
+		const auto leaf = directory;
+		if (!valid_leaf) directory = root;
 		for (; !directory.empty(); directory = directory.parent_path()) {
-			groups.push_back({directory, unified});
+			groups.push_back({directory, unified, valid_leaf && directory == leaf});
 			if (directory == root || directory == directory.root_path()) break;
 		}
 	}
 	return groups;
 }
 
-SystemMemory LimitToMemoryControlGroup(SystemMemory memory) {
+const std::vector<MemoryControlGroup>& ProcessMemoryGroups() {
 	static const auto& groups = *new std::vector<MemoryControlGroup>(MemoryControlGroups());
-	for (const auto& group: groups) {
+	return groups;
+}
+
+SystemMemory LimitToMemoryControlGroup(SystemMemory memory) {
+	for (const auto& group: ProcessMemoryGroups()) {
 		std::ifstream limit_file(group.directory / (group.unified ? "memory.max" : "memory.limit_in_bytes"));
 		std::ifstream usage_file(group.directory / (group.unified ? "memory.current" : "memory.usage_in_bytes"));
 		uint64_t limit = 0;
@@ -609,6 +616,29 @@ std::optional<SystemMemory> ReadSystemMemory() {
 	}
 #endif
 	return std::nullopt;
+}
+
+void ReclaimColdGroupFiles([[maybe_unused]] uint64_t target_available) {
+#if defined(__linux__)
+	for (const auto& group: ProcessMemoryGroups()) {
+		if (!group.unified || !group.member) continue;
+		uint64_t limit = 0, usage = 0;
+		if (!(std::ifstream(group.directory / "memory.max") >> limit) ||
+		    !(std::ifstream(group.directory / "memory.current") >> usage)) return;
+		const auto available = limit - std::min(limit, usage);
+		if (available >= target_available) return;
+		std::ifstream stats(group.directory / "memory.stat");
+		std::string field;
+		uint64_t bytes = 0;
+		while (stats >> field >> bytes) {
+			if (field != "inactive_file") continue;
+			if (bytes > 0) {
+				std::ofstream(group.directory / "memory.reclaim") << std::min(bytes, target_available - available) << " swappiness=0";
+			}
+			return;
+		}
+	}
+#endif
 }
 
 struct HostStatsSampler::Impl {
