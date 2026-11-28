@@ -559,6 +559,7 @@ public:
 
 private:
 	friend struct PipelineCacheTestAccess;
+	friend class PipelineLibraries;
 
 	template <class Key, class Value, class Hash = std::hash<Key>>
 	using CacheMap = std::unordered_map<Key, Value, Hash, std::equal_to<Key>,
@@ -959,7 +960,7 @@ private:
 	void CheckpointDriverCache(bool slow_creation = false);
 	void NoteCreatedPipeline(std::chrono::steady_clock::time_point started);
 	void PostDueDriverCache(bool force = false);
-	void WriteDriverCache();
+	void WriteDriverCache(bool checkpoint);
 
 	void WarmUp(const std::filesystem::path& path, bool driver_cache_restored);
 	void WarmUpNativePipelines() KYTY_REQUIRES(m_program_lock);
@@ -1006,6 +1007,7 @@ private:
 	};
 
 	CompilationTicket AdmitWorker(const std::stop_token& stop, size_t words, bool driver);
+	CompilationTicket AdmitOptimization(const std::stop_token& stop, size_t words);
 	struct ManifestStateDeleter {
 		void operator()(ManifestState* state) const;
 	};

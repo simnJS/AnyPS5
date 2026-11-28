@@ -161,14 +161,12 @@ struct PipelineLibraries::Library {
 	vk::Pipeline        handle = nullptr;
 };
 
-PipelineLibraries::PipelineLibraries(GraphicContext& graphics, vk::PipelineCache driver_cache,
-                                     std::function<void(std::chrono::steady_clock::time_point)> on_optimized)
-    : m_graphics(graphics), m_driver_cache(driver_cache), m_on_optimized(std::move(on_optimized)) {
+PipelineLibraries::PipelineLibraries(PipelineCache& cache): m_cache(cache), m_graphics(cache.m_graphics) {
 	for (uint32_t i = 0; i < LibraryWorkers; i++) {
 		m_workers.emplace_back([this] { Worker(); });
 	}
 	for (uint32_t i = 0; i < OptimizedWorkers; i++) {
-		m_optimized_workers.emplace_back([this] { OptimizedWorker(); });
+		m_optimized_workers.emplace_back([this](const std::stop_token& stop) { OptimizedWorker(stop); });
 	}
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-gpl] graphics pipeline libraries on: {} library threads, {} background threads for the "
@@ -467,7 +465,7 @@ void PipelineLibraries::QueueOptimized(const PipelineCache::Pipeline& linked, co
 	m_optimized_available.notify_one();
 }
 
-void PipelineLibraries::OptimizedWorker() {
+void PipelineLibraries::OptimizedWorker(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("Thread_PipelineOptimized");
 	PlaceBackgroundCompileThread(true);
 	for (;;) {
@@ -481,21 +479,25 @@ void PipelineLibraries::OptimizedWorker() {
 			job = m_optimized_jobs.front();
 			m_optimized_jobs.pop_front();
 		}
+		size_t words = 0;
+		for (const auto* stage: job.stages) {
+			if (stage != nullptr) words += stage->spirv_words;
+		}
+		const auto ticket = m_cache.AdmitOptimization(stop, words);
+		if (!ticket) return;
 		PipelineCache::Pipeline layout;
 		layout.native_bindings = job.native;
 		layout.pipeline_layout = job.layout;
 		vk::Pipeline handle    = nullptr;
 		const auto   started   = std::chrono::steady_clock::now();
-		const auto   result    = CreateGraphicsPipelineWhole(m_graphics, layout, job.key, job.stages, m_driver_cache,
+		const auto   result    = CreateGraphicsPipelineWhole(m_graphics, layout, job.key, job.stages, m_cache.m_driver_cache,
 		                                                     {}, handle);
 		if (result != vk::Result::eSuccess || !handle) {
 			continue;
 		}
 		m_optimized_ns.fetch_add(Elapsed(started), std::memory_order_relaxed);
 		m_optimized_built.fetch_add(1, std::memory_order_relaxed);
-		if (m_on_optimized) {
-			m_on_optimized(started);
-		}
+		m_cache.NoteCreatedPipeline(started);
 		{
 			std::lock_guard lock(m_optimized_mutex);
 			m_optimized.push_back({.key = job.key, .native = job.native, .pipeline = handle});
