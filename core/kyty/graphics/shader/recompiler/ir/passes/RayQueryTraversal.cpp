@@ -2391,8 +2391,27 @@ bool MatchLaneMaskWalk(Program& program, Inst& bvh, LaneMaskWalk& w) {
 	const auto* ballot  = BallotOf(minus != nullptr ? both->Arg(0) : initial);
 	const auto* without = minus != nullptr ? BallotOf(minus->Arg(0)) : nullptr;
 	if (ballot == nullptr || (minus != nullptr && without == nullptr)) {
-		const auto mask = initial.Resolve();
-		if (mask.IsEmpty() || mask.IsImmediate() || mask.GetType() != Type::U32) return false;
+		const auto  mask = initial.Resolve();
+		const auto* test = Producer(bvh.Arg(2), ValueOpcode::INotEqual32);
+		const Inst* bits = nullptr;
+		for (uint32_t side = 0; test != nullptr && side < 2 && bits == nullptr; ++side) {
+			const auto* bit = Immediate(test->Arg(1 - side)) == 0u ? Producer(test->Arg(side), ValueOpcode::BitwiseAnd32) : nullptr;
+			for (uint32_t low = 0; bit != nullptr && low < 2 && bits == nullptr; ++low) {
+				if (Immediate(bit->Arg(1 - low)) == 1u) bits = Producer(bit->Arg(low), ValueOpcode::ShiftRightLogical32);
+			}
+		}
+		bool               paired = false;
+		std::vector<Value> pending;
+		if (bits != nullptr) pending.push_back(bits->Arg(0));
+		for (size_t at = 0; at < pending.size() && at < 16 && !paired; ++at) {
+			const auto* inst = pending[at].Resolve().TryInstruction();
+			paired           = inst == w.pair_mask;
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+				pending.push_back(inst->Arg(0));
+				pending.push_back(inst->Arg(1));
+			}
+		}
+		if (!paired || mask.IsEmpty() || mask.IsImmediate() || mask.GetType() != Type::U32) return false;
 		w.entry_mask = mask;
 	} else {
 		w.lanes         = ballot->Arg(0).Resolve();
