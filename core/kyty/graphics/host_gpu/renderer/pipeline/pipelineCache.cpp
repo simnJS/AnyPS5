@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/guest_gpu/command_processor/computeDispatchOrigin.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
@@ -1305,7 +1307,7 @@ const ShaderModule* PipelineCache::RestoreLinkedModule(const ProgramKey& key, Pr
 		return nullptr;
 	const auto* entry = m_linked_store->Find(key.hash, key.user_data_count, key.static_state, code,
 	                                         program.FunctionCode(), program.specialization, cursor);
-	if (entry == nullptr || entry->module.guest_traversal != key.guest_traversal ||
+	if (entry == nullptr || GpuBreadcrumbs::NeedsBvhPaths(entry->module) || entry->module.guest_traversal != key.guest_traversal ||
 	    entry->module.rt_mode != RayTracingModuleMode(entry->module.bvh, key.stage, options.native_ray_tracing,
 	                                                   options.rt_emulation, options.rt_oracle)) return nullptr;
 	const std::array<const ShaderModule*, 1> stages {&entry->module};

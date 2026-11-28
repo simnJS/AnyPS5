@@ -36,6 +36,7 @@ public:
 	void           Begin(const HW::Context& registers, const HW::UserConfig& user_config,
 	                     const HW::Shader& shaders);
 	void           EndRendering() { m_command.EndRendering(); }
+	[[nodiscard]] uint32_t MarkerSlot() const noexcept { return m_marker_slot; }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           Finish();

@@ -233,6 +233,15 @@ public:
 		m_stream->Record([](vk::CommandBuffer c) { c.endRendering(); });
 	}
 
+	void setCheckpointNV(uintptr_t token) const {
+		const auto* marker = reinterpret_cast<const void*>(token);
+		if (m_stream == nullptr) {
+			m_direct.setCheckpointNV(marker);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.setCheckpointNV(marker); });
+	}
+
 	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset, uint32_t marker) const {
 		if (m_stream == nullptr) {
 			m_direct.writeBufferMarkerAMD(stage, buffer, offset, marker);

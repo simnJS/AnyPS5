@@ -463,6 +463,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, unified_layouts, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
 	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
+	if (GpuBreadcrumbs::PerOperation()) {
+		graphics.checkpoints_enabled = add(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		LOGF("Vulkan GPU checkpoints: VK_NV_device_diagnostic_checkpoints %s\n", graphics.checkpoints_enabled ? "true" : "false");
+	}
 	if (GpuBreadcrumbs::Requested()) {
 		graphics.buffer_marker_enabled = add(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 		LOGF("Vulkan GPU markers: VK_AMD_buffer_marker %s\n", graphics.buffer_marker_enabled ? "true" : "false");

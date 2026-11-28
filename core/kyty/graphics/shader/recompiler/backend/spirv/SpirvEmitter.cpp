@@ -53,7 +53,7 @@ bool UsesMipStats(const IR::Program& program) {
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
                                   bool emit_debug_info,
-                                  bool mip_stats_records, SplitHints* split_hints) {
+                                  bool mip_stats_records, SplitHints* split_hints, uint8_t* bvh_paths) {
 	using namespace Emitter;
 
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
@@ -63,6 +63,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	IR::ValidateProgram(program);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, profile);
+	state.bvh_paths = bvh_paths;
+	if (bvh_paths != nullptr) *bvh_paths = static_cast<uint8_t>(BvhPath::Recorded);
 	if (emit_debug_info) {
 		char name[64];
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",

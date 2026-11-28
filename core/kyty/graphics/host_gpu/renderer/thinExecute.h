@@ -159,7 +159,10 @@ struct DispatchPlan {
 	PushPlan                push;
 	bool                    thread_dimensions = false;
 	bool                    writes            = false;
-	uint64_t                shader_hash       = 0;
+	union {
+		uint64_t            shader_hash = 0;
+		const ShaderModule* module;
+	};
 };
 
 struct DispatchEntry {

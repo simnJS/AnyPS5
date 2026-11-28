@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -121,7 +123,12 @@ bool RenderExecutor::TryThinDispatch(CommandBuffer& buffer, const HW::ComputeSha
 	}
 	auto& scheduler = m_context.GetCommandScheduler();
 #if defined(ANYPS5_KYTY)
-	scheduler.GetMasterSemaphore().NoteWork(scheduler.CurrentTick(), plan.shader_hash);
+	if (GpuBreadcrumbs::PerOperation()) {
+		GpuBreadcrumbs::NoteProgram(*plan.module);
+		scheduler.GetMasterSemaphore().NoteWork(scheduler.CurrentTick(), plan.module->info.shader_hash);
+	} else {
+		scheduler.GetMasterSemaphore().NoteWork(scheduler.CurrentTick(), plan.shader_hash);
+	}
 #endif
 	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
 	if (plan.writes && !chained) {
@@ -178,7 +185,8 @@ void RenderExecutor::LearnThinDispatch(const ShaderComputeInputInfo& input_info,
 	plan.push_stages       = pipeline.push_stages;
 	plan.thread_dimensions = input_info.dispatch_thread_dimensions;
 	plan.writes            = writes;
-	plan.shader_hash       = program.shader_hash;
+	if (GpuBreadcrumbs::PerOperation()) plan.module = input_info.stage.module;
+	else plan.shader_hash = program.shader_hash;
 	OwnThin().table.Learn(op->m_key, entry);
 	op->m_refusals = entry.refusals;
 }

@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -686,6 +688,7 @@ bool Swapchain::Recreate(CommandScheduler& scheduler, bool surface_lost, bool re
 	for (auto fence: m_present_fences) {
 		const auto result = device.waitForFences(1, &fence, VK_TRUE, repeat ? 0 : UINT64_MAX);
 		if (result == vk::Result::eTimeout) return false;
+		if (result == vk::Result::eErrorDeviceLost) GpuBreadcrumbs::ReportDeviceLost(m_window.graphic_ctx, result, "vkWaitForFences", "presentation", scheduler.CurrentTick());
 		RequireVulkanSuccess(result, "wait for retired presentation");
 	}
 	if (m_handle && m_present_fences.empty()) {
@@ -731,6 +734,7 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler, bool 
 		const auto fence = m_present_fences[m_frame_index];
 		const auto result = m_window.graphic_ctx.device.waitForFences(1, &fence, VK_TRUE, repeat ? 0 : UINT64_MAX);
 		if (result == vk::Result::eTimeout) return Status::Busy;
+		if (result == vk::Result::eErrorDeviceLost) GpuBreadcrumbs::ReportDeviceLost(m_window.graphic_ctx, result, "vkWaitForFences", "presentation", tick);
 		RequireVulkanSuccess(result, "wait for presentation slot");
 	}
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
@@ -752,7 +756,9 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler, bool 
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
+		default:
+			GpuBreadcrumbs::ReportDeviceLost(m_window.graphic_ctx, result, "vkAcquireNextImageKHR", "presentation", tick);
+			EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	return Status::Success;
 }
@@ -1648,7 +1654,9 @@ Swapchain::Status Swapchain::Present(bool repeat) {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
+		default:
+			GpuBreadcrumbs::ReportDeviceLost(m_window.graphic_ctx, result, "vkQueuePresentKHR", "presentation", m_image_acquired_ticks[m_frame_index]);
+			EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	if (!repeat) {
 		NotePresentGap();

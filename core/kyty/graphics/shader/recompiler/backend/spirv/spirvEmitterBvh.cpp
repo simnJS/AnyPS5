@@ -393,7 +393,10 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
 	const auto node_words = inst.Flags<uint32_t>() & ~IntersectFlags;
-	if ((inst.Flags<uint32_t>() & IR::BvhIntersectOracle) != 0 && s.oracle.lanes[0].state != 0) return EmitBvhOracle(ctx, inst);
+	if ((inst.Flags<uint32_t>() & IR::BvhIntersectOracle) != 0 && s.oracle.lanes[0].state != 0) {
+		s.NoteBvhPath(BvhPath::Oracle);
+		return EmitBvhOracle(ctx, inst);
+	}
 	auto triangle = (inst.Flags<uint32_t>() & ServedFlags) != 0;
 	if (triangle && (inst.Flags<uint32_t>() & (IR::BvhIntersectOracle | IR::BvhIntersectEmpty)) == 0 &&
 	    s.bvh_intersect_function != 0) {
@@ -411,6 +414,7 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return Vector(s, TypeF32Vector(s, 3), values);
 	};
 	if ((inst.Flags<uint32_t>() & (IR::BvhIntersectStrict | IR::BvhIntersectNative)) == IR::BvhIntersectStrict) {
+		s.NoteBvhPath(BvhPath::Empty);
 		const auto u    = TypeU32(s);
 		const auto kind = Binary(s, spv::OpBitwiseAnd, u, ctx.Arg(*ray, 0), ConstantU32(s, 7));
 		const auto leaf = Binary(s, spv::OpULessThan, TypeBool(s), kind, ConstantU32(s, 4));
@@ -419,6 +423,7 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 		for (uint32_t i = 0; i < 4; ++i) words[i] = Select(s, u, leaf, ConstantU32(s, leaf_miss[i]), ConstantU32(s, ~0u));
 		return Vector(s, TypeU32Vector(s, 4), words);
 	}
+	s.NoteBvhPath(triangle ? BvhPath::Triangle : BvhPath::Emulated);
 	const auto descriptor = ctx.Arg(inst, 0);
 	const auto node   = node_words == 2u ? PackU64(s, ctx.Arg(*ray, 0), ctx.Arg(*ray, 1))
 	                                     : Unary(s, spv::OpUConvert, TypeU64(s), ctx.Arg(*ray, 0));

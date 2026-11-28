@@ -157,6 +157,10 @@ struct EmitterState {
 	}
 
 	Builder                                          builder;
+	void NoteBvhPath(BvhPath path) {
+		if (bvh_paths != nullptr) *bvh_paths |= static_cast<uint8_t>(path);
+	}
+	uint8_t*                                         bvh_paths = nullptr;
 	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
 	const Profile&                                      profile;

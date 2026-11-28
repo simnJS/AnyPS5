@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/host_gpu/renderer/cxCompat.h"
@@ -2446,6 +2448,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (shader_write_stages && !buffer.HasPendingShaderWrites()) {
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+	}
+	if (GpuBreadcrumbs::PerOperation()) {
+		for (const auto* runtime: runtimes) {
+			const auto& module = *runtime->module;
+			GpuBreadcrumbs::NoteProgram(state.ps_plain && module.info.stage == ShaderType::Pixel && module.plain ? *module.plain : module);
+		}
 	}
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);

@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -743,6 +745,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 
 		if (rt_pass == 5 || rt_pass == 6) m_generic_check->Timestamp(vk_buffer, rt_pass == 5 ? 0 : 2);
+		if (GpuBreadcrumbs::PerOperation()) GpuBreadcrumbs::NoteProgram(*input_info.stage.module);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		m_context.NoteFirstGuestCommand(true);
 		constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
@@ -1094,6 +1097,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	if (has_storage_writes) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	if (GpuBreadcrumbs::PerOperation()) GpuBreadcrumbs::NoteProgram(*input_info.stage.module);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	m_context.NoteFirstGuestCommand(true);
 	vk_buffer.dispatchIndirect(stream.Handle(), scratch_offset);
@@ -1258,6 +1262,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 			                          1, &barrier, 0, nullptr, 0, nullptr);
 		}
+		if (GpuBreadcrumbs::PerOperation()) GpuBreadcrumbs::NoteProgram(*input_info.stage.module);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		if (rt_pass == 5 || rt_pass == 6) m_generic_check->Timestamp(vk_buffer, rt_pass == 5 ? 0 : 2);
 		m_context.NoteFirstGuestCommand(true);

@@ -34,6 +34,7 @@ struct ShaderModule {
 	uint32_t                                     spirv_words       = 0;
 	std::shared_ptr<const ShaderModule>          plain;
 	bool                                         guest_traversal = false;
+	uint8_t                                      bvh_paths = 0;
 	ShaderBvh                                    bvh = ShaderBvh::None;
 	uint32_t                                     rt_mode = 0;
 	const ShaderRecompiler::IR::ResourcePlan*    plan = nullptr;

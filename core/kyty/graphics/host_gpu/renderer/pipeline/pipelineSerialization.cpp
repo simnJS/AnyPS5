@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStoreFormat.h"
 
@@ -203,7 +205,7 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 			record.key.guest_traversal = module.guest_traversal;
 			const auto& info = module.info.info;
 			const bool legacy_rt = module.bvh == ShaderBvh::None && (info.bvh || info.bvh8 || info.ray_query);
-			if (legacy_rt || module.rt_mode != StoredRayTracingMode(module) ||
+			if (GpuBreadcrumbs::NeedsBvhPaths(module) || legacy_rt || module.rt_mode != StoredRayTracingMode(module) ||
 			    ShaderRecompiler::MarkedProgram(record.key.hash)) {
 				record.incompatible = true;
 				return true;
