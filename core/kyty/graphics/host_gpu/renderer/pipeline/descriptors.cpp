@@ -55,8 +55,7 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
-constexpr size_t MaxTableElements   = size_t {1} << 16u;
-constexpr size_t TableElementBudget = 8 * MaxTableElements;
+constexpr size_t MaxTableElements = size_t {1} << 16u;
 
 constexpr auto TableOversized = [](const auto& table) { return table.elements.size() > MaxTableElements; };
 
@@ -1272,6 +1271,7 @@ size_t RenderExecutor::TableResolutionKeyHash::operator()(
 void RenderExecutor::ConfigureTableResolutions() {
 	const auto settings = ReadTableResolutionSettings();
 	m_table_resolutions.Configure(settings.capacity);
+	m_table_element_budget = TableElementBudgetForDevice(m_context.GetGraphics().physical_device_memory_properties);
 }
 
 void RenderExecutor::RetireTableResolution(TableResolution& table) {
@@ -1287,7 +1287,7 @@ void RenderExecutor::RetireTableResolution(TableResolution& table) {
 void RenderExecutor::TrimTableResolutions() {
 	const auto weight = [](const TableResolution& table) { return table.elements.size(); };
 	const auto retire = [this](TableResolution& table) { RetireTableResolution(table); };
-	while (m_table_element_count > TableElementBudget / 4 * 3 &&
+	while (m_table_element_count > m_table_element_budget / 4 * 3 &&
 	       m_table_resolutions.ClearLeastRecent(weight, retire)) {
 	}
 }
@@ -1297,7 +1297,7 @@ size_t RenderExecutor::TrimTableBindings() {
 	for (const auto& [program, state]: m_table_states) {
 		slots += state.values.capacity();
 	}
-	if (slots <= TableElementBudget) {
+	if (slots <= m_table_element_budget) {
 		return slots;
 	}
 	constexpr uint64_t RecentPreparations = 256;
@@ -1315,7 +1315,7 @@ size_t RenderExecutor::TrimTableBindings() {
 	auto& heap      = m_context.GetDescriptorHeap();
 	semaphore.Refresh();
 	for (const auto& [stamp, program]: candidates) {
-		if (slots <= TableElementBudget) {
+		if (slots <= m_table_element_budget) {
 			break;
 		}
 		const auto found = m_table_states.find(program);
@@ -2253,7 +2253,7 @@ void RenderExecutor::ResetBindings() {
 		}
 	}
 	m_retired_table_elements.clear();
-	if (m_table_element_count > TableElementBudget) {
+	if (m_table_element_count > m_table_element_budget) {
 		TrimTableResolutions();
 	}
 	if ((++m_table_stats.resets & 255u) == 0) {

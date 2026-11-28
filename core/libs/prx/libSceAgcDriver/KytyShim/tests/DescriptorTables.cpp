@@ -851,6 +851,30 @@ void CheckDriverDefault(const std::string& what) {
 }
 
 int HostTests() {
+	vk::PhysicalDeviceMemoryProperties discrete {};
+	discrete.memoryHeapCount = 2;
+	discrete.memoryHeaps[0].size = uint64_t {8} << 30u;
+	discrete.memoryHeaps[0].flags = vk::MemoryHeapFlagBits::eDeviceLocal;
+	discrete.memoryHeaps[1].size = uint64_t {24} << 30u;
+	Check(TableElementBudgetForDevice(discrete) == LowVramTableElementBudget,
+	      "discrete budget uses the largest device-local heap, excluding host memory");
+
+	vk::PhysicalDeviceMemoryProperties integrated {};
+	integrated.memoryHeapCount = 1;
+	integrated.memoryHeaps[0].size = uint64_t {16} << 30u;
+	integrated.memoryHeaps[0].flags = vk::MemoryHeapFlagBits::eDeviceLocal;
+	Check(TableElementBudgetForDevice(integrated) == TableElementBudget,
+	      "integrated budget uses the larger shared device-local heap");
+
+	vk::PhysicalDeviceMemoryProperties multiple_local_heaps {};
+	multiple_local_heaps.memoryHeapCount = 2;
+	multiple_local_heaps.memoryHeaps[0].size = uint64_t {8} << 30u;
+	multiple_local_heaps.memoryHeaps[0].flags = vk::MemoryHeapFlagBits::eDeviceLocal;
+	multiple_local_heaps.memoryHeaps[1].size = uint64_t {8} << 30u;
+	multiple_local_heaps.memoryHeaps[1].flags = vk::MemoryHeapFlagBits::eDeviceLocal;
+	Check(TableElementBudgetForDevice(multiple_local_heaps) == LowVramTableElementBudget,
+	      "multiple device-local heaps are not summed");
+
 	CheckGaps();
 	CheckFills();
 	CheckSeeds();
