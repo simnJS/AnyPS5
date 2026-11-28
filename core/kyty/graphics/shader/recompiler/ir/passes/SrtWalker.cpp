@@ -15,6 +15,7 @@
 #include <deque>
 #include <map>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -610,7 +611,45 @@ private:
 	Xbyak::CodeGenerator&                             m_code;
 	std::vector<Value>                                m_masks {Value {}};
 	std::deque<Node>                                  m_nodes;
-	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
+	class Memo {
+	public:
+		std::pair<uint32_t, bool> TryEmplace(const Inst* inst, uint32_t context, uint32_t index) {
+			if ((m_count + 1u) * 2u > m_slots.size()) Grow();
+			const auto [slot, found] = Find(inst, context);
+			if (!found) {
+				m_slots[slot] = {inst, context, index};
+				m_count++;
+			}
+			return {m_slots[slot].index, !found};
+		}
+
+	private:
+		struct Slot {
+			const Inst* inst    = nullptr;
+			uint32_t    context = 0;
+			uint32_t    index   = 0;
+		};
+		[[nodiscard]] std::pair<size_t, bool> Find(const Inst* inst, uint32_t context) const {
+			const auto mask = m_slots.size() - 1u;
+			auto hash = (reinterpret_cast<uintptr_t>(inst) >> 4u) * 0x9e3779b97f4a7c15ull;
+			hash      = (hash ^ (hash >> 32u)) + uint64_t {context} * 0xc2b2ae3d27d4eb4full;
+			for (auto slot = static_cast<size_t>(hash) & mask;; slot = (slot + 1u) & mask) {
+				const auto& entry = m_slots[slot];
+				if (entry.inst == nullptr) return {slot, false};
+				if (entry.inst == inst && entry.context == context) return {slot, true};
+			}
+		}
+		void Grow() {
+			auto old = std::exchange(m_slots, std::vector<Slot>(std::max<size_t>(256u, m_slots.size() * 2u)));
+			for (const auto& entry: old) {
+				if (entry.inst != nullptr) m_slots[Find(entry.inst, entry.context).first] = entry;
+			}
+		}
+
+		std::vector<Slot> m_slots;
+		size_t            m_count = 0;
+	};
+	Memo                                              m_memo;
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	std::map<std::pair<uint64_t, uint64_t>, uint32_t> m_bases;
@@ -905,8 +944,7 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 			break;
 		default: break;
 	}
-	const auto [found, inserted] = m_memo.try_emplace({inst, context}, static_cast<uint32_t>(m_nodes.size()));
-	const auto index = found->second;
+	const auto [index, inserted] = m_memo.TryEmplace(inst, context, static_cast<uint32_t>(m_nodes.size()));
 	if (!inserted) {
 		auto& node = m_nodes[index];
 		if (!node.pending) return {node.result, node.masked};
