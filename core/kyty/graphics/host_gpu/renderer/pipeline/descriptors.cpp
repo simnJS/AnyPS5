@@ -1597,7 +1597,7 @@ static bool ReadsStencilPlane(const Image& image, const TextureCache::ImageDesc&
 
 static bool ImageReadReady(const Image& image, const TextureBinding& texture) {
 	const auto layout = image.info.IsDepth() && (!image.info.data.Empty() || image.is_depth_copy)
-	                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+	                        ? image.ReadLayout()
 	                        : vk::ImageLayout::eGeneral;
 	if (texture.layout != layout) {
 		return false;
@@ -3515,7 +3515,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						EXIT("sampling a writable depth/stencil attachment aspect\n");
 					}
 				}
-				prepare_image(image, layout,
+				prepare_image(image, image.binding.attachment_host_layout,
 				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
 				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),

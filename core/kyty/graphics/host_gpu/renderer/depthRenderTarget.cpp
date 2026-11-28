@@ -474,9 +474,9 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
 	                                  read_desc.view_info.base_layer,
 	                                  read_desc.view_info.layer_count};
-	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	source.Transit(source.TransferSrcLayout(), vk::AccessFlagBits2::eTransferRead,
 	               range, command);
-	destination.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	destination.Transit(destination.TransferDstLayout(), vk::AccessFlagBits2::eTransferWrite,
 	                    range, command);
 	std::array<vk::ImageCopy, 2> regions {};
 	uint32_t                   count = 0;
@@ -491,8 +491,8 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		region.dstSubresource = region.srcSubresource;
 		region.extent = write_desc.info.extent;
 	}
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
+	command.copyImage(source.backing.image, source.TransferSrcLayout(),
+	                  destination.backing.image, destination.TransferDstLayout(),
 	                  count, regions.data());
 	return true;
 }

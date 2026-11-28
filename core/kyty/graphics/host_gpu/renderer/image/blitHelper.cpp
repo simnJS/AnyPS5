@@ -151,14 +151,15 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 
 	auto& command_buffer = m_scheduler.Current();
 	auto  command        = command_buffer.Handle();
-	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
-	               command);
-	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
+	const auto source_layout = source.PreferredLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+	const auto destination_layout = destination.PreferredLayout(ColorToMsDepthLayout);
+	source.Transit(source_layout, vk::AccessFlagBits2::eShaderRead, {}, command);
+	destination.Transit(destination_layout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
 	                    command);
 
 	vk::RenderingAttachmentInfo depth_attachment {};
 	depth_attachment.imageView               = destination_view;
-	depth_attachment.imageLayout             = ColorToMsDepthLayout;
+	depth_attachment.imageLayout             = destination_layout;
 	depth_attachment.loadOp                  = vk::AttachmentLoadOp::eClear;
 	depth_attachment.storeOp                 = vk::AttachmentStoreOp::eStore;
 	depth_attachment.clearValue.depthStencil = {0.0f, 0};
@@ -171,7 +172,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 
 	vk::DescriptorImageInfo descriptor_image {};
 	descriptor_image.imageView   = source_view;
-	descriptor_image.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	descriptor_image.imageLayout = source_layout;
 	vk::WriteDescriptorSet descriptor_write {};
 	descriptor_write.dstBinding      = 0;
 	descriptor_write.descriptorCount = 1;
@@ -268,12 +269,12 @@ void BlitHelper::CopyDepthToColor(Image& depth, Image& color) {
 	const auto color_view  = color.FindView(color_view_info);
 
 	auto command = m_scheduler.Current().Handle();
-	depth.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+	depth.Transit(depth.ReadLayout(),
 	              vk::AccessFlagBits2::eShaderSampledRead, {}, command);
 	color.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderStorageWrite, {}, command);
 	std::array<vk::DescriptorImageInfo, 2> images {};
 	images[0].imageView   = depth_view;
-	images[0].imageLayout = vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+	images[0].imageLayout = depth.ReadLayout();
 	images[1].imageView   = color_view;
 	images[1].imageLayout = vk::ImageLayout::eGeneral;
 	std::array<vk::WriteDescriptorSet, 2> writes {};
@@ -310,9 +311,10 @@ void BlitHelper::CopyColorToDepth(Image& color, Image& depth) {
 	const auto depth_view  = depth.FindView(depth_view_info);
 
 	auto command = m_scheduler.Current().Handle();
-	color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead,
-	              {}, command);
-	depth.Transit(vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	const auto color_layout = color.PreferredLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+	const auto depth_layout = depth.PreferredLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal);
+	color.Transit(color_layout, vk::AccessFlagBits2::eShaderSampledRead, {}, command);
+	depth.Transit(depth_layout,
 	              vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 	                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
 	              {}, command);
@@ -321,7 +323,7 @@ void BlitHelper::CopyColorToDepth(Image& color, Image& depth) {
 	const auto                  height = depth.backing.extent.height;
 	vk::RenderingAttachmentInfo depth_attachment {};
 	depth_attachment.imageView   = depth_view;
-	depth_attachment.imageLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+	depth_attachment.imageLayout = depth_layout;
 	depth_attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
 	depth_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
 	vk::RenderingInfo rendering {};
@@ -332,7 +334,7 @@ void BlitHelper::CopyColorToDepth(Image& color, Image& depth) {
 
 	vk::DescriptorImageInfo descriptor_image {};
 	descriptor_image.imageView   = color_view;
-	descriptor_image.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	descriptor_image.imageLayout = color_layout;
 	vk::WriteDescriptorSet descriptor_write {};
 	descriptor_write.dstBinding      = 0;
 	descriptor_write.descriptorCount = 1;

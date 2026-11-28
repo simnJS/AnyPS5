@@ -449,6 +449,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT,
 	                   vk::PhysicalDeviceProvokingVertexFeaturesEXT,
 	                   vk::PhysicalDeviceMaintenance8FeaturesKHR,
+	                   vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR,
 	                   vk::PhysicalDeviceShaderClockFeaturesKHR,
 	                   vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
 	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
@@ -460,7 +461,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
-	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
+	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, unified_layouts, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
 	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
 	if (GpuBreadcrumbs::Requested()) {
@@ -506,6 +507,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!add(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceProvokingVertexFeaturesEXT>();
+	}
+	if (!HasExtension(available_extensions, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>();
 	}
 	if (!add(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
@@ -675,6 +679,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.provoking_vertex_last_enabled    = provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	graphics.unified_image_layouts_enabled    = unified_layouts.unifiedImageLayouts;
+	if (graphics.unified_image_layouts_enabled) device_extensions.push_back(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
 	graphics.maintenance8_enabled             = maintenance8.maintenance8;
 	graphics.shader_resource_min_lod_enabled  = supported2.features.shaderResourceMinLod == VK_TRUE;
 	graphics.ray_query_enabled                = ray_query_enabled;
@@ -693,6 +699,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
 	}
 	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering;
+	LOGF("Vulkan unified image layouts: %s\n", graphics.unified_image_layouts_enabled ? "true" : "false");
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan shaderResourceMinLod support: %s\n",
@@ -872,6 +879,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    barycentric,
 	    vk::PhysicalDeviceMeshShaderFeaturesEXT {.taskShader = VK_TRUE, .meshShader = VK_TRUE},
 	    feedback_layout, feedback_dynamic, provoking_vertex, image_atomic_int64, maintenance8,
+	    vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR {.unifiedImageLayouts = VK_TRUE},
 	    shader_clock, conditional_rendering, compute_derivatives,
 	    vk::PhysicalDeviceAccelerationStructureFeaturesKHR {.accelerationStructure = VK_TRUE},
 	    vk::PhysicalDeviceRayQueryFeaturesKHR {.rayQuery = VK_TRUE}, cooperative_matrix, float8,
@@ -898,6 +906,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!graphics.shader_image_int64_atomics_enabled) {
 		create.unlink<vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT>();
 	}
+	if (!graphics.unified_image_layouts_enabled) create.unlink<vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>();
 	if (!graphics.maintenance8_enabled) create.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
 	if (graphics.device_clock_period_ps == 0u) {
 		create.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();

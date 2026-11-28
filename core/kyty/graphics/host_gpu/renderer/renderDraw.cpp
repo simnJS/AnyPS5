@@ -1124,8 +1124,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 #endif
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
-		                                            : vk::ImageLayout::eColorAttachmentOptimal;
-		image.binding.attachment_layout = layout;
+		                                            : image.PreferredLayout(vk::ImageLayout::eColorAttachmentOptimal);
+		image.binding.attachment_layout      = layout;
+		image.binding.attachment_host_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
 		image.Transit(layout, image.binding.attachment_access,
@@ -1242,12 +1243,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
+		const auto host_layout = sampled_aspects ? layout : image.PreferredLayout(layout);
 		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-		image.binding.attachment_layout = layout;
-		image.binding.attachment_access = access;
+		image.binding.attachment_layout      = layout;
+		image.binding.attachment_host_layout = host_layout;
+		image.binding.attachment_access      = access;
 		const auto& view                = depth.desc.view_info;
-		image.Transit(layout, access,
+		image.Transit(host_layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
@@ -1257,7 +1260,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
-		attachment.image_layout   = layout;
+		attachment.image_layout   = host_layout;
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
@@ -1318,17 +1321,19 @@ bool RenderExecutor::TakeTemplateTargets(const DrawTemplate& found) {
 			return false;
 		}
 	}
-	const auto take = [&](ImageId id, uint32_t i) {
+	const auto take = [&](ImageId id, uint32_t i, vk::ImageLayout host_layout) {
 		auto& image                     = cache.GetImage(id);
-		image.binding.attachment_layout = found.target_layouts[i];
+		image.binding.attachment_layout      = found.target_layouts[i];
+		image.binding.attachment_host_layout = host_layout;
 		image.binding.attachment_access = found.target_access[i];
 		image.write_count++;
 	};
 	for (uint32_t i = 0; i < targets.color_count; i++) {
-		take(targets.colors[i].image_id, i);
+		const auto& target = targets.colors[i];
+		take(target.image_id, i, found.rendering.color_attachments[target.target_slot].image_layout);
 	}
 	if (targets.depth.image_id) {
-		take(targets.depth.image_id, targets.color_count);
+		take(targets.depth.image_id, targets.color_count, found.rendering.depth_stencil_attachment.image_layout);
 	}
 	return true;
 }
@@ -2065,12 +2070,12 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 		     static_cast<uint32_t>(rect.bottom - rect.top), 1}};
 		buffer.EndRendering();
 		const auto command = buffer.Handle();
-		source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+		source.Transit(source.TransferSrcLayout(), vk::AccessFlagBits2::eTransferRead,
 		               {}, command);
-		destination.Transit(vk::ImageLayout::eTransferDstOptimal,
+		destination.Transit(destination.TransferDstLayout(),
 		                    vk::AccessFlagBits2::eTransferWrite, {}, command);
-		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-		                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		command.copyImage(source.backing.image, source.TransferSrcLayout(),
+		                  destination.backing.image, destination.TransferDstLayout(),
 		                  1, &region);
 	}
 	return true;
