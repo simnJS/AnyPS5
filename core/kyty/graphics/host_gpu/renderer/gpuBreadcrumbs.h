@@ -21,7 +21,7 @@ namespace GpuBreadcrumbs {
 
 [[nodiscard]] uint32_t SubmissionSlot(const char* name);
 void                   MarkSubmission(GraphicContext& graphics, const CommandRecorder& command, uint32_t slot, uint64_t tick);
-[[nodiscard]] std::optional<uint64_t> StartedTick(uint32_t slot, uint64_t near);
+[[nodiscard]] std::optional<uint64_t> StartedTick(uint32_t slot, uint64_t reference);
 
 class OperationScope {
 public:

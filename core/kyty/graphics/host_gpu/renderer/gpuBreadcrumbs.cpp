@@ -266,14 +266,14 @@ void MarkSubmission(GraphicContext& graphics, const CommandRecorder& command, ui
 	                                                  static_cast<uint32_t>(tick));
 }
 
-std::optional<uint64_t> StartedTick(uint32_t slot, uint64_t near) {
+std::optional<uint64_t> StartedTick(uint32_t slot, uint64_t reference) {
 	const auto markers = Mapped();
 	if (slot >= markers.size()) return std::nullopt;
 	const uint64_t low = markers[slot].tick;
 	if (low == 0) return std::nullopt;
-	uint64_t tick = (near & ~uint64_t {0xffffffff}) | low;
-	if (tick > near + (uint64_t {1} << 31u) && tick >= (uint64_t {1} << 32u)) tick -= uint64_t {1} << 32u;
-	if (tick + (uint64_t {1} << 31u) < near) tick += uint64_t {1} << 32u;
+	uint64_t tick = (reference & ~uint64_t {0xffffffff}) | low;
+	if (tick > reference + (uint64_t {1} << 31u) && tick >= (uint64_t {1} << 32u)) tick -= uint64_t {1} << 32u;
+	if (tick + (uint64_t {1} << 31u) < reference) tick += uint64_t {1} << 32u;
 	return tick;
 }
 
