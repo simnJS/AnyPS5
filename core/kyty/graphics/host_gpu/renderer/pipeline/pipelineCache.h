@@ -430,6 +430,7 @@ private:
 };
 
 class LinkedComputeStore;
+class StoreFile;
 
 struct ComputeServeMiss {
 	uint64_t                           shader = 0;
@@ -965,8 +966,9 @@ private:
 	void WarmUp(const std::filesystem::path& path, bool driver_cache_restored);
 	void WarmUpNativePipelines() KYTY_REQUIRES(m_program_lock);
 	size_t RestoreStoreRecords(std::span<const uint8_t> bytes, std::span<const uint8_t> header);
+	std::shared_ptr<const StoreFile> m_store_file;
 	struct StoreRecord;
-	bool ReadRecord(std::span<const uint8_t> frame, StoreRecord& record) const;
+	bool ReadRecord(std::span<const uint8_t> frame, uint64_t offset, StoreRecord& record) const;
 	bool AddRecord(StoreRecord& record) KYTY_REQUIRES(m_program_lock);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
@@ -1132,6 +1134,8 @@ void DescribeDriverPipelineCreation(std::string& report);
                                       const ShaderModule& module, const std::vector<uint32_t>& spirv,
                                       const std::vector<uint32_t>& plain_spirv,
                                       std::vector<uint8_t>&        record);
+[[nodiscard]] bool DecodeStoredSpirv(std::span<const uint8_t> frame, uint64_t checksum, bool plain,
+                                     std::vector<uint32_t>& spirv);
 
 #if defined(ANYPS5_KYTY)
 [[nodiscard]] std::vector<uint8_t> ComputeShaderStoreHeader(const GraphicContext& graphics);

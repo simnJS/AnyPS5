@@ -337,6 +337,13 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_image_heap_fill PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_fill: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/StoredSpirvRecord.cpp)
+    add_test_executable(kyty_shim_stored_spirv_record_tests ${CMAKE_CURRENT_SOURCE_DIR}/StoredSpirvRecordMain.cpp)
+    configure_host_test_executable(kyty_shim_stored_spirv_record_tests)
+    target_link_libraries(kyty_shim_stored_spirv_record_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_stored_spirv_record COMMAND kyty_shim_stored_spirv_record_tests)
+    set_tests_properties(kyty_shim_stored_spirv_record PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_stored_spirv_record: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePages.cpp)
     add_test_executable(kyty_shim_buffer_cache_pages_tests ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePagesMain.cpp)
     configure_host_test_executable(kyty_shim_buffer_cache_pages_tests)

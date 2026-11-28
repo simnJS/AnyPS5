@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineShaderDiagnostics.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineShaderOptions.h"
+#include "graphics/host_gpu/renderer/pipeline/storedSpirv.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/pipelineLinkedStore.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
@@ -1399,7 +1400,7 @@ bool PipelineCache::ComputePipelineReady(const ShaderModule& module, bool ahead)
 }
 
 bool PipelineCache::CanCoverEmptyComputePipeline(const ShaderModule& empty, const ShaderModule& populated) {
-	if (empty.plan == nullptr || empty.plan != populated.plan || !populated.module ||
+	if (empty.plan == nullptr || empty.plan != populated.plan || !HasShaderModule(populated) ||
 	    empty.shared_variant || populated.shared_variant || empty.linked_prepared || populated.linked_prepared ||
 	    !empty.function_code.empty() || !populated.function_code.empty() ||
 	    empty.guest_traversal != populated.guest_traversal || empty.bvh != populated.bvh ||
@@ -1451,7 +1452,7 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 	const auto& plan = program.resource_plan;
 	const auto compatible = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
-		if (&candidate == exact || candidate.shared_variant || !candidate.module) return false;
+		if (&candidate == exact || candidate.shared_variant || !HasShaderModule(candidate)) return false;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords())) {
 			ShaderRecompiler::IR::NoteServeRefusal(Step::PushLayout);
 			return false;

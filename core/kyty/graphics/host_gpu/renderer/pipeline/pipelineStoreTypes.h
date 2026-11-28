@@ -9,6 +9,8 @@
 
 namespace Libs::Graphics {
 
+class StoredSpirv;
+
 inline constexpr uint32_t TableShaderKeyMarker = 0x54424c45u;
 
 struct ShaderProgramKey {
@@ -33,6 +35,7 @@ struct ShaderModule {
 	uint32_t                                     mesh_shared_bytes = 0;
 	uint32_t                                     spirv_words       = 0;
 	std::shared_ptr<const ShaderModule>          plain;
+	std::shared_ptr<StoredSpirv>                 stored;
 	bool                                         guest_traversal = false;
 	uint8_t                                      bvh_paths = 0;
 	ShaderBvh                                    bvh = ShaderBvh::None;

@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStoreFormat.h"
+#include "graphics/host_gpu/renderer/pipeline/storedSpirv.h"
 
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -158,8 +159,10 @@ size_t PipelineCache::RestoreStoreRecords(std::span<const uint8_t> bytes, std::s
 		}
 		std::vector<StoreRecord> loaded(frames.size());
 		std::vector<uint8_t>     read(frames.size());
-		Common::ParallelFor(frames.size(), [&](size_t i) { read[i] = ReadRecord(frames[i], loaded[i]) ? 1 : 0; },
-		                    Common::ParallelThreads());
+		Common::ParallelFor(frames.size(), [&](size_t i) {
+			const auto offset = static_cast<uint64_t>(frames[i].data() - bytes.data());
+			read[i] = ReadRecord(frames[i], offset, loaded[i]) ? 1 : 0;
+		}, Common::ParallelThreads());
 		size_t kept = 0;
 		while (kept < frames.size() && read[kept] != 0 && AddRecord(loaded[kept])) {
 			records = records.subspan(frames[kept].size());
@@ -176,12 +179,34 @@ size_t PipelineCache::RestoreStoreRecords(std::span<const uint8_t> bytes, std::s
 	return reusable ? bytes.size() - records.size() : 0;
 }
 
+bool DecodeStoredSpirv(std::span<const uint8_t> frame_bytes, uint64_t checksum, bool plain, std::vector<uint32_t>& spirv) {
+	if (frame_bytes.size() < sizeof(Frame)) return false;
+	Frame frame;
+	std::memcpy(&frame, frame_bytes.data(), sizeof(frame));
+	if (frame.checksum != checksum || frame_bytes.size() - sizeof(frame) != frame.compressed_size) return false;
+	std::vector<uint8_t> raw;
+	if (!DecodeShaderStoreFrame(frame, frame_bytes.subspan(sizeof(frame)), raw)) return false;
+	Reader reader {raw};
+	Record type = Record::Module;
+	IoAll(reader, type);
+	if (!reader.ok || type != Record::Module) return false;
+	ShaderProgramKey      key;
+	ShaderModule          module;
+	std::vector<uint8_t>  plan;
+	std::vector<uint32_t> code;
+	std::vector<uint32_t> plain_code;
+	IoStoreModule(reader, key, module, plan, code, plain_code);
+	if (!reader.ok || !reader.bytes.empty()) return false;
+	spirv = std::move(plain ? plain_code : code);
+	return !spirv.empty();
+}
+
 static uint32_t StoredRayTracingMode(const ShaderModule& module) {
 	return RayTracingModuleMode(module.bvh, module.info.stage, RayTracing::NativeTraversals() && !module.guest_traversal,
 	                            Config::RayTracingEmulation(), Config::RayTracingOracle());
 }
 
-bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord& record) const {
+bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, uint64_t offset, StoreRecord& record) const {
 	Frame frame;
 	std::memcpy(&frame, frame_bytes.data(), sizeof(frame));
 	const auto compressed = frame_bytes.subspan(sizeof(frame), frame.compressed_size);
@@ -213,11 +238,29 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 			const std::array<const ShaderModule*, 1> stages {&module};
 			if (!SampledDescriptorBudgetFits(stages)) return false;
 			record.plan_loaded = ShaderRecompiler::IR::LoadResourcePlan(plan, record.plan);
-			module.module      = CompileSPV(spirv, m_graphics.device);
 			module.spirv_words = static_cast<uint32_t>(spirv.size());
 			if (m_graphics.fn_get_shader_info != nullptr && module.info.stage == ShaderType::Mesh) {
 				module.mesh_shared_bytes = ShaderRecompiler::Spirv::MeshWorkgroupBytes(spirv);
 			}
+			if (m_store_file != nullptr) {
+				const auto size = static_cast<uint32_t>(frame_bytes.size());
+				module.stored = std::make_shared<StoredSpirv>(m_store_file, offset, size, frame.checksum, false, &DecodeStoredSpirv);
+				if (!plain_spirv.empty()) {
+					auto plain             = std::make_shared<ShaderModule>();
+					plain->id              = module.id ^ PlainModuleIdXor;
+					plain->bvh_paths       = module.bvh_paths;
+					plain->info            = module.info;
+					plain->specialization  = module.specialization;
+					plain->function_code   = module.function_code;
+					plain->vertex_formats  = module.vertex_formats;
+					plain->rect_parameters = module.rect_parameters;
+					plain->spirv_words     = static_cast<uint32_t>(plain_spirv.size());
+					plain->stored = std::make_shared<StoredSpirv>(m_store_file, offset, size, frame.checksum, true, &DecodeStoredSpirv);
+					module.plain  = std::move(plain);
+				}
+				return true;
+			}
+			module.module = CompileSPV(spirv, m_graphics.device);
 			if (!plain_spirv.empty()) {
 				module.plain = MakePlainModule(module, plain_spirv, m_graphics.device);
 				if (module.plain == nullptr) {
