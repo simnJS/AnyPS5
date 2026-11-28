@@ -1150,6 +1150,84 @@ const char* CheckSparseImport(GraphicContext& graphics) {
 #endif
 }
 
+const char* CheckManyImports(GraphicContext& graphics) {
+#ifdef _WIN32
+	static_cast<void>(graphics);
+	return nullptr;
+#else
+	constexpr uint64_t Page      = GuestHostView::PageSize;
+	constexpr uint64_t Many      = 0xa200000000;
+	constexpr uint64_t Bytes     = uint64_t {64} << 20u;
+	constexpr uint64_t Slice     = uint64_t {32} << 10u;
+	constexpr uint64_t Hole      = uint64_t {32} << 20u;
+	constexpr uint64_t HoleBytes = uint64_t {4} << 20u;
+	constexpr uint64_t Written   = Hole + HoleBytes / 2u;
+	RenderContext    renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+	auto&       buffers = renderer.GetBufferCache();
+	auto*       mirror  = buffers.GetGuestMirror();
+	const auto* view    = buffers.GetGuestHostView();
+	if (view == nullptr || !view->Enabled()) {
+		g_unchecked = "the device does not import host memory";
+		return nullptr;
+	}
+	if (!mirror->Holds(Many, Bytes)) return "the fixture of many imports lies outside the guest mirror";
+	void* mapped = reinterpret_cast<void*>(Many);
+	if (DoMapAnon_nid_no_patch(&mapped, Bytes, CpuReadWrite, 0x10, Page, false) != 0 || reinterpret_cast<uint64_t>(mapped) != Many) {
+		return "could not map the guest range of many imports";
+	}
+	for (uint64_t at = 0; at < Bytes; at += 0x1000) {
+		if (at < Hole || at >= Hole + HoleBytes) *reinterpret_cast<volatile uint64_t*>(Many + at) = (uint64_t {Pattern(at)} << 32u) | Pattern(at + 1);
+	}
+	AddressReader reader(graphics, scheduler, 16);
+	const auto    reads = [&](uint64_t guest_address) {
+		const auto page = view->Lookup(guest_address & ~(Page - 1));
+		if (page == 0) return false;
+		reader.Record(scheduler, page + (guest_address & (Page - 1)), 8);
+		Finish(scheduler);
+		const auto words = reader.Words(8);
+		return std::memcmp(words.data(), reinterpret_cast<const void*>(guest_address), 8) == 0;
+	};
+	const auto verify = [&]() -> const char* {
+		for (uint64_t at = 0; at < Bytes; at += Slice) {
+			if (!renderer.MapMemory(Many + at, Slice)) return "a slice of many imports was not admitted";
+		}
+		renderer.PrepareBda(false, false);
+		if (view->Lookup(Many) == 0) {
+			g_unchecked = "the driver did not import the fixture of many imports";
+			return nullptr;
+		}
+		for (uint64_t at = 0; at < Bytes; at += Slice) {
+			const bool hole = at >= Hole && at < Hole + HoleBytes;
+			if ((view->Lookup(Many + at) != 0) == hole) {
+				return hole ? "a slice of many imports that lies in a hole was imported" : "a written slice of many imports was not imported";
+			}
+		}
+		for (const auto at: {uint64_t {0}, Hole - Slice, Hole + HoleBytes, Bytes - Slice}) {
+			if (!reads(Many + at)) return "a written slice of many imports does not read its guest memory";
+		}
+		if (view->Totals().holes != 1 || view->Totals().pending != HoleBytes) return "the holes of adjacent imports are not kept as one hole";
+		*reinterpret_cast<volatile uint64_t*>(Many + Written) = 0x5eed5eed00c0ffeeull;
+		renderer.PrepareBda(false, true);
+		if (!reads(Many + Written)) return "a dispatch with no known reach did not import a page written in the hole of adjacent imports";
+		if (view->Lookup(Many + Hole) != 0 || view->Lookup(Many + Hole + HoleBytes - Page) != 0) {
+			return "a dispatch with no known reach imported the unwritten rest of the hole of adjacent imports";
+		}
+		if (view->Totals().holes != 2) return "the hole of adjacent imports was not cut around its written page";
+		renderer.PrepareBda(false, true);
+		if (view->Totals().holes != 2) return "a dispatch with no known reach changed the unwritten holes of adjacent imports";
+		return nullptr;
+	};
+	const auto* failure = verify();
+	renderer.UnmapMemory(Many, Bytes);
+	if (failure == nullptr && (view->Totals().holes != 0 || view->Totals().pending != 0)) failure = "an unmap of many imports kept their holes";
+	if (DoMunmap_nid_no_patch(mapped, Bytes) != 0 && failure == nullptr) failure = "could not unmap the guest range of many imports";
+	return failure;
+#endif
+}
 }
 
 extern "C" int RunKytyMirrorWindowsTest() {
@@ -1181,6 +1259,7 @@ extern "C" int RunKytyMirrorWindowsTest() {
 	if (failure == nullptr && g_skipped.empty()) failure = CheckTableReach(graphics, address, false);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckTableReach(graphics, address, true);
 	if (failure == nullptr && g_skipped.empty()) failure = CheckSparseImport(graphics);
+	if (failure == nullptr && g_skipped.empty()) failure = CheckManyImports(graphics);
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", Name);
 		return 1;

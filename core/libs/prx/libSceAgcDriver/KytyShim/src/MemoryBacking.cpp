@@ -4,6 +4,7 @@
 #include "common/hackNotice.h"
 
 #include "MemoryShim.hpp"
+#include "PopulatedRuns.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #ifdef _WIN32
 #include "prx/libc/include/RedZoneGate.hpp"
@@ -1057,28 +1058,17 @@ bool TryGetPopulatedRuns(const uint8_t* host, uint64_t size, uint64_t join, std:
 		const auto file = guest ? state.guest_file : state.direct_file;
 		const auto file_start = guest ? 0 : state.guest_bytes;
 		const auto file_stop = guest ? std::min(end, state.guest_bytes) : end;
-		const auto data = ::lseek(file, static_cast<off_t>(cursor - file_start), SEEK_DATA);
-		if (data < 0) {
-			if (errno != ENXIO) return false;
-			cursor = file_stop;
-			continue;
-		}
-		const auto first = file_start + static_cast<uint64_t>(data);
-		if (first >= file_stop) {
-			cursor = file_stop;
-			continue;
-		}
-		const auto hole = ::lseek(file, static_cast<off_t>(first - file_start), SEEK_HOLE);
-		if (hole < 0) return false;
-		const auto last = std::min(file_stop, std::max(first + 1u, file_start + static_cast<uint64_t>(hole)));
-		const auto begin = std::max(offset, first & ~PageMask);
-		const auto stop = std::min(end, (last + PageMask) & ~PageMask);
-		if (!runs.empty() && offset + runs.back().first + runs.back().second + join >= begin) {
-			runs.back().second = std::max(runs.back().second, stop - offset - runs.back().first);
-		} else {
-			runs.emplace_back(begin - offset, stop - begin);
-		}
-		cursor = std::max(last, stop);
+		const auto seek = [&](uint64_t at, uint64_t& data) {
+			const auto found = ::lseek(file, static_cast<off_t>(at - file_start), SEEK_DATA);
+			if (found < 0) {
+				data = PopulatedRuns::None;
+				return errno == ENXIO;
+			}
+			data = file_start + static_cast<uint64_t>(found);
+			return true;
+		};
+		if (!PopulatedRuns::Append(seek, PageSize, join, offset, end, cursor, file_stop, runs)) return false;
+		cursor = file_stop;
 	}
 	return true;
 #endif
