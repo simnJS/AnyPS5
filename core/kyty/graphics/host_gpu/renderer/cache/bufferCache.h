@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/guestHostView.h"
 #include "graphics/host_gpu/renderer/cache/guestMirror.h"
+#include "graphics/host_gpu/renderer/cache/readbackPublication.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
@@ -471,6 +472,7 @@ private:
 	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};
 	std::atomic<uint32_t>                             m_stale_ring_next {0};
 	MemoryTracker                                     m_memory_tracker;
+	ReadbackPublication                               m_cp_publication;
 	uint64_t                                           m_gpu_write_generation = 0;
 	uint64_t                                          m_readback_count = 0;
 	WriteTicks                                        m_write_ticks;

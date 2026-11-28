@@ -68,12 +68,15 @@ def main():
         if args.thread and row["thread"] != args.thread:
             continue
         times = {name: int(row[column]) for name, column in COLUMNS.items()}
+        times["join"] = int(row.get("join_ns", 0))
         times["n"] = 1
         times["replay_wait"] = replay.get(ident, 0)
         times["caller"] += times["replay_wait"]
         times["async"] = int(row["async"] == "true")
         source = writer(row)
         location = "requested bytes" if row["request_dirty"] == "true" else "other bytes on page" if int(row["dirty_bytes"]) else "clean page"
+        if row["path"] in ("joined_cp", "clean_fault"):
+            source = location = "not sampled"
         keys = {
             "Thread": row["thread"],
             "Access": f"{row['access']} / {location}",
@@ -87,7 +90,7 @@ def main():
             groups[group][key].update(times)
     if not groups:
         parser.exit(1, "No completed records for the selected thread.\n")
-    columns = ["n", "async", *COLUMNS, "replay_wait"]
+    columns = ["n", "async", *COLUMNS, "join", "replay_wait"]
     for label, group in groups.items():
         print(f"\n{label}  (cumulative seconds)")
         print("key\t" + "\t".join(columns))

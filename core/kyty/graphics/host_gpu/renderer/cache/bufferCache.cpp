@@ -181,7 +181,7 @@ struct BufferCache::ReadbackTrace {
 	uint64_t dirty = 0, shader = 0, immediate = 0;
 	bool request_dirty = false, unknown_tick = false, pending = false, device_pending = false;
 	bool imported = false, resident = false, async = false;
-	int64_t ordered = 0, dispatch_queue = 0, dispatch_work = 0, dispatch_call = 0;
+	int64_t join = 0, ordered = 0, dispatch_queue = 0, dispatch_work = 0, dispatch_call = 0;
 	int64_t timeline = 0, fence = 0, priority = 0, publish = 0;
 	int64_t release_queue = 0, release_work = 0, release_call = 0, total = 0;
 
@@ -196,11 +196,11 @@ struct BufferCache::ReadbackTrace {
 		    "[kyty-readback-detail] id={} thread={} access={} addr={:#x} size={} page={:#x} block={:#x} path={} "
 		    "request_dirty={} dirty_bytes={} shader_bytes={} immediate_bytes={} writer_tick={} unknown_tick={} "
 		    "pending={} device_tick={} device_pending={} submitted={} wait_tick={} imported={} resident={} async={} "
-		    "ordered_ns={} dispatch_queue_ns={} dispatch_work_ns={} dispatch_call_ns={} timeline_ns={} "
+		    "join_ns={} ordered_ns={} dispatch_queue_ns={} dispatch_work_ns={} dispatch_call_ns={} timeline_ns={} "
 		    "fence_ns={} priority_ns={} publish_ns={} release_queue_ns={} release_work_ns={} release_call_ns={} total_ns={}\n",
 		    id, thread, access, address, size, page, block, path, request_dirty, dirty, shader, immediate,
 		    writer_tick, unknown_tick, pending, device_tick, device_pending, submitted, wait_tick, imported, resident,
-		    async, ordered, dispatch_queue, dispatch_work, dispatch_call, timeline, fence, priority, publish,
+		    async, join, ordered, dispatch_queue, dispatch_work, dispatch_call, timeline, fence, priority, publish,
 		    release_queue, release_work, release_call, total).c_str(), stderr);
 	}
 };
@@ -757,6 +757,24 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		stats.cp_ordered_ns.fetch_add(static_cast<uint64_t>(SteadyNs() - started), std::memory_order_relaxed);
 		stats.cp_not_waited.fetch_add(skipped, std::memory_order_relaxed);
 	}
+	const bool page_fault = guest_fault && !is_write && size == 1;
+	if (page_fault && !command_processor) {
+		const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto previous = m_cp_publication.Find(page);
+		if (previous) {
+			const auto start = trace ? SteadyNs() : 0;
+			ReadbackPublication::Wait(previous);
+			if (trace) trace->join = SteadyNs() - start;
+		}
+		if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+			if (trace) {
+				trace->path = previous ? "joined_cp" : "clean_fault";
+				trace->total = SteadyNs() - request_start;
+			}
+			return;
+		}
+	}
+	ReadbackPublication::Ticket cp_request;
 	auto&      split          = g_readback_stats;
 	const auto dispatch_start = SteadyNs();
 	const auto note_split     = [&](std::atomic<uint64_t>& counter, int64_t since) {
@@ -812,6 +830,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		                           guest_read && !command_processor)) {
 			if (trace) trace->path = "copy_queue";
 			tick = queue_read.recorded;
+			if (page_fault && command_processor) cp_request = m_cp_publication.Begin(pages_begin);
 		} else if (DownloadMemory<true>(vaddr, read_size)) {
 			if (trace) trace->path = "main_queue";
 			const auto recorded = m_scheduler.CurrentTick();
@@ -919,6 +938,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write);
 		});
 	}
+	if (cp_request) m_cp_publication.Finish(cp_request);
 	if (trace) trace->total = SteadyNs() - request_start;
 }
 
