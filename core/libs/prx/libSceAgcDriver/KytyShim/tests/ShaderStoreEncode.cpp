@@ -312,13 +312,14 @@ void NativeGraphicsRequiresExactTableStages() {
 void StoredComputeModuleSelection() {
     using namespace ShaderStoreFormat;
 
-    const auto frame = [](ShaderType stage, uint64_t id, ShaderBvh bvh = ShaderBvh::None, uint32_t mode = 0) {
+    const auto frame = [](ShaderType stage, uint64_t id, ShaderBvh bvh = ShaderBvh::None, uint32_t mode = 0, uint8_t paths = 0) {
         ShaderStoreFormat::Key key {.stage = stage, .hash = id};
         ShaderModule module;
         module.id = id;
         module.info.stage = stage;
         module.bvh = bvh;
         module.rt_mode = mode;
+        module.bvh_paths = paths;
         const std::vector<uint8_t> plan;
         const std::vector<uint32_t> spirv {0x07230203u, 0x00010300u, 0u, 1u, 0u};
         const std::vector<uint32_t> plain;
@@ -353,9 +354,12 @@ void StoredComputeModuleSelection() {
             "replay accepted a graphics module");
     Require(!load(header + compute + compute, 42) && error.find("duplicate") != std::string::npos,
             "replay accepted duplicate IDs");
+    const auto paths = static_cast<uint8_t>(BvhPath::Recorded) | static_cast<uint8_t>(BvhPath::Native) | static_cast<uint8_t>(BvhPath::Empty);
+    Require(load(header + frame(ShaderType::Compute, 42, ShaderBvh::Bvh4, 2, paths), 42) && module.bvh_paths == paths,
+            "stored compute module lost mixed BVH paths");
     const auto native = frame(ShaderType::Compute, 42, ShaderBvh::Bvh4, 2);
     const auto guest = frame(ShaderType::Compute, 42, ShaderBvh::Bvh4, 0);
-    Require(load(header + native + guest, 42) && module.bvh == ShaderBvh::Bvh4 && module.rt_mode == 2,
+    Require(load(header + native + guest, 42) && module.bvh == ShaderBvh::Bvh4 && module.rt_mode == 2 && module.bvh_paths == 0,
             "replay lost a shader shared by two traversal modes");
     Require(!load(header + native + guest + guest, 42) && error.find("duplicate") != std::string::npos,
             "replay accepted the same traversal mode twice");

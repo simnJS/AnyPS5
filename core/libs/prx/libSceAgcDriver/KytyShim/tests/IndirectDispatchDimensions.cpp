@@ -1,4 +1,5 @@
 #include "TestVulkanDevice.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -16,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -153,6 +155,17 @@ void Probe(GraphicContext& graphics) {
 		GpuWritesCleanup cleanup {cache, args, output};
 		Dispatch(processor, counter_code, output, sizeof(uint32_t));
 		Complete(scheduler);
+		if (GpuBreadcrumbs::PerOperation() && graphics.buffer_marker_enabled && StallSnapshot::Enabled()) {
+			const auto tick = scheduler.CurrentTick() - 1;
+			const auto path = StallSnapshot::Write(graphics, tick, tick, "synthetic dispatch completed");
+			std::ifstream file(path);
+			std::string line;
+			bool attributed = false;
+			while (std::getline(file, line)) {
+				if (line.starts_with("last finished:") && line.find("type=dispatch CS=0x") != std::string::npos) attributed = true;
+			}
+			Require(attributed, "the completed dispatch marker did not resolve to its compute program");
+		}
 		Require(ReadCounter(cache, output) == 1, "the direct counter control produced the wrong count");
 		Dispatch(processor, sentinel_code, args + 12, sizeof(uint32_t));
 		Complete(scheduler);
@@ -204,7 +217,7 @@ extern "C" int RunKytyIndirectDispatchDimensionsTest() {
 		Config::Initialize();
 		Config::Load(Config::ConfigOptions {});
 		KytyShimTests::TestVulkanDevice gpu;
-		if (const auto* unavailable = gpu.Initialize(false, true)) {
+		if (const auto* unavailable = gpu.Initialize(false, true, false, false, GpuBreadcrumbs::PerOperation())) {
 			const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 			std::fprintf(stderr, "kyty_shim_indirect_dispatch_dimensions: %s, no usable Vulkan device (%s)\n",
 			             required ? "FAILED" : "skipped", unavailable);

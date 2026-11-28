@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/stallSnapshot.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbHistory.h"
+#include "graphics/shader/shader.h"
 
 #include <atomic>
 #include <cstdio>
@@ -34,9 +36,85 @@ void Section(void* owner, std::FILE* file) {
 	std::fprintf(file, "section of %s\n", static_cast<const char*>(owner));
 }
 
+namespace Crumbs = Libs::Graphics::GpuBreadcrumbs;
+uintptr_t checkpoint;
+
+VKAPI_ATTR void VKAPI_CALL Checkpoints(VkQueue, uint32_t* count, VkCheckpointDataNV* data) {
+	if (data) {
+		Check(*count == 2 && data[0].sType == VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV, "checkpoint destination is initialized");
+		data[0].stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+		data[0].pCheckpointMarker = reinterpret_cast<void*>(checkpoint);
+		data[1].stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+		data[1].pCheckpointMarker = reinterpret_cast<void*>(checkpoint - 1);
+	}
+	*count = 2;
 }
 
-int main() {
+int DeviceLost(const std::filesystem::path& directory, bool enabled, bool nv_only) {
+	using namespace Libs::Graphics;
+	setenv("KYTY_HANG_SNAPSHOT_DIR", directory.c_str(), 1);
+	setenv("KYTY_GPU_BREADCRUMBS", enabled ? "1" : "0", 1);
+	GraphicContext graphics;
+	if (!enabled) {
+		Crumbs::ReportDeviceLost(graphics, vk::Result::eErrorDeviceLost, "vkQueueSubmit", "work", 92);
+		Check(!Crumbs::PerOperation() && !std::filesystem::exists(directory), "the disabled device-loss path leaves no report");
+		return g_failures == 0 ? 0 : 1;
+	}
+	Crumbs::History history;
+	const auto work = Crumbs::SubmissionSlot("work");
+	const auto present = Crumbs::SubmissionSlot("present");
+	const auto finished = history.Record(work, 39, "draw", 7, nullptr);
+	const auto open = history.Record(work, 40, "dispatch", 11, nullptr);
+	history.AddProgram(open, {ShaderType::Compute, 0xba5e, 0x1234, static_cast<uint8_t>(BvhPath::Empty)});
+	std::array<Crumbs::Markers, 2> markers {};
+	markers[work] = {40, open, finished};
+	const auto mapped = nv_only ? std::span<const Crumbs::Markers>() : std::span<const Crumbs::Markers>(markers);
+	if (!nv_only) history.Sample(mapped);
+	const auto callback = history.Record(present, 40, "callback", 13, "flush");
+	markers[present] = {40, callback, 0};
+	for (unsigned i = 0; i < 32768; ++i) history.Record(work, 41, "callback", 12, "copy");
+	history.Retire(work, 39);
+	history.Retire(present, 40);
+	Check(Crumbs::PerOperation() == enabled, "operation marker switch");
+	graphics.queue = vk::Queue(reinterpret_cast<VkQueue>(uintptr_t{1}));
+	graphics.checkpoints_enabled = true;
+	checkpoint = uintptr_t{open} << 1;
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV = Checkpoints;
+	history.Report(graphics, vk::Result::eTimeout, "wait", "work", 90, mapped);
+	Check(!std::filesystem::exists(directory), "a timeout does not create a device-loss file");
+	history.Report(graphics, vk::Result::eErrorDeviceLost, "vkWaitSemaphores", "present", 91, mapped);
+	std::thread second([&] { history.Report(graphics, vk::Result::eErrorDeviceLost, "vkQueueSubmit", "work", 92, mapped); });
+	second.join();
+	{
+		size_t count = 0;
+		if (std::filesystem::is_directory(directory)) {
+			for (const auto& entry: std::filesystem::directory_iterator(directory)) {
+				++count;
+				const auto report = Read(entry.path().string());
+				Check(report.starts_with("VK_ERROR_DEVICE_LOST call=vkWaitSemaphores scheduler=present tick=91"), "the first error is retained");
+				Check(report.find("last begun, not finished: operation 2 scheduler=work tick=40 submission=11 type=dispatch CS=0x000000000000ba5e module=0x0000000000001234 bvh=empty") != std::string::npos,
+				      "the open operation survives wrap of the former ring and retirement on a different scheduler");
+				Check((report.find("sample steady_ms=") == std::string::npos) == nv_only, "the report keeps a pre-loss observation");
+				if (!nv_only) Check(report.find("operation 3 (descriptor retired") != std::string::npos, "a signalled tick releases its descriptors");
+				Check(report.find("checkpoint=begin operation 2 scheduler=work") != std::string::npos, "NV checkpoints resolve to the recorded operation");
+			}
+		}
+		Check(count == 1, "only the first loss writes a file");
+	}
+	return g_failures == 0 ? 0 : 1;
+}
+
+}
+
+int main(int argc, char** argv) {
+	if (argc >= 2) {
+		const auto directory = argc == 3 ? std::filesystem::path(argv[2]) :
+		    std::filesystem::temp_directory_path() / ("kyty-device-lost-" + std::to_string(getpid()));
+		const auto mode = std::string_view(argv[1]);
+		const auto result = DeviceLost(directory, mode != "--device-lost-disabled", mode == "--device-lost-nv");
+		if (argc == 2) std::filesystem::remove_all(directory);
+		return result;
+	}
 	const auto directory = std::filesystem::temp_directory_path() / ("kyty-stall-snapshot-" + std::to_string(getpid()));
 	std::filesystem::remove_all(directory);
 	setenv("KYTY_HANG_SNAPSHOT_DIR", directory.c_str(), 1);
