@@ -833,7 +833,10 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 		}
 	}
 	ReadElements(r, "si", images);
-	if (stage == ShaderType::Compute) ShaderRecompiler::IR::OrderDenseCandidates(module.specialization);
+	if (stage == ShaderType::Compute) {
+		ShaderRecompiler::IR::OrderDenseCandidates(module.specialization);
+		ShaderRecompiler::IR::NormalizeComputeTableMappings(module.specialization);
+	}
 	ReadElements(r, "ss", samplers);
 	if (module.generic_graphics && (!buffers.empty() || !images.empty() || !samplers.empty())) return false;
 	if (const auto words = r.Find("fn")) {

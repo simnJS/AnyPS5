@@ -1679,6 +1679,30 @@ static void TakeCandidateClass(ResourceSpecialization::Image& root, const Resour
 	root.cube              = kind.cube;
 }
 
+static void ReadTableMappingsAtRunTime(ResourceSpecialization& shape, ResourceSnapshot* snapshot) {
+	uint32_t slot = 0;
+	for (auto& image: shape.images) {
+		if (image.fmask) continue;
+		if (image.table_capacity != 0 && image.table_mapping_offset != RuntimeTableMapping) {
+			if (snapshot != nullptr) {
+				if (snapshot->graphics_image_banks.size() <= slot) snapshot->graphics_image_banks.resize(slot + 1);
+				snapshot->graphics_image_banks[slot] = image.table_mapping_offset;
+			}
+			image.table_mapping_offset = RuntimeTableMapping;
+		}
+		++slot;
+	}
+}
+
+void NormalizeComputeTableMappings(ResourceSpecialization& shape, ResourceSnapshot* snapshot) {
+	bool dense = false;
+	for (uint32_t i = 0; i < shape.images.size(); ++i) {
+		if (shape.images[i].heap) return;
+		dense |= DenseRoot(shape.images[i], i);
+	}
+	if (dense) ReadTableMappingsAtRunTime(shape, snapshot);
+}
+
 void OrderDenseCandidates(ResourceSpecialization& specialization) {
 	auto&                                      images = specialization.images;
 	std::vector<uint32_t>                      slots;
@@ -2092,7 +2116,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
-	if (program.stage == ShaderType::Compute) OrderDenseCandidates(snapshot, specialization);
+	if (program.stage == ShaderType::Compute) {
+		OrderDenseCandidates(snapshot, specialization);
+		if (!snapshot.image_tables.empty()) NormalizeComputeTableMappings(specialization, &snapshot);
+	}
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
 }
@@ -3497,13 +3524,7 @@ bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime&
 	if (ok) {
 		for (uint32_t i = 0; i < specialization.buffers.size(); ++i)
 			ReadFallbackBufferFormat(program, snapshot, i, specialization.buffers[i]);
-		for (uint32_t i = 0; i < specialization.images.size(); ++i) {
-			auto& view = specialization.images[i];
-			if (view.table_capacity == 0u) continue;
-			snapshot.graphics_image_banks.resize(i + 1);
-			snapshot.graphics_image_banks[i] = view.table_mapping_offset;
-			view.table_mapping_offset = RuntimeTableMapping;
-		}
+		ReadTableMappingsAtRunTime(specialization, &snapshot);
 	}
 	t_indirect_buffer_failure  = buffer_failure;
 	t_indirect_sampler_failure = sampler_failure;
