@@ -131,9 +131,17 @@ void MemoryAdmission() {
 	Check(!admission.Admit(low + 1s, Words, true, first, low + 1s), "nothing starts when even one compilation does not fit");
 	Check(!admission.Admit(low + 30s, Words, true, first, low + 1s), "nothing starts for 30 s when even one does not fit");
 	const auto lone = admission.Admit(low + 31s, Words, true, first, low + 1s);
-	Check(lone.has_value(), "one compilation runs alone after 30 s so that work never stops");
+	Check(lone.has_value(), "a lone compilation can use its margin after 30 s");
 	Check(!admission.Admit(low + 32s, Words, true, second, low + 1s), "and only one");
 	admission.Finish(*lone);
+
+	const auto estimate = admission.Estimate(Words, true);
+	admission.Sample(low + 33s, {.total = 44 * GiB, .available = estimate - 1});
+	Check(!admission.Admit(low + 33s, Words, true, first, start), "waiting cannot spend more than available memory");
+	admission.Sample(low + 34s, {.total = 44 * GiB, .available = estimate});
+	const auto fitting = admission.Admit(low + 34s, Words, true, first, start);
+	Check(fitting.has_value(), "a lone waiting compilation resumes when its estimate fits");
+	admission.Finish(*fitting);
 
 	admission.Sample(low + 40s, {.total = 60 * GiB, .available = 30 * GiB, .process = 4 * GiB, .busy_cpus = 0.0, .cpus = 32});
 	Check(admission.Admit(low + 40s, Words, true, second, low + 40s).has_value(), "work resumes when memory comes back");

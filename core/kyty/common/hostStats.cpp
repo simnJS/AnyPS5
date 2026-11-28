@@ -421,15 +421,6 @@ SystemMemory LimitToMemoryControlGroup(SystemMemory memory) {
 		uint64_t usage = 0;
 		if (!(limit_file >> limit) || !(usage_file >> usage)) continue;
 
-		std::ifstream stats(group.directory / "memory.stat");
-		const std::string_view field = group.unified ? "inactive_file" : "total_inactive_file";
-		std::string key;
-		uint64_t bytes = 0;
-		while (stats >> key >> bytes) {
-			if (key != field) continue;
-			usage -= std::min(usage, bytes);
-			break;
-		}
 		memory.total = std::min(memory.total, limit);
 		memory.available = std::min(memory.available, limit - std::min(limit, usage));
 	}

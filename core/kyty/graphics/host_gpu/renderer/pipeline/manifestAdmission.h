@@ -254,7 +254,8 @@ private:
 		const auto reserved       = other_reserved ? static_cast<int64_t>(m_reservation->bytes) : 0;
 		if (static_cast<int64_t>(estimate) + reserved <= Room()) return Refusal::None;
 		const auto waited = now - waiting_since;
-		if (m_jobs.empty() && !other_reserved && (estimate + LoneMargin <= m_sample.available || waited >= LoneWait)) {
+		if (m_jobs.empty() && !other_reserved && (estimate + LoneMargin <= m_sample.available ||
+		                                       (waited >= LoneWait && estimate <= m_sample.available))) {
 			return Refusal::None;
 		}
 		if (waited >= StarveWait && (!m_reservation || m_reservation->caller == caller)) {
