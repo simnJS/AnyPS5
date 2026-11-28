@@ -10,6 +10,13 @@
 #include <thread>
 #include <unordered_map>
 
+#if defined(__linux__)
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
+#endif
+
 namespace Libs::Graphics {
 
 struct ManifestAdmissionSample {
@@ -45,7 +52,46 @@ public:
 
 	enum class Refusal { None, Limit, Cpu, Memory, Closed };
 
-	explicit ManifestAdmission(uint32_t limit = 1): m_limit(std::max(1u, limit)) {}
+	using ThreadBytes = std::optional<uint64_t> (*)(int thread);
+
+	explicit ManifestAdmission(uint32_t limit = 1, ThreadBytes thread_bytes = FaultedThreadBytes)
+	    : m_limit(std::max(1u, limit)), m_thread_bytes(thread_bytes) {}
+
+	[[nodiscard]] static int CurrentThread() {
+#if defined(__linux__)
+		return static_cast<int>(::gettid());
+#else
+		return 0;
+#endif
+	}
+
+	[[nodiscard]] static std::optional<uint64_t> FaultedThreadBytes(int thread) {
+#if defined(__linux__)
+		if (thread <= 0) return std::nullopt;
+		char path[64];
+		std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", thread);
+		std::FILE* file = std::fopen(path, "re");
+		if (file == nullptr) return std::nullopt;
+		char       text[1024];
+		const auto size = std::fread(text, 1, sizeof(text) - 1, file);
+		std::fclose(file);
+		text[size]       = '\0';
+		const char* field = std::strrchr(text, ')');
+		if (field == nullptr) return std::nullopt;
+		for (int skipped = 0; skipped < 8; ++skipped) {
+			field = std::strchr(field + 1, ' ');
+			if (field == nullptr) return std::nullopt;
+		}
+		char*      end    = nullptr;
+		const auto faults = std::strtoull(field + 1, &end, 10);
+		if (end == field + 1) return std::nullopt;
+		static const auto page = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
+		return static_cast<uint64_t>(faults) * page;
+#else
+		static_cast<void>(thread);
+		return std::nullopt;
+#endif
+	}
 
 	void SetLimit(uint32_t limit) { m_limit = std::max(1u, limit); }
 	void Close() { m_closed = true; }
@@ -59,8 +105,9 @@ public:
 		const auto committed = Committed();
 		if (committed != 0) {
 			for (auto& job: m_jobs | std::views::values) {
-				const auto share = static_cast<uint64_t>(static_cast<double>(usage) * static_cast<double>(job.estimate) /
-				                                         static_cast<double>(committed));
+				auto share = static_cast<uint64_t>(static_cast<double>(usage) * static_cast<double>(job.estimate) /
+				                                   static_cast<double>(committed));
+				if (const auto own = ThreadUse(job)) share = std::min(share, *own);
 				job.peak = std::max(job.peak, share);
 				++job.samples;
 			}
@@ -69,13 +116,15 @@ public:
 	}
 
 	[[nodiscard]] std::optional<uint64_t> Admit(Clock::time_point now, size_t words, bool driver, std::thread::id caller,
-	                                            Clock::time_point waiting_since) {
+	                                            Clock::time_point waiting_since, int thread = CurrentThread()) {
 		const auto estimate = Estimate(words, driver);
 		m_refusal           = Decide(now, estimate, caller, waiting_since);
 		if (m_refusal != Refusal::None) return std::nullopt;
 		if (m_reservation && m_reservation->caller == caller) m_reservation.reset();
 		const auto ticket = ++m_next_ticket;
-		m_jobs.emplace(ticket, Job {.estimate = estimate, .words = words, .driver = driver, .start = now});
+		Job        job {.estimate = estimate, .words = words, .driver = driver, .start = now, .thread = thread};
+		if (m_thread_bytes != nullptr && thread > 0) job.thread_start = m_thread_bytes(thread);
+		m_jobs.emplace(ticket, job);
 		return ticket;
 	}
 
@@ -170,13 +219,24 @@ public:
 
 private:
 	struct Job {
-		uint64_t          estimate = 0;
-		size_t            words    = 0;
-		bool              driver   = false;
-		Clock::time_point start;
-		uint64_t          peak    = 0;
-		uint32_t          samples = 0;
+		uint64_t                estimate = 0;
+		size_t                  words    = 0;
+		bool                    driver   = false;
+		Clock::time_point       start;
+		int                     thread = 0;
+		std::optional<uint64_t> thread_start {};
+		uint64_t                thread_taken = 0;
+		uint64_t                peak         = 0;
+		uint32_t                samples      = 0;
 	};
+
+	std::optional<uint64_t> ThreadUse(Job& job) const {
+		if (!job.thread_start || m_thread_bytes == nullptr) return std::nullopt;
+		if (const auto now = m_thread_bytes(job.thread); now && *now > *job.thread_start) {
+			job.thread_taken = std::max(job.thread_taken, *now - *job.thread_start);
+		}
+		return job.thread_taken;
+	}
 
 	struct Reservation {
 		std::thread::id   caller;
@@ -204,6 +264,7 @@ private:
 	}
 
 	uint32_t                               m_limit;
+	ThreadBytes                            m_thread_bytes = nullptr;
 	bool                                   m_closed  = false;
 	bool                                   m_sampled = false;
 	ManifestAdmissionSample                m_sample;

@@ -2,9 +2,13 @@
 #include "graphics/host_gpu/renderer/pipeline/manifestStartup.h"
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -94,7 +98,7 @@ void MemoryAdmission() {
 	const auto second = second_thread.get_id();
 	second_thread.join();
 
-	ManifestAdmission admission(28);
+	ManifestAdmission admission(28, nullptr);
 	admission.Sample(start, {.total = 60 * GiB, .available = 40 * GiB, .process = 4 * GiB, .busy_cpus = 0.0, .cpus = 32});
 	Check(admission.Reserve() == 12 * GiB, "a fifth of the memory stays free, at most 12 GiB");
 	std::vector<uint64_t> running;
@@ -142,7 +146,7 @@ void CpuAdmission() {
 	constexpr uint64_t GiB = ManifestAdmission::GiB;
 	const auto now = ManifestAdmission::Clock::time_point {};
 	const auto id = std::this_thread::get_id();
-	ManifestAdmission admission(28);
+	ManifestAdmission admission(28, nullptr);
 	admission.Sample(now, {.total = 60 * GiB, .available = 50 * GiB, .process = 1 * GiB, .busy_cpus = 0.0, .cpus = 32});
 	Check(admission.CpuCap() == 28, "an idle machine runs as many compilations as the limit");
 	Check(admission.Admit(now, 1, false, id, now) && admission.Admit(now, 1, false, id, now), "two translations start");
@@ -159,7 +163,7 @@ void LearnedEstimate() {
 	constexpr uint64_t GiB = ManifestAdmission::GiB;
 	const auto now = ManifestAdmission::Clock::time_point {};
 	const auto id = std::this_thread::get_id();
-	ManifestAdmission admission(4);
+	ManifestAdmission admission(4, nullptr);
 	admission.Sample(now, {.total = 60 * GiB, .available = 50 * GiB, .process = 2 * GiB, .busy_cpus = 0.0, .cpus = 32});
 	const auto before = admission.Estimate(100'000, true);
 	Check(admission.Estimate(100'000, false) == ManifestAdmission::LightBytes, "a translation has a fixed estimate");
@@ -183,7 +187,7 @@ void LearnedEstimateFollowsMeasuredUse() {
 	constexpr uint64_t Real = 512 * MiB;
 	const auto start = ManifestAdmission::Clock::time_point {};
 	const auto id = std::this_thread::get_id();
-	ManifestAdmission admission(28);
+	ManifestAdmission admission(28, nullptr);
 	const ManifestAdmissionSample idle {.total = 60 * GiB, .available = 48 * GiB, .process = 2 * GiB, .busy_cpus = 0.0, .cpus = 32};
 	admission.Sample(start, idle);
 	Check(admission.BytesPerWord() > 4096.0, "the first estimate starts cautious");
@@ -223,7 +227,7 @@ void MemoryFloorStaysLow() {
 	constexpr uint64_t GiB = ManifestAdmission::GiB;
 	const auto start = ManifestAdmission::Clock::time_point {};
 	const auto id = std::this_thread::get_id();
-	ManifestAdmission admission(4);
+	ManifestAdmission admission(4, nullptr);
 	auto now = start;
 	admission.Sample(now, {.total = 60 * GiB, .available = 50 * GiB, .process = 2 * GiB, .busy_cpus = 0.0, .cpus = 32});
 	for (int round = 0; round < 200; ++round) {
@@ -237,6 +241,88 @@ void MemoryFloorStaysLow() {
 	Check(admission.Estimate(100'000, true) >= ManifestAdmission::BaseBytes + 100'000 * 768, "the estimate keeps the fixed base");
 }
 
+std::unordered_map<int, uint64_t> g_thread_bytes;
+
+std::optional<uint64_t> SimulatedThreadBytes(int thread) {
+	const auto found = g_thread_bytes.find(thread);
+	if (found == g_thread_bytes.end()) return std::nullopt;
+	return found->second;
+}
+
+struct GrowthRun {
+	double   measured_per_word = 0.0;
+	double   blind_per_word    = 0.0;
+	uint64_t measured_estimate = 0;
+};
+
+GrowthRun RunWithGrowth(uint64_t game_growth_per_tick, uint64_t real_per_job, int first_thread) {
+	constexpr uint64_t GiB   = ManifestAdmission::GiB;
+	constexpr size_t   Words = 150'000;
+	constexpr int      Jobs  = 4;
+	const auto         id    = std::this_thread::get_id();
+	ManifestAdmission  measured(16, SimulatedThreadBytes);
+	ManifestAdmission  blind(16, nullptr);
+	g_thread_bytes.clear();
+	uint64_t process = 20 * GiB;
+	auto     now     = ManifestAdmission::Clock::time_point {};
+	const auto sample = [&](uint64_t taken) {
+		const ManifestAdmissionSample values {.total = 44 * GiB, .available = 30 * GiB - taken, .process = process,
+		                                      .busy_cpus = 4.0, .cpus = 32};
+		measured.Sample(now, values);
+		blind.Sample(now, values);
+	};
+	sample(0);
+	for (int round = 0; round < 80; ++round) {
+		std::vector<uint64_t> measured_jobs;
+		std::vector<uint64_t> blind_jobs;
+		for (int job = 0; job < Jobs; ++job) {
+			const int thread = first_thread + job;
+			if (first_thread > 0) g_thread_bytes.try_emplace(thread, 0);
+			const auto a = measured.Admit(now, Words, true, id, now, thread);
+			const auto b = blind.Admit(now, Words, true, id, now, thread);
+			Check(a.has_value() && b.has_value(), "the compilations of a round start");
+			measured_jobs.push_back(*a);
+			blind_jobs.push_back(*b);
+		}
+		for (int tick = 1; tick <= 4; ++tick) {
+			now += 250ms;
+			process += game_growth_per_tick + Jobs * real_per_job / 4;
+			for (auto& bytes: g_thread_bytes | std::views::values) bytes += real_per_job / 4;
+			sample(Jobs * real_per_job * tick / 4);
+		}
+		for (const auto ticket: measured_jobs) measured.Finish(ticket);
+		for (const auto ticket: blind_jobs) blind.Finish(ticket);
+		now += 250ms;
+		process -= Jobs * real_per_job;
+		sample(0);
+	}
+	return {.measured_per_word = measured.BytesPerWord(), .blind_per_word = blind.BytesPerWord(),
+	        .measured_estimate = measured.Estimate(Words, true)};
+}
+
+void GameGrowthIsNotLearned() {
+	constexpr uint64_t GiB  = ManifestAdmission::GiB;
+	constexpr uint64_t MiB  = ManifestAdmission::MiB;
+	constexpr uint64_t Real = 512 * MiB;
+	const auto run = RunWithGrowth(3 * GiB, Real, 101);
+	Check(run.blind_per_word > 8192.0, "without a measure per thread the game's growth is learned as compilation memory");
+	Check(run.measured_per_word < 4096.0, "the game's growth is not learned as compilation memory");
+	Check(run.measured_estimate >= Real, "the estimate still covers what a compilation really takes");
+	Check(run.measured_estimate < 2 * Real, "the estimate stays near what a compilation really takes");
+}
+
+void CompilationGrowthStillLearned() {
+	constexpr uint64_t MiB  = ManifestAdmission::MiB;
+	constexpr uint64_t Real = 768 * MiB;
+	const auto run = RunWithGrowth(0, Real, 201);
+	Check(std::abs(run.measured_per_word - run.blind_per_word) <= run.blind_per_word * 0.01,
+	      "when only the compilations grow, the measure per thread learns what the process memory shows");
+	Check(run.measured_estimate >= Real, "the learned estimate covers a compilation");
+	const auto unmeasured = RunWithGrowth(0, Real, 0);
+	Check(unmeasured.measured_per_word == unmeasured.blind_per_word,
+	      "a job whose thread cannot be measured is learned from the process memory as before");
+}
+
 void LargeJobsDoNotStarve() {
 	constexpr uint64_t GiB = ManifestAdmission::GiB;
 	const auto start = ManifestAdmission::Clock::time_point {};
@@ -244,7 +330,7 @@ void LargeJobsDoNotStarve() {
 	std::thread other_thread([] {});
 	const auto small = other_thread.get_id();
 	other_thread.join();
-	ManifestAdmission admission(28);
+	ManifestAdmission admission(28, nullptr);
 	admission.Sample(start, {.total = 60 * GiB, .available = 20 * GiB, .process = 1 * GiB, .busy_cpus = 0.0, .cpus = 32});
 	const auto running = admission.Admit(start, 1, true, small, start);
 	Check(running.has_value(), "a small compilation runs");
@@ -320,6 +406,8 @@ int main() {
 	LearnedEstimate();
 	LearnedEstimateFollowsMeasuredUse();
 	MemoryFloorStaysLow();
+	GameGrowthIsNotLearned();
+	CompilationGrowthStillLearned();
 	LargeJobsDoNotStarve();
 	GenericRefusalSkipsPipelines();
 	return 0;

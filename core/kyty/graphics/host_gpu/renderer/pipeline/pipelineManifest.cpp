@@ -3154,17 +3154,18 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large
 					return stage == nullptr || stage->spirv_words <= LargeSpirvWords;
 				});
 			};
-			const auto eligible = [allow_large](auto& jobs, auto small) {
-				return allow_large ? jobs.begin() : std::ranges::find_if(jobs, small);
+			const auto large    = [&] { return allow_large || state.startup; };
+			const auto eligible = [&](auto& jobs, auto small) {
+				return large() ? jobs.begin() : std::ranges::find_if(jobs, small);
 			};
 			if (!state.available.wait(lock, stop, [&] {
 				    if (state.admission_closed) return true;
-				    if (allow_large && !state.large_compute.empty()) return true;
+				    if (large() && !state.large_compute.empty()) return true;
 				    restore_job = eligible(m_restore_jobs, [&](const auto& job) {
 					    return job.compute ? job.module->spirv_words <= LargeSpirvWords : small_stages(job.stages);
 				    });
 				    if (restore_job != m_restore_jobs.end()) return true;
-				    module_job = NextManifestModule(state.module_jobs, state.module_rank, state.module_words, allow_large, prefer_large);
+				    module_job = NextManifestModule(state.module_jobs, state.module_rank, state.module_words, large(), prefer_large);
 				    pipeline_job = eligible(state.pipeline_jobs, [&](auto job) {
 					    return small_stages(state.PipelineStages(state.warm_pipelines[job]));
 				    });
@@ -3172,7 +3173,7 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large
 			    }) || stop.stop_requested() || state.admission_closed) {
 				return;
 			}
-			if (allow_large && !state.large_compute.empty()) {
+			if (large() && !state.large_compute.empty()) {
 				compute = state.large_compute.front();
 				state.large_compute.pop_front();
 			} else if (restore_job != m_restore_jobs.end()) {
