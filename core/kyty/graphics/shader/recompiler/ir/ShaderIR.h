@@ -170,6 +170,11 @@ inline constexpr uint32_t ExactBufferBounds      = 1u << 22u;
 	return (packed_stride & BufferStrideMask) == RuntimeBufferStride;
 }
 
+[[nodiscard]] constexpr uint32_t RuntimeStrideKey(ShaderType stage, uint32_t packed_stride) {
+	packed_stride |= RuntimeBufferStride;
+	return stage == ShaderType::Compute ? packed_stride & ~(StructuredBufferBounds | ExactBufferBounds) : packed_stride;
+}
+
 [[nodiscard]] inline uint32_t RuntimeStrideData(const ShaderBufferResource& descriptor) {
 	const uint32_t stride = descriptor.Stride();
 	if (descriptor.NumRecords() == 0u || descriptor.OutOfBounds() == 3u) return stride | ExactBufferBounds;

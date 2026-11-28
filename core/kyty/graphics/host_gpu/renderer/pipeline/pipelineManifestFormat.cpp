@@ -818,6 +818,12 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 	}
 	auto& [buffers, images, samplers] = module.specialization;
 	ReadElements(r, "sb", buffers);
+	for (auto& buffer: buffers) {
+		if (ShaderRecompiler::IR::HasRuntimeStride(buffer.packed_stride) &&
+		    buffer.indirect_root == ResourceSpecialization::Buffer {}.indirect_root) {
+			buffer.packed_stride = ShaderRecompiler::IR::RuntimeStrideKey(stage, buffer.packed_stride);
+		}
+	}
 	ReadElements(r, "si", images);
 	ReadElements(r, "ss", samplers);
 	if (module.generic_graphics && (!buffers.empty() || !images.empty() || !samplers.empty())) return false;

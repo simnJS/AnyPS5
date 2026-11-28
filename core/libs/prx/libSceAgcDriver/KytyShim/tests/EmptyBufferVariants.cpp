@@ -138,11 +138,21 @@ void RawSlot(bool sharing) {
 		const auto label = "raw: mode " + std::to_string(select);
 		Check(mode.ok, label + " materializes");
 		if (!mode.ok) continue;
-		Check(mode.specialization != bound.specialization, label + " keeps a distinct key from mode 3");
-		Check(!IR::SameModuleCode(program.plan, mode.specialization, bound.specialization),
-		      label + " keeps a distinct module from mode 3");
-		Check(IR::EmptyBuffersServe(program.plan, zero.snapshot, zero.specialization, mode.specialization) == sharing,
-		      label + " safely serves an empty request when sharing is on");
+		Check(mode.specialization == bound.specialization, label + " keys like mode 3, the bounds being read at run time");
+		Check((zero.specialization == mode.specialization) == sharing,
+		      label + " is the variant of an empty request when sharing is on");
+		const auto baked = Materialize(program.plan,
+		                               MakeSharp(SourceAddress, Records * 4u, Format32UInt, SwizzleXyzw, select, 4),
+		                               target, false);
+		const auto baked_bound = Materialize(program.plan,
+		                                     MakeSharp(SourceAddress, Records * 4u, Format32UInt, SwizzleXyzw, 3, 4),
+		                                     target, false);
+		Check(baked.ok && baked_bound.ok, label + " materializes with a fixed stride");
+		if (!baked.ok || !baked_bound.ok) continue;
+		Check(baked.specialization != baked_bound.specialization,
+		      label + " keeps a distinct key from mode 3 with a fixed stride");
+		Check(!IR::SameModuleCode(program.plan, baked.specialization, baked_bound.specialization),
+		      label + " keeps a distinct module from mode 3 with a fixed stride");
 	}
 	Check(zero_baked.specialization.buffers[slot].zero_stride_oob,
 	      "raw: a null V# of a baked-stride program keeps its empty form");
