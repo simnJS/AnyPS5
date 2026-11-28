@@ -188,6 +188,12 @@ class StallReportTests(unittest.TestCase):
         self.assertEqual((last.kind, last.program, last.seconds), ("unfinished", "00000000000000f1", 3.0))
         summary = session.summary()
         self.assertEqual((summary["waits"], summary["engine_causes"], summary["unknown_waits"]), (4, 2, 1))
+        self.assertEqual(session.timeline(5), [
+            {"from_s": 0, "waits": 2, "seconds": 2.3, "main_cause": "generic-unbound:image-format", "main_seconds": 1.5},
+            {"from_s": 5, "waits": 1, "seconds": 4.2, "main_cause": "generic-not-prepared:no-recipe", "main_seconds": 4.2},
+            {"from_s": 15, "waits": 1, "seconds": 3.0, "main_cause": "other:prepared-module-without-driver-pipeline",
+             "main_seconds": 3.0},
+        ])
 
     def test_variant_map_ranks_the_fields_that_make_variants(self):
         search = "n:Float/d:2D/ir:0"

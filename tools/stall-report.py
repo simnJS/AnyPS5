@@ -724,6 +724,23 @@ class Session:
             "state_fields": state_table,
         }
 
+    def timeline(self, seconds=60):
+        if not self.waits:
+            return []
+        origin = self.guest_entry if self.guest_entry is not None else min(
+            wait.end_ns - int(wait.seconds * 1e9) for wait in self.waits)
+        rows = {}
+        for wait in self.waits:
+            index = max(0, int((wait.end_ns - origin) // (seconds * 1e9)))
+            row = rows.setdefault(index, {"waits": 0, "seconds": 0.0, "causes": Counter()})
+            row["waits"] += 1
+            row["seconds"] += wait.seconds
+            row["causes"][wait.cause] += wait.seconds
+        return [{"from_s": index * seconds, "waits": row["waits"], "seconds": round(row["seconds"], 3),
+                 "main_cause": max(row["causes"], key=lambda cause: (row["causes"][cause], cause)),
+                 "main_seconds": round(max(row["causes"].values()), 3)}
+                for index, row in sorted(rows.items())]
+
     def summary(self):
         families = {name: {"waits": 0, "seconds": 0.0, "programs": set(), "causes": defaultdict(lambda: [0, 0.0, set()])}
                     for name, _ in FAMILIES}
@@ -811,6 +828,13 @@ def print_report(session, detail, limit):
         print(f"{'':12s}{wait.evidence}")
 
 
+def print_timeline(session, seconds):
+    print(f"waits per {seconds} s since the guest entry (a wait counts where it ends)")
+    print(f"{'from':>8} {'waits':>6} {'seconds':>8}  main cause")
+    for row in session.timeline(seconds):
+        print(f"{row['from_s']:6d} s {row['waits']:6d} {row['seconds']:8.1f}  {row['main_cause']} ({row['main_seconds']:.1f} s)")
+
+
 def print_variants(session, top):
     report = session.variant_map(top)
     stages = ", ".join(f"{count} {stage}" for stage, count in sorted(report["stages"].items()))
@@ -857,6 +881,8 @@ def main():
     parser.add_argument("--code-store", type=Path)
     parser.add_argument("--detail", action="store_true", help="list every wait with its evidence")
     parser.add_argument("--top", type=int, default=0, help="with --detail, only the longest N waits")
+    parser.add_argument("--timeline", type=int, nargs="?", const=60, default=0, metavar="SECONDS",
+                        help="count the waits and the seconds lost per period (60 s when no value is given)")
     parser.add_argument("--variants", action="store_true",
                         help="map the variants: which fields of the key make them, per program and overall")
     parser.add_argument("--json", action="store_true")
@@ -868,6 +894,8 @@ def main():
                           arguments.code_store or code)
         if arguments.json:
             report = session.summary()
+            if arguments.timeline:
+                report["timeline"] = session.timeline(arguments.timeline)
             if arguments.variants:
                 report["variants"] = session.variant_map(arguments.top)
             if arguments.detail:
@@ -881,6 +909,9 @@ def main():
             if index:
                 print()
             print_report(session, arguments.detail, arguments.top)
+            if arguments.timeline:
+                print()
+                print_timeline(session, arguments.timeline)
             if arguments.variants:
                 print()
                 print_variants(session, arguments.top or 20)
