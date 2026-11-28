@@ -14,7 +14,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-class Program;
+struct Program;
 class Block;
 class Inst;
 
