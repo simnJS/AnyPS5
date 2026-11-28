@@ -276,6 +276,8 @@ struct PipelineCache::ManifestState {
 	std::unordered_map<uint64_t, uint32_t> pipeline_index;
 	std::unordered_set<uint32_t>           mixed_float_modes;
 	std::unordered_set<size_t>             unlinked_pipelines;
+	GraphicsPipelineKey                    last_missing_key {};
+	Pipeline                               last_missing_pipeline {};
 	std::atomic<uint64_t>                  module_generation {1};
 	std::unordered_set<uint64_t>           layout_keys;
 	std::unordered_map<uint64_t, std::pair<uint32_t, bool>> module_records;
@@ -3920,6 +3922,15 @@ bool PipelineCache::RecordPipeline(const GraphicsPipelineKey& key,
 		state.dirty = true;
 	}
 	return true;
+}
+
+void PipelineCache::NoteMissingGraphicsPipeline(const GraphicsPipelineKey& key, const HW::Shader& shaders) {
+	if (!m_manifest || m_manifest->record_path.empty()) return;
+	if (m_manifest->last_missing_key != key) {
+		m_manifest->last_missing_key = key;
+		m_manifest->last_missing_pipeline = {};
+	}
+	NoteFloatModes(m_manifest->last_missing_pipeline, key, shaders);
 }
 
 void PipelineCache::NoteFloatModes(Pipeline& pipeline, const GraphicsPipelineKey& key,

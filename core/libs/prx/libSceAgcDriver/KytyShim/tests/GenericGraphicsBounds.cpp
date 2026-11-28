@@ -13,6 +13,7 @@
 #include <iostream>
 #include <iterator>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -206,6 +207,29 @@ std::string readFile(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
 }
 
+bool hasMixedPipeline(const std::filesystem::path& manifest) {
+    std::istringstream lines(readFile(manifest));
+    std::string generic_vertex;
+    std::string exact_pixel;
+    std::vector<std::string> pipelines;
+    for (std::string line; std::getline(lines, line);) {
+        std::istringstream fields(line);
+        std::string kind, id, stage;
+        fields >> kind >> id >> stage;
+        if (kind == "P") pipelines.push_back(" " + line + " ");
+        if (kind != "M") continue;
+        const bool generic = (" " + line + " ").find(" gg ") != std::string::npos;
+        if (stage == "vs" && generic) generic_vertex = id;
+        if (stage == "ps" && !generic) exact_pixel = id;
+    }
+    if (generic_vertex.empty() || exact_pixel.empty()) return false;
+    for (const auto& pipeline : pipelines) {
+        if (pipeline.find(" v=" + generic_vertex + " ") != std::string::npos &&
+            pipeline.find(" p=" + exact_pixel + " ") != std::string::npos) return true;
+    }
+    return false;
+}
+
 std::string quote(const std::filesystem::path& path) {
     return "\"" + path.string() + "\"";
 }
@@ -325,6 +349,14 @@ int main(int argc, char** argv) {
         require(mixed.completed && mixed.frame == mixed_control.frame && mixed_draw != std::string::npos &&
                     mixed.log.find(BuildLine, mixed_draw) == std::string::npos && mixed.log.find(PipelineLine) == std::string::npos,
                 "a legacy exact recipe must serve live bounds when the generic pixel module cannot bind", mixed);
+
+        require(hasMixedPipeline(mixed_manifest),
+                "the first draw must record the missing generic vertex and exact pixel combination", mixed);
+        const auto warmed = replay(tool, root, "mixed", "warmed", Bounds::Structured, true, true);
+        const auto warmed_draw = warmed.log.find(FirstDraw);
+        require(warmed.completed && warmed.frame == mixed_control.frame && warmed_draw != std::string::npos &&
+                    warmed.log.find(BuildLine, warmed_draw) == std::string::npos && warmed.log.find(PipelineLine) == std::string::npos,
+                "the recorded mixed pipeline must replay the reference frame without compiling", warmed);
 
         if (std::getenv("APS5_REPLAY_KEEP_ARTIFACTS") == nullptr) {
             std::filesystem::remove_all(root);

@@ -1000,6 +1000,7 @@ private:
 	void RecordModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
 	                  std::span<const uint32_t> code, uint32_t push_data_cursor,
 	                  const ShaderModule& module);
+	void NoteMissingGraphicsPipeline(const GraphicsPipelineKey& key, const HW::Shader& shaders);
 	bool RecordPipeline(const GraphicsPipelineKey& key, const ManifestFloatModes& float_modes);
 	void CaptureQueuedPipeline(const GraphicsPipelineKey& key, const HW::Shader& shaders);
 	void NoteFloatModes(Pipeline& pipeline, const GraphicsPipelineKey& key, const HW::Shader& shaders);

@@ -4440,7 +4440,11 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				NoteFloatModes(ready, key, command.GetShaders());
 				return &ready;
 			}
-			if (ready_only) return nullptr;
+			if (ready_only) {
+				lock.unlock();
+				NoteMissingGraphicsPipeline(key, command.GetShaders());
+				return nullptr;
+			}
 			if (m_async_stopping) {
 				break;
 			}
