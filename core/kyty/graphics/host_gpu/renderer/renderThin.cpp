@@ -187,7 +187,7 @@ void RenderExecutor::LearnThinDispatch(const ShaderComputeInputInfo& input_info,
 	op->m_learning      = false;
 	const auto& program = input_info.stage.module->info;
 	constexpr uint32_t OrderedAppend = 1u << 3u;
-	auto facts = Thin::DescribeProgram(program, *input_info.stage.resources);
+	auto facts = Thin::DescribeProgram(program, *input_info.stage.resources, input_info.stage.module->specialization);
 	Thin::NotePipeline(facts, pipeline.pipeline != nullptr, pipeline.uses_image_heap);
 	facts.lds_storage          = input_info.lds_storage || bindings.shared_memory.buffer != nullptr;
 	facts.write_targets        = facts.write_targets || indirect_writes;
@@ -236,7 +236,7 @@ void RenderExecutor::ClassifyThinDraw(std::span<PreparedBindings* const> stages,
 	for (const auto* prepared: stages) {
 		const auto& runtime  = *prepared->runtime;
 		const auto& program  = runtime.module->info;
-		auto        facts    = Thin::DescribeProgram(program, *runtime.resources);
+		auto        facts    = Thin::DescribeProgram(program, *runtime.resources, runtime.module->specialization);
 		Thin::NotePipeline(facts, pipeline.pipeline != nullptr, pipeline.uses_image_heap);
 		facts.lds_storage    = prepared->shared_memory.buffer != nullptr;
 		facts.indirect_args_on_cpu = op->m_kind == Thin::OperationKind::IndirectDraw;

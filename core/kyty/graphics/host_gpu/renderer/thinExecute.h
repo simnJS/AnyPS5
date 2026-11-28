@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <array>
 #include <cstddef>
@@ -42,6 +43,7 @@ enum class Refusal : uint8_t {
 	Instrumentation,
 	Targets,
 	MeshDraw,
+	SpecializedBehind,
 	Count,
 };
 
@@ -58,6 +60,7 @@ enum class Owner : uint8_t { A, B, C, D, E, Count };
 [[nodiscard]] constexpr Owner RefusalOwner(Refusal refusal) {
 	switch (refusal) {
 		case Refusal::Specialized:
+		case Refusal::SpecializedBehind:
 		case Refusal::PipelineWait: return Owner::B;
 		case Refusal::CpuBuffers:
 		case Refusal::CpuSrt:
@@ -114,6 +117,7 @@ struct ProgramFacts {
 	bool     samplers             = false;
 	bool     flattened_srt        = false;
 	bool     specialization_reads = false;
+	bool     descriptor_specialization = false;
 	bool     gpu_flat_loads       = false;
 	bool     uniform_fill         = false;
 	bool     memory_access        = false;
@@ -130,8 +134,11 @@ struct ProgramFacts {
 	bool     checked              = false;
 };
 
-[[nodiscard]] ProgramFacts DescribeProgram(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                           const ShaderRecompiler::IR::ResourceSnapshot&  snapshot);
+[[nodiscard]] bool SpecializedOnDescriptors(const ShaderRecompiler::IR::ResourceSpecialization& specialization);
+
+[[nodiscard]] ProgramFacts DescribeProgram(const ShaderRecompiler::IR::CompiledShaderInfo&     program,
+                                           const ShaderRecompiler::IR::ResourceSnapshot&      snapshot,
+                                           const ShaderRecompiler::IR::ResourceSpecialization& specialization);
 
 void NotePipeline(ProgramFacts& facts, bool pipeline, bool uses_image_heap);
 
