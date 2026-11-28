@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
@@ -1363,8 +1364,19 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto& dimension_info = ImageDimensionInfoFor(candidate.dimension);
 				const auto sample = dimension_info.multisampled != 0u
 				    ? AddressU32(ctx, mem, *address, dimension_info.coordinate_components) : 0u;
-				const auto texel = StoreTexel(ctx, selected, ctx.Arg(inst, 2),
+				auto texel = StoreTexel(ctx, selected, ctx.Arg(inst, 2),
 				    candidate.numeric_class == Prospero::TextureNumericClass::Uint);
+				if (MarkedProgram(state.program.shader_hash)) {
+					const auto axis = [&](uint32_t index) {
+						if (dimension_info.coordinate_components == 1u) return index == 0u ? coord : ConstantU32(state, 0u);
+						const auto value = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, coord, index);
+						return value;
+					};
+					texel = MarkerTexel(state, axis(0), axis(1),
+					                    candidate.numeric_class == Prospero::TextureNumericClass::Uint
+					                        ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
+				}
 				EmitStorageImageWrite(state, resource, mip_lod, coord, texel, array_index, sample);
 			});
 		});

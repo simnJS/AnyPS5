@@ -487,6 +487,35 @@ RayTracingPrograms                          g_ray_tracing_counts;
 
 }
 
+bool MarkedProgram(uint64_t shader_hash) {
+	static const std::unordered_set<uint64_t> marked = [] {
+		std::unordered_set<uint64_t> hashes;
+		const char* value = std::getenv("KYTY_MARK_PROGRAMS");
+		if (value == nullptr) return hashes;
+		std::string_view rest(value);
+		while (!rest.empty()) {
+			const auto end  = rest.find_first_of(", ;");
+			auto       word = rest.substr(0, end);
+			rest            = end == std::string_view::npos ? std::string_view {} : rest.substr(end + 1);
+			if (word.starts_with("0x") || word.starts_with("0X")) word.remove_prefix(2);
+			uint64_t hash = 0;
+			const auto [last, error] = std::from_chars(word.data(), word.data() + word.size(), hash, 16);
+			if (!word.empty() && error == std::errc {} && last == word.data() + word.size() && hash != 0) {
+				hashes.insert(hash);
+			}
+		}
+		if (!hashes.empty()) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "[kyty-mark] {} programs write a magenta and green checkerboard instead of their colour outputs "
+			    "and image stores (KYTY_MARK_PROGRAMS); their modules are neither read from nor written to the "
+			    "shader store\n",
+			    hashes.size()));
+		}
+		return hashes;
+	}();
+	return !marked.empty() && marked.contains(shader_hash);
+}
+
 bool NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash) {
 	const std::lock_guard lock(g_ray_tracing_programs_mutex);
 	if (!g_ray_tracing_programs[static_cast<size_t>(kind)].insert(shader_hash).second) {

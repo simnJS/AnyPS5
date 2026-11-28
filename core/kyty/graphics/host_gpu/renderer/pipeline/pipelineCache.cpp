@@ -1295,7 +1295,9 @@ void PipelineCache::DestroyModule(const ShaderModule& module) const {
 const ShaderModule* PipelineCache::RestoreLinkedModule(const ProgramKey& key, Program& program,
                                                        const ShaderRecompiler::CompileOptions& options,
                                                        std::span<const uint32_t> code, uint32_t cursor) {
-	if (!m_linked_store || !program.call_source || program.call_source->expand_calls) return nullptr;
+	if (!m_linked_store || !program.call_source || program.call_source->expand_calls ||
+	    ShaderRecompiler::MarkedProgram(key.hash))
+		return nullptr;
 	const auto* entry = m_linked_store->Find(key.hash, key.user_data_count, key.static_state, code,
 	                                         program.FunctionCode(), program.specialization, cursor);
 	if (entry == nullptr || entry->module.guest_traversal != key.guest_traversal ||

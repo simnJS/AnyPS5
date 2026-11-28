@@ -105,6 +105,7 @@ struct RayTracingPrograms {
 	uint64_t last_always_guest = 0;
 	uint64_t last_pixel_guest  = 0;
 };
+[[nodiscard]] bool MarkedProgram(uint64_t shader_hash);
 bool                             NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash);
 [[nodiscard]] RayTracingPrograms GetRayTracingPrograms();
 

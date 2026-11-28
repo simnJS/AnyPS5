@@ -32,6 +32,40 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
 }
 
+uint32_t MarkerTexel(EmitterState& state, uint32_t x, uint32_t y, uint32_t vector_type) {
+	const auto u32  = TypeU32(state);
+	const auto cell = Binary(
+	    state, spv::OpBitwiseAnd, u32,
+	    Binary(state, spv::OpBitwiseXor, u32, Binary(state, spv::OpShiftRightLogical, u32, x, ConstantU32(state, 3u)),
+	           Binary(state, spv::OpShiftRightLogical, u32, y, ConstantU32(state, 3u))),
+	    ConstantU32(state, 1u));
+	const auto texel = state.builder.AllocateId();
+	if (vector_type == TypeF32Vector(state, 4)) {
+		const auto f32 = TypeF32(state);
+		const auto on  = Unary(state, spv::OpConvertUToF, f32, cell);
+		const auto off = Binary(state, spv::OpFSub, f32, ConstantF32Value(state, 1.0f), on);
+		state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, texel, on, off, on,
+		                          ConstantF32Value(state, 1.0f));
+		return texel;
+	}
+	const auto on  = Binary(state, spv::OpISub, u32, ConstantU32(state, 0u), cell);
+	const auto off = Unary(state, spv::OpNot, u32, on);
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), texel, on, off, on,
+	                          ConstantU32(state, 0xffffffffu));
+	return vector_type == TypeU32Vector(state, 4) ? texel : Unary(state, spv::OpBitcast, vector_type, texel);
+}
+
+uint32_t MarkerFragment(EmitterState& state, uint32_t vector_type) {
+	const auto coord = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), coord, state.mark_frag_coord_variable);
+	const auto component = [&](uint32_t index) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, index);
+		return Unary(state, spv::OpConvertFToU, TypeU32(state), value);
+	};
+	return MarkerTexel(state, component(0), component(1), vector_type);
+}
+
 uint32_t MrtOutputType(EmitterState& state, uint32_t index) {
 	const auto& pixel = *state.input_info.pixel;
 	if ((pixel.target_sint_mask & (1u << index)) != 0u) return TypeI32Vector(state, 4);
