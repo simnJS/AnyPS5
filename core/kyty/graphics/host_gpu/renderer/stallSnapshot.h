@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 
 namespace Libs::Graphics {
@@ -37,6 +38,14 @@ struct CompileWait {
 void                      EnterCompileWait(const void* key, const char* what, uint64_t hash);
 void                      LeaveCompileWait(const void* key);
 [[nodiscard]] CompileWait LongestCompileWait();
+
+struct StallWatch {
+	uint32_t periods = 0;
+	[[nodiscard]] std::optional<double> GpuStallSeconds(uint64_t now_ns, uint64_t submitted_ns) noexcept;
+
+private:
+	uint64_t submitted_by_ns = 0;
+};
 
 enum class Holder : uint8_t { NotIssued, Recording, Driver, Gpu };
 inline constexpr double DriverHoldSeconds = 10.0;

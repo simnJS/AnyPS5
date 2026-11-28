@@ -6,6 +6,8 @@
 
 #include <atomic>
 #if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
+
 #include <array>
 #include <cstdio>
 #include <span>
@@ -37,7 +39,7 @@ public:
 	void Refresh();
 	void Wait(uint64_t tick);
 #if defined(ANYPS5_KYTY)
-	void ReportStall(uint64_t tick, uint32_t periods);
+	void ReportStall(uint64_t tick, StallSnapshot::StallWatch& watch);
 	void NoteIssued(uint64_t tick) noexcept;
 	void NoteSubmitting(uint64_t tick) noexcept;
 	void NoteSubmitted(uint64_t tick, std::span<const vk::Semaphore> waits, std::span<const uint64_t> values) noexcept;

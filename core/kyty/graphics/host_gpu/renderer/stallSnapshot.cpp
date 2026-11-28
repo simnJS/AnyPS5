@@ -402,6 +402,14 @@ CompileWait LongestCompileWait() {
 	return longest;
 }
 
+std::optional<double> StallWatch::GpuStallSeconds(uint64_t now_ns, uint64_t submitted_ns) noexcept {
+	const auto known_by = submitted_ns == 0 ? now_ns : submitted_ns;
+	if (submitted_by_ns == 0 || known_by < submitted_by_ns) submitted_by_ns = known_by;
+	const auto seconds = Ago(now_ns, submitted_by_ns);
+	if (seconds < 10.0) return std::nullopt;
+	return seconds;
+}
+
 Holder Classify(uint64_t tick, uint64_t next_tick, uint64_t submitted, uint64_t submitting_tick,
                 double submitting_seconds) noexcept {
 	if (tick <= submitted) return Holder::Gpu;
