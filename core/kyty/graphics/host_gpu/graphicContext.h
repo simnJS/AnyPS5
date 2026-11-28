@@ -23,6 +23,8 @@ namespace Libs::Graphics {
 
 struct VulkanImage;
 
+enum class ImageAllocation : uint8_t { PreferDevice, Texture, HeapTexture };
+
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
 [[nodiscard]] constexpr bool NeedsMeshLdsPadding(uint32_t vendor, uint32_t device, vk::DriverId driver) {
@@ -185,7 +187,7 @@ struct GraphicContext {
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
-	                                   bool bindless);
+	                                   ImageAllocation allocation);
 	void                   DeleteImage(VulkanImage& image);
 	void                   TrimRecycledImages();
 	[[nodiscard]] size_t   RecycledImageCount() const;

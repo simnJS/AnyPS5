@@ -68,7 +68,7 @@ class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
-	      bool bindless);
+	      ImageAllocation allocation);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
