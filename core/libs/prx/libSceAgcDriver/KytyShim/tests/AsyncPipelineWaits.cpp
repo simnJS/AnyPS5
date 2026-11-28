@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -249,6 +250,28 @@ void ComputeWaitWokenByWorker(PipelineCache& cache, GraphicContext& graphics, co
 	Check(wait.cpu_ms < MaxCpuMs, "the compute wait used " + std::to_string(wait.cpu_ms) + " ms of CPU: it spins");
 }
 
+void TranslateBeforeWorkerAdmission(PipelineCache& cache) {
+	static constexpr uint32_t code[] = {0xbf810000u};
+	HW::ComputeShaderInfo regs {};
+	regs.cs_regs.data_addr = reinterpret_cast<uintptr_t>(code);
+	regs.cs_regs.wave_size = 32;
+	regs.cs_regs.num_thread_x = regs.cs_regs.num_thread_y = regs.cs_regs.num_thread_z = 1;
+	ShaderMapUserData(regs.cs_regs.data_addr, {.type = Prospero::ShaderBinaryType::kCs, .code_size_bytes = sizeof(code)});
+	auto held = Access::HoldCompilationSlot(cache);
+	Require(static_cast<bool>(held), "could not reserve the translation slot");
+	ShaderComputeInputInfo input {};
+	ProgramResolution ahead;
+	Require(cache.GetComputeProgramAhead(regs, input, ahead) == nullptr && ahead.reads.Refusal() == AheadRefusal::Compiling,
+	        "the program was not queued for translation");
+	auto waiter = std::async(std::launch::async, [&] { return cache.GetComputeProgram(regs, input); });
+	const bool ready = waiter.wait_for(2s) == std::future_status::ready;
+	held.Reset();
+	Check(ready, "foreground translation waited for an unstarted worker");
+	const auto* module = waiter.get();
+	Require(module != nullptr, "foreground translation returned no module");
+	Check(cache.GetComputeProgram(regs, input) == module, "the translated module was not reused");
+}
+
 void GraphicsWaitWokenAtTheEnd(PipelineCache& cache) {
 	GraphicsPipelineKey key {};
 	key.stage_ids = {0x9a0001u, 0, 0, 0x9a0002u};
@@ -319,6 +342,7 @@ int Run(GraphicContext& graphics) {
 		NoImageHeap   heap;
 		PipelineCache cache(graphics, &heap, {}, true, 1, 1);
 		Require(Access::AsyncWorkersRunning(cache), "the pipeline cache started no async workers");
+		TranslateBeforeWorkerAdmission(cache);
 		ComputeWaitWokenByWorker(cache, graphics, code);
 		GraphicsWaitWokenAtTheEnd(cache);
 		StopWakesEveryWait(cache, graphics, code);
