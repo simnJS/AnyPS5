@@ -399,6 +399,13 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     add_test(NAME kyty_shim_compute_pipeline_binaries COMMAND kyty_shim_compute_pipeline_binaries_tests)
     set_tests_properties(kyty_shim_compute_pipeline_binaries PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "kyty_shim_compute_pipeline_binaries: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/GraphicsPipelineBinaries.cpp)
+    add_test_executable(kyty_shim_graphics_pipeline_binaries_tests ${CMAKE_CURRENT_SOURCE_DIR}/GraphicsPipelineBinariesMain.cpp)
+    configure_host_test_executable(kyty_shim_graphics_pipeline_binaries_tests)
+    target_link_libraries(kyty_shim_graphics_pipeline_binaries_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_graphics_pipeline_binaries COMMAND kyty_shim_graphics_pipeline_binaries_tests)
+    set_tests_properties(kyty_shim_graphics_pipeline_binaries PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "kyty_shim_graphics_pipeline_binaries: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/AsyncPipelineWaits.cpp)
     add_test_executable(kyty_shim_async_pipeline_waits_tests ${CMAKE_CURRENT_SOURCE_DIR}/AsyncPipelineWaitsMain.cpp)
     configure_host_test_executable(kyty_shim_async_pipeline_waits_tests)
@@ -929,6 +936,21 @@ set_tests_properties(kyty_shim_restored_graphics_wait PROPERTIES TIMEOUT 120 SKI
         PASS_REGULAR_EXPRESSION "kyty_shim_restored_graphics_wait: ok")
 if(WIN32)
     set_property(TEST kyty_shim_depth_target_alias kyty_shim_restored_graphics_wait APPEND PROPERTY
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+endif()
+
+add_test_executable(kyty_shim_generic_graphics_bounds_tests ${CMAKE_CURRENT_SOURCE_DIR}/GenericGraphicsBounds.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_generic_graphics_bounds_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_generic_graphics_bounds_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_generic_graphics_bounds_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_generic_graphics_bounds_tests)
+add_dependencies(kyty_shim_generic_graphics_bounds_tests agc_frame_replay)
+add_test(NAME kyty_shim_generic_graphics_bounds COMMAND kyty_shim_generic_graphics_bounds_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_generic_graphics_bounds PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_generic_graphics_bounds: ok")
+if(WIN32)
+    set_property(TEST kyty_shim_generic_graphics_bounds APPEND PROPERTY
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
 endif()
 

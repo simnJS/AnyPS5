@@ -174,12 +174,6 @@ inline constexpr uint32_t ExactBufferBounds      = 1u << 22u;
 	return (packed_stride | RuntimeBufferStride) & ~(StructuredBufferBounds | ExactBufferBounds);
 }
 
-[[nodiscard]] inline uint32_t RuntimeStrideData(const ShaderBufferResource& descriptor) {
-	const uint32_t stride = descriptor.Stride();
-	if (descriptor.NumRecords() == 0u || descriptor.OutOfBounds() == 3u) return stride | ExactBufferBounds;
-	return stride | (stride != 0u && descriptor.OutOfBounds() == 0u ? StructuredBufferBounds : 0u);
-}
-
 struct BufferWriteSpan {
 	uint32_t offset         = 0;
 	bool     per_invocation = false;

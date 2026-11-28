@@ -413,7 +413,7 @@ std::vector<MemoryControlGroup> MemoryControlGroups() {
 }
 
 SystemMemory LimitToMemoryControlGroup(SystemMemory memory) {
-	static const auto groups = MemoryControlGroups();
+	static const auto& groups = *new std::vector<MemoryControlGroup>(MemoryControlGroups());
 	for (const auto& group: groups) {
 		std::ifstream limit_file(group.directory / (group.unified ? "memory.max" : "memory.limit_in_bytes"));
 		std::ifstream usage_file(group.directory / (group.unified ? "memory.current" : "memory.usage_in_bytes"));

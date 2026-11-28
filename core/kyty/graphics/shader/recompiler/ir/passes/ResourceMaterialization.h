@@ -91,6 +91,7 @@ bool BindGenericGraphics(const ResourcePlan& plan, ResourceSnapshot& snapshot,
 bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
                           const ResourceSpecialization::Buffer& buffer);
 void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization);
+[[nodiscard]] uint32_t RuntimeStrideData(const ShaderBufferResource& descriptor);
 uint32_t FormattedReadComponents(const ResourcePlan& program, uint32_t index);
 #if defined(ANYPS5_KYTY)
 bool SharesEmptyBuffers();
