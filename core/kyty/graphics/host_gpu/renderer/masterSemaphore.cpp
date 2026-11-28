@@ -139,7 +139,12 @@ void MasterSemaphore::NoteSubmitting(uint64_t tick) noexcept {
 void MasterSemaphore::ReportStall(uint64_t tick, StallSnapshot::StallWatch& watch) {
 	const auto periods = ++watch.periods;
 	uint64_t   reached = 0;
-	if (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &reached) != vk::Result::eSuccess || reached >= tick) return;
+	const auto observed = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &reached);
+	if (observed != vk::Result::eSuccess) {
+		GpuBreadcrumbs::ReportDeviceLost(m_graphics, observed, "vkGetSemaphoreCounterValue", m_name, tick);
+		return;
+	}
+	if (reached >= tick) return;
 	const auto submitted       = SubmittedTick();
 	const auto next            = CurrentTick();
 	const auto submitting_tick = m_submitting_tick.load(std::memory_order_acquire);
@@ -206,7 +211,9 @@ void MasterSemaphore::ReportStall(uint64_t tick, StallSnapshot::StallWatch& watc
 	}
 	if (StallSnapshot::GpuSide(holder)) {
 		uint64_t current = 0;
-		if (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &current) != vk::Result::eSuccess || current != reached ||
+		const auto checked = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &current);
+		if (checked != vk::Result::eSuccess) GpuBreadcrumbs::ReportDeviceLost(m_graphics, checked, "vkGetSemaphoreCounterValue", m_name, tick);
+		if (checked != vk::Result::eSuccess || current != reached ||
 		    (holder == StallSnapshot::Holder::Driver && m_submitting_tick.load(std::memory_order_acquire) != submitting_tick)) {
 			m_reported_gpu.clear();
 			return;
@@ -256,6 +263,10 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+#if defined(ANYPS5_KYTY)
+	if (result != vk::Result::eSuccess)
+		GpuBreadcrumbs::ReportDeviceLost(m_graphics, result, "vkGetSemaphoreCounterValue", m_name, CurrentTick());
+#endif
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
@@ -289,6 +300,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		ReportStall(tick, watch);
 		result = m_graphics.device.waitSemaphores(&wait_info, StallNs);
 	}
+	if (result != vk::Result::eSuccess) GpuBreadcrumbs::ReportDeviceLost(m_graphics, result, "vkWaitSemaphores", m_name, tick);
 #else
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 #endif

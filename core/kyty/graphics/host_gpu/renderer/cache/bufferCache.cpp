@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "graphics/host_gpu/shaders/guest_apertures.inc"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
@@ -975,7 +977,8 @@ bool BufferCache::StartReadbackQueueRead(uint64_t vaddr, uint64_t size, uint64_t
 	submit.pWaitDstStageMask  = &wait_stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &command;
-	if (m_graphics.readback_queue.submit(1, &submit, queue.fence) != vk::Result::eSuccess) {
+	if (const auto result = m_graphics.readback_queue.submit(1, &submit, queue.fence); result != vk::Result::eSuccess) {
+		GpuBreadcrumbs::ReportDeviceLost(m_graphics, result, "vkQueueSubmit", "readback", needed);
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
 	read.slot           = slot;
@@ -1022,8 +1025,8 @@ void BufferCache::ReadbackQueue::Finish(GraphicContext& graphics) {
 
 void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 	auto& queue = read.slot->queue;
-	if (m_graphics.device.waitForFences(1, &queue.fence, VK_TRUE, UINT64_MAX) !=
-	    vk::Result::eSuccess) {
+	if (const auto result = m_graphics.device.waitForFences(1, &queue.fence, VK_TRUE, UINT64_MAX); result != vk::Result::eSuccess) {
+		GpuBreadcrumbs::ReportDeviceLost(m_graphics, result, "vkWaitForFences", "readback", read.needed);
 		EXIT("BufferCache: readback queue wait failed\n");
 	}
 	m_scheduler.WaitPriorityOperations(read.needed);
@@ -2561,7 +2564,8 @@ bool BufferCache::DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies
 	submit.pWaitDstStageMask  = &wait_stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &command;
-	if (m_graphics.readback_queue.submit(1, &submit, m_readback.fence) != vk::Result::eSuccess) {
+	if (const auto result = m_graphics.readback_queue.submit(1, &submit, m_readback.fence); result != vk::Result::eSuccess) {
+		GpuBreadcrumbs::ReportDeviceLost(m_graphics, result, "vkQueueSubmit", "readback", needed);
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
 #if defined(ANYPS5_KYTY)
@@ -2574,6 +2578,7 @@ bool BufferCache::DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies
 			break;
 		}
 		if (status != vk::Result::eNotReady) {
+			GpuBreadcrumbs::ReportDeviceLost(m_graphics, status, "vkGetFenceStatus", "readback", needed);
 			EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(status).c_str());
 		}
 		if ((spins & 1023u) == 1023u && std::chrono::steady_clock::now() - spin_from >= SpinLimit) {
@@ -2601,6 +2606,7 @@ bool BufferCache::DownloadOnReadbackQueue(std::span<const vk::BufferCopy> copies
 				result = device.waitForFences(1, &m_readback.fence, VK_TRUE, StallNs);
 			}
 			if (result != vk::Result::eSuccess) {
+				GpuBreadcrumbs::ReportDeviceLost(m_graphics, result, "vkWaitForFences", "readback", needed);
 				EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(result).c_str());
 			}
 			break;

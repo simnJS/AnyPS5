@@ -778,8 +778,8 @@ void CommandProcessor::NoteGuestWrite(uint64_t sequence, uint64_t address, uint6
 	}
 }
 
-void CommandProcessor::EmitHostCommand(Common::UniqueFunction<void>&& command) {
-	EmitCallback(std::move(command));
+void CommandProcessor::EmitHostCommand(Common::UniqueFunction<void>&& command, std::source_location origin) {
+	EmitCallback(std::move(command), {}, origin);
 }
 
 void CommandProcessor::ReadDecisionMemory(const volatile void* address, void* value,
@@ -794,8 +794,9 @@ void CommandProcessor::ReadDecisionMemory(const volatile void* address, void* va
 	CopyFromGuest(value, address, size);
 }
 
-uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWrite& write) {
+uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWrite& write, std::source_location origin) {
 	auto operation        = MakeOperation(GpuOperationKind::Callback);
+	if (GpuBreadcrumbs::PerOperation()) operation.callback_name = origin.function_name();
 	operation.callback    = std::move(callback);
 	operation.guest_write = write;
 	return Emit(std::move(operation));
@@ -847,10 +848,10 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		BufferCache& buffers;
 		~CommitWriteTicks() { buffers.CommitWriteTicks(); }
 	} commit_write_ticks {m_renderer.GetBufferCache()};
-	uint32_t crumb = 0;
+	std::optional<GpuBreadcrumbs::OperationScope> crumb;
 	if (GpuBreadcrumbs::PerOperation() && GetScheduler().Recording()) {
-		crumb = GpuBreadcrumbs::BeginOperation(m_renderer.GetGraphics(), GetScheduler().Current().Handle(),
-		                                       GetScheduler().CurrentTick(), OperationName(operation.kind), operation.submit_id);
+		crumb.emplace(GetScheduler(), OperationName(operation.kind), operation.submit_id,
+		              operation.kind == GpuOperationKind::Callback && operation.callback ? operation.callback_name : nullptr);
 	}
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:
@@ -903,9 +904,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			}
 			break;
 	}
-	if (crumb != 0 && GetScheduler().Recording()) {
-		GpuBreadcrumbs::EndOperation(GetScheduler().Current().Handle(), crumb);
-	}
+	crumb.reset();
 	if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
 		(void)copies->Flush();
 	}

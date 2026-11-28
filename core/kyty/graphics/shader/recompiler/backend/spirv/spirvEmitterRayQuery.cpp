@@ -734,6 +734,7 @@ void InitializeRayQueryVariables(EmitterState& s) {
 }
 
 uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.state.NoteBvhPath(BvhPath::Native);
 	auto&      s    = ctx.state;
 	const auto site = SiteOf(ctx, inst);
 	const auto lane = Lane(s, site, ctx.half);
@@ -1010,6 +1011,7 @@ uint32_t EmitRayQueryValid(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 void EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.state.NoteBvhPath(BvhPath::Native);
 	auto& s = ctx.state;
 	EmitIfCondition(s, ctx.Arg(inst, 8), [&] {
 		const auto              f = TypeF32(s), b = TypeBool(s), zero = ConstantF32Value(s, 0.0f);

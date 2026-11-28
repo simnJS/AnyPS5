@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "common/assert.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -839,7 +841,10 @@ std::shared_ptr<PreparedFrames> PrepareGuestFrames(Libs::Graphics::RenderContext
         while (!complete(&wait)) {
             const auto result = scheduler.Graphics().device.waitSemaphores(&info, 10'000'000);
             if (result == vk::Result::eSuccess) break;
-            if (result != vk::Result::eTimeout) Libs::Graphics::RequireVulkanSuccess(result, "wait for prepared overlay");
+            if (result != vk::Result::eTimeout) {
+                Libs::Graphics::GpuBreadcrumbs::ReportDeviceLost(scheduler.Graphics(), result, "vkWaitSemaphores", "overlay", wait.tick);
+                Libs::Graphics::RequireVulkanSuccess(result, "wait for prepared overlay");
+            }
             if (pumpEvents != nullptr) pumpEvents();
             RepeatWhenIdle(complete, &wait);
         }

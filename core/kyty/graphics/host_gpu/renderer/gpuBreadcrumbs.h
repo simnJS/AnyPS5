@@ -10,6 +10,8 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandRecorder;
+class CommandScheduler;
+struct ShaderModule;
 
 namespace GpuBreadcrumbs {
 
@@ -21,9 +23,32 @@ namespace GpuBreadcrumbs {
 void                   MarkSubmission(GraphicContext& graphics, const CommandRecorder& command, uint32_t slot, uint64_t tick);
 [[nodiscard]] std::optional<uint64_t> StartedTick(uint32_t slot, uint64_t near);
 
-[[nodiscard]] uint32_t BeginOperation(GraphicContext& graphics, const CommandRecorder& command, uint64_t tick, const char* kind,
-                                      uint64_t submit_id);
-void                   EndOperation(const CommandRecorder& command, uint32_t id);
+class OperationScope {
+public:
+	OperationScope(CommandScheduler& scheduler, const char* kind, uint64_t submit_id, const char* callback);
+	~OperationScope();
+	OperationScope(const OperationScope&) = delete;
+	OperationScope& operator=(const OperationScope&) = delete;
+
+	void BeginSegment();
+	void EndSegment();
+
+	CommandScheduler& scheduler;
+	uint32_t id = 0;
+
+private:
+	const char* kind;
+	uint64_t submit_id;
+	const char* callback;
+	OperationScope* outer;
+};
+
+void BeforeSubmit(CommandScheduler& scheduler);
+void AfterBegin(CommandScheduler& scheduler);
+void NoteProgram(const ShaderModule& module);
+[[nodiscard]] bool NeedsBvhPaths(const ShaderModule& module);
+void ReportDeviceLost(GraphicContext& graphics, vk::Result result, const char* call, const char* scheduler, uint64_t tick);
+void Shutdown(GraphicContext& graphics);
 
 }
 

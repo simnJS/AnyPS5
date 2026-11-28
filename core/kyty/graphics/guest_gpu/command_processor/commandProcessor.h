@@ -1,6 +1,8 @@
 #ifndef GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
+#include <source_location>
+
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/command_processor/drawStateObserver.h"
@@ -155,7 +157,7 @@ public:
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 	void WriteLodStats(void* dst, uint32_t size, uint32_t control);
 	void RunGarbageCollector();
-	void EmitHostCommand(Common::UniqueFunction<void>&& command);
+	void EmitHostCommand(Common::UniqueFunction<void>&& command, std::source_location origin = std::source_location::current());
 	bool HleTlasDispatch(uint64_t data_addr);
 	bool HleBlasDispatch(uint64_t data_addr);
 	void EmitHleRefit();
@@ -208,7 +210,8 @@ private:
 	[[nodiscard]] GpuOperation MakeOperation(GpuOperationKind kind);
 	[[nodiscard]] GpuRegisterState SnapshotState(uint64_t sequence);
 	uint64_t                   Emit(GpuOperation&& operation);
-	uint64_t                   EmitCallback(GpuCallback&& callback, const GpuGuestWrite& write = {});
+	uint64_t                   EmitCallback(GpuCallback&& callback, const GpuGuestWrite& write = {},
+	                                         std::source_location origin = std::source_location::current());
 	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
 	                    const void* value = nullptr);
 

@@ -46,7 +46,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   const Profile& profile               = DefaultProfile,
                                   bool           emit_debug_info       = false,
                                   bool           mip_stats_records     = true,
-                                  SplitHints*    split_hints           = nullptr);
+                                  SplitHints*    split_hints           = nullptr, uint8_t* bvh_paths = nullptr);
 
 [[nodiscard]] bool     UsesMipStats(const IR::Program& program);
 [[nodiscard]] uint32_t MeshWorkgroupBytes(std::span<const uint32_t> spirv);

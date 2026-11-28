@@ -149,6 +149,7 @@ bool LinkedComputeStore::Read(std::istream& input, std::span<const uint8_t> head
 		if (module.bvh != ShaderBvh::None) {
 			const auto digest = [](std::span<const uint32_t> words) { return XXH3_64bits(words.data(), words.size_bytes()); };
 			IoAll(inputs, module.info, digest(entry.spirv), digest(plain));
+			if (module.bvh_paths != 0) IoAll(inputs, module.bvh_paths);
 		}
 		if (inputs.failure.Failed() || XXH3_64bits(inputs.bytes.data(), inputs.bytes.size()) != module.id ||
 		    !ids.insert(module.id).second) return false;

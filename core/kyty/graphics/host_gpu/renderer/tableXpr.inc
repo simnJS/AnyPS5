@@ -1900,6 +1900,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (push_dwords != 0)
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0, push_dwords * sizeof(uint32_t),
 		                        push_data.dwords.data());
+	if (GpuBreadcrumbs::PerOperation()) {
+		for (uint32_t st = 0; st < stages; ++st) GpuBreadcrumbs::NoteProgram(*pair.tables[st]);
+	}
 	if (!same_index) vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
 	if (direct != nullptr && !vertex_arguments) {
 		const auto& vertex = *pair.programs[0];

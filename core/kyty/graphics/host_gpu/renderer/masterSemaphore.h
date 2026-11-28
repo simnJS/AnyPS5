@@ -46,7 +46,7 @@ public:
 	[[nodiscard]] uint64_t SubmittedTick() const noexcept { return m_submitted.load(std::memory_order_acquire); }
 	void                   WriteSubmissions(std::FILE* file, size_t count);
 	[[nodiscard]] std::string PendingWait(uint64_t tick);
-	void SetMarkerSlot(uint32_t slot) noexcept { m_marker_slot = slot; }
+	void SetMarkerSlot(uint32_t slot, const char* name) noexcept { m_marker_slot = slot; m_name = name; }
 	void NoteWork(uint64_t tick, uint64_t shader) noexcept {
 		const auto next = m_work_next.load(std::memory_order_relaxed);
 		const auto at   = next % m_work.size();
@@ -78,6 +78,7 @@ private:
 	};
 	std::array<Submission, 128> m_submissions {};
 	std::atomic<uint64_t>       m_submitted {0};
+	const char*                 m_name = "unknown";
 	uint32_t                    m_marker_slot      = UINT32_MAX;
 	std::atomic<uint64_t>       m_submitting_tick {0};
 	std::atomic<uint64_t>       m_submitting_since {0};

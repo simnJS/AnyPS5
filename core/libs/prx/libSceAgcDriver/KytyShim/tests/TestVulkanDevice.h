@@ -17,7 +17,7 @@ struct TestVulkanDevice {
 	Libs::Graphics::GraphicContext graphics;
 	bool acceleration_storage = false;
 
-	const char* Initialize(bool require_tiling = false, bool sparse = false, bool report_budget = false, bool measure_acceleration_storage = false) {
+	const char* Initialize(bool require_tiling = false, bool sparse = false, bool report_budget = false, bool measure_acceleration_storage = false, bool markers = false) {
 		if (!loader.success()) {
 			return "Vulkan loader unavailable";
 		}
@@ -38,7 +38,7 @@ struct TestVulkanDevice {
 			return "Vulkan device enumeration failed";
 		}
 		for (const auto device : devices.value) {
-			if (InitializeDevice(device, require_tiling, sparse, report_budget, measure_acceleration_storage)) {
+			if (InitializeDevice(device, require_tiling, sparse, report_budget, measure_acceleration_storage, markers)) {
 				return nullptr;
 			}
 		}
@@ -59,7 +59,7 @@ struct TestVulkanDevice {
 	}
 
 private:
-	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse, bool report_budget, bool measure_acceleration_storage) {
+	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse, bool report_budget, bool measure_acceleration_storage, bool markers) {
 		vk::PhysicalDeviceVulkan12Properties limits {};
 		vk::PhysicalDeviceVulkan11Properties properties11 {.pNext = &limits};
 		vk::PhysicalDeviceProperties2 properties {.pNext = &properties11};
@@ -183,6 +183,12 @@ private:
 			}
 		}
 		std::vector<const char*> enabled_extensions(required_extensions.begin(), required_extensions.end());
+		if (markers) {
+			graphics.buffer_marker_enabled = has_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			graphics.checkpoints_enabled = has_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			if (graphics.buffer_marker_enabled) enabled_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			if (graphics.checkpoints_enabled) enabled_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		}
 		const bool host_memory = has_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 		const bool budget = (report_budget || measure_acceleration_storage) && has_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 		if (budget) enabled_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);

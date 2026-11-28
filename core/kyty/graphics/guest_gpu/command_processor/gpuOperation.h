@@ -101,6 +101,7 @@ struct GpuOperation {
 		DrawAutoArgs        draw_auto;
 		GpuDrawIndirectArgs draw_indirect;
 		GpuDispatchArgs     dispatch;
+		const char*         callback_name;
 	};
 	GpuCallback callback;
 	GpuGuestWrite guest_write;

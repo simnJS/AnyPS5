@@ -20,6 +20,7 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 struct CompileOptions {
+	uint8_t*                    bvh_paths = nullptr;
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
 	uint32_t                    user_data_base  = 0;

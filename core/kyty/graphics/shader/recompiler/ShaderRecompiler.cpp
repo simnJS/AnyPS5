@@ -974,7 +974,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		wide_input.compute      = &wide;
 		Spirv::SplitHints hints;
 		spirv = Spirv::EmitProgram(ir, wide_input, push_data_start_dword, *options.profile, options.emit_debug_info,
-		                           true, &hints);
+		                           true, &hints, options.bvh_paths);
 		std::string refusal;
 		if (!Spirv::SplitWaveAcrossSubgroups(spirv, refusal, &hints)) {
 			LOGF("ShaderRecompiler %s wave64 kept in lane pairs: hash=0x%016" PRIx64 " reason=%s\n", stage,
@@ -989,7 +989,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	}
 	if (spirv.empty()) {
 		spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-		                           options.emit_debug_info, true);
+		                           options.emit_debug_info, true, nullptr, options.bvh_paths);
 	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",

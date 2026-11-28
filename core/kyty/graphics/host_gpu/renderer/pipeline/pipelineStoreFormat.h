@@ -57,9 +57,14 @@ void IoRayTracingMode(Stream& io, Module& module) {
 	if constexpr (ShaderRecompiler::IR::Reading<Stream>) {
 		if (io.bytes.empty()) return;
 		ShaderRecompiler::IR::IoAll(io, module.bvh, module.rt_mode);
+		if (!io.bytes.empty()) {
+			ShaderRecompiler::IR::IoAll(io, module.bvh_paths);
+			io.ok = io.ok && (module.bvh_paths & static_cast<uint8_t>(BvhPath::Recorded)) != 0;
+		}
 		io.ok = io.ok && (module.bvh == ShaderBvh::Bvh4 || module.bvh == ShaderBvh::Bvh8Only);
 	} else if (module.bvh != ShaderBvh::None) {
 		ShaderRecompiler::IR::IoAll(io, module.bvh, module.rt_mode);
+		if (module.bvh_paths != 0) ShaderRecompiler::IR::IoAll(io, module.bvh_paths);
 	}
 }
 

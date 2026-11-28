@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "graphics/host_gpu/renderer/cache/guestMirror.h"
 
 #include "common/alignment.h"
@@ -785,6 +787,7 @@ void GuestMirror::Unbind(const Command& command) {
 		const vk::SemaphoreWaitInfo wait {
 		    .semaphoreCount = 1, .pSemaphores = &command.after.semaphore, .pValues = &command.after.value};
 		if (const auto waited = m_graphics.device.waitSemaphores(&wait, UINT64_MAX); waited != vk::Result::eSuccess) {
+			GpuBreadcrumbs::ReportDeviceLost(m_graphics, waited, "vkWaitSemaphores", "mirror unbind", command.after.value);
 			EXIT("[kyty-mirror] waiting for tick %" PRIu64 " before an unbind failed: %s\n", command.after.value,
 			     vk::to_string(waited).c_str());
 		}
@@ -866,6 +869,7 @@ void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* 
 			}
 		}
 		if (result != vk::Result::eSuccess) {
+			GpuBreadcrumbs::ReportDeviceLost(m_graphics, result, "sparse bind or fence wait", "mirror", signal);
 			EXIT("[kyty-mirror] vkQueueBindSparse (%s of %zu ranges at 0x%" PRIx64 ") failed: %s\n", what, count,
 			     count != 0 ? binds[begin].resourceOffset : 0, vk::to_string(result).c_str());
 		}

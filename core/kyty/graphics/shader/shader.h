@@ -24,6 +24,8 @@ struct ShaderRegisters;
 
 enum class ShaderBvh : uint8_t { None, Bvh4, Bvh8Only };
 
+enum class BvhPath : uint8_t { Recorded = 1, Native = 2, Oracle = 4, Empty = 8, Emulated = 16, Triangle = 32 };
+
 enum class ShaderType {
 	Unknown,
 	Vertex,

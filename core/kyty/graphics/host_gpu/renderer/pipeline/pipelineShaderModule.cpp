@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/hackNotice.h"
 #if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "common/fallback.h"
 #endif
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -251,6 +252,10 @@ std::optional<ShaderModule> PipelineCache::BuildModule(const ProgramKey&        
 	compile_options.sampler_limit = std::min(limits.maxPerStageDescriptorSamplers, limits.maxDescriptorSetSamplers);
 	compile_options.plain_mip_stats_variant = key.stage == ShaderType::Pixel;
 	const auto bvh = translated.bvh;
+	uint8_t bvh_paths = 0;
+#if defined(ANYPS5_KYTY)
+	if (bvh != ShaderBvh::None && GpuBreadcrumbs::PerOperation()) compile_options.bvh_paths = &bvh_paths;
+#endif
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
 	                                               specialization, push_data_cursor);
 	if (result.required_samplers > compile_options.sampler_limit) {
@@ -274,6 +279,7 @@ std::optional<ShaderModule> PipelineCache::BuildModule(const ProgramKey&        
 	if (bvh != ShaderBvh::None) {
 		const auto digest = [](std::span<const uint32_t> words) { return XXH3_64bits(words.data(), words.size_bytes()); };
 		ShaderRecompiler::IR::IoAll(inputs, info, digest(result.spirv), digest(result.spirv_plain));
+		if (bvh_paths != 0) ShaderRecompiler::IR::IoAll(inputs, bvh_paths);
 	}
 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
 
@@ -286,6 +292,7 @@ std::optional<ShaderModule> PipelineCache::BuildModule(const ProgramKey&        
 	    .specialization = specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
 	    .guest_traversal = key.guest_traversal,
+	    .bvh_paths       = bvh_paths,
 	    .bvh             = bvh,
 	    .rt_mode         = RayTracingModuleMode(bvh, key.stage, options.native_ray_tracing, options.rt_emulation, options.rt_oracle),
 	};
@@ -326,6 +333,7 @@ std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&       mo
 	if (plain->module == nullptr) {
 		return nullptr;
 	}
+	plain->bvh_paths       = module.bvh_paths;
 	plain->info            = module.info;
 	plain->specialization  = module.specialization;
 	plain->function_code   = module.function_code;

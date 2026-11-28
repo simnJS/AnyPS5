@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -246,6 +248,7 @@ bool GraphicContext::CreateAllocator() {
 }
 
 void GraphicContext::DestroyAllocator() {
+	if (GpuBreadcrumbs::Requested()) GpuBreadcrumbs::Shutdown(*this);
 	if (allocator == nullptr) {
 		return;
 	}

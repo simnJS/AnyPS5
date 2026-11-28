@@ -143,7 +143,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 	StallSnapshot::Register(this, m_snapshot_name.c_str(), &CommandScheduler::WriteSnapshot);
 	if (GpuBreadcrumbs::Requested()) {
 		m_marker_slot = GpuBreadcrumbs::SubmissionSlot(name);
-		m_master.SetMarkerSlot(m_marker_slot);
+		m_master.SetMarkerSlot(m_marker_slot, name);
 	}
 	if (m_deferred) {
 		m_host_copies = std::make_unique<HostCopyQueue>(
@@ -649,6 +649,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.Begin();
 	GpuBreadcrumbs::MarkSubmission(m_graphics, m_command.Handle(), m_marker_slot, m_master.CurrentTick());
 	m_dynamic_state.Invalidate();
+	if (GpuBreadcrumbs::PerOperation()) GpuBreadcrumbs::AfterBegin(*this);
 	return m_command;
 }
 
@@ -658,6 +659,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		m_submit_hook(m_submit_hook_data, m_command, submit);
 	}
 
+	if (GpuBreadcrumbs::PerOperation()) GpuBreadcrumbs::BeforeSubmit(*this);
 	m_command.End();
 	const auto     tick = m_master.NextTick();
 	m_master.NoteIssued(tick);
@@ -709,6 +711,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
+		GpuBreadcrumbs::ReportDeviceLost(graphics, result, "vkQueueSubmit", m_snapshot_name.c_str(), tick);
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 	m_master.NoteSubmitted(tick, std::span(submit.wait_semaphores.data(), submit.num_wait_semaphores),

@@ -490,6 +490,7 @@ uint32_t EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Fail(inst, "BVH8 intersection requires the complete ray and shared function");
 	Bvh8Emitter e {s};
 	if ((inst.Flags<uint32_t>() & IR::BvhIntersectEmpty) != 0) {
+		s.NoteBvhPath(BvhPath::Empty);
 		const auto leaf = Binary(s, spv::OpULessThan, e.b, e.And(ctx.Arg(*ray, 10), e.C(7)), e.C(2));
 		std::array<uint32_t, 10> invalid;
 		invalid.fill(e.C(~0u));
@@ -502,6 +503,7 @@ uint32_t EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const Vec3 dir {e.Float(ctx.Arg(*ray, 7)), e.Float(ctx.Arg(*ray, 8)), e.Float(ctx.Arg(*ray, 9))};
 		return e.Result(invalid, org, dir, e.C(0));
 	}
+	s.NoteBvhPath(BvhPath::Emulated);
 	const auto vector = [&](uint32_t first) {
 		return e.Make(e.v3, Vec3{e.Float(ctx.Arg(*ray, first)), e.Float(ctx.Arg(*ray, first + 1)),
 		    e.Float(ctx.Arg(*ray, first + 2))});
