@@ -27,7 +27,7 @@ std::atomic<int>           g_replays {0};
 std::atomic<int>           g_fallbacks {0};
 std::atomic<int>           g_traps {0};
 std::atomic<bool>          g_eligible {true};
-std::atomic<bool>          g_snapshot {false};
+std::atomic<std::size_t>   g_snapshot_bytes {0};
 alignas(8) std::uint64_t    g_snapshot_value = 0;
 #ifndef _WIN32
 std::atomic<bool>          g_raise_on_replay {false};
@@ -65,10 +65,10 @@ bool ProtectGuest(bool readable) {
 
 bool ReplayReadFault(Replay::Context& context, std::uint64_t address) {
     const auto eligible = [](std::uint64_t, std::uint64_t) { return g_eligible.load(); };
-    if (g_snapshot.load()) {
+    if (g_snapshot_bytes.load() != 0) {
         const auto from_copy = [](std::uint64_t, std::uint64_t) { return &g_snapshot_value; };
         const auto exact = [address](std::uint64_t ea, std::uint64_t size) {
-            return ea == address && size == sizeof(g_snapshot_value);
+            return ea == address && size == g_snapshot_bytes.load();
         };
         if (!Replay::Start(context, address, exact, from_copy, true)) return false;
     } else if (!Replay::Start(context, address, eligible, Backing)) {
@@ -166,6 +166,11 @@ std::uint64_t LoadThrough(std::uint64_t address, std::uint64_t& base_after) {
 
 std::uint64_t LoadSelf(std::uint64_t address) {
     asm volatile("mov (%0), %0" : "+d"(address) : : "memory");
+    return address;
+}
+
+std::uint64_t LoadDwordSelf(std::uint64_t address) {
+    asm volatile("movl (%0), %k0" : "+d"(address) : : "memory");
     return address;
 }
 
@@ -349,12 +354,20 @@ int main() {
     Require(std::signal(SIGUSR1, OnUser) != SIG_ERR, "signal failed");
 #endif
     Replaying();
-    g_snapshot.store(true);
+    g_snapshot_bytes.store(8);
     g_snapshot_value = reinterpret_cast<std::uint64_t>(&g_snapshot_value);
     std::uint64_t captured = 0;
     const auto snapshot = Run([&] { captured = LoadSelf(Address(PageSize - 8)); });
     Require(snapshot.replays == 1 && snapshot.fallbacks == 0 && captured == g_snapshot_value,
             "scalar read at the page boundary did not keep the published value");
+    g_snapshot_bytes.store(4);
+    g_snapshot_value = Word;
+    const auto dword = Run([&] { captured = LoadDwordSelf(Address(PageSize - 4)); });
+    Require(dword.replays == 1 && dword.fallbacks == 0 && captured == static_cast<std::uint32_t>(Word),
+            "a four-byte snapshot did not zero-extend the destination register");
+    const auto short_copy = Run([&] { captured = LoadSelf(Address(64)); });
+    Require(short_copy.replays == 0 && short_copy.fallbacks == 1 && captured == Word,
+            "an eight-byte load accepted an incomplete snapshot");
 #ifdef _WIN32
     Require(RemoveVectoredExceptionHandler(handler) != 0, "could not remove the vectored exception handler");
     Require(UnmapViewOfFile(g_guest) != 0 && UnmapViewOfFile(g_backing) != 0, "could not unmap both views");
