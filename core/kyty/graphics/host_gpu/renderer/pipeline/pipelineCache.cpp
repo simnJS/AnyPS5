@@ -1617,9 +1617,13 @@ bool PipelineCache::FallbackComputeVariant(const ProgramKey& key, Program& progr
 		if (!SpecializesComputeInBackground()) return true;
 		if (!m_in_flight.empty()) return false;
 	}
+	std::vector<const ShaderRecompiler::IR::ResourceSpecialization*> recorded;
+	for (const auto& module: program.modules) {
+		if (!module.shared_variant) recorded.push_back(&module.specialization);
+	}
 	ShaderRecompiler::IR::ResourceSpecialization fallback;
 	ShaderRecompiler::IR::ResourceSnapshot       resources;
-	if (!ShaderRecompiler::IR::MaterializeFallbackResources(program.resource_plan, runtime, resources, fallback) ||
+	if (!ShaderRecompiler::IR::MaterializeFallbackResources(program.resource_plan, runtime, resources, fallback, recorded) ||
 	    fallback == program.specialization || program.Failed(fallback, push_data_cursor)) {
 		return true;
 	}

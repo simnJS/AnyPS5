@@ -53,10 +53,17 @@ struct RecordBlocks {
 thread_local std::vector<RecordBlocks> t_record_blocks;
 thread_local std::span<const ResourceSpecialization::Image> t_slot_views;
 thread_local bool t_fallback_forms = false;
+thread_local std::span<const uint32_t> t_fallback_slots;
 
 struct FallbackForms {
-	FallbackForms() { t_fallback_forms = true; }
-	~FallbackForms() { t_fallback_forms = false; }
+	explicit FallbackForms(std::span<const uint32_t> slots) {
+		t_fallback_forms = true;
+		t_fallback_slots = slots;
+	}
+	~FallbackForms() {
+		t_fallback_forms = false;
+		t_fallback_slots = {};
+	}
 	FallbackForms(const FallbackForms&)            = delete;
 	FallbackForms& operator=(const FallbackForms&) = delete;
 };
@@ -74,7 +81,9 @@ bool DenseRoot(const ResourceSpecialization::Image& image, uint32_t root) {
 
 uint32_t ForcedSlots(uint32_t root) {
 	const auto views = t_slot_views;
-	if (root >= views.size() || !DenseRoot(views[root], root)) return 0u;
+	if (root >= views.size() || !DenseRoot(views[root], root)) {
+		return t_fallback_forms && root < t_fallback_slots.size() ? t_fallback_slots[root] : 0u;
+	}
 	uint32_t slots = 0;
 	for (uint32_t index = 0; index < views.size(); ++index) slots += index != root && views[index].indirect_root == root;
 	return slots;
@@ -3518,17 +3527,102 @@ static bool ReadFallbackBufferFormat(const ResourcePlan& plan, const ResourceSna
 	return true;
 }
 
+#if defined(ANYPS5_KYTY)
+static bool RecordedPopulatedBuffer(const ResourcePlan& plan, uint32_t index, ResourceSpecialization::Buffer& form) {
+	constexpr uint32_t recorded =
+	    BufferStrideMask | (1u << 14u) | (3u << 16u) | (1u << 20u) | StructuredBufferBounds | ExactBufferBounds;
+	if (!DirectBufferSlot(plan, index, form) || form.zero_stride_oob || form.scalar_empty ||
+	    (form.packed_stride & ~recorded) != 0u) {
+		return false;
+	}
+	if (ReadsStrideAtRunTime(plan, index, form)) form.packed_stride = RuntimeStrideKey(form.packed_stride);
+	return true;
+}
+
+static void TakeKnownPopulatedBuffer(const ResourcePlan& plan, const ResourceSnapshot& snapshot, uint32_t index,
+                                     std::span<const ResourceSpecialization* const> known,
+                                     ResourceSpecialization::Buffer&                buffer) {
+	using Form = std::pair<ResourceSpecialization::Buffer, uint32_t>;
+	std::vector<Form> forms;
+	for (const auto* other: known) {
+		if (other == nullptr || other->buffers.size() <= index) continue;
+		auto form = other->buffers[index];
+		if (!RecordedPopulatedBuffer(plan, index, form) || !EmptyBufferServes(plan, snapshot, index, buffer, form)) continue;
+		const auto found = std::ranges::find(forms, form, &Form::first);
+		if (found == forms.end()) {
+			forms.emplace_back(form, 1u);
+		} else {
+			++found->second;
+		}
+	}
+	if (const auto best = std::ranges::max_element(forms, {}, &Form::second); best != forms.end()) buffer = best->first;
+}
+
+static bool OneNarrowFormat(const ResourcePlan& plan, uint32_t index, std::span<const ResourceSpecialization* const> known,
+                            const ResourceSpecialization::Buffer& live) {
+	std::optional<Prospero::BufferFormat> format;
+	bool                                  single = true;
+	const auto note = [&](ResourceSpecialization::Buffer form) {
+		if (!RecordedPopulatedBuffer(plan, index, form) ||
+		    Format::GetFormatInfo(form.descriptor_format).type == Format::ComponentType::Unknown) {
+			return;
+		}
+		single = single && (!format || *format == form.descriptor_format);
+		format = form.descriptor_format;
+	};
+	note(live);
+	for (const auto* other: known) {
+		if (other != nullptr && index < other->buffers.size()) note(other->buffers[index]);
+	}
+	return single && format && (Format::GetFormatInfo(*format).byte_size & 3u) != 0u;
+}
+
+static void ChooseFallbackBuffer(const ResourcePlan& plan, const ResourceSnapshot& snapshot, uint32_t index,
+                                 std::span<const ResourceSpecialization* const> known,
+                                 ResourceSpecialization::Buffer&                buffer) {
+	if (!OneNarrowFormat(plan, index, known, buffer) && ReadFallbackBufferFormat(plan, snapshot, index, buffer)) return;
+	if (buffer.zero_stride_oob || buffer.scalar_empty) TakeKnownPopulatedBuffer(plan, snapshot, index, known, buffer);
+}
+#endif
+
+static std::vector<uint32_t> RecordedCandidateSlots(const ResourcePlan& program,
+                                                    std::span<const ResourceSpecialization* const> known) {
+	const auto            roots = program.info.images.size();
+	std::vector<uint32_t> slots(roots, 0u);
+	for (const auto* other: known) {
+		if (other == nullptr || other->images.size() < roots) continue;
+		const auto children = std::span(other->images).subspan(roots);
+		for (uint32_t root = 0; root < roots; ++root) {
+			const auto& image = other->images[root];
+			if (image.indirect_root != root || image.heap || image.table_capacity != 0u) continue;
+			const auto count = std::ranges::count(children, root, &ResourceSpecialization::Image::indirect_root);
+			slots[root] = std::max(slots[root], static_cast<uint32_t>(count));
+		}
+	}
+	for (auto& count: slots) {
+		if (count != 0u) count = static_cast<uint32_t>(std::bit_ceil(uint64_t {count} + 1u) - 1u);
+	}
+	return slots;
+}
+
 bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                                  ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                                  ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                  std::span<const ResourceSpecialization* const> known) {
 	const bool buffer_failure  = t_indirect_buffer_failure;
 	const bool sampler_failure = t_indirect_sampler_failure;
-	const FallbackForms fallback;
+	const auto          slots = RecordedCandidateSlots(program, known);
+	const FallbackForms fallback(slots);
 	auto fallback_runtime = runtime;
 	fallback_runtime.runtime_stride = true;
 	const bool ok = MaterializeResourcesForViews(program, fallback_runtime, snapshot, specialization, {});
 	if (ok) {
-		for (uint32_t i = 0; i < specialization.buffers.size(); ++i)
+		for (uint32_t i = 0; i < specialization.buffers.size(); ++i) {
+#if defined(ANYPS5_KYTY)
+			ChooseFallbackBuffer(program, snapshot, i, known, specialization.buffers[i]);
+#else
 			ReadFallbackBufferFormat(program, snapshot, i, specialization.buffers[i]);
+#endif
+		}
 		ReadTableMappingsAtRunTime(specialization, &snapshot);
 	}
 	t_indirect_buffer_failure  = buffer_failure;
