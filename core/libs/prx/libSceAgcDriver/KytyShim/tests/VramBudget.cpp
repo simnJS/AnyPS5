@@ -48,6 +48,39 @@ struct VramBudgetTestAccess {
 
 	static bool Collecting(const TextureCache& cache) { return cache.m_collecting; }
 
+	static bool CheckParkedDepth(TextureCache& cache, uint64_t address) {
+		ImageInfo info;
+		info.data.address    = address;
+		info.pixel_format    = vk::Format::eD16Unorm;
+		info.guest_format    = Prospero::BufferFormat::k16UNorm;
+		info.extent          = vk::Extent3D {64, 64, 1};
+		info.pitch           = 64;
+		info.bytes_per_block = sizeof(uint16_t);
+		info.UpdateSize();
+
+		Common::ScopedLock lock {cache.m_lock};
+		const auto baseline = MemoryTelemetry::parked_local.load();
+		ImageId second;
+		uint64_t bytes = 0;
+		uint64_t local = 0;
+		for (size_t i = 0; i < 257; ++i) {
+			const auto id = cache.InsertImage(info);
+			if (i == 1) second = id;
+			const auto& image = cache.m_slot_images[id];
+			bytes = image.AccountedSize();
+			if (i != 0 && image.backing.charge.local) local += image.backing.charge.bytes;
+			cache.ParkImage(id);
+		}
+		const bool bounded = bytes != 0 && cache.m_parked_images.size() == 256 &&
+		                     cache.m_parked_bytes == 256 * bytes && MemoryTelemetry::parked_local.load() == baseline + local;
+		const auto restored = cache.UnparkImage(info);
+		const bool reused = restored == second && cache.m_parked_bytes == 255 * bytes;
+		cache.DiscardParkedImages(address, info.data.size);
+		if (restored) cache.FreeImage(restored);
+		return bounded && reused && cache.m_parked_images.empty() && cache.m_parked_bytes == 0 &&
+		       MemoryTelemetry::parked_local.load() == baseline;
+	}
+
 	static bool CheckScratch(TextureCache& cache) {
 		constexpr uint64_t MiB = 1024 * 1024;
 		auto& tiler = cache.m_tiler;
@@ -435,6 +468,7 @@ const char* CheckSpillContent(GraphicContext& graphics, CommandScheduler& schedu
 }
 
 const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures, uint64_t address) {
+	if (!VramBudgetTestAccess::CheckParkedDepth(textures, address)) return "parked depth image budget or reuse";
 	ImageInfo info;
 	info.data.address = address;
 	info.pixel_format = vk::Format::eR8G8B8A8Unorm;

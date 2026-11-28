@@ -2448,15 +2448,30 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		                          spv::FunctionControlMaskNone, function_type);
 		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 		EmitLabel(state, state.builder.AllocateId());
-		const auto result = EmitIndexSwitch(
-		    state, format, format_count, result_type, [&](uint32_t format) {
-			    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-			    return state.builder.Constant(
-			        spv::OpConstantComposite, result_type, ConstantU32(state, info.byte_size),
-			        ConstantU32(state, std::max(1u, info.component_count)),
-			        ConstantU32(state, info.packed_bitfield ? 0u : info.component_bits[0] / 8u),
-			        ConstantU32(state, info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u));
-		    });
+		std::vector<uint32_t> entries;
+		for (uint32_t known = 0; known < format_count; known++) {
+			const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(known));
+			entries.push_back(state.builder.Constant(
+			    spv::OpConstantComposite, result_type, ConstantU32(state, info.byte_size),
+			    ConstantU32(state, std::max(1u, info.component_count)),
+			    ConstantU32(state, info.packed_bitfield ? 0u : info.component_bits[0] / 8u),
+			    ConstantU32(state, info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u)));
+		}
+		const auto array_type = state.builder.Type(spv::OpTypeArray, result_type,
+		                                           ConstantU32(state, format_count));
+		const auto geometry_table = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, array_type), spv::StorageClassPrivate,
+		    state.builder.Constant(spv::OpConstantComposite, array_type, entries));
+		const auto index = Select(state, type,
+		                          Binary(state, spv::OpULessThan, TypeBool(state), format,
+		                                 ConstantU32(state, format_count)),
+		                          format, ConstantU32(state, 0));
+		const auto geometry_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassPrivate, result_type),
+		                          geometry_pointer, geometry_table, index);
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, result_type, result, geometry_pointer);
 		state.builder.AddFunction(spv::OpReturnValue, result);
 		state.builder.AddFunction(spv::OpFunctionEnd);
 	}

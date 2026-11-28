@@ -455,6 +455,10 @@ void DefineDescriptors(EmitterState& state) {
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
 		};
+		const auto ReadOnly = [&](uint32_t variable) {
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationRestrict);
+		};
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
 			    spv::OpTypeArray, type,
@@ -485,6 +489,7 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
+				ReadOnly(state.shader_data_storage_variable);
 				break;
 			case IR::DescriptorBindingKind::MipStats:
 				state.mip_stats_variable =
@@ -503,6 +508,7 @@ void DefineDescriptors(EmitterState& state) {
 				} else {
 					state.flattened_srt_variable =
 					    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
+					ReadOnly(state.flattened_srt_variable);
 					state.flattened_srt_pointer = TypeStorageBufferElementPointer(state);
 				}
 				break;

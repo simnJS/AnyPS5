@@ -11,6 +11,7 @@
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libkernel/System/include/UserContext.hpp"
+#include "prx/libkernel/System/include/GuestFpState.hpp"
 #include <vector>
 #include <algorithm>
 #include <array>
@@ -192,7 +193,10 @@ void CallHandler(GuestExceptionHandler handler, int signum, GuestUcontext& ucont
     m.err = trap.error;
     const std::uint32_t mxcsrMask = FpWord(m, MxcsrMaskOffset);
     LogGuestExceptionContext(signum, m);
-    handler(signum, &ucontext);
+    {
+        const GuestFpState::Scope guestFp;
+        handler(signum, &ucontext);
+    }
     SetFpWord(m, MxcsrOffset, FpWord(m, MxcsrOffset) & (mxcsrMask != 0 ? mxcsrMask : DefaultMxcsrMask));
     SetFpWord(m, MxcsrMaskOffset, mxcsrMask);
 }

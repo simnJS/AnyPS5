@@ -56,7 +56,8 @@ struct TextureCache::WriteBack {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 16;
-constexpr size_t   MaxParkedImages  = 8;
+constexpr size_t   MaxParkedImages  = 256;
+constexpr uint64_t MaxParkedBytes   = uint64_t {128} << 20;
 constexpr uint64_t ParkedImageTicks = 2048;
 constexpr uint64_t LazyReadbackBytes = 256 * 1024;
 constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
@@ -1427,7 +1428,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, const Imag
 		           cached.backing.samples, replacement.backing.samples);
 	}
 	if (cached.depth_id || cached.backing.samples != 1 || replacement.backing.samples != 1 ||
-	    outgrown) {
+	    outgrown || cached.AccountedSize() > MaxParkedBytes) {
 		FreeImage(cached_id);
 	} else {
 		ParkImage(cached_id);
@@ -2293,10 +2294,15 @@ void TextureCache::ParkImage(ImageId id) {
 	StencilPlanesChanged(image);
 	image.binding.needs_rebind = true;
 	image.StateChanged();
-	m_parked_images.emplace_back(id, m_scheduler.CurrentTick(), image.backing.charge.local ? image.backing.charge.bytes : 0);
-	if (m_parked_images.size() > MaxParkedImages) {
-		DiscardParkedImage(m_parked_images.front().id);
+	const auto bytes = image.AccountedSize();
+	auto& parked = m_parked_images.emplace_back(id, m_scheduler.CurrentTick(), bytes);
+	parked.local_bytes.Set(image.backing.charge.local ? image.backing.charge.bytes : 0);
+	m_parked_bytes += bytes;
+	while (m_parked_images.size() > MaxParkedImages || m_parked_bytes > MaxParkedBytes) {
+		const auto oldest = m_parked_images.front().id;
+		m_parked_bytes -= m_parked_images.front().bytes;
 		m_parked_images.erase(m_parked_images.begin());
+		DiscardParkedImage(oldest);
 	}
 }
 
@@ -2307,6 +2313,7 @@ ImageId TextureCache::UnparkImage(const ImageInfo& info) {
 		if (!SameParkedLayout(image.info, info)) {
 			continue;
 		}
+		m_parked_bytes -= it->bytes;
 		m_parked_images.erase(it);
 		image.info    = info;
 		image.binding = {};
@@ -2348,6 +2355,7 @@ void TextureCache::DiscardParkedImages(uint64_t address, uint64_t size) {
 		    size == 0 ? tick - std::min(tick, parked.tick) > ParkedImageTicks
 		              : data.address < address + size && address < data.End();
 		if (discard) {
+			m_parked_bytes -= parked.bytes;
 			DiscardParkedImage(parked.id);
 		}
 		return discard;
@@ -2649,10 +2657,13 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 						break;
 					}
 					const auto depth_id = image.depth_id;
-					std::erase_if(m_parked_images,
-					              [depth_id](const ParkedImage& parked) {
-						              return parked.id == depth_id;
-					              });
+					std::erase_if(m_parked_images, [&](const ParkedImage& parked) {
+						if (parked.id != depth_id) {
+							return false;
+						}
+						m_parked_bytes -= parked.bytes;
+						return true;
+					});
 					DiscardParkedImage(depth_id);
 					continue;
 				}
