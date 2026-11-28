@@ -413,6 +413,7 @@ private:
 
 thread_local bool t_ahead_unlocked = false;
 #if defined(ANYPS5_KYTY)
+thread_local PipelineCache::ChainRefusal t_chain_refusal = PipelineCache::ChainRefusal::Attempts;
 thread_local bool t_execute_unlocked = false;
 thread_local bool t_ahead_missing    = false;
 #endif
@@ -430,6 +431,7 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 }
 
 void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSource& source) {
+	Common::SkipLog::Fail(Common::SkipLog::Cause::CallTables, hash);
 	Common::HackNotice::Report("dispatch whose call tables do not expand skipped",
 	                           "PipelineCache::GetProgram", hash, 0, source.refresh_failure);
 }
@@ -1558,6 +1560,7 @@ const ShaderModule* PipelineCache::GetRuntimeSamplerProgram(const ShaderParams& 
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor, bool prefer_generic) {
+	Common::SkipLog::Request(params.hash);
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -1639,6 +1642,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			}
 			return nullptr;
 		}
+		Common::SkipLog::Fail(Common::SkipLog::Cause::UnresolvableResources, params.hash);
 		Common::HackNotice::Report("draw or dispatch with unresolvable resources skipped",
 		                           "PipelineCache::GetProgram", params.hash, 0);
 		return nullptr;
@@ -1647,8 +1651,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) {
-			return cached.serve_runtime_samplers ? GetRuntimeSamplerProgram(params, input_info, push_data_cursor)
-			                                     : nullptr;
+			if (cached.serve_runtime_samplers) return GetRuntimeSamplerProgram(params, input_info, push_data_cursor);
+			Common::SkipLog::Fail(cached.skip_cause, params.hash);
+			return nullptr;
 		}
 		ShaderModule* module = nullptr;
 #if defined(ANYPS5_KYTY)
@@ -1671,6 +1676,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			if (cached.call_source && cached.call_source->refresh_failed) {
 				SkipCallExpansionFailure(params.hash, *cached.call_source);
 				cached.skip_dispatch = true;
+				cached.skip_cause    = Common::SkipLog::Cause::CallTables;
 				return nullptr;
 			}
 			if (materialized && !failed) {
@@ -1688,6 +1694,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			if (cached.call_source->refresh_failed) {
 				SkipCallExpansionFailure(params.hash, *cached.call_source);
 				cached.skip_dispatch = true;
+				cached.skip_cause    = Common::SkipLog::Cause::CallTables;
 				return nullptr;
 			}
 			runtime.call_words = cached.call_source->call_words;
@@ -1733,6 +1740,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 #if defined(ANYPS5_KYTY)
 		if (specialized && !cached.failed_variants.empty() &&
 		    cached.Failed(cached.specialization, push_data_cursor)) {
+			Common::SkipLog::Fail(Common::SkipLog::Cause::FailedVariant, params.hash);
 			return nullptr;
 		}
 #endif
@@ -1804,7 +1812,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
 			                 params.hash, source.unsupported_call_pc);
-			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+			Common::SkipLog::Fail(Common::SkipLog::Cause::UnsupportedCall, params.hash);
+			m_program_cache.emplace(m_lookup_key,
+			                        Program {.skip_dispatch = true, .skip_cause = Common::SkipLog::Cause::UnsupportedCall});
 			return nullptr;
 		}
 	}
@@ -1816,7 +1826,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				ShaderRecompiler::RefreshShaderSource(*current, runtime);
 				if (current->refresh_failed) {
 					SkipCallExpansionFailure(params.hash, *current);
-					m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+					m_program_cache.emplace(m_lookup_key,
+					                        Program {.skip_dispatch = true, .skip_cause = Common::SkipLog::Cause::CallTables});
 					return nullptr;
 				}
 				runtime.call_words = current->call_words;
@@ -1862,6 +1873,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 #endif
 	const auto* module = CompileModule(entry->second, entry->first, options, std::move(translated),
 	                                   push_data_cursor, params.code);
+	if (module == nullptr) Common::SkipLog::Fail(Common::SkipLog::Cause::ModuleNotBuilt, params.hash);
 	return module != nullptr ? bind(*module) : nullptr;
 #if defined(ANYPS5_KYTY)
 	};
@@ -1879,10 +1891,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		                 "set of samplers",
 		                 params.hash);
 	}
+	Common::SkipLog::Fail(Common::SkipLog::Cause::RecompilerStopped, params.hash);
 	if (const auto found = m_program_cache.find(m_lookup_key); found != m_program_cache.end()) {
 		if (found->second.modules.empty()) {
 			found->second.skip_dispatch          = true;
 			found->second.serve_runtime_samplers = serve_runtime_samplers;
+			found->second.skip_cause             = Common::SkipLog::Cause::RecompilerStopped;
 			if (serve_runtime_samplers) return GetRuntimeSamplerProgram(params, input_info, push_data_cursor);
 		} else {
 			found->second.NoteFailed(push_data_cursor);
@@ -1895,12 +1909,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				                          [&]() KYTY_NO_THREAD_SAFETY_ANALYSIS { built = build(); })) {
 					return built;
 				}
+				Common::SkipLog::Fail(Common::SkipLog::Cause::RecompilerStopped, params.hash);
 				found->second.NoteFailed(push_data_cursor);
 			}
 		}
 	} else {
-		m_program_cache.emplace(m_lookup_key,
-		                        Program {.skip_dispatch = true, .serve_runtime_samplers = serve_runtime_samplers});
+		m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch          = true,
+		                                               .serve_runtime_samplers = serve_runtime_samplers,
+		                                               .skip_cause             = Common::SkipLog::Cause::RecompilerStopped});
 		if (serve_runtime_samplers) return GetRuntimeSamplerProgram(params, input_info, push_data_cursor);
 	}
 	return nullptr;
@@ -2249,6 +2265,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
                                             const HW::UserConfig& user_config,
                                             const HW::Shader& shaders, DrawRenderState& state,
                                             ProgramResolution* ahead, bool prefer_generic) KYTY_NO_THREAD_SAFETY_ANALYSIS {
+	if (ahead == nullptr) Common::SkipLog::Request(0);
 	const auto& sh                = context.GetShaderRegisters();
 	const auto& vertex_regs       = shaders.GetVs();
 	const auto& pixel_regs        = shaders.GetPs();
@@ -2303,10 +2320,12 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	if (tess_active) {
 #if defined(ANYPS5_KYTY)
 		if (!Config::TessellationEnabled()) {
+			Common::SkipLog::Fail(Common::SkipLog::Cause::TessellationOff);
 			return false;
 		}
 #endif
 		if ((context.GetShaderStages() & 0x20u) != 0) {
+			Common::SkipLog::Fail(Common::SkipLog::Cause::TessellationWithGeometry);
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(
@@ -2318,6 +2337,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
 		                           0, vertex_regs.ls_regs.data_addr, ahead != nullptr,
 		                           [&] { vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info); })) {
+			Common::SkipLog::Fail(Common::SkipLog::Cause::StageNotPrepared);
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
@@ -2327,6 +2347,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 #endif
 #if defined(ANYPS5_KYTY)
 		const auto skip_tessellation = [&] {
+			Common::SkipLog::Fail(Common::SkipLog::Cause::TessellationLayout, vertex_params[1].hash);
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
@@ -2341,6 +2362,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 					ahead->reads.Fail(AheadRefusal::Stage);
 					return false;
 				}
+				Common::SkipLog::Fail(Common::SkipLog::Cause::TessellationLayout, vertex_params[0].hash);
 				vertex_info[0].stage = {};
 				return true;
 			}
@@ -2371,6 +2393,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
 		                           0, vertex_regs.es_regs.data_addr, ahead != nullptr,
 		                           [&] { vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]); })) {
+			Common::SkipLog::Fail(Common::SkipLog::Cause::StageNotPrepared);
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
@@ -2410,6 +2433,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		    mesh.max_vertices > limits.maxMeshOutputVertices ||
 		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+			Common::SkipLog::Fail(Common::SkipLog::Cause::MeshLimits, vertex_params[0].hash);
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(fmt::format(
@@ -2446,6 +2470,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
 		                           0, pixel_regs.ps_regs.data_addr, ahead != nullptr,
 		                           [&] { pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info); })) {
+			Common::SkipLog::Fail(Common::SkipLog::Cause::StageNotPrepared);
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
@@ -3026,7 +3051,9 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	    !module && ShaderRecompiler::IR::TakeRuntimeSamplerStop() && !options.runtime_sampler_descriptors;
 	LockPrograms();
 	if (serve_runtime_samplers) {
-		m_program_cache.try_emplace(job.key, Program {.skip_dispatch = true, .serve_runtime_samplers = true});
+		m_program_cache.try_emplace(job.key, Program {.skip_dispatch          = true,
+		                                              .serve_runtime_samplers = true,
+		                                              .skip_cause             = Common::SkipLog::Cause::RecompilerStopped});
 	}
 #if defined(ANYPS5_KYTY)
 	if (!compiled && job.speculative) {
@@ -3196,6 +3223,7 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			{
 				std::lock_guard lock(m_chain_mutex);
 				if (m_chain_stopping) {
+					t_chain_refusal = ChainRefusal::Stopping;
 					return nullptr;
 				}
 			}
@@ -3209,6 +3237,7 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 		     std::ranges::any_of(program->modules,
 		                         [](const ShaderModule& module) { return module.info.info.uses_image_heap; }))) {
 			UnlockPrograms();
+			t_chain_refusal = ChainRefusal::NotChainable;
 			return nullptr;
 		}
 		if (program != nullptr && !materialized) {
@@ -3224,6 +3253,7 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			};
 			if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
 			                                                specialization)) {
+				t_chain_refusal = ChainRefusal::NotReadableAhead;
 				return nullptr;
 			}
 			materialized = true;
@@ -3232,6 +3262,7 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 #if defined(ANYPS5_KYTY)
 		if (program != nullptr && materialized && program->Failed(specialization, push_data_cursor)) {
 			UnlockPrograms();
+			t_chain_refusal = ChainRefusal::FailedVariant;
 			return nullptr;
 		}
 #endif
@@ -3249,6 +3280,7 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			}
 			if (module != program->modules.end() && module->info.info.uses_image_heap) {
 				UnlockPrograms();
+				t_chain_refusal = ChainRefusal::NotChainable;
 				return nullptr;
 			}
 #endif
@@ -3269,6 +3301,7 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 		if (program != nullptr ? !TakesSpeculativeCompile(*program, key, specialization, push_data_cursor, false)
 		                       : m_speculative_failed_programs.contains(key)) {
 			UnlockPrograms();
+			t_chain_refusal = ChainRefusal::CompileRefused;
 			return nullptr;
 		}
 #endif
@@ -3288,10 +3321,12 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			const bool added = m_program_cache.contains(key);
 			UnlockPrograms();
 			if (!added) {
+				t_chain_refusal = ChainRefusal::NotCompiled;
 				return nullptr;
 			}
 		}
 	}
+	t_chain_refusal = ChainRefusal::Attempts;
 	return nullptr;
 }
 
@@ -3301,16 +3336,20 @@ void PipelineCache::RunChain(ChainJob& job) {
 	ShaderRecompiler::IR::ResourceSnapshot pixel_resources;
 	ShaderRecompiler::IR::ResourceSnapshot vertex_resources;
 	std::array<const ShaderModule*, 4>     stages {};
+	const auto refused = [&] {
+		m_chain_failed.fetch_add(1, std::memory_order_relaxed);
+		m_chain_refused[static_cast<size_t>(t_chain_refusal)].fetch_add(1, std::memory_order_relaxed);
+	};
 	const auto* pixel = ChainModule(job.pixel_params, job.pixel_info, pixel_cursor, pixel_resources);
 	if (pixel == nullptr) {
-		m_chain_failed.fetch_add(1, std::memory_order_relaxed);
+		refused();
 		return;
 	}
 	for (uint32_t i = 0; i < job.vertex_count; i++) {
 		auto cursor = PushData::GraphicsStageCursor(job.vertex_info[i].logical_stage);
 		stages[i] = ChainModule(job.vertex_params[i], job.vertex_info[i], cursor, vertex_resources);
 		if (stages[i] == nullptr) {
-			m_chain_failed.fetch_add(1, std::memory_order_relaxed);
+			refused();
 			return;
 		}
 	}
@@ -3320,7 +3359,11 @@ void PipelineCache::RunChain(ChainJob& job) {
 	for (uint32_t i = 0; i < stages.size(); i++) {
 		key.stage_ids[i] = stages[i] != nullptr ? stages[i]->id : 0;
 	}
-	if (!SampledDescriptorBudgetFits(stages)) return;
+	if (!SampledDescriptorBudgetFits(stages)) {
+		t_chain_refusal = ChainRefusal::DescriptorBudget;
+		refused();
+		return;
+	}
 	m_libraries->PrepareNow(key, stages, false);
 	m_chain_prepared.fetch_add(1, std::memory_order_relaxed);
 }
@@ -3672,6 +3715,8 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	ShaderParams params;
 	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::GetComputeProgram", 0, regs.cs_regs.data_addr,
 	                           [&] { params = PrepareProgram(regs, input_info); })) {
+		Common::SkipLog::Request(0);
+		Common::SkipLog::Fail(Common::SkipLog::Cause::StageNotPrepared);
 		return nullptr;
 	}
 #else

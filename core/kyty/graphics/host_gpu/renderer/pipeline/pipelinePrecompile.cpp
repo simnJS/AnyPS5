@@ -9,12 +9,15 @@
 #include "graphics/presentation/precompileNotice.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 
 extern "C" void KernelPauseGuestClock_nid_no_patch();
@@ -184,9 +187,20 @@ void PipelineCache::LogStallStats(bool force) {
 		const auto prepared = m_chain_prepared.load(std::memory_order_relaxed);
 		const auto failed   = m_chain_failed.load(std::memory_order_relaxed);
 		const auto runs     = prepared + failed;
-		PrecompileLog("[kyty-gpl] chains queued {} dropped {} prepared {} failed {} modules compiled {} ({:.1f} ms avg)",
+		static constexpr std::array<std::string_view, static_cast<size_t>(ChainRefusal::Count)> RefusalNames {
+		    "stopping", "not chainable (calls, image heap or skipped program)", "resources not readable ahead",
+		    "failed variant", "compile ahead refused", "not compiled", "attempts", "descriptor budget"};
+		std::string refusals;
+		for (size_t i = 0; i < RefusalNames.size(); i++) {
+			const auto count = m_chain_refused[i].load(std::memory_order_relaxed);
+			if (count == 0) continue;
+			refusals += fmt::format("{}{} {}", refusals.empty() ? " (" : ", ", RefusalNames[i], count);
+		}
+		if (!refusals.empty()) refusals += "; the draw resolves its stages itself";
+		if (!refusals.empty()) refusals += ")";
+		PrecompileLog("[kyty-gpl] chains queued {} dropped {} prepared {} failed {}{} modules compiled {} ({:.1f} ms avg)",
 		              m_chain_queued.load(std::memory_order_relaxed), m_chain_dropped.load(std::memory_order_relaxed),
-		              prepared, failed, m_chain_compiled.load(std::memory_order_relaxed),
+		              prepared, failed, refusals, m_chain_compiled.load(std::memory_order_relaxed),
 		              runs != 0 ? static_cast<double>(m_chain_ns.load(std::memory_order_relaxed)) / 1e6 /
 		                              static_cast<double>(runs)
 		                        : 0.0);

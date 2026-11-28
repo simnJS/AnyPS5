@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStoreTypes.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "common/skipLog.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/rectListShader.h"
@@ -509,6 +510,17 @@ public:
 		return m_pipeline_waiting;
 	}
 
+	enum class ChainRefusal : uint8_t {
+		Stopping,
+		NotChainable,
+		NotReadableAhead,
+		FailedVariant,
+		CompileRefused,
+		NotCompiled,
+		Attempts,
+		DescriptorBudget,
+		Count
+	};
 	enum class TableStatus : uint8_t {
 		Ready,
 		Pending,
@@ -552,6 +564,7 @@ private:
 		std::deque<ShaderModule, MemoryTelemetry::PipelineAllocator<ShaderModule>>                     modules;
 		bool                                         skip_dispatch = false;
 		bool                                         serve_runtime_samplers = false;
+		Common::SkipLog::Cause                               skip_cause = Common::SkipLog::Cause::Unknown;
 		std::array<size_t, 2>                        last_module {SIZE_MAX, SIZE_MAX};
 #if defined(ANYPS5_KYTY)
 		struct FailedVariant {
@@ -881,6 +894,7 @@ private:
 	    m_async_probes {0}, m_async_probe_ns {0}, m_async_created_now {0};
 	std::atomic<uint64_t> m_chain_queued {0}, m_chain_dropped {0}, m_chain_prepared {0}, m_chain_failed {0},
 	    m_chain_compiled {0}, m_chain_ns {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(ChainRefusal::Count)> m_chain_refused {};
 	void NoteFirstWait(std::chrono::steady_clock::time_point started, bool ready);
 	void QueueChain(std::unique_ptr<ChainJob>&& job);
 	void ChainWorker(uint32_t index);
