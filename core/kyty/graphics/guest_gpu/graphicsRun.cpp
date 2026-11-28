@@ -14,6 +14,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/command_processor/submitScan.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/labelOrder.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -40,6 +41,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <optional>
 #include <cstdio>
 #include <deque>
@@ -50,6 +53,7 @@
 #include <thread>
 #include <utility>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -114,6 +118,56 @@ static void CopyFromGuest(void* destination, const volatile void* source, size_t
 	}
 }
 
+namespace {
+constexpr size_t SubmitScanEnds = static_cast<size_t>(SubmitScanEnd::Error) + 1;
+}
+
+struct GuestGpu::SubmitAhead {
+	struct Request {
+		HW::Shader                   shaders;
+		std::unique_ptr<HW::Context> context;
+		HW::UserConfig               user_config;
+		ShaderIndirectOffsets        offsets;
+		SubmitScanDispatch           dispatch;
+		bool                         draw          = false;
+		bool                         indirect_draw = false;
+		bool                         async_compute = false;
+	};
+	struct Queue {
+		std::mutex                                         mutex;
+		std::unique_ptr<CommandProcessor>                  shadow;
+		std::unique_ptr<std::array<uint64_t, 8192>>        seen;
+		std::unordered_map<uint64_t, bool>                 psr;
+	};
+	static constexpr size_t MaxRequests = 512;
+	static constexpr size_t MaxPsrAddresses = 4096;
+
+	std::array<Queue, QueueCount> queues;
+	std::mutex                    mutex;
+	std::condition_variable_any   ready;
+	std::deque<Request>           requests;
+	bool                          stopped = false;
+	std::jthread                  thread;
+
+	std::atomic<uint64_t>                            submissions {0}, draws {0}, dispatches {0};
+	std::atomic<uint64_t>                            sent_draws {0}, sent_dispatches {0}, seen_before {0};
+	std::atomic<uint64_t>                            full {0}, library {0}, unindexed {0}, failed {0};
+	std::array<std::atomic<uint64_t>, SubmitScanEnds> ends {};
+	std::atomic<uint64_t>                            logged_at {0};
+
+	bool Push(Request&& request) {
+		{
+			std::lock_guard lock(mutex);
+			if (stopped || requests.size() >= MaxRequests) {
+				return false;
+			}
+			requests.push_back(std::move(request));
+		}
+		ready.notify_one();
+		return true;
+	}
+};
+
 GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer),
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
@@ -132,6 +186,8 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		}
 	}
 	Scout::Start(renderer);
+	m_submit_ahead         = std::make_unique<SubmitAhead>();
+	m_submit_ahead->thread = std::jthread([this](std::stop_token stop) { SubmitAheadThread(std::move(stop)); });
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -151,6 +207,7 @@ void GuestGpu::Shutdown() {
 		m_work_epoch.fetch_add(1, std::memory_order_release);
 		m_work_available.SignalAll();
 	}
+	StopSubmitAhead();
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
@@ -321,6 +378,7 @@ void GuestGpu::Submit(std::span<const uint32_t> commands) {
 	submission.queue_id = 0;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
+	ScanAhead(0, commands);
 }
 
 void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands) {
@@ -334,6 +392,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
+	ScanAhead(1 + compute_queue, commands);
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
@@ -628,6 +687,233 @@ void GuestGpu::ResolveThread() {
 		m_resolved.Push(std::move(*operation));
 	}
 	m_resolved.Stop();
+}
+
+namespace {
+
+class FilterKey {
+public:
+	void Add(uint64_t value) {
+		if (m_count < m_words.size()) m_words[m_count++] = value;
+	}
+	[[nodiscard]] uint64_t Hash() const { return XXH3_64bits(m_words.data(), m_count * sizeof(uint64_t)) | 1u; }
+
+private:
+	std::array<uint64_t, 64> m_words {};
+	size_t                   m_count = 0;
+};
+
+uint64_t DrawFilterKey(const HW::Context& context, const HW::UserConfig& user_config, const HW::Shader& shaders,
+                       const ShaderIndirectOffsets& offsets, bool indirect) {
+	const auto& vs = shaders.GetVs();
+	const auto& ps = shaders.GetPs();
+	const auto& sh = context.GetShaderRegisters();
+	FilterKey   key;
+	key.Add(vs.es_regs.data_addr);
+	key.Add(vs.ls_regs.data_addr);
+	key.Add(vs.hs_regs.data_addr);
+	key.Add(vs.gs_regs.data_addr);
+	key.Add(ps.ps_regs.data_addr);
+	key.Add(uint64_t {vs.gs_regs.rsrc1.float_mode} | uint64_t {vs.gs_regs.rsrc2.user_sgpr} << 8u |
+	        uint64_t {vs.gs_regs.rsrc2.lds_size} << 16u | uint64_t {vs.hs_regs.rsrc2.user_sgpr} << 24u |
+	        uint64_t {vs.hs_regs.rsrc2.lds_size} << 32u | uint64_t {ps.ps_regs.rsrc1.float_mode} << 48u |
+	        uint64_t {ps.ps_regs.rsrc2.user_sgpr} << 56u);
+	key.Add(uint64_t {context.GetShaderStages()} | uint64_t {context.GetRenderTargetMask()} << 32u);
+	for (uint32_t slot = 0; slot < 8; slot++) {
+		const auto& target = context.GetRenderTarget(slot);
+		key.Add(static_cast<uint64_t>(target.info.format) | static_cast<uint64_t>(target.info.channel_type) << 16u |
+		        static_cast<uint64_t>(target.info.channel_order) << 32u |
+		        uint64_t {target.info.blend_bypass ? 1u : 0u} << 48u | uint64_t {target.base.addr != 0 ? 1u : 0u} << 49u);
+	}
+	key.Add(uint64_t {sh.m_paClVsOutCntl} | uint64_t {sh.m_geNggSubgrpCntl} << 32u);
+	key.Add(uint64_t {sh.m_geMaxOutputPerSubgroup} | uint64_t {sh.m_vgtGsMaxVertOut} << 32u);
+	key.Add(uint64_t {sh.m_vgtGsOutPrimType} | uint64_t {sh.m_vgtDrawPayloadCntl} << 32u);
+	key.Add(uint64_t {sh.m_paClObjprimIdCntl} | uint64_t {sh.m_vgtLsHsConfig} << 32u);
+	key.Add(uint64_t {sh.m_vgtTfParam} | uint64_t {sh.ps_input_ena} << 32u);
+	key.Add(uint64_t {sh.ps_input_addr} | uint64_t {sh.ps_in_control} << 32u);
+	key.Add(uint64_t {sh.baryc_cntl} | uint64_t {sh.m_cbShaderMask} << 32u);
+	uint64_t modes = 0;
+	std::memcpy(&modes, sh.target_output_mode, sizeof(modes));
+	key.Add(modes);
+	const auto& db = sh.db_shader_control;
+	key.Add(uint64_t {db.shader_z_behavior} | uint64_t {db.shader_kill_enable} << 8u |
+	        uint64_t {db.shader_z_export_enable} << 9u | uint64_t {db.shader_mask_export_enable} << 10u |
+	        uint64_t {db.shader_dual_export_enable} << 11u | uint64_t {db.shader_execute_on_noop} << 12u |
+	        uint64_t {db.alpha_to_mask_disable} << 13u | uint64_t {sh.alpha_to_mask_enable} << 14u |
+	        uint64_t {indirect} << 15u | uint64_t {offsets.vertex} << 16u | uint64_t {offsets.instance} << 24u |
+	        static_cast<uint64_t>(user_config.GetPrimType()) << 32u);
+	key.Add(XXH3_64bits(sh.ps_interpolator_settings, sizeof(sh.ps_interpolator_settings)));
+	return key.Hash();
+}
+
+uint64_t DispatchFilterKey(const HW::CsStageRegisters& cs, const SubmitScanDispatch& dispatch, bool async_compute) {
+	FilterKey key;
+	key.Add(cs.data_addr);
+	key.Add(uint64_t {cs.num_thread_x} | uint64_t {cs.num_thread_y} << 32u);
+	key.Add(uint64_t {cs.num_thread_z} | uint64_t {cs.lds_size} << 32u | uint64_t {cs.shared_vgprs} << 48u);
+	key.Add(uint64_t {cs.vgprs} | uint64_t {cs.float_mode} << 8u | uint64_t {cs.wave_size} << 16u |
+	        uint64_t {cs.user_sgpr} << 24u | uint64_t {cs.tidig_comp_cnt} << 32u | uint64_t {cs.scratch_en} << 40u |
+	        uint64_t {cs.tgid_x_en} << 41u | uint64_t {cs.tgid_y_en} << 42u | uint64_t {cs.tgid_z_en} << 43u |
+	        uint64_t {cs.tg_size_en} << 44u | uint64_t {dispatch.indirect} << 45u | uint64_t {async_compute} << 46u |
+	        uint64_t {(dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0} << 47u);
+	return key.Hash();
+}
+
+}
+
+void GuestGpu::ScanAhead(uint32_t queue_id, std::span<const uint32_t> commands) {
+	if (m_submit_ahead == nullptr || commands.empty() || queue_id >= QueueCount) {
+		return;
+	}
+	auto& ahead = *m_submit_ahead;
+	auto& queue = ahead.queues[queue_id];
+	struct Sink final: SubmitScanSink {
+		SubmitAhead&        ahead;
+		SubmitAhead::Queue& queue;
+		Sink(SubmitAhead& a, SubmitAhead::Queue& q): ahead(a), queue(q) {}
+
+		bool Fresh(uint64_t key) {
+			if ((*queue.seen)[key % queue.seen->size()] != key) return true;
+			ahead.seen_before.fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
+		void Remember(uint64_t key) { (*queue.seen)[key % queue.seen->size()] = key; }
+		void Send(SubmitAhead::Request&& request, uint64_t key, std::atomic<uint64_t>& sent) {
+			if (!ahead.Push(std::move(request))) {
+				ahead.full.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			Remember(key);
+			sent.fetch_add(1, std::memory_order_relaxed);
+		}
+
+		void Draw(CommandProcessor& shadow, const IndirectDrawRegisters* indirect) override {
+			ShaderIndirectOffsets offsets;
+			if (indirect != nullptr && !IndirectDrawOffsets(*indirect, offsets)) {
+				ahead.unindexed.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			const auto& context     = shadow.GetCtx();
+			const auto& user_config = shadow.GetUcfg();
+			const auto& shaders     = shadow.GetShCtx();
+			const auto  key         = DrawFilterKey(context, user_config, shaders, offsets, indirect != nullptr);
+			if (!Fresh(key)) return;
+			SubmitAhead::Request request {.shaders       = shaders,
+			                              .context       = std::make_unique<HW::Context>(context),
+			                              .user_config   = user_config,
+			                              .offsets       = offsets,
+			                              .draw          = true,
+			                              .indirect_draw = indirect != nullptr};
+			Send(std::move(request), key, ahead.sent_draws);
+		}
+
+		void Dispatch(CommandProcessor& shadow, const SubmitScanDispatch& dispatch) override {
+			const auto& shaders = shadow.GetShCtx();
+			const auto& cs      = shaders.GetCs().cs_regs;
+			if (cs.data_addr == 0) return;
+			const bool async_compute = shadow.IsAsyncComputeQueue();
+			const auto key           = DispatchFilterKey(cs, dispatch, async_compute);
+			if (!Fresh(key)) return;
+			auto known = queue.psr.find(cs.data_addr);
+			if (known == queue.psr.end()) {
+				if (queue.psr.size() >= SubmitAhead::MaxPsrAddresses) queue.psr.clear();
+				known = queue.psr.emplace(cs.data_addr, Psr::IdentifyShader(cs.data_addr) != Psr::Shader::None).first;
+			}
+			if (known->second) {
+				ahead.library.fetch_add(1, std::memory_order_relaxed);
+				Remember(key);
+				return;
+			}
+			SubmitAhead::Request request {
+			    .shaders = shaders, .dispatch = dispatch, .draw = false, .async_compute = async_compute};
+			Send(std::move(request), key, ahead.sent_dispatches);
+		}
+	} sink(ahead, queue);
+	{
+		std::lock_guard lock(queue.mutex);
+		if (queue.shadow == nullptr) {
+			queue.shadow = std::make_unique<CommandProcessor>(
+			    m_renderer, queue_id == 0 ? 0 : static_cast<int>(ComputeQueueBase + queue_id - 1));
+			queue.shadow->Reset();
+			queue.seen = std::make_unique<std::array<uint64_t, 8192>>();
+		}
+		const auto result = ScanSubmission(commands, *queue.shadow, m_renderer, sink);
+		ahead.submissions.fetch_add(1, std::memory_order_relaxed);
+		ahead.draws.fetch_add(result.draws, std::memory_order_relaxed);
+		ahead.dispatches.fetch_add(result.dispatches, std::memory_order_relaxed);
+		ahead.ends[static_cast<size_t>(result.end)].fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto now  = Common::SteadyNs();
+	auto       last = ahead.logged_at.load(std::memory_order_relaxed);
+	if (last == 0) {
+		ahead.logged_at.compare_exchange_strong(last, now, std::memory_order_relaxed);
+	} else if (now - last >= 10'000'000'000ull &&
+	           ahead.logged_at.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		const auto load = [](const std::atomic<uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-submit-scan] submissions {}; draws {}, dispatches {}; sent to translation: draws {}, dispatches {}; "
+		    "seen before {}; queue full {}; ray tracing library programs {}; indirect draws with a draw index {}; "
+		    "scans ended by rewind {}, unreadable memory {}, unknown packets {}, budget {}, errors {}; translation "
+		    "errors {}\n",
+		    load(ahead.submissions), load(ahead.draws), load(ahead.dispatches), load(ahead.sent_draws),
+		    load(ahead.sent_dispatches), load(ahead.seen_before), load(ahead.full), load(ahead.library),
+		    load(ahead.unindexed), load(ahead.ends[static_cast<size_t>(SubmitScanEnd::Rewind)]),
+		    load(ahead.ends[static_cast<size_t>(SubmitScanEnd::Unreadable)]),
+		    load(ahead.ends[static_cast<size_t>(SubmitScanEnd::Malformed)]),
+		    load(ahead.ends[static_cast<size_t>(SubmitScanEnd::Budget)]),
+		    load(ahead.ends[static_cast<size_t>(SubmitScanEnd::Error)]), load(ahead.failed)));
+	}
+}
+
+void GuestGpu::SubmitAheadThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("Thread_GpuSubmitAhead");
+	if (PipelineCache::NarrowProgramLock()) {
+		PipelineCache::BeginAheadThread(1);
+	}
+	auto& ahead    = *m_submit_ahead;
+	auto& executor = m_renderer.GetRenderExecutor();
+	for (;;) {
+		SubmitAhead::Request request;
+		{
+			std::unique_lock lock(ahead.mutex);
+			if (!ahead.ready.wait(lock, stop, [&] { return !ahead.requests.empty(); })) {
+				return;
+			}
+			request = std::move(ahead.requests.front());
+			ahead.requests.pop_front();
+		}
+		const bool translated = Common::Fallback::Run(
+		    "translation ahead dropped: the draw or dispatch found at submission could not be prepared",
+		    "GuestGpu::SubmitAheadThread", 0, 0, true, [&] {
+			    if (request.draw) {
+				    executor.TranslateDrawAhead(*request.context, request.user_config, request.shaders,
+				                                request.offsets, request.indirect_draw);
+			    } else {
+				    executor.TranslateDispatchAhead(request.shaders, request.dispatch.thread_groups,
+				                                    request.dispatch.mode, request.dispatch.indirect,
+				                                    request.dispatch.args_addr, request.async_compute);
+			    }
+		    });
+		if (!translated) {
+			ahead.failed.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+}
+
+void GuestGpu::StopSubmitAhead() {
+	if (m_submit_ahead == nullptr) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_submit_ahead->mutex);
+		m_submit_ahead->stopped = true;
+		m_submit_ahead->requests.clear();
+	}
+	m_submit_ahead->thread.request_stop();
+	m_submit_ahead->ready.notify_all();
+	if (m_submit_ahead->thread.joinable()) {
+		m_submit_ahead->thread.join();
+	}
 }
 
 void GuestGpu::StopExecution() {

@@ -2706,6 +2706,22 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 			if (entry != m_program_cache.end()) generic = entry->second.GenericModule(push_data_cursor);
 		}
 		if (!generic) entry = m_program_cache.find(key);
+#if defined(ANYPS5_KYTY)
+		if (ahead.translate_only) {
+			if (ahead.reads.Failed()) {
+				m_submit_ahead.refused.fetch_add(1, std::memory_order_relaxed);
+			} else if (entry != m_program_cache.end() || m_in_flight.contains(key)) {
+				m_submit_ahead.known.fetch_add(1, std::memory_order_relaxed);
+			} else if (m_speculative_failed_programs.contains(key)) {
+				m_submit_ahead.refused.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				QueueCompile(key, params, input_info, push_data_cursor, nullptr, false, true);
+				NoteSubmitAheadRequest(key);
+			}
+			return nullptr;
+		}
+		NoteSubmitAheadLookup(key, entry != m_program_cache.end() ? &entry->second : nullptr);
+#endif
 		if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
 #if defined(ANYPS5_KYTY)
 			if (!m_speculative_failed_programs.contains(key)) {
@@ -3037,6 +3053,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			entry->second.NoteSpeculativeFailure(*job.specialization, job.push_data_cursor);
 		}
 	}
+	Program* finished = nullptr;
 #endif
 	if (module) {
 		auto entry = m_program_cache.find(job.key);
@@ -3044,6 +3061,9 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			entry = m_program_cache.try_emplace(job.key, Program {.resource_plan = std::move(*plan)})
 			            .first;
 		}
+#if defined(ANYPS5_KYTY)
+		finished = &entry->second;
+#endif
 		auto&       modules = entry->second.modules;
 		const auto& layout  = module->info.bindings;
 		const bool  known   = std::ranges::any_of(modules, [&](const ShaderModule& other) {
@@ -3062,8 +3082,15 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			}
 		}
 	} else if (job.guest_traversal && plan) {
+#if defined(ANYPS5_KYTY)
+		finished = &m_program_cache.try_emplace(job.key, Program {.resource_plan = std::move(*plan)}).first->second;
+#else
 		m_program_cache.try_emplace(job.key, Program {.resource_plan = std::move(*plan)});
+#endif
 	}
+#if defined(ANYPS5_KYTY)
+	NoteSubmitAheadDone(job.key, finished);
+#endif
 	if (const auto job_count = m_in_flight.find(job.key); --job_count->second == 0) {
 		m_in_flight.erase(job_count);
 	}

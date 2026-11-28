@@ -215,6 +215,11 @@ private:
 	GpuRegisterState                m_neutral_state;
 	std::jthread                    m_executor;
 	std::jthread                    m_resolver;
+	struct SubmitAhead;
+	void                            ScanAhead(uint32_t queue_id, std::span<const uint32_t> commands);
+	void                            SubmitAheadThread(std::stop_token stop);
+	void                            StopSubmitAhead();
+	std::unique_ptr<SubmitAhead>    m_submit_ahead;
 
 	std::jthread m_thread;
 

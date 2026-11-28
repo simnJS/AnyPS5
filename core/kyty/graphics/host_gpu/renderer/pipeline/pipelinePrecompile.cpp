@@ -142,7 +142,64 @@ PipelineCache::StallScope::~StallScope() {
 }
 
 #if defined(ANYPS5_KYTY)
+void PipelineCache::NoteSubmitAheadRequest(const ProgramKey& key) {
+	m_submit_ahead_pending.insert(key);
+	auto& requested = key.stage == ShaderType::Compute ? m_submit_ahead.requested_compute
+	                                                   : m_submit_ahead.requested_graphics;
+	requested.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteSubmitAheadLookup(const ProgramKey& key, Program* program) {
+	if (program != nullptr) {
+		if (program->submit_ahead) {
+			program->submit_ahead = false;
+			m_submit_ahead.used_ready.fetch_add(1, std::memory_order_relaxed);
+		}
+		return;
+	}
+	if (!m_submit_ahead_pending.empty() && m_submit_ahead_pending.erase(key) != 0) {
+		m_submit_ahead.used_compiling.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void PipelineCache::NoteSubmitAheadDone(const ProgramKey& key, Program* program) {
+	if (m_submit_ahead_pending.empty() || m_submit_ahead_pending.erase(key) == 0) {
+		return;
+	}
+	if (program != nullptr) {
+		program->submit_ahead = true;
+		m_submit_ahead.finished.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		m_submit_ahead.dropped.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+PipelineCache::SubmitAheadCounts PipelineCache::GetSubmitAheadCounts() const {
+	const auto load = [](const std::atomic<uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+	return {.requested_graphics = load(m_submit_ahead.requested_graphics),
+	        .requested_compute  = load(m_submit_ahead.requested_compute),
+	        .finished           = load(m_submit_ahead.finished),
+	        .used_ready         = load(m_submit_ahead.used_ready),
+	        .used_compiling     = load(m_submit_ahead.used_compiling),
+	        .known              = load(m_submit_ahead.known),
+	        .refused            = load(m_submit_ahead.refused),
+	        .dropped            = load(m_submit_ahead.dropped)};
+}
+
 void PipelineCache::LogStallStats(bool force) {
+	const auto                    ahead = GetSubmitAheadCounts();
+	const std::array<uint64_t, 8> submit_ahead {ahead.requested_graphics, ahead.requested_compute, ahead.finished,
+	                                            ahead.used_ready,         ahead.used_compiling,    ahead.known,
+	                                            ahead.refused,            ahead.dropped};
+	if (force || submit_ahead != m_submit_ahead_logged) {
+		m_submit_ahead_logged = submit_ahead;
+		PrecompileLog("[kyty-submit-ahead] translations requested at submission {} ({} graphics, {} compute); "
+		              "finished {}; used {} ({} ready at the draw or dispatch, {} still compiling); already known {}; "
+		              "refused as failed before {}; dropped {}",
+		              ahead.requested_graphics + ahead.requested_compute, ahead.requested_graphics,
+		              ahead.requested_compute, ahead.finished, ahead.used_ready + ahead.used_compiling, ahead.used_ready,
+		              ahead.used_compiling, ahead.known, ahead.refused, ahead.dropped);
+	}
 	const std::array<uint64_t, 3> speculative {m_speculative_failed.load(std::memory_order_relaxed),
 	                                           m_speculative_refused.load(std::memory_order_relaxed),
 	                                           m_speculative_skipped.load(std::memory_order_relaxed)};
