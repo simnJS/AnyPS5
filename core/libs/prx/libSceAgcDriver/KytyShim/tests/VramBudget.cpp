@@ -366,13 +366,30 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	info.pitch        = 64;
 	info.UpdateSize();
 
-	const auto id = VramBudgetTestAccess::CreateImage(textures, info);
+	TextureCache::ImageDesc desc {.info = info};
+	desc.view_info.format = info.pixel_format;
+	const auto id = textures.FindImage(desc);
+	if (textures.GetImage(id).backing.spilled) {
+		return "ordinary texture spilled below the pressure threshold";
+	}
 	if (!VramBudgetTestAccess::IsImageRegistered(textures, id)) {
 		return "test image was not registered";
 	}
 
 	info.data.address += info.data.size;
-	const auto mixed = VramBudgetTestAccess::CreateImage(textures, info);
+	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 5 * GiB);
+	desc.info = info;
+	const auto mixed = textures.FindImage(desc);
+	const auto& crowded = textures.GetImage(mixed).backing;
+	const auto types = graphics.device.getImageMemoryRequirements(crowded.image).memoryTypeBits;
+	bool can_spill = false;
+	for (uint32_t type = 0; type < graphics.physical_device_memory_properties.memoryTypeCount; ++type) {
+		if ((types & (uint32_t {1} << type)) && !graphics.IsLocalMemoryType(type)) can_spill = true;
+	}
+	can_spill &= graphics.spill_allocator != nullptr;
+	if (crowded.charge.kind != MemoryTelemetry::Kind::Texture || (can_spill && (!crowded.spilled || crowded.charge.local))) {
+		return "ordinary texture did not use compatible system memory under pressure";
+	}
 	VramBudgetTestAccess::MarkMixedOwnership(textures, mixed);
 	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 0);
 	textures.RunGarbageCollector();
@@ -385,6 +402,25 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	info.data.address += info.data.size;
 	const auto renewed = VramBudgetTestAccess::CreateImage(textures, info);
 	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 6 * GiB);
+	info.data.address += info.data.size;
+	desc.info = info;
+	desc.type = TextureCache::BindingType::RenderTarget;
+	desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+	const auto target = textures.FindImage(desc);
+	if (textures.GetImage(target).backing.spilled) return "new color target spilled under pressure";
+
+	desc.type = TextureCache::BindingType::Texture;
+	desc.heap = true;
+	desc.info.resources.layers = 2;
+	desc.info.UpdateSize();
+	desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+	const auto expanded = textures.FindImage(desc);
+	const auto& backing = textures.GetImage(expanded).backing;
+	if (expanded == target || backing.charge.kind != MemoryTelemetry::Kind::HeapTexture ||
+	    (can_spill && (!backing.spilled || backing.charge.local))) {
+		return "expanded heap texture lost its allocation policy under pressure";
+	}
+
 	textures.EvictUnread(unread, VramBudgetTestAccess::Serial(textures, unread));
 	textures.EvictUnread(unread_mixed, VramBudgetTestAccess::Serial(textures, unread_mixed));
 	textures.EvictUnread(renewed, VramBudgetTestAccess::Serial(textures, renewed) + 1u);

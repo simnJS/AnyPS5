@@ -53,6 +53,12 @@ public:
 		BindingType   type = BindingType::Texture;
 		bool          heap = false;
 		bool candidate = false;
+
+		[[nodiscard]] ImageAllocation Allocation() const {
+			if (heap) return ImageAllocation::HeapTexture;
+			if (type == BindingType::Texture || type == BindingType::Storage) return ImageAllocation::Texture;
+			return ImageAllocation::PreferDevice;
+		}
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -389,7 +395,7 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info) KYTY_REQUIRES(m_lock);
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, bool bindless) KYTY_REQUIRES(m_lock);
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, ImageAllocation allocation) KYTY_REQUIRES(m_lock);
 	void                      RegisterImage(ImageId id) KYTY_REQUIRES(m_lock);
 	void                      UnregisterImage(ImageId id) KYTY_REQUIRES(m_lock);
 	void                      DeleteImage(ImageId id) KYTY_REQUIRES(m_lock);
@@ -426,17 +432,18 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
-	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
+	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, const ImageDesc& desc,
 	                                           ImageId cached, ImageId merged,
-	                                           bool speculative = false, bool candidate = false)
+	                                           bool speculative)
 	    KYTY_REQUIRES(m_lock);
 	[[nodiscard]] ImageId       FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative,
 	                                          ImageId* depth_source = nullptr);
 	[[nodiscard]] static bool   DepthOverlapNeedsRecreate(const ImageInfo& requested,
 	                                                      BindingType binding, const Image& cached);
-	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
+	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, const ImageDesc& desc,
 	                                                ImageId cached) KYTY_REQUIRES(m_lock);
-	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source) KYTY_REQUIRES(m_lock);
+	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source, ImageAllocation allocation)
+	    KYTY_REQUIRES(m_lock);
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);

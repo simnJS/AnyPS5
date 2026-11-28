@@ -415,10 +415,10 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
-	return CreateImage(image_info, image, false);
+	return CreateImage(image_info, image, ImageAllocation::PreferDevice);
 }
 
-static uint32_t BindlessImageSpillTypes(const GraphicContext& graphics) {
+static uint32_t TextureSpillTypes(const GraphicContext& graphics) {
 	if (graphics.spill_allocator == nullptr) {
 		return 0;
 	}
@@ -450,7 +450,7 @@ static uint32_t BindlessImageSpillTypes(const GraphicContext& graphics) {
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
-                                 bool bindless) {
+                                 ImageAllocation allocation) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
@@ -459,9 +459,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
+	const bool heap_texture = allocation == ImageAllocation::HeapTexture;
 	const auto category = (image_info.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment)
 	                          ? MemoryTelemetry::Kind::Depth
-	                          : bindless ? MemoryTelemetry::Kind::HeapTexture : MemoryTelemetry::Kind::Texture;
+	                          : heap_texture ? MemoryTelemetry::Kind::HeapTexture : MemoryTelemetry::Kind::Texture;
 	if (Recyclable(image_info)) {
 		std::lock_guard lock(g_recycled_mutex);
 		const auto      found =
@@ -481,7 +482,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		VmaAllocationInfo info {};
 		const auto* create = static_cast<const vk::ImageCreateInfo::NativeType*>(image_info);
 		auto result = vk::Result::eErrorOutOfDeviceMemory;
-		if (const uint32_t types = bindless ? BindlessImageSpillTypes(*this) : 0; types != 0) {
+		const bool texture = heap_texture ||
+		                     (allocation == ImageAllocation::Texture && category != MemoryTelemetry::Kind::Depth);
+		if (const uint32_t types = texture ? TextureSpillTypes(*this) : 0; types != 0) {
 			VmaAllocationCreateInfo spill_info {};
 			spill_info.flags          = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
 			spill_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;

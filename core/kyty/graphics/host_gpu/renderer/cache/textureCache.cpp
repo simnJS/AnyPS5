@@ -242,11 +242,11 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	return InsertImage(info, false);
+	return InsertImage(info, ImageAllocation::PreferDevice);
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info, bool bindless) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, bindless);
+ImageId TextureCache::InsertImage(const ImageInfo& info, ImageAllocation allocation) {
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, allocation);
 	AttachImageVersion(id);
 	RegisterImage(id);
 	return id;
@@ -1361,7 +1361,7 @@ bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, Binding
 	return recreate;
 }
 
-ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
+ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, const ImageDesc& desc,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
 	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
@@ -1369,10 +1369,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		return {};
 	}
 	const bool retain_cached_layout = RetainsCachedDepthLayout(requested, cached);
-	if (!DepthOverlapNeedsRecreate(requested, binding, cached)) {
+	if (!DepthOverlapNeedsRecreate(requested, desc.type, cached)) {
 		return cached_id;
 	}
-	const bool outgrown = binding == BindingType::DepthTarget && cached.info.IsDepth() &&
+	const bool outgrown = desc.type == BindingType::DepthTarget && cached.info.IsDepth() &&
 	                      DepthTargetOutgrows(requested, cached);
 	RefreshImage(cached_id);
 	auto info = requested;
@@ -1388,7 +1388,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	info.htile_initial_clear  = false;
 	auto replacement_id = UnparkImage(info);
 	if (!replacement_id) {
-		replacement_id = InsertImage(info);
+		replacement_id = InsertImage(info, desc.Allocation());
 	}
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
@@ -1477,9 +1477,9 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) KYTY_REQ
 }
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
-                                                         BindingType binding, ImageId cached_id,
-                                                         ImageId merged_id, bool speculative,
-                                                         bool candidate) {
+                                                         const ImageDesc& desc, ImageId cached_id,
+                                                         ImageId merged_id, bool speculative) {
+	const auto binding = desc.type;
 	auto& cached = m_slot_images[cached_id];
 	if (!cached.registered) {
 		return {merged_id};
@@ -1517,7 +1517,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (keep_bound && DepthOverlapNeedsRecreate(requested, binding, cached)) {
 			return {.rejected = true, .bound_depth = true};
 		}
-		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
+		if (const auto depth_id = ResolveDepthOverlap(requested, desc, cached_id)) {
 			return {depth_id};
 		}
 		if (requested.tile_mode != cached.info.tile_mode ||
@@ -1536,16 +1536,16 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {merged_id};
 		}
 		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
-			return {ExpandImage(requested, cached_id)};
+			return {ExpandImage(requested, cached_id, desc.Allocation())};
 		}
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
-			return {ExpandImage(requested, cached_id)};
+			return {ExpandImage(requested, cached_id, desc.Allocation())};
 		}
 		if ((requested.IsVolume() || cached.info.IsVolume()) &&
 		    (requested.data.size == cached.info.data.size ||
 		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
 		      requested.extent.depth > cached.info.extent.depth))) {
-			return {ExpandImage(requested, cached_id)};
+			return {ExpandImage(requested, cached_id, desc.Allocation())};
 		}
 		if (requested.data.size == cached.info.data.size &&
 		    requested.resources == cached.info.resources &&
@@ -1555,7 +1555,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		         : requested.extent.width > cached.info.extent.width &&
 		               requested.extent.height >= cached.info.extent.height &&
 		               requested.extent.depth >= cached.info.extent.depth)) {
-			return {ExpandImage(requested, cached_id)};
+			return {ExpandImage(requested, cached_id, desc.Allocation())};
 		}
 		if (requested.pixel_format == cached.info.pixel_format &&
 		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
@@ -1564,7 +1564,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.extent == cached.info.extent &&
 		      cached.info.resources.levels > 1 &&
 		      requested.resources.layers == cached.info.resources.layers))) {
-			return {ExpandImage(requested, cached_id)};
+			return {ExpandImage(requested, cached_id, desc.Allocation())};
 		}
 		if (requested.type != cached.info.type) {
 			return {merged_id};
@@ -1577,7 +1577,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
-		if (candidate) {
+		if (desc.candidate) {
 			static std::atomic_bool reported {false};
 			if (!reported.exchange(true, std::memory_order_relaxed)) {
 				LOGF("TextureCache: a T# candidate that overlaps another image at its address "
@@ -1612,7 +1612,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		const int32_t layer = cached.info.SliceOf(requested, mip);
 		if (!merged_id) {
-			return {ExpandImage(requested, cached_id)};
+			return {ExpandImage(requested, cached_id, desc.Allocation())};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
@@ -1629,9 +1629,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	return {merged_id};
 }
 
-ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id, ImageAllocation allocation) {
 	RefreshCopySource(source_id);
-	const auto expanded_id = InsertImage(info);
+	const auto expanded_id = InsertImage(info, allocation);
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
@@ -2678,9 +2678,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 		if (!result) {
 			for (const auto candidate: candidates) {
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto  overlap =
-				    ResolveOverlap(merged_info, desc.type, candidate, result, speculative,
-				                   desc.candidate);
+				const auto  overlap = ResolveOverlap(merged_info, desc, candidate, result, speculative);
 				if (overlap.rejected) {
 					if (overlap.bound_depth) {
 						return NullForBoundDepth(desc, m_slot_images[candidate]);
@@ -2729,7 +2727,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				}
 				if (resolved.IsGpuModified() && RefreshesAsCopySource(resolved) &&
 				    resolved.info.resources.levels == desc.info.resources.levels) {
-					result = ExpandImage(desc.info, result);
+					result = ExpandImage(desc.info, result, desc.Allocation());
 				} else {
 					FreeImage(result);
 					result = {};
@@ -2745,7 +2743,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 			exact.valid        = true;
 		}
 		if (!result) {
-			result         = InsertImage(desc.info, desc.heap);
+			result         = InsertImage(desc.info, desc.Allocation());
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {

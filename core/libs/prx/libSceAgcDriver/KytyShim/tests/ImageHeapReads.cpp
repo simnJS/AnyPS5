@@ -1046,7 +1046,7 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	Check(!graphics.LocalMemoryCrowded(), "heap allocation still prefers local memory at 69 percent");
 	Access::Pressure(graphics, 100ull << 20u, 70ull << 20u);
 	VulkanImage crowded_image {};
-	Check(graphics.CreateImage(heap_info, crowded_image, true) && crowded_image.spilled == Access::CanSpill(graphics) &&
+	Check(graphics.CreateImage(heap_info, crowded_image, ImageAllocation::HeapTexture) && crowded_image.spilled == Access::CanSpill(graphics) &&
 	          crowded_image.charge.local != Access::CanSpill(graphics),
 	      "a heap image made while memory is crowded is placed in system memory");
 	if (crowded_image.image) graphics.DeleteImage(crowded_image);
@@ -1058,7 +1058,7 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	Check(!Access::Crowded(heap) && !graphics.LocalMemoryCrowded(), "the crowded state ends below the low watermark");
 	graphics.TrimRecycledImages();
 	VulkanImage relaxed_image {};
-	Check(graphics.CreateImage(heap_info, relaxed_image, true) && !relaxed_image.spilled && relaxed_image.charge.local,
+	Check(graphics.CreateImage(heap_info, relaxed_image, ImageAllocation::HeapTexture) && !relaxed_image.spilled && relaxed_image.charge.local,
 	      "a heap image made below the crowded mark stays on device-local memory");
 	if (relaxed_image.image) graphics.DeleteImage(relaxed_image);
 	graphics.TrimRecycledImages();
