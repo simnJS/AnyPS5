@@ -26,8 +26,10 @@ struct RenderExecutor::ThinDispatches {
 	Thin::Counters      counters;
 	ThinOperation*      current   = nullptr;
 	uint32_t            ticks     = 0;
-	uint64_t            log_ns    = 0;
-	uint64_t            log_frame = 0;
+	uint64_t            log_ns     = 0;
+	uint64_t            log_frame  = 0;
+	uint64_t            open_ns    = 0;
+	uint64_t            open_frame = 0;
 };
 
 static constexpr uint64_t ThinSummaryNs     = 10'000'000'000ull;
@@ -35,9 +37,29 @@ static constexpr uint32_t ThinSummaryPeriod = 1024;
 
 RenderExecutor::ThinDispatches& RenderExecutor::OwnThin() {
 	if (!m_thin) {
-		m_thin = {new ThinDispatches, [](ThinDispatches* thin) { delete thin; }};
+		m_thin             = {new ThinDispatches, [](ThinDispatches* thin) { delete thin; }};
+		m_thin->open_ns    = Common::SteadyNs();
+		m_thin->open_frame = m_context.FrameNumber();
 	}
 	return *m_thin;
+}
+
+void RenderExecutor::ReportThin() {
+	if (!m_thin || m_thin->current != nullptr) {
+		return;
+	}
+	auto& thin = *m_thin;
+	if (std::ranges::none_of(thin.counters.kinds, [](const auto& kind) { return kind.operations != 0; })) {
+		return;
+	}
+	const auto now   = Common::SteadyNs();
+	const auto frame = m_context.FrameNumber();
+	const auto since = thin.log_ns != 0 ? thin.log_ns : thin.open_ns;
+	const auto first = thin.log_ns != 0 ? thin.log_frame : thin.open_frame;
+	Log::WriteToConsoleAndLog(thin.counters.Summary(static_cast<double>(now - since) / 1e9, frame - first));
+	thin.log_ns    = now;
+	thin.log_frame = frame;
+	thin.counters  = {};
 }
 
 RenderExecutor::ThinOperation::ThinOperation(RenderExecutor& executor, Thin::OperationKind kind)
