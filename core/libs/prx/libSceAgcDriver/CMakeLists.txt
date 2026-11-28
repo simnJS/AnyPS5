@@ -171,6 +171,16 @@ if(BUILD_TESTING)
         add_test(NAME kyty_shim_lod_stats_destination COMMAND kyty_shim_lod_stats_destination_tests)
         set_tests_properties(kyty_shim_lod_stats_destination PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_lod_stats_destination: ok"
                 FAIL_REGULAR_EXPRESSION "FAILED")
+        add_test_executable(kyty_shim_stall_snapshot_tests
+                KytyShim/tests/StallSnapshot.cpp
+                KytyShim/src/MemoryView.cpp
+                KytyShim/src/Log.cpp)
+        target_include_directories(kyty_shim_stall_snapshot_tests PRIVATE ${LIBS_INCLUDE_DIR} ${LIBS_INCLUDE_DIR}/nid/include)
+        target_link_libraries(kyty_shim_stall_snapshot_tests PRIVATE $<IF:$<TARGET_EXISTS:Kyty::gpu>,Kyty::gpu,kyty_gpu> libkernel libc)
+        set_target_properties(kyty_shim_stall_snapshot_tests PROPERTIES CXX_EXTENSIONS OFF)
+        add_test(NAME kyty_shim_stall_snapshot COMMAND kyty_shim_stall_snapshot_tests)
+        set_tests_properties(kyty_shim_stall_snapshot PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_stall_snapshot: ok"
+                FAIL_REGULAR_EXPRESSION "FAILED")
         add_test(NAME kyty_shim_memory_sparse_reads_switch
                 COMMAND sh -c "\"$0\" 2>&1 | grep -q 'ANYPS5_KYTY_SPARSE_READS=2 is neither 0 nor 1'" $<TARGET_FILE:kyty_shim_memory_tests>)
         set_tests_properties(kyty_shim_memory_sparse_reads_switch PROPERTIES TIMEOUT 20 ENVIRONMENT "ANYPS5_KYTY_SPARSE_READS=2;KYTY_DIRECT_MEMORY_PAGES=demand")

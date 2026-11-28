@@ -11,9 +11,11 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -27,7 +29,7 @@ namespace Libs::Graphics {
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics,
-	                 bool deferred_recording = false);
+	                 bool deferred_recording = false, const char* name = "work");
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -62,6 +64,7 @@ public:
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	[[nodiscard]] bool Recording() const noexcept { return !m_command.IsInvalid(); }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
@@ -133,6 +136,11 @@ private:
 	void SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_index,
 	                    const RecordedSubmit& recorded);
 	void QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick);
+	enum class RecordStage : uint32_t { Commands, Replaying, HostCopies, Submitting };
+	enum class SubmitStage : uint32_t { None, QueueLock, Submit };
+	void        EnterRecord(RecordStage stage, uint64_t tick) noexcept;
+	void        EnterSubmit(SubmitStage stage, uint64_t tick) noexcept;
+	static void WriteSnapshot(void* self, std::FILE* file);
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 #if defined(ANYPS5_KYTY)
@@ -186,6 +194,14 @@ private:
 	std::once_flag              m_flip_thread_once;
 	std::jthread                m_flip_thread;
 #endif
+	std::string           m_snapshot_name;
+	uint32_t              m_marker_slot = UINT32_MAX;
+	std::atomic<uint32_t> m_record_stage {0};
+	std::atomic<uint64_t> m_record_tick {0};
+	std::atomic<uint64_t> m_record_since {0};
+	std::atomic<uint32_t> m_submit_stage {0};
+	std::atomic<uint64_t> m_submit_tick {0};
+	std::atomic<uint64_t> m_submit_since {0};
 	std::jthread m_recording_thread;
 };
 

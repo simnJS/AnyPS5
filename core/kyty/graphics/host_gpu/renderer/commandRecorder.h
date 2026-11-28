@@ -233,6 +233,14 @@ public:
 		m_stream->Record([](vk::CommandBuffer c) { c.endRendering(); });
 	}
 
+	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset, uint32_t marker) const {
+		if (m_stream == nullptr) {
+			m_direct.writeBufferMarkerAMD(stage, buffer, offset, marker);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.writeBufferMarkerAMD(stage, buffer, offset, marker); });
+	}
+
 	void writeTimestamp(vk::QueryPool pool, uint32_t query) const {
 		if (m_stream == nullptr) {
 			m_direct.writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, pool, query);

@@ -4,7 +4,10 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/guest_gpu/graphicsRun.h"
 #endif
@@ -13,6 +16,7 @@
 #include <chrono>
 #include <limits>
 #include <optional>
+#include <span>
 #include <tuple>
 
 #if defined(ANYPS5_KYTY)
@@ -129,11 +133,18 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 }
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
-                                   bool deferred_recording)
+                                   bool deferred_recording, const char* name)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_deferred(deferred_recording),
       m_stream(&m_chunk_queue), m_command(*this, deferred_recording ? &m_stream : nullptr),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_snapshot_name(std::string("scheduler of the ") + name + " ticks") {
+	StallSnapshot::Name(m_master.Handle(), std::string("the ") + name + " ticks", true);
+	StallSnapshot::Register(this, m_snapshot_name.c_str(), &CommandScheduler::WriteSnapshot);
+	if (GpuBreadcrumbs::Requested()) {
+		m_marker_slot = GpuBreadcrumbs::SubmissionSlot(name);
+		m_master.SetMarkerSlot(m_marker_slot);
+	}
 	if (m_deferred) {
 		m_host_copies = std::make_unique<HostCopyQueue>(
 		    [] { Config::ConfigureGpuStageThread(Config::GpuStageThread::HostCopy); });
@@ -142,7 +153,54 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 }
 
 CommandScheduler::~CommandScheduler() {
+	StallSnapshot::Unregister(this);
+	StallSnapshot::Forget(m_master.Handle());
 	Shutdown();
+}
+
+void CommandScheduler::EnterRecord(RecordStage stage, uint64_t tick) noexcept {
+	m_record_tick.store(tick, std::memory_order_relaxed);
+	m_record_since.store(Common::SteadyNs(), std::memory_order_relaxed);
+	m_record_stage.store(static_cast<uint32_t>(stage), std::memory_order_release);
+}
+
+void CommandScheduler::EnterSubmit(SubmitStage stage, uint64_t tick) noexcept {
+	m_submit_tick.store(tick, std::memory_order_relaxed);
+	m_submit_since.store(Common::SteadyNs(), std::memory_order_relaxed);
+	m_submit_stage.store(static_cast<uint32_t>(stage), std::memory_order_release);
+}
+
+void CommandScheduler::WriteSnapshot(void* self, std::FILE* file) {
+	auto&      scheduler = *static_cast<CommandScheduler*>(self);
+	const auto now       = Common::SteadyNs();
+	const auto ago       = [now](uint64_t then) { return then == 0 || then > now ? 0.0 : static_cast<double>(now - then) / 1e9; };
+	static constexpr const char* RecordStages[] {"waiting for recorded commands", "replaying recorded commands",
+	                                             "waiting for the host copies of a submission", "submitting"};
+	static constexpr const char* SubmitStages[] {"none", "waiting for the queue lock", "in vkQueueSubmit"};
+	if (scheduler.m_deferred) {
+		const auto stage = std::min<uint32_t>(scheduler.m_record_stage.load(std::memory_order_acquire), std::size(RecordStages) - 1);
+		std::fprintf(file, "recording thread: %s (tick %" PRIu64 ") for %.3f s\n", RecordStages[stage],
+		             scheduler.m_record_tick.load(std::memory_order_relaxed),
+		             ago(scheduler.m_record_since.load(std::memory_order_relaxed)));
+		if (scheduler.m_host_copies != nullptr) {
+			std::fprintf(file, "host copies: %" PRIu64 " handed to their thread, %" PRIu64 " done\n",
+			             scheduler.m_host_copies->Published(), scheduler.m_host_copies->Completed());
+		}
+	} else {
+		std::fprintf(file, "recorded on the submitting thread\n");
+	}
+	const auto submit = std::min<uint32_t>(scheduler.m_submit_stage.load(std::memory_order_acquire), std::size(SubmitStages) - 1);
+	if (submit == 0) {
+		std::fprintf(file, "queue submission: none in progress (the last was tick %" PRIu64 ", %.3f s ago)\n",
+		             scheduler.m_submit_tick.load(std::memory_order_relaxed),
+		             ago(scheduler.m_submit_since.load(std::memory_order_relaxed)));
+	} else {
+		std::fprintf(file, "queue submission: tick %" PRIu64 " %s for %.3f s\n", scheduler.m_submit_tick.load(std::memory_order_relaxed),
+		             SubmitStages[submit], ago(scheduler.m_submit_since.load(std::memory_order_relaxed)));
+	}
+	const auto front = scheduler.m_pending_front_tick.load(std::memory_order_acquire);
+	if (front != UINT64_MAX) std::fprintf(file, "deferred operations wait for tick %" PRIu64 "\n", front);
+	scheduler.m_master.WriteSubmissions(file, 24);
 }
 
 void CommandScheduler::Shutdown() {
@@ -589,6 +647,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		m_command.m_buffer = m_command_pool.Commit();
 	}
 	m_command.Begin();
+	GpuBreadcrumbs::MarkSubmission(m_graphics, m_command.Handle(), m_marker_slot, m_master.CurrentTick());
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -601,6 +660,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.End();
 	const auto     tick = m_master.NextTick();
+	m_master.NoteIssued(tick);
 	if (m_deferred) {
 		auto* recorded = m_stream.RecordSpecial<RecordedSubmit>(CommandStream::RecordKind::Submit);
 		recorded->info = submit;
@@ -638,15 +698,20 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 	vk::Result result;
+	EnterSubmit(SubmitStage::QueueLock, tick);
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
+		EnterSubmit(SubmitStage::Submit, tick);
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	EnterSubmit(SubmitStage::None, tick);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
+	m_master.NoteSubmitted(tick, std::span(submit.wait_semaphores.data(), submit.num_wait_semaphores),
+	                       std::span(submit.wait_ticks.data(), submit.num_wait_semaphores));
 	m_submitted_tick.store(tick, std::memory_order_release);
 #if defined(ANYPS5_KYTY)
 	if (m_flips_pending.load(std::memory_order_acquire)) {
@@ -673,10 +738,12 @@ void CommandScheduler::RecordingThread() {
 		return buffer;
 	};
 	for (;;) {
+		EnterRecord(RecordStage::Commands, m_submitted_tick.load(std::memory_order_relaxed));
 		auto chunk = m_chunk_queue.Pop();
 		if (chunk == nullptr) {
 			break;
 		}
+		EnterRecord(RecordStage::Replaying, m_submitted_tick.load(std::memory_order_relaxed) + 1);
 		CommandStream::Replay(*chunk, acquire, [&](const CommandStream::Entry& entry) {
 			if (entry.kind == CommandStream::RecordKind::TrimPool) {
 				m_command_pool.TrimCompleted();
@@ -697,10 +764,13 @@ void CommandScheduler::SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_i
 		EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
 	}
 	if (m_host_copies != nullptr) {
+		EnterRecord(RecordStage::HostCopies, recorded.tick);
 		m_host_copies->WaitFor(recorded.host_copies);
 	}
+	EnterRecord(RecordStage::Submitting, recorded.tick);
 	auto submit = recorded.info;
 	QueueSubmit(buffer, submit, recorded.tick);
+	EnterRecord(RecordStage::Replaying, recorded.tick + 1);
 	if (buffer != nullptr) {
 		m_command_pool.Retire(buffer_index, recorded.tick);
 		buffer = nullptr;

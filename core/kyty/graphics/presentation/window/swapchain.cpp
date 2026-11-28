@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/UpscaleMode.hpp"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stallSnapshot.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
@@ -328,7 +329,7 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+	      present_scheduler(renderer, owner.graphic_ctx, false, "presentation"), frames(owner, present_scheduler) {
 #if defined(ANYPS5_KYTY)
 		if (owner.surface == nullptr) {
 			return;
@@ -562,6 +563,7 @@ void Swapchain::Create() {
 		RequireVulkanSuccess(
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_image_acquired[i]),
 		    "create swapchain image-acquired semaphore");
+		StallSnapshot::Name(m_image_acquired[i], "the acquisition of swapchain slot " + std::to_string(i), false);
 		RequireVulkanSuccess(
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
 		    "create swapchain render-complete semaphore");
@@ -644,6 +646,7 @@ void Swapchain::Destroy(bool wait_queue) {
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
+			StallSnapshot::Forget(semaphore);
 			graphics.device.destroySemaphore(semaphore, nullptr);
 		}
 	}
