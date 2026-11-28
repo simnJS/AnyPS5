@@ -431,6 +431,7 @@ private:
 };
 
 class LinkedComputeStore;
+class StoreFile;
 
 struct ComputeServeMiss {
 	uint64_t                           shader = 0;
@@ -826,6 +827,16 @@ private:
 	CacheMap<uint64_t, Pipeline>                                     m_async_ready_compute;
 #if defined(ANYPS5_KYTY)
 	std::unordered_set<uint64_t>                                               m_installed_compute_ready;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash>           m_released_graphics;
+	std::unordered_set<uint64_t>                                               m_released_compute;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash>           m_cached_ready_graphics;
+	std::unordered_set<uint64_t>                                               m_cached_ready_compute;
+	[[nodiscard]] bool StartupStages(std::span<const ShaderModule* const> stages) const;
+	[[nodiscard]] bool TakeReleasedGraphics(const GraphicsPipelineKey& key);
+	[[nodiscard]] bool TakeReleasedCompute(uint64_t module_id);
+	void               NoteReleasedReuse(bool reused, const char* kind, uint64_t key);
+	void               DestroyPreparedPipeline(Pipeline& pipeline) const;
+	size_t             ReleaseCachedReadyPipelines();
 #endif
 	std::unordered_set<uint64_t>                                               m_async_asked_compute;
 	std::mutex                                                       m_async_mutex;
@@ -984,8 +995,9 @@ private:
 	void WarmUp(const std::filesystem::path& path, bool driver_cache_restored);
 	void WarmUpNativePipelines() KYTY_REQUIRES(m_program_lock);
 	size_t RestoreStoreRecords(std::span<const uint8_t> bytes, std::span<const uint8_t> header);
+	std::shared_ptr<const StoreFile> m_store_file;
 	struct StoreRecord;
-	bool ReadRecord(std::span<const uint8_t> frame, StoreRecord& record) const;
+	bool ReadRecord(std::span<const uint8_t> frame, uint64_t offset, StoreRecord& record) const;
 	bool AddRecord(StoreRecord& record) KYTY_REQUIRES(m_program_lock);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
@@ -1147,6 +1159,8 @@ void DescribeDriverPipelineCreation(std::string& report);
                                       const ShaderModule& module, const std::vector<uint32_t>& spirv,
                                       const std::vector<uint32_t>& plain_spirv,
                                       std::vector<uint8_t>&        record);
+[[nodiscard]] bool DecodeStoredSpirv(std::span<const uint8_t> frame, uint64_t checksum, bool plain,
+                                     std::vector<uint32_t>& spirv);
 
 #if defined(ANYPS5_KYTY)
 [[nodiscard]] std::vector<uint8_t> ComputeShaderStoreHeader(const GraphicContext& graphics);

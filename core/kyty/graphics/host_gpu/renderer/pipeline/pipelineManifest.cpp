@@ -570,8 +570,12 @@ void PipelineCache::ManifestStateDeleter::operator()(ManifestState* state) const
 struct PipelineCache::UseOrder {
 	static constexpr std::string_view Header  = "# kyty shader use order v1";
 	static constexpr uintmax_t        MaxSize = 4u << 20u;
+	static constexpr auto             StartupWindow = std::chrono::seconds(60);
 
 	std::unordered_map<uint64_t, uint32_t> rank;
+	uint32_t                               startup = 0;
+	std::optional<std::chrono::steady_clock::time_point> first_use;
+	bool                                                 window_written = false;
 
 	std::filesystem::path        path;
 	std::mutex                   mutex;
@@ -587,6 +591,10 @@ struct PipelineCache::UseOrder {
 		{
 			std::scoped_lock lock(mutex);
 			lines.swap(pending);
+			if (!window_written && first_use && std::chrono::steady_clock::now() - *first_use >= StartupWindow) {
+				lines += "W\n";
+				window_written = true;
+			}
 		}
 		if (lines.empty()) {
 			return;
@@ -597,7 +605,7 @@ struct PipelineCache::UseOrder {
 			if (file.tellp() == std::streampos(0)) {
 				file << Header << '\n';
 			}
-			file << "S\n";
+			file << "S\nT\n";
 			session_started = true;
 		}
 		file << lines;
@@ -614,14 +622,28 @@ void PipelineCache::OpenUseOrder(const std::filesystem::path& path) {
 	auto& order = *m_use_order;
 	order.path  = path;
 	std::vector<std::vector<uint64_t>> sessions;
+	std::vector<size_t>                windows;
+	std::vector<bool>                  timed;
 	const auto                         bytes = ReadFile(path);
 	const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 	for (const auto line: Split(text, '\n')) {
 		if (line == "S") {
 			sessions.emplace_back();
+			windows.push_back(SIZE_MAX);
+			timed.push_back(false);
+		} else if (line == "T") {
+			if (!sessions.empty()) timed.back() = true;
+		} else if (line == "W") {
+			if (!sessions.empty() && windows.back() == SIZE_MAX) windows.back() = sessions.back().size();
 		} else if (uint64_t hash = 0;
 		           !sessions.empty() && line.size() == 16 && ParseNumber(line, hash, 16)) {
 			sessions.back().push_back(hash);
+		}
+	}
+	for (size_t i = sessions.size(); i-- > 0;) {
+		if (!sessions[i].empty()) {
+			order.startup = timed[i] ? static_cast<uint32_t>(std::min(windows[i], sessions[i].size())) : 0u;
+			break;
 		}
 	}
 	std::vector<uint64_t> programs;
@@ -633,9 +655,10 @@ void PipelineCache::OpenUseOrder(const std::filesystem::path& path) {
 		}
 	}
 	if (bytes.size() > UseOrder::MaxSize) {
-		std::string out = fmt::format("{}\nS\n", UseOrder::Header);
-		for (const auto hash: programs) {
-			out += fmt::format("{:016x}\n", hash);
+		std::string out = fmt::format("{}\nS\nT\n", UseOrder::Header);
+		for (size_t i = 0; i < programs.size(); i++) {
+			if (i == order.startup) out += "W\n";
+			out += fmt::format("{:016x}\n", programs[i]);
 		}
 		auto temporary = path;
 		temporary += ".tmp";
@@ -647,8 +670,9 @@ void PipelineCache::OpenUseOrder(const std::filesystem::path& path) {
 		std::filesystem::rename(temporary, path, error);
 	}
 	if (!programs.empty()) {
-		ManifestLog("Pipeline manifest: the {} shaders used in {} earlier sessions go first ({})",
-		            programs.size(), sessions.size(), Common::PathToString(path));
+		ManifestLog("Pipeline manifest: the {} shaders used in {} earlier sessions go first, {} of them in the "
+		            "first minute of the last one ({})",
+		            programs.size(), sessions.size(), order.startup, Common::PathToString(path));
 	}
 	order.writer = std::jthread([&order](const std::stop_token& stop) {
 		constexpr auto Period = std::chrono::seconds(2);
@@ -674,9 +698,72 @@ void PipelineCache::NoteUse(Pipeline& pipeline, std::span<const ShaderModule* co
 	for (const auto* stage: stages) {
 		if (stage != nullptr && order.noted.insert(stage->info.shader_hash).second) {
 			order.pending += fmt::format("{:016x}\n", stage->info.shader_hash);
+			if (!order.first_use) order.first_use = std::chrono::steady_clock::now();
 		}
 	}
 }
+
+#if defined(ANYPS5_KYTY)
+bool PipelineCache::StartupStages(std::span<const ShaderModule* const> stages) const {
+	if (m_use_order == nullptr) return true;
+	for (const auto* stage: stages) {
+		if (stage == nullptr) continue;
+		const auto found = m_use_order->rank.find(stage->info.shader_hash);
+		if (found == m_use_order->rank.end() || found->second >= m_use_order->startup) return false;
+	}
+	return true;
+}
+
+bool PipelineCache::TakeReleasedGraphics(const GraphicsPipelineKey& key) {
+	std::scoped_lock lock(m_async_mutex);
+	return m_released_graphics.erase(key) != 0;
+}
+
+bool PipelineCache::TakeReleasedCompute(uint64_t module_id) {
+	std::scoped_lock lock(m_async_mutex);
+	return m_released_compute.erase(module_id) != 0;
+}
+
+void PipelineCache::NoteReleasedReuse(bool reused, const char* kind, uint64_t key) {
+	if (reused) {
+		MemoryTelemetry::released_reused.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	MemoryTelemetry::released_missed.fetch_add(1, std::memory_order_relaxed);
+	ManifestLog("[kyty-startup] released_pipeline_missed kind={} key={:016x}", kind, key);
+}
+
+void PipelineCache::DestroyPreparedPipeline(Pipeline& pipeline) const {
+	MemoryTelemetry::Destroy(m_graphics.device, pipeline.pipeline);
+	m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	pipeline = {};
+}
+
+size_t PipelineCache::ReleaseCachedReadyPipelines() {
+	std::vector<Pipeline> released;
+	{
+		std::scoped_lock lock(m_async_mutex);
+		for (const auto& key: m_cached_ready_graphics) {
+			if (auto node = m_async_ready.extract(key); !node.empty()) {
+				released.push_back(node.mapped());
+				m_released_graphics.insert(key);
+			}
+		}
+		for (const auto id: m_cached_ready_compute) {
+			if (auto node = m_async_ready_compute.extract(id); !node.empty()) {
+				released.push_back(node.mapped());
+				m_released_compute.insert(id);
+			}
+		}
+		m_cached_ready_graphics.clear();
+		m_cached_ready_compute.clear();
+	}
+	for (auto& pipeline: released) DestroyPreparedPipeline(pipeline);
+	MemoryTelemetry::released_pressure.fetch_add(released.size(), std::memory_order_relaxed);
+	return released.size();
+}
+#endif
 
 uint32_t PipelineCache::UseRank(uint64_t program_hash) const {
 	if (m_use_order == nullptr) {
@@ -3608,17 +3695,35 @@ void PipelineCache::CreateManifestGraphicsPipeline(const GraphicsPipelineKey& ke
 		pipeline.stored = true;
 		if (!cache_hit) NoteCreatedPipeline(start);
 	}
+#if defined(ANYPS5_KYTY)
+	const bool release = created && cache_hit && !StartupStages(stages);
+#endif
 	{
 		std::scoped_lock lock(m_async_mutex);
+#if defined(ANYPS5_KYTY)
+		if (release) {
+			m_released_graphics.insert(key);
+		} else if (created) {
+			m_async_ready.try_emplace(key, pipeline);
+			if (cache_hit) m_cached_ready_graphics.insert(key);
+		} else if (ran) {
+#else
 		if (created) {
 			m_async_ready.try_emplace(key, pipeline);
 		} else if (ran) {
+#endif
 			m_async_failed_graphics.insert(key);
 		} else {
 			m_claimed_graphics.erase(key);
 		}
 		m_async_pending_graphics.erase(key);
 	}
+#if defined(ANYPS5_KYTY)
+	if (release) {
+		DestroyPreparedPipeline(pipeline);
+		MemoryTelemetry::released_pipelines.fetch_add(1, std::memory_order_relaxed);
+	}
+#endif
 	m_async_finished.notify_all();
 	if (!admitted) return;
 #if defined(ANYPS5_KYTY)
@@ -3668,15 +3773,34 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bo
 	if (created && !cache_hit) {
 		NoteCreatedPipeline(start);
 	}
+#if defined(ANYPS5_KYTY)
+	const ShaderModule* const stages[] = {&module};
+	const bool release = created && cache_hit && !StartupStages(stages);
+#endif
 	{
 		std::scoped_lock lock(m_async_mutex);
+#if defined(ANYPS5_KYTY)
+		if (release) {
+			m_released_compute.insert(module.id);
+		} else if (created) {
+			m_async_ready_compute.try_emplace(module.id, pipeline);
+			if (cache_hit) m_cached_ready_compute.insert(module.id);
+		} else if (!ran) {
+#else
 		if (created) {
 			m_async_ready_compute.try_emplace(module.id, pipeline);
 		} else if (!ran) {
+#endif
 			m_claimed_compute.erase(module.id);
 		}
 		m_async_pending_compute.erase(module.id);
 	}
+#if defined(ANYPS5_KYTY)
+	if (release) {
+		DestroyPreparedPipeline(pipeline);
+		MemoryTelemetry::released_pipelines.fetch_add(1, std::memory_order_relaxed);
+	}
+#endif
 	m_async_finished.notify_all();
 	if (!admitted) return;
 	std::scoped_lock lock(state.mutex);
@@ -3786,6 +3910,11 @@ void PipelineCache::ManifestProgress(bool force) {
 	            Milliseconds(state.build_ns), state.found, state.failed, waiting, state.pipelines,
 	            state.compute, Milliseconds(state.pipeline_ns), state.pipelines_known,
 	            state.pipelines_failed, state.compute_failed, state.dropped.load(std::memory_order_relaxed));
+#if defined(ANYPS5_KYTY)
+	ManifestLog("Pipeline manifest: {} pipelines found in the cache and released until their first use; the pipelines "
+	            "of the {} shaders of the last session's first minute stay created",
+	            MemoryTelemetry::released_pipelines.load(std::memory_order_relaxed), m_use_order != nullptr ? m_use_order->startup : 0u);
+#endif
 }
 
 void PipelineCache::RecordModule(const ProgramKey&                       key,

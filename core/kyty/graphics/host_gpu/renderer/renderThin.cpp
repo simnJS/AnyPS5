@@ -26,8 +26,10 @@ struct RenderExecutor::ThinDispatches {
 	Thin::Counters      counters;
 	ThinOperation*      current   = nullptr;
 	uint32_t            ticks     = 0;
-	uint64_t            log_ns    = 0;
-	uint64_t            log_frame = 0;
+	uint64_t            log_ns     = 0;
+	uint64_t            log_frame  = 0;
+	uint64_t            open_ns    = 0;
+	uint64_t            open_frame = 0;
 };
 
 static constexpr uint64_t ThinSummaryNs     = 10'000'000'000ull;
@@ -35,9 +37,29 @@ static constexpr uint32_t ThinSummaryPeriod = 1024;
 
 RenderExecutor::ThinDispatches& RenderExecutor::OwnThin() {
 	if (!m_thin) {
-		m_thin = {new ThinDispatches, [](ThinDispatches* thin) { delete thin; }};
+		m_thin             = {new ThinDispatches, [](ThinDispatches* thin) { delete thin; }};
+		m_thin->open_ns    = Common::SteadyNs();
+		m_thin->open_frame = m_context.FrameNumber();
 	}
 	return *m_thin;
+}
+
+void RenderExecutor::ReportThin() {
+	if (!m_thin || m_thin->current != nullptr) {
+		return;
+	}
+	auto& thin = *m_thin;
+	if (std::ranges::none_of(thin.counters.kinds, [](const auto& kind) { return kind.operations != 0; })) {
+		return;
+	}
+	const auto now   = Common::SteadyNs();
+	const auto frame = m_context.FrameNumber();
+	const auto since = thin.log_ns != 0 ? thin.log_ns : thin.open_ns;
+	const auto first = thin.log_ns != 0 ? thin.log_frame : thin.open_frame;
+	Log::WriteToConsoleAndLog(thin.counters.Summary(static_cast<double>(now - since) / 1e9, frame - first));
+	thin.log_ns    = now;
+	thin.log_frame = frame;
+	thin.counters  = {};
 }
 
 RenderExecutor::ThinOperation::ThinOperation(RenderExecutor& executor, Thin::OperationKind kind)
@@ -165,9 +187,8 @@ void RenderExecutor::LearnThinDispatch(const ShaderComputeInputInfo& input_info,
 	op->m_learning      = false;
 	const auto& program = input_info.stage.module->info;
 	constexpr uint32_t OrderedAppend = 1u << 3u;
-	auto facts                 = Thin::DescribeProgram(program, *input_info.stage.resources);
-	facts.pipeline_ready       = pipeline.pipeline != nullptr && !pipeline.uses_image_heap;
-	facts.image_heap           = facts.image_heap || pipeline.uses_image_heap;
+	auto facts = Thin::DescribeProgram(program, *input_info.stage.resources, input_info.stage.module->specialization);
+	Thin::NotePipeline(facts, pipeline.pipeline != nullptr, pipeline.uses_image_heap);
 	facts.lds_storage          = input_info.lds_storage || bindings.shared_memory.buffer != nullptr;
 	facts.write_targets        = facts.write_targets || indirect_writes;
 	facts.ordered_append       = (mode & OrderedAppend) != 0 && program.info.uses_gds;
@@ -215,9 +236,8 @@ void RenderExecutor::ClassifyThinDraw(std::span<PreparedBindings* const> stages,
 	for (const auto* prepared: stages) {
 		const auto& runtime  = *prepared->runtime;
 		const auto& program  = runtime.module->info;
-		auto        facts    = Thin::DescribeProgram(program, *runtime.resources);
-		facts.pipeline_ready = pipeline.pipeline != nullptr;
-		facts.image_heap     = facts.image_heap || pipeline.uses_image_heap;
+		auto        facts    = Thin::DescribeProgram(program, *runtime.resources, runtime.module->specialization);
+		Thin::NotePipeline(facts, pipeline.pipeline != nullptr, pipeline.uses_image_heap);
 		facts.lds_storage    = prepared->shared_memory.buffer != nullptr;
 		facts.indirect_args_on_cpu = op->m_kind == Thin::OperationKind::IndirectDraw;
 		Thin::PushPlan plan;

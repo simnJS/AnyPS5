@@ -471,6 +471,11 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 			next_heap_check = Clock::now() + std::chrono::seconds(5);
 			const auto memory = Common::ReadSystemMemory();
 			if (memory && memory->available < ManifestAdmission::Reserve(memory->total)) {
+				if (const auto released = ReleaseCachedReadyPipelines(); released != 0) {
+					PrecompileLog("[kyty-heap-trim] released {} prepared pipelines the title has not used yet; they "
+					              "are created again from the cache at first use",
+					              released);
+				}
 				const auto start = Clock::now();
 				if (const auto trim = Common::TrimUnusedHeap()) {
 					PrecompileLog("[kyty-heap-trim] available={} malloc_free={} rss_before={} rss_after={} elapsed_ms={}",

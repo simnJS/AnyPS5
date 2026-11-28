@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLinkedStore.h"
+#include "graphics/host_gpu/renderer/pipeline/storedSpirv.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/logging/log.h"
@@ -92,7 +93,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
 	    Common::ParallelThreads()));
 
+	m_store_file = read_store ? StoreFile::Open(path) : nullptr;
 	const auto kept = RestoreStoreRecords(bytes, header);
+	if (kept == 0) m_store_file.reset();
 	if (kept == 0 && existed) {
 		const auto reason = read_store ? StoreMismatch(bytes, header, stamp) : "could not read the store";
 		Log::WriteToConsoleAndLog(fmt::format("Shader cache: replacing {}: {}\n", Common::PathToString(path), reason));

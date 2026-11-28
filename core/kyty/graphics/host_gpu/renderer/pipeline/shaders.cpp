@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/storedSpirv.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #endif
@@ -866,10 +867,16 @@ public:
 			tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 		}
 
-		for (const auto* stage: stages) {
-			if (stage != nullptr) {
+		for (size_t i = 0; i < stages.size(); i++) {
+			if (const auto* stage = stages[i]; stage != nullptr) {
+				const auto handle = AcquireShaderModule(graphics.device, *stage);
+				if (handle) {
+					m_acquired[i] = stage;
+				} else {
+					m_missing = true;
+				}
 				shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
-				                                       .module = stage->module,
+				                                       .module = handle,
 				                                       .pName  = "main"};
 			}
 		}
@@ -1011,6 +1018,9 @@ public:
 		pipeline_info.pDynamicState       = &dynamic_state;
 	}
 	~GraphicsPipelineState() {
+		for (const auto* stage: m_acquired) {
+			if (stage != nullptr) ReleaseShaderModule(m_graphics.device, *stage);
+		}
 		m_graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 		m_graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 		m_graphics.device.destroyShaderModule(task_module, nullptr);
@@ -1023,6 +1033,7 @@ public:
 
 	vk::Result Create(vk::PipelineCache cache, vk::PipelineLayout layout, vk::PipelineCreateFlags flags,
 	                  vk::Pipeline& out) {
+		if (m_missing) return vk::Result::eErrorInitializationFailed;
 		pipeline_info.layout = layout;
 		const ScopedDriverCreation creation(
 		    {Name(0, mesh ? "ms" : "vs"), Name(1, "hs"), Name(2, "ds"), Name(3, "ps")},
@@ -1050,6 +1061,7 @@ public:
 	}
 
 	vk::Pipeline CreateLibrary(vk::PipelineLayout layout, PipelineLibraryPart part) {
+		if (m_missing) return {};
 		using Flag = vk::GraphicsPipelineLibraryFlagBitsEXT;
 		vk::GraphicsPipelineLibraryCreateInfoEXT library {};
 		vk::PipelineRenderingCreateInfo          view_only {};
@@ -1124,6 +1136,8 @@ public:
 	GraphicContext&                            m_graphics;
 	const GraphicsPipelineKey&                 m_key;
 	const std::array<const ShaderModule*, 4>& m_stages;
+	std::array<const ShaderModule*, 4>        m_acquired {};
+	bool                                       m_missing  = false;
 	bool                                       mesh       = false;
 	bool                                       with_depth = false;
 	vk::ShaderModule                           tess_control_shader_module = nullptr;
@@ -1257,12 +1271,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 	}
 
-	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
-	uint32_t                          shader_stage_count = 0;
-	for (const auto* stage: stages) {
-		if (stage != nullptr) {
+	vk::PipelineShaderStageCreateInfo             shader_stages[4] {};
+	uint32_t                                      shader_stage_count = 0;
+	std::array<std::optional<ShaderModuleUse>, 4> stage_uses;
+	for (size_t i = 0; i < stages.size(); i++) {
+		if (const auto* stage = stages[i]; stage != nullptr) {
+			stage_uses[i].emplace(graphics.device, *stage);
 			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
-			                                       .module = stage->module,
+			                                       .module = stage_uses[i]->Get(),
 			                                       .pName  = "main"};
 		}
 	}
@@ -1475,8 +1491,10 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 	const bool lookup = cache_mode == ComputePipelineCacheMode::Lookup;
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
+	const ShaderModuleUse module_use(graphics.device, module);
+	if (!module_use.Get()) return vk::Result::eErrorInitializationFailed;
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module = module.module;
+	comp_shader_stage_info.module = module_use.Get();
 	comp_shader_stage_info.pName  = "main";
 	const auto wave_size = module.info.wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&

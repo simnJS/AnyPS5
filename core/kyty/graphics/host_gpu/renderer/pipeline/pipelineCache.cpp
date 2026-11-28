@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineShaderDiagnostics.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineShaderOptions.h"
+#include "graphics/host_gpu/renderer/pipeline/storedSpirv.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/pipelineLinkedStore.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
@@ -1395,11 +1396,12 @@ bool PipelineCache::ComputePipelineReady(const ShaderModule& module, bool ahead)
 	};
 	if (!ahead && ready(m_compute_pipelines)) return true;
 	std::lock_guard lock(m_async_mutex);
-	return (ahead && m_installed_compute_ready.contains(module.id)) || ready(m_async_ready_compute);
+	return (ahead && m_installed_compute_ready.contains(module.id)) || ready(m_async_ready_compute) ||
+	       m_released_compute.contains(module.id);
 }
 
 bool PipelineCache::CanCoverEmptyComputePipeline(const ShaderModule& empty, const ShaderModule& populated) {
-	if (empty.plan == nullptr || empty.plan != populated.plan || !populated.module ||
+	if (empty.plan == nullptr || empty.plan != populated.plan || !HasShaderModule(populated) ||
 	    empty.shared_variant || populated.shared_variant || empty.linked_prepared || populated.linked_prepared ||
 	    !empty.function_code.empty() || !populated.function_code.empty() ||
 	    empty.guest_traversal != populated.guest_traversal || empty.bvh != populated.bvh ||
@@ -1451,7 +1453,7 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 	const auto& plan = program.resource_plan;
 	const auto compatible = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
-		if (&candidate == exact || candidate.shared_variant || !candidate.module) return false;
+		if (&candidate == exact || candidate.shared_variant || !HasShaderModule(candidate)) return false;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords())) {
 			ShaderRecompiler::IR::NoteServeRefusal(Step::PushLayout);
 			return false;
@@ -4393,6 +4395,20 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		return &found->second;
 	}
 #if defined(ANYPS5_KYTY)
+	if (TakeReleasedGraphics(key)) {
+		Pipeline   created;
+		const bool reused = CreateGraphicsPipelineNow(created, key, stages, false);
+		NoteReleasedReuse(reused, "graphics", GraphicsPipelineKeyHash {}(key));
+		if (reused) {
+			created.stored           = true;
+			auto& ready              = m_graphics_pipelines.try_emplace(key, created).first->second;
+			m_last_graphics_key      = key;
+			m_last_graphics_pipeline = &ready;
+			NoteUse(ready, stages);
+			NoteFloatModes(ready, key, command.GetShaders());
+			return &ready;
+		}
+	}
 	const AsyncDraw held      = allow_async ? AsyncDraw::Eligible : HeldDraw(command, state, targets);
 	const bool      probe_now = Config::AsyncPipelinesProbe() &&
 	                       (allow_async || held == AsyncDraw::Occlusion || held == AsyncDraw::SmallTarget) &&
@@ -4801,6 +4817,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 	}
 	{
 		std::unique_lock lock(m_async_mutex);
+#if defined(ANYPS5_KYTY)
+		if (m_released_compute.contains(module.id)) {
+			lock.unlock();
+			return &GetComputePipeline(input_info);
+		}
+#endif
 		if (!m_async_ready_compute.contains(module.id)) {
 			if (m_async_pending_compute.contains(module.id)) {
 				return nullptr;
@@ -4881,6 +4903,19 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	}
 	auto& pipeline = m_compute_pipelines[module.id];
 #if defined(ANYPS5_KYTY)
+	if (TakeReleasedCompute(module.id)) {
+		const bool reused = FindComputePipeline(m_graphics, pipeline, module, m_driver_cache);
+		NoteReleasedReuse(reused, "compute", module.id);
+		if (reused) {
+			if (ShaderVariantLog()) {
+				PipelineCacheLog("[kyty-variant] ready-pipeline stage=CS module={:016x} from=cache", module.id);
+			}
+			pipeline.stored = true;
+			NoteInstalledComputeReady(module.id, pipeline);
+			NoteUse(pipeline, stages);
+			return pipeline;
+		}
+	}
 	if ((module.linked_prepared || CanUseComputeBinaries(m_graphics, module)) &&
 	    FindComputePipeline(m_graphics, pipeline, module, m_driver_cache)) {
 		NoteInstalledComputeReady(module.id, pipeline);

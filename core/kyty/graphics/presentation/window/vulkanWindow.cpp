@@ -1319,6 +1319,7 @@ void WindowContext::CreateVulkan() {
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, std::move(device_extensions), r.required_extensions);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	MemoryTelemetry::CountShaderModules();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
@@ -1451,6 +1452,7 @@ bool CreateHeadlessVulkanChecked(GraphicContext& graphics, const VulkanDeviceIde
 	graphics.physical_device.getMemoryProperties(&graphics.physical_device_memory_properties);
 	graphics.device = VulkanCreateDevice(graphics, std::move(required_extensions), extensions);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
+	MemoryTelemetry::CountShaderModules();
 	return true;
 #else
 	(void)graphics;

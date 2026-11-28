@@ -43,6 +43,14 @@ void Destroy(vk::Device device, Handle handle) {
 [[nodiscard]] vk::Result Create(vk::Device device, vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info, vk::Pipeline& handle);
 [[nodiscard]] vk::Result Create(vk::Device device, vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& info, vk::Pipeline& handle);
 
+struct ShaderModuleTotals {
+	uint64_t count = 0;
+	uint64_t bytes = 0;
+};
+
+void CountShaderModules();
+[[nodiscard]] ShaderModuleTotals LiveShaderModules();
+
 }
 
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
