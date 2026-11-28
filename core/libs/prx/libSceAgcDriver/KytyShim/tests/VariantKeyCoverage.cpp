@@ -44,9 +44,10 @@ void Check(bool condition, const std::string& what) {
 
 using Sharp = std::array<uint32_t, 4>;
 
-Sharp MakeSharp(uint64_t address, uint32_t records, uint32_t select, uint32_t stride = 0) {
+Sharp MakeSharp(uint64_t address, uint32_t records, uint32_t select, uint32_t stride = 0,
+                uint32_t format = Format32UInt) {
 	return {static_cast<uint32_t>(address), static_cast<uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u),
-	        records, SwizzleXyzw | (Format32UInt << 12u) | (1u << 24u) | (select << 28u)};
+	        records, SwizzleXyzw | (format << 12u) | (1u << 24u) | (select << 28u)};
 }
 
 struct Plan {
@@ -374,6 +375,88 @@ void CandidateOrder(const Plan& program) {
 	      "a graphics stage keeps the candidates in their order in memory");
 }
 
+void MixedComputeTables(const Plan& program) {
+	auto plan = CandidatePlan(ShaderType::Compute);
+	auto& table = plan.descriptor_sources.emplace_back();
+	table.dword_count = 4;
+	const auto sharp = MakeSharp(TableAddress, sizeof(g_table), 3);
+	for (uint32_t i = 0; i < 4; ++i) table.dwords[i] = IR::Value(sharp[i]);
+	auto& array = plan.descriptor_sources.emplace_back();
+	array.dword_count = 8;
+	array.indirect_descriptor = IR::DescriptorSource::IndirectDescriptor {
+	    .table_source = 3u, .table_mask = 0xffu, .table_array = true};
+	auto image = plan.info.images.front();
+	image.source = 4;
+	plan.info.images.push_back(image);
+	auto& source = plan.descriptor_sources.emplace_back();
+	source.dword_count = 4;
+	for (uint32_t i = 0; i < 4; ++i) {
+		auto& word = plan.value_storage.emplace_back(IR::ValueOpcode::GetUserData);
+		word.SetArg(0, IR::Value(static_cast<IR::ScalarReg>(i)));
+		source.dwords[i] = IR::Value(&word);
+	}
+	auto& buffer = plan.info.buffers.emplace_back();
+	buffer.source = 5;
+	buffer.read = true;
+	buffer.formatted = true;
+	plan.buffer_vector_access = {1};
+	plan.memory_info.push_back({.kind = IR::ResourceKind::Buffer, .formatted = true});
+	IR::CompileSrtWalker(plan);
+
+	std::array<uint32_t, TableEntries> addresses {};
+	for (uint32_t i = 0; i < TableEntries; ++i) addresses[i] = TextureAddress(i);
+	FillTable(addresses, {});
+	auto user = MakeSharp(SourceAddress, Records, 0, 4);
+	const IR::SrtRuntime runtime {.user_data = user, .read_specialization_memory = ReadTable};
+	Candidates prepared;
+	if (!IR::MaterializeFallbackResources(plan, runtime, prepared.snapshot, prepared.specialization) ||
+	    prepared.snapshot.graphics_image_banks.size() < 2) {
+		Check(false, "the fallback captures a dense root and an image table");
+		return;
+	}
+	Check((prepared.specialization.buffers[0].packed_stride & IR::RuntimeBufferFormat) != 0u &&
+	          IR::HasRuntimeStride(prepared.specialization.buffers[0].packed_stride),
+	      "the combined fallback takes the buffer format and stride from the dispatch");
+	auto historical = prepared.specialization;
+	const auto old_offset = prepared.snapshot.graphics_image_banks[1];
+	historical.images[1].table_mapping_offset = old_offset;
+	const auto loaded = Reload({Recipe(program, historical)});
+	Check(loaded.size() == 1, "the historical combined table recipe reads back");
+	if (loaded.size() != 1) return;
+	Check(loaded.front().specialization == prepared.specialization,
+	      "the old fixed mapping reloads as the fallback used for new dispatches");
+	std::fill(g_table.begin() + 16, g_table.end(), 0u);
+	for (const auto records: {0u, Records}) {
+		user = MakeSharp(SourceAddress, records, 3, 16, static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm));
+		Candidates live;
+		IR::ResourceSnapshot bound;
+		if (!IR::MaterializeResources(plan, runtime, live.snapshot, live.specialization) ||
+		    !IR::RebindComputeImages(plan, runtime, live.snapshot, live.specialization, loaded.front().specialization, bound)) {
+			Check(false, "fewer dense candidates and a live formatted buffer bind the recorded table layout");
+			continue;
+		}
+		Check(live.snapshot.images.size() < bound.images.size() && bound.images.size() == prepared.snapshot.images.size() &&
+		          bound.buffers == live.snapshot.buffers && bound.image_tables.size() == 1 &&
+		          bound.graphics_image_banks.size() >= 2 && bound.graphics_image_banks[1] < old_offset,
+		      "the wide module keeps the current descriptor and takes its table offset from the dispatch");
+		const auto mapping = loaded.front().specialization.images[0].indirect_mapping_offset;
+		for (uint32_t entry = 0; entry < 2; ++entry) {
+			const auto key = 1u + mapping + entry * 8u;
+			const auto ordinal = key < bound.flattened_srt.size() ? bound.flattened_srt[key] : 0;
+			Check(ordinal > 0 && size_t {ordinal} + 1 < bound.images.size() &&
+			          bound.images[ordinal + 1].dwords[0] == addresses[entry],
+			      "the dense selector still reaches its texture in the wide variant");
+		}
+		if (bound.image_tables.size() == 1 && bound.graphics_image_banks.size() >= 2) {
+			const auto& map = bound.image_tables.front()->mapping;
+			const auto base = bound.graphics_image_banks[1];
+			Check(base <= bound.flattened_srt.size() && map.size() <= bound.flattened_srt.size() - base &&
+			          std::equal(map.begin(), map.end(), bound.flattened_srt.begin() + base),
+			      "the shader data points at the live table entries");
+		}
+	}
+}
+
 void GenericGraphics() {
 	IR::ResourcePlan plan;
 	plan.stage                      = ShaderType::Pixel;
@@ -520,6 +603,7 @@ int main() {
 	}
 
 	CandidateOrder(program);
+	MixedComputeTables(program);
 
 	std::printf("variant key coverage: %u of %zu requests are the prepared variant\n", covered, bound.size());
 	if (g_failures != 0) {

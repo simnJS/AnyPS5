@@ -75,6 +75,7 @@ bool DecodeResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
 void SetComputeIndirectFloors(size_t keys, size_t images);
+void NormalizeComputeTableMappings(ResourceSpecialization& shape, ResourceSnapshot* snapshot = nullptr);
 void OrderDenseCandidates(ResourceSpecialization& specialization);
 
 bool HasIndirectBuffers(const ResourcePlan& program);
@@ -127,6 +128,7 @@ struct ServeRefusal {
 		ImageAddressing,
 		TableConversion,
 		HeapKinds,
+		HeapUnavailable,
 		SameAddressing,
 		TableView,
 		TableViewCount,
