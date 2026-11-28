@@ -1,6 +1,7 @@
 #include "SamplerSpillProgram.hpp"
 #include "common/assert.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/pipeline/floatMinMaxProbe.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -376,6 +377,7 @@ struct Dispatch {
 	uint32_t                           wave_size = WaveSize;
 	std::optional<uint32_t>            sampler_word;
 	std::vector<uint8_t>*              image_texels = nullptr;
+	const Recompiler::Spirv::Profile*  profile = nullptr;
 };
 
 std::optional<uint32_t> StoredWord(const Recompiler::IR::Program& program) {
@@ -414,6 +416,7 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stor
 	options.dump_ir               = false;
 	options.user_data             = dispatch.user_data;
 	options.input_info.compute    = &compute;
+	if (dispatch.profile != nullptr) options.profile = dispatch.profile;
 	const auto source             = Recompiler::PrepareShaderSource(dispatch.code, options);
 	auto       translated         = Recompiler::TranslateProgram(source.decoded, options);
 	if (stored_word) *stored_word = StoredWord(translated.program);
@@ -723,9 +726,11 @@ void FillInput(uint64_t state, std::span<const std::array<uint32_t, 4>> edges, b
 	}
 }
 
-bool RunInputOutput(const Gpu& gpu, const char* name, std::span<const uint32_t> code, uint32_t threads) {
+bool RunInputOutput(const Gpu& gpu, const char* name, std::span<const uint32_t> code, uint32_t threads,
+                    const Recompiler::Spirv::Profile* profile = nullptr) {
 	g_output.fill(0xdeadbeefu);
 	Dispatch dispatch;
+	dispatch.profile   = profile;
 	dispatch.name      = name;
 	dispatch.code      = code;
 	dispatch.threads   = threads;
@@ -1274,6 +1279,86 @@ void NarrowImageAtomic(const Gpu& gpu) {
 	}
 }
 
+alignas(256) constexpr std::array<uint32_t, 14> MinMaxProgram {
+    0x34020082, 0x34060084, 0xe0302000, 0x80000401, 0xe0302004, 0x80000501, 0xbf8c3f70, 0x1e140b04,
+    0x20160b04, 0xe0702000, 0x80010a03, 0xe0702004, 0x80010b03, 0xbf810000,
+};
+
+constexpr std::array<std::array<uint32_t, 2>, 16> MinMaxPairs {{
+    {0x00000000u, 0x80000000u}, {0x80000000u, 0x00000000u}, {0x40000000u, 0xc0400000u}, {0xc0400000u, 0x40000000u},
+    {0x7fc00000u, 0x40a00000u}, {0x40a00000u, 0x7fc00000u}, {0x7fc00000u, 0x7fc00000u}, {0x7f800000u, 0xff800000u},
+    {0xff800000u, 0x7f800000u}, {0x7fc00000u, 0xff800000u}, {0xff800000u, 0x7fc00000u}, {0xffc00000u, 0x40a00000u},
+    {0x7fc00000u, 0x7fc00001u}, {0x7f800001u, 0x40a00000u}, {0x40a00000u, 0xff800001u}, {0x7fa00000u, 0x7f800001u},
+}};
+
+bool IsNanBits(uint32_t bits) {
+	return (bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0u;
+}
+
+std::array<uint32_t, 2> GuestMinMax(uint32_t lhs, uint32_t rhs) {
+	if (IsNanBits(lhs) || IsNanBits(rhs)) {
+		const uint32_t source = IsNanBits(rhs) ? lhs : rhs;
+		return {source, source};
+	}
+	const float left  = std::bit_cast<float>(lhs);
+	const float right = std::bit_cast<float>(rhs);
+	if (left < right) return {lhs, rhs};
+	if (left > right) return {rhs, lhs};
+	const bool negative = (lhs & 0x80000000u) != 0u;
+	return {negative ? lhs : rhs, negative ? rhs : lhs};
+}
+
+std::optional<bool> MinMaxMatchesGuest(const Gpu& gpu, Recompiler::Spirv::FloatMinMax level,
+                                       std::array<uint32_t, 2 * MinMaxPairs.size()>* results = nullptr) {
+	constexpr std::array<const char*, 3> Levels {"compare and select", "NMin/NMax with a NaN-pair select", "NMin/NMax"};
+	Recompiler::Spirv::Profile profile = Recompiler::Spirv::DefaultProfile;
+	profile.float_min_max              = level;
+	g_input.fill(0u);
+	for (uint32_t tid = 0; tid < Threads; ++tid) {
+		const auto& pair         = MinMaxPairs[tid % MinMaxPairs.size()];
+		g_input[tid * Inputs]      = pair[0];
+		g_input[tid * Inputs + 1u] = pair[1];
+	}
+	const std::string name = std::string("v_min_f32 and v_max_f32, ") + Levels[static_cast<size_t>(level)];
+	if (!RunInputOutput(gpu, name.c_str(), MinMaxProgram, Threads, &profile)) return std::nullopt;
+	bool matches = true;
+	for (uint32_t tid = 0; tid < Threads; ++tid) {
+		const auto& pair     = MinMaxPairs[tid % MinMaxPairs.size()];
+		const auto  expected = GuestMinMax(pair[0], pair[1]);
+		const auto  min      = g_output[tid * Results];
+		const auto  max      = g_output[tid * Results + 1u];
+		matches &= min == expected[0] && max == expected[1];
+		if (results != nullptr && tid < MinMaxPairs.size()) {
+			(*results)[2u * tid]      = min;
+			(*results)[2u * tid + 1u] = max;
+		}
+	}
+	return matches;
+}
+
+void FloatMinMaxLowering(const Gpu& gpu) {
+	using Recompiler::Spirv::FloatMinMax;
+	constexpr const char* Test = "float min/max lowering";
+	const auto cascade = MinMaxMatchesGuest(gpu, FloatMinMax::Cascade);
+	if (!cascade) return;
+	Check(*cascade, std::string(Test) + ": the compare and select lowering does not give the guest results");
+	std::array<uint32_t, 2 * MinMaxPairs.size()> native {};
+	const auto exact = MinMaxMatchesGuest(gpu, FloatMinMax::Exact, &native);
+	if (!exact) return;
+	std::array<uint32_t, 2 * MinMaxPairs.size()> pairs {};
+	for (size_t i = 0; i < MinMaxPairs.size(); ++i) {
+		pairs[2u * i]      = MinMaxPairs[i][0];
+		pairs[2u * i + 1u] = MinMaxPairs[i][1];
+	}
+	const auto level = FloatMinMaxLevel(pairs.data(), native.data(), static_cast<uint32_t>(MinMaxPairs.size()));
+	const auto chosen = MinMaxMatchesGuest(gpu, level);
+	if (!chosen) return;
+	Check(*chosen, std::string(Test) + ": the level the probe rule picks does not give the guest results");
+	constexpr std::array<const char*, 3> Levels {"compare and select", "NMin/NMax with a NaN-pair select", "NMin/NMax"};
+	std::printf("%s: translated NMin/NMax %s the guest results; the probe rule picks %s\n", Test,
+	            *exact ? "give" : "do not give", Levels[static_cast<size_t>(level)]);
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1302,6 +1387,7 @@ int main(int argc, char** argv) {
 		QuadSumOfAbsoluteDifferences(*gpu);
 		SumOfAbsoluteDifferencesClamp(*gpu);
 		MultiplyThenAddRoundsProduct(*gpu);
+		FloatMinMaxLowering(*gpu);
 	}
 	const auto name = gpu->name;
 	CloseGpu(*gpu);

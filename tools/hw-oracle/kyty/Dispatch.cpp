@@ -356,7 +356,8 @@ void Device::State::Open(std::string_view selector, Choice choice) {
     max_workgroup_subgroups = properties13.maxComputeWorkgroupSubgroups;
     subgroup_control = features13.subgroupSizeControl == VK_TRUE &&
                        (properties13.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
-    profile.native_float_min_max = properties.properties.vendorID == AmdVendor;
+    profile.float_min_max = properties.properties.vendorID == AmdVendor ? Recompiler::Spirv::FloatMinMax::Exact
+                                                                               : Recompiler::Spirv::FloatMinMax::Cascade;
     profile.native_float16 = features12.shaderFloat16 == VK_TRUE;
 }
 

@@ -10,6 +10,7 @@
 #endif
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/floatMinMaxProbe.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -139,7 +140,7 @@ void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, boo
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	const auto operations = graphics.subgroup_supported_operations;
 	return {.maintenance8           = graphics.maintenance8_enabled,
-	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
+	        .float_min_max          = ProbeFloatMinMax(graphics),
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,

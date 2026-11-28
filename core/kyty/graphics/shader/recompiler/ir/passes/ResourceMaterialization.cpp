@@ -2424,6 +2424,7 @@ static void FindBufferSpecializationUses(const Program& program, ResourcePlan& p
 }
 
 ResourcePlan ExtractResourcePlan(const Program& program) {
+	RuntimeValueValidator validator(program);
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
@@ -2450,7 +2451,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			return Clone(program.srt_reads[slot.U32()].value);
 		}
 		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
-		    ValidateRuntimeValue(program, source->Arg(0))) {
+		    validator.Validate(source->Arg(0))) {
 			return Clone(source->Arg(0));
 		}
 		if (source->GetOpcode() == ValueOpcode::Phi) {
@@ -2534,7 +2535,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
 			uniform_control |= value.GetType() == Type::U1;
-			return ValidateRuntimeValue(program, value, RuntimeValueType::Integer) ? value : Value {};
+			return validator.Validate(value, RuntimeValueType::Integer) ? value : Value {};
 		}
 		const auto [found, inserted] = predicates.try_emplace(inst);
 		auto& entry = found->second;
@@ -2549,10 +2550,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			entry.complete = true;
 			return result = projected;
 		};
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
+		if (validator.Validate(value, RuntimeValueType::Integer)) {
 			uniform_control = true;
 			capture_control_reads |=
-			    !ValidateRuntimeValue(program, value, RuntimeValueType::ImmutableInteger);
+			    !validator.Validate(value, RuntimeValueType::ImmutableInteger);
 			return finish(Clone(value));
 		}
 		const auto op = inst->GetOpcode();

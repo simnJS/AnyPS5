@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <memory>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -103,6 +104,19 @@ enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+class RuntimeValueValidator {
+public:
+	explicit RuntimeValueValidator(const ResourcePlan& program);
+	~RuntimeValueValidator();
+	RuntimeValueValidator(const RuntimeValueValidator&)            = delete;
+	RuntimeValueValidator& operator=(const RuntimeValueValidator&) = delete;
+
+	bool Validate(Value value, RuntimeValueType type = RuntimeValueType::Any);
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> m_impl;
+};
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
