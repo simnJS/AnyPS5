@@ -436,11 +436,16 @@ int prepared(const std::filesystem::path& tool, const std::filesystem::path& roo
     setVariable("KYTY_ASYNC_PIPELINES", "1");
     const auto served = preparedReplay(tool, root, "bounds", "first-use", structured, true);
     require(served.completed && served.dump == exact.dump && served.frame == exact.frame &&
-                manifestCompute(served.log) == 1 && count(served.log, ServeLine) == 1 &&
-                served.log.find("[kyty-variant] specialize stage=CS") != std::string::npos &&
-                served.log.find("compute-sync") == std::string::npos && served.log.find("compute-wait") == std::string::npos &&
                 served.log.find("\"dispatches\":1.0") != std::string::npos,
-            "a prepared pipeline must enforce the live record bounds while specializing the first dispatch", served);
+            "a pipeline prepared from a recipe with other bounds must enforce the live record bounds", served);
+    const auto first_dispatch = served.log.find("[kyty-startup] first_dispatch");
+    require(manifestCompute(served.log) == 1 && readyPipelineIds(served.log).size() == 1 &&
+                count(served.log, ServeLine) == 0 &&
+                served.log.find("[kyty-variant] specialize stage=CS") == std::string::npos &&
+                first_dispatch != std::string::npos && served.log.find(BuildLine, first_dispatch) == std::string::npos,
+            "a pipeline prepared from a recipe with other bounds must be the variant its first dispatch requests", served);
+    require(served.log.find("compute-sync") == std::string::npos && served.log.find("compute-wait") == std::string::npos,
+            "a pipeline prepared from a recipe with other bounds must not wait on its first dispatch", served);
 
     if (std::getenv("APS5_REPLAY_KEEP_ARTIFACTS") == nullptr) {
         std::filesystem::remove_all(root);
