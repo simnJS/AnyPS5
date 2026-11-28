@@ -156,6 +156,9 @@ void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds, bool 
 	                    live_objects<vk::PipelineCache>.load(std::memory_order_relaxed),
 	                    live_objects<vk::DescriptorPool>.load(std::memory_order_relaxed),
 	                    live_objects<vk::CommandPool>.load(std::memory_order_relaxed), modules.count, modules.bytes);
+	line += fmt::format(" released_pipelines={},{},{},{}", released_pipelines.load(std::memory_order_relaxed),
+	                    released_reused.load(std::memory_order_relaxed), released_missed.load(std::memory_order_relaxed),
+	                    released_pressure.load(std::memory_order_relaxed));
 	line += fmt::format(" sample_us={}\n", std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
 	::Log::WriteToConsoleAndLog(line);
 }

@@ -808,6 +808,16 @@ private:
 	CacheMap<uint64_t, Pipeline>                                     m_async_ready_compute;
 #if defined(ANYPS5_KYTY)
 	std::unordered_set<uint64_t>                                               m_installed_compute_ready;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash>           m_released_graphics;
+	std::unordered_set<uint64_t>                                               m_released_compute;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash>           m_cached_ready_graphics;
+	std::unordered_set<uint64_t>                                               m_cached_ready_compute;
+	[[nodiscard]] bool StartupStages(std::span<const ShaderModule* const> stages) const;
+	[[nodiscard]] bool TakeReleasedGraphics(const GraphicsPipelineKey& key);
+	[[nodiscard]] bool TakeReleasedCompute(uint64_t module_id);
+	void               NoteReleasedReuse(bool reused, const char* kind, uint64_t key);
+	void               DestroyPreparedPipeline(Pipeline& pipeline) const;
+	size_t             ReleaseCachedReadyPipelines();
 #endif
 	std::unordered_set<uint64_t>                                               m_async_asked_compute;
 	std::mutex                                                       m_async_mutex;

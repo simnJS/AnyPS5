@@ -1396,7 +1396,8 @@ bool PipelineCache::ComputePipelineReady(const ShaderModule& module, bool ahead)
 	};
 	if (!ahead && ready(m_compute_pipelines)) return true;
 	std::lock_guard lock(m_async_mutex);
-	return (ahead && m_installed_compute_ready.contains(module.id)) || ready(m_async_ready_compute);
+	return (ahead && m_installed_compute_ready.contains(module.id)) || ready(m_async_ready_compute) ||
+	       m_released_compute.contains(module.id);
 }
 
 bool PipelineCache::CanCoverEmptyComputePipeline(const ShaderModule& empty, const ShaderModule& populated) {
@@ -4424,6 +4425,20 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		return &found->second;
 	}
 #if defined(ANYPS5_KYTY)
+	if (TakeReleasedGraphics(key)) {
+		Pipeline   created;
+		const bool reused = CreateGraphicsPipelineNow(created, key, stages, false);
+		NoteReleasedReuse(reused, "graphics", GraphicsPipelineKeyHash {}(key));
+		if (reused) {
+			created.stored           = true;
+			auto& ready              = m_graphics_pipelines.try_emplace(key, created).first->second;
+			m_last_graphics_key      = key;
+			m_last_graphics_pipeline = &ready;
+			NoteUse(ready, stages);
+			NoteFloatModes(ready, key, command.GetShaders());
+			return &ready;
+		}
+	}
 	const AsyncDraw held      = allow_async ? AsyncDraw::Eligible : HeldDraw(command, state, targets);
 	const bool      probe_now = Config::AsyncPipelinesProbe() &&
 	                       (allow_async || held == AsyncDraw::Occlusion || held == AsyncDraw::SmallTarget) &&
@@ -4832,6 +4847,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 	}
 	{
 		std::unique_lock lock(m_async_mutex);
+#if defined(ANYPS5_KYTY)
+		if (m_released_compute.contains(module.id)) {
+			lock.unlock();
+			return &GetComputePipeline(input_info);
+		}
+#endif
 		if (!m_async_ready_compute.contains(module.id)) {
 			if (m_async_pending_compute.contains(module.id)) {
 				return nullptr;
@@ -4912,6 +4933,19 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	}
 	auto& pipeline = m_compute_pipelines[module.id];
 #if defined(ANYPS5_KYTY)
+	if (TakeReleasedCompute(module.id)) {
+		const bool reused = FindComputePipeline(m_graphics, pipeline, module, m_driver_cache);
+		NoteReleasedReuse(reused, "compute", module.id);
+		if (reused) {
+			if (ShaderVariantLog()) {
+				PipelineCacheLog("[kyty-variant] ready-pipeline stage=CS module={:016x} from=cache", module.id);
+			}
+			pipeline.stored = true;
+			NoteInstalledComputeReady(module.id, pipeline);
+			NoteUse(pipeline, stages);
+			return pipeline;
+		}
+	}
 	if ((module.linked_prepared || CanUseComputeBinaries(m_graphics, module)) &&
 	    FindComputePipeline(m_graphics, pipeline, module, m_driver_cache)) {
 		NoteInstalledComputeReady(module.id, pipeline);
