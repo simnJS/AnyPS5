@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/guestHostView.h"
 #include "graphics/host_gpu/renderer/cache/guestMirror.h"
+#include "graphics/host_gpu/renderer/cache/readbackPublication.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
@@ -190,8 +191,8 @@ public:
 	[[nodiscard]] bool NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool NoGpuBytesNow(uint64_t vaddr, uint64_t size) const noexcept;
 	static void NoteReplayedRead();
-	static void AllowReplayAfterReadback() noexcept;
-	static bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end) noexcept;
+	static void AllowReplayAfterReadback(uint8_t load_size) noexcept;
+	static bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end, const uint8_t** copied) noexcept;
 	static void NoteReplayAfterReadback(bool replayed) noexcept;
 	void        WaitReadbackRelease();
 	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
@@ -366,6 +367,7 @@ private:
 	void CollectDownloadCopies(uint64_t vaddr, uint64_t size, std::vector<vk::BufferCopy>& copies,
 	                           uint64_t& total_size);
 	struct ReadbackQueueRead;
+	struct ReadbackTrace;
 	[[nodiscard]] bool StartReadbackQueueRead(uint64_t vaddr, uint64_t size, uint64_t pages_begin,
 	                                          uint64_t pages_end, ReadbackQueueRead& read, bool followers);
 	struct GuestReadPage {
@@ -377,10 +379,16 @@ private:
 	std::vector<GuestReadPage> m_guest_read_pages;
 	uint64_t                   m_guest_reads = 0;
 	void                       NoteGuestReadPages(uint64_t pages_begin, uint64_t pages_end);
-	void FinishReadbackQueueRead(ReadbackQueueRead& read);
+	void FinishReadbackQueueRead(ReadbackQueueRead& read, ReadbackTrace* trace, uint64_t fault, uint8_t load_size);
 	void WaitReadbackQueueCopies();
 	void DrainHostCopies();
 	void NoteWrite(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate) {
+		if (m_trace_writers && size != 0) {
+			auto& [shader, immediate] = *m_trace_writers;
+			const bool from_shader = writer == HeapWriteSource::Shader;
+			(from_shader ? immediate : shader).Subtract(vaddr, size);
+			(from_shader ? shader : immediate).Add(vaddr, size);
+		}
 		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);
 		NoteHeapTransfer(vaddr, size, writer);
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
@@ -417,6 +425,11 @@ private:
 	std::vector<uint32_t>                             m_residency_words;
 	Buffer                                            m_null_buffer;
 	RangeSet                                          m_gpu_modified_ranges;
+	struct TraceWriters {
+		RangeSet shader;
+		RangeSet immediate;
+	};
+	std::unique_ptr<TraceWriters>                     m_trace_writers;
 	struct DirtyPageMask {
 		uint64_t                 page = UINT64_MAX;
 		std::array<uint64_t, 64> bits {};
@@ -482,6 +495,7 @@ private:
 	ReadbackQueue m_readback;
 	struct ReadbackQueueSlot {
 		ReadbackQueue     queue;
+		ReadbackPublication publication;
 		std::atomic<bool> busy {false};
 	};
 	std::array<ReadbackQueueSlot, 4> m_readback_slots;
@@ -491,7 +505,7 @@ private:
 		uint64_t                           total_size     = 0;
 		uint64_t                           needed   = 0;
 		uint64_t                           recorded = 0;
-		std::shared_ptr<std::atomic<bool>> published;
+		ReadbackPublication::Ticket        publication;
 		struct Follower {
 			uint64_t                    page = 0;
 			std::vector<vk::BufferCopy> copies;

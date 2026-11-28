@@ -190,12 +190,12 @@ bool TextureGpuModified(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && g_gpu_resources->GetTextureCache().IsRegionGpuModified(vaddr, size);
 }
 
-void AllowReplayAfterReadback() {
-	Graphics::BufferCache::AllowReplayAfterReadback();
+void AllowReplayAfterReadback(uint8_t load_size) {
+	Graphics::BufferCache::AllowReplayAfterReadback(load_size);
 }
 
-bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end) {
-	return Graphics::BufferCache::TakeReplayAfterReadback(begin, end);
+bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end, const uint8_t** copied) {
+	return Graphics::BufferCache::TakeReplayAfterReadback(begin, end, copied);
 }
 
 void FinishReplayAfterReadback(bool replayed) {
