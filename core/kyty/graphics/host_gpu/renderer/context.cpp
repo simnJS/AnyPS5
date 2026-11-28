@@ -26,10 +26,6 @@ void CommandBuffer::InvalidateDynamicState() const {
 	m_scheduler.GetDynamicState().Invalidate();
 }
 
-CommandRecorder CommandBuffer::Handle() const {
-	return m_stream != nullptr ? CommandRecorder(m_stream) : CommandRecorder(m_buffer);
-}
-
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || m_pending_shader_writes || IsInvalid());
 	if (m_stream != nullptr) {

@@ -148,7 +148,9 @@ public:
 		return static_cast<bool>(m_pending_shader_writes);
 	}
 
-	[[nodiscard]] CommandRecorder Handle() const;
+	[[nodiscard]] CommandRecorder Handle() const {
+		return m_stream != nullptr ? CommandRecorder(m_stream) : CommandRecorder(m_buffer);
+	}
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] const HW::Context&    GetRegisters() const noexcept { return *m_registers; }
