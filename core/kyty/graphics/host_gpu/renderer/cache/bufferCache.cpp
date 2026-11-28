@@ -113,11 +113,14 @@ WriteBlockStats g_write_block_stats;
 struct ReadbackReplay {
 	bool     allowed   = false;
 	bool     published = false;
+	bool     copied    = false;
+	uint8_t  load_size = 0;
 	uint64_t begin     = 0;
 	uint64_t end       = 0;
 };
 
 thread_local ReadbackReplay g_readback_replay;
+alignas(8) thread_local std::array<uint8_t, 16> g_readback_load;
 thread_local uint64_t g_replay_trace_id = 0;
 
 int64_t SteadyNs() {
@@ -593,15 +596,16 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 	(command_processor ? stats.cp_ns : stats.other_ns).fetch_add(elapsed, std::memory_order_relaxed);
 }
 
-void BufferCache::AllowReplayAfterReadback() noexcept {
-	g_readback_replay = {.allowed = true};
+void BufferCache::AllowReplayAfterReadback(uint8_t load_size) noexcept {
+	g_readback_replay = {.allowed = true, .load_size = load_size};
 	g_replay_trace_id = 0;
 }
 
-bool BufferCache::TakeReplayAfterReadback(uint64_t* begin, uint64_t* end) noexcept {
+bool BufferCache::TakeReplayAfterReadback(uint64_t* begin, uint64_t* end, const uint8_t** copied) noexcept {
 	const auto replay = std::exchange(g_readback_replay, {});
 	*begin            = replay.begin;
 	*end              = replay.end;
+	*copied           = replay.copied ? g_readback_load.data() + replay.begin % 8 : nullptr;
 	return replay.published;
 }
 
@@ -774,6 +778,8 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			return;
 		}
 	}
+	const auto load_size = page_fault ? g_readback_replay.load_size : 0;
+	bool capture_load = false;
 	ReadbackPublication::Ticket cp_request;
 	auto&      split          = g_readback_stats;
 	const auto dispatch_start = SteadyNs();
@@ -831,6 +837,8 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			if (trace) trace->path = "copy_queue";
 			tick = queue_read.recorded;
 			if (page_fault && command_processor) cp_request = m_cp_publication.Begin(pages_begin);
+			capture_load = (load_size == 4 || load_size == 8) && load_size <= pages_end - vaddr &&
+			               !m_texture_cache.IsRegionGpuModified(vaddr, load_size);
 		} else if (DownloadMemory<true>(vaddr, read_size)) {
 			if (trace) trace->path = "main_queue";
 			const auto recorded = m_scheduler.CurrentTick();
@@ -862,7 +870,6 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		if (trace) trace->total = SteadyNs() - request_start;
 		return;
 	}
-	const bool replay_after = g_readback_replay.allowed && !is_write && !command_processor;
 	const auto release      = [&](Common::UniqueFunction<void>&& operation) {
 		const auto release_start = SteadyNs();
 		if (trace) {
@@ -873,6 +880,8 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 				trace->release_work = SteadyNs() - begin;
 			};
 		}
+		const bool replay_after = g_readback_replay.allowed && !is_write &&
+		                          (!command_processor || (capture_load && g_readback_replay.copied));
 		if (replay_after && gpu.PostReadbackCommand(std::move(operation))) {
 			if (trace) {
 				trace->async = true;
@@ -880,7 +889,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			}
 			g_readback_replay.published = true;
 			g_readback_replay.begin     = vaddr;
-			g_readback_replay.end       = vaddr + read_size;
+			g_readback_replay.end       = vaddr + (g_readback_replay.copied ? load_size : read_size);
 			split.released_async.fetch_add(1, std::memory_order_relaxed);
 		} else {
 			gpu.SendReadbackCommandSync(std::move(operation));
@@ -890,9 +899,9 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 	};
 	const auto wait_start = SteadyNs();
 	if (queue_read.slot != nullptr) {
-		FinishReadbackQueueRead(queue_read, trace.get());
+		FinishReadbackQueueRead(queue_read, trace.get(), vaddr, capture_load ? load_size : 0);
 		note_split(split.other_wait_ns, wait_start);
-		release([this, vaddr, size, pages_begin, pages_end, is_write, recorded = queue_read.recorded,
+		release([this, vaddr, size, pages_begin, pages_end, is_write, cp_request, recorded = queue_read.recorded,
 		         followers = std::move(queue_read.followers)] {
 			const auto own = std::find_if(m_inflight_readbacks.begin(), m_inflight_readbacks.end(),
 			                              [&](const InFlightReadback& readback) {
@@ -904,6 +913,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 				m_inflight_readbacks.erase(own);
 			}
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, 0, is_write);
+			if (cp_request) m_cp_publication.Finish(cp_request);
 			if (!followers.empty()) {
 				std::vector<uint64_t> pages;
 				pages.reserve(followers.size());
@@ -938,7 +948,6 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write);
 		});
 	}
-	if (cp_request) m_cp_publication.Finish(cp_request);
 	if (trace) trace->total = SteadyNs() - request_start;
 }
 
@@ -1145,7 +1154,7 @@ void BufferCache::ReadbackQueue::Finish(GraphicContext& graphics) {
 	}
 }
 
-void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read, ReadbackTrace* trace) {
+void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read, ReadbackTrace* trace, uint64_t fault, uint8_t load_size) {
 	int64_t start = 0;
 	if (trace) {
 		start = SteadyNs();
@@ -1170,7 +1179,13 @@ void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read, ReadbackTrace
 	queue.staging->Invalidate(0, read.total_size);
 	const auto* mapped = queue.staging->Mapped().data();
 	for (const auto& copy: read.copies) {
-		Libs::LibKernel::Memory::WriteBacking(m_storage->GuestAddress(copy.srcOffset), mapped + copy.dstOffset, copy.size);
+		const auto guest = m_storage->GuestAddress(copy.srcOffset);
+		const auto* data = mapped + copy.dstOffset;
+		Libs::LibKernel::Memory::WriteBacking(guest, data, copy.size);
+		if (load_size && guest <= fault && load_size <= copy.size && fault - guest <= copy.size - load_size) {
+			std::memcpy(g_readback_load.data() + fault % 8, data + (fault - guest), load_size);
+			g_readback_replay.copied = true;
+		}
 	}
 	for (const auto& follower: read.followers) {
 		for (const auto& copy: follower.copies) {

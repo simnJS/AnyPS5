@@ -67,6 +67,7 @@ struct Slot {
     std::uint64_t             rip      = 0;
     std::uint64_t             rsp      = 0;
     bool                      trap     = false;
+    bool                      restores = true;
 #ifndef _WIN32
     sigset_t                  mask {};
 #endif
@@ -385,11 +386,11 @@ inline void BlockAsynchronousSignals(sigset_t& mask) {
 }
 #endif
 
-inline bool Finish(Context& context) {
+inline bool Finish(Context& context, bool retired = true) {
     auto* slot = Find(CurrentThread());
     if (slot == nullptr) return false;
     auto* reg = Register(context, slot->reg);
-    if (*reg == slot->expected) *reg -= slot->delta;
+    if ((!retired || slot->restores) && *reg == slot->expected) *reg -= slot->delta;
     SetFlags(context, slot->trap ? (Flags(context) | TrapFlag) : (Flags(context) & ~TrapFlag));
 #ifndef _WIN32
     context.uc_sigmask = slot->mask;
@@ -398,31 +399,45 @@ inline bool Finish(Context& context) {
     return true;
 }
 
+inline std::uint8_t PlainLoadSize(const std::uint8_t* code) {
+    const bool rex = (code[0] & 0xf0u) == 0x40u;
+    if (code[rex ? 1 : 0] != 0x8b) return 0;
+    return rex && (code[0] & 8u) != 0 ? 8 : 4;
+}
+
 template <typename Replayable, typename Backing>
-bool Start(Context& context, std::uint64_t address, Replayable&& replayable, Backing&& backing) {
+bool Start(Context& context, std::uint64_t address, Replayable&& replayable, Backing&& backing, bool plain_load = false) {
     const auto rip = InstructionPointer(context);
     const auto rsp = StackPointer(context);
     if (auto* active = Find(CurrentThread()); active != nullptr) {
         if (active->rip != rip || active->rsp != rsp) return false;
-        (void)Finish(context);
+        (void)Finish(context, false);
         g_broken.store(true, std::memory_order_relaxed);
         return true;
     }
+    const auto* code = reinterpret_cast<const std::uint8_t*>(rip);
+    const auto span = plain_load ? PlainLoadSize(code) : Span;
     Operand operand;
-    if (!Decode(reinterpret_cast<const std::uint8_t*>(rip), operand)) return false;
+    if (span == 0 || !Decode(code, operand)) return false;
     const auto value = [&](int reg) { return *Register(context, reg); };
     const auto ea    = (operand.base >= 0 ? value(operand.base) : 0) + (operand.index >= 0 ? value(operand.index) << operand.scale : 0) +
                     static_cast<std::uint64_t>(operand.disp);
-    if (ea > address || address - ea >= Span) return false;
+    if (ea > address || address - ea >= span) return false;
     const int shifted = ShiftedRegister(operand);
-    if (shifted < 0 || !replayable(ea, Span)) return false;
-    const auto target = reinterpret_cast<std::uint64_t>(backing(ea, Span));
+    if (shifted < 0 || !replayable(ea, span)) return false;
+    const auto target = reinterpret_cast<std::uint64_t>(backing(ea, span));
     if (target == 0) return false;
     auto* slot = Claim(CurrentThread());
     if (slot == nullptr) return false;
     const auto delta = target - ea;
     auto*      reg   = Register(context, shifted);
     *reg += delta;
+    slot->restores = true;
+    if (plain_load) {
+        const bool rex = (code[0] & 0xf0u) == 0x40u;
+        const auto dest = ((code[rex ? 2 : 1] >> 3u) & 7u) | (rex && (code[0] & 4u) ? 8u : 0u);
+        slot->restores = static_cast<unsigned>(shifted) != dest;
+    }
     slot->reg      = shifted;
     slot->delta    = delta;
     slot->expected = *reg;

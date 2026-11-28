@@ -191,8 +191,8 @@ public:
 	[[nodiscard]] bool NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool NoGpuBytesNow(uint64_t vaddr, uint64_t size) const noexcept;
 	static void NoteReplayedRead();
-	static void AllowReplayAfterReadback() noexcept;
-	static bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end) noexcept;
+	static void AllowReplayAfterReadback(uint8_t load_size) noexcept;
+	static bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end, const uint8_t** copied) noexcept;
 	static void NoteReplayAfterReadback(bool replayed) noexcept;
 	void        WaitReadbackRelease();
 	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
@@ -379,7 +379,7 @@ private:
 	std::vector<GuestReadPage> m_guest_read_pages;
 	uint64_t                   m_guest_reads = 0;
 	void                       NoteGuestReadPages(uint64_t pages_begin, uint64_t pages_end);
-	void FinishReadbackQueueRead(ReadbackQueueRead& read, ReadbackTrace* trace);
+	void FinishReadbackQueueRead(ReadbackQueueRead& read, ReadbackTrace* trace, uint64_t fault, uint8_t load_size);
 	void WaitReadbackQueueCopies();
 	void DrainHostCopies();
 	void NoteWrite(uint64_t vaddr, uint64_t size, HeapWriteSource writer = HeapWriteSource::Immediate) {

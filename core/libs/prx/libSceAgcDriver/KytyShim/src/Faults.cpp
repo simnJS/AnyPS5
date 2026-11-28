@@ -78,13 +78,12 @@ bool ReplayReady() {
 #else
     const bool stepping = g_trap_installed;
 #endif
-    return stepping && !FaultReplay::g_broken.load(std::memory_order_relaxed) && !Libs::Graphics::GuestGpu::IsGpuThread() &&
-           !Libs::Graphics::GuestGpu::IsCommandProcessorThread();
+    return stepping && !FaultReplay::g_broken.load(std::memory_order_relaxed) && !Libs::Graphics::GuestGpu::IsGpuThread();
 }
 
 bool ReplayEnabled() {
     static const bool on = SwitchOn("KYTY_REPLAY_GPU_PAGE_READS");
-    return on && ReplayReady();
+    return on && ReplayReady() && !Libs::Graphics::GuestGpu::IsCommandProcessorThread();
 }
 
 bool TryReplayOnBacking(FaultContext& context, std::uint64_t address) {
@@ -106,7 +105,16 @@ void FinishReplayAfterReadback(FaultContext& context, std::uint64_t address) {
     namespace Memory = Libs::LibKernel::Memory;
     std::uint64_t begin = 0;
     std::uint64_t end   = 0;
-    if (!Memory::TakeReplayAfterReadback(&begin, &end)) return;
+    const std::uint8_t* copied = nullptr;
+    if (!Memory::TakeReplayAfterReadback(&begin, &end, &copied)) return;
+    if (copied != nullptr) {
+        const auto valid = [&](std::uint64_t ea, std::uint64_t bytes) {
+            return ea == begin && bytes == end - begin && !Memory::TextureGpuModified(ea, bytes);
+        };
+        const auto snapshot = [copied](std::uint64_t, std::uint64_t) { return copied; };
+        Memory::FinishReplayAfterReadback(FaultReplay::Start(context, address, valid, snapshot, true));
+        return;
+    }
     const auto replayable = [begin, end](std::uint64_t ea, std::uint64_t size) {
         return ea + size <= end && (ea >= begin || Memory::ReplayableGpuRead(ea, begin - ea)) && !Memory::TextureGpuModified(ea, size);
     };
@@ -156,8 +164,10 @@ bool ResolveFault(FaultContext& context, GpuAccess access, std::uint64_t address
     if (access == GpuAccess::Read && TryReplayOnBacking(context, address)) {
         return true;
     }
-    const bool after = access == GpuAccess::Read && ReplayAfterReadbackEnabled();
-    if (after) Memory::AllowReplayAfterReadback();
+    const bool ready = access == GpuAccess::Read && ReplayAfterReadbackEnabled();
+    const auto load_size = ready ? FaultReplay::PlainLoadSize(reinterpret_cast<const std::uint8_t*>(rip)) : 0;
+    const bool after = ready && (load_size != 0 || !Libs::Graphics::GuestGpu::IsCommandProcessorThread());
+    if (after) Memory::AllowReplayAfterReadback(load_size);
     if (Memory::HandleGpuFault(access, address)) {
         Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
         if (after) FinishReplayAfterReadback(context, address);
