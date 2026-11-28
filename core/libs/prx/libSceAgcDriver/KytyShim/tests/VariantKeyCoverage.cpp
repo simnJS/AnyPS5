@@ -627,6 +627,71 @@ void FallbackBufferForms() {
 	      "buffer forms: the format read at run time refuses a 16-bit buffer that ends inside a dword, at buffer slot 0");
 }
 
+std::array<uint32_t, TableEntries> Textures(uint32_t distinct) {
+	std::array<uint32_t, TableEntries> textures {};
+	for (uint32_t entry = 0; entry < TableEntries; ++entry) textures[entry] = TextureAddress(entry % distinct);
+	return textures;
+}
+
+void FallbackOnce() {
+	IR::SetComputeIndirectFloors(1u, 1u);
+	const auto plan    = BufferFormsPlan();
+	const auto even    = MakeSharp(SourceAddress, Records, 3, 2, Format16UInt);
+	const auto odd     = MakeSharp(SourceAddress, Records - 1u, 3, 2, Format16UInt);
+	const auto written = MakeSharp(TargetAddress, Records, 3, 4);
+	FillTable(Textures(TableEntries), {});
+	const auto recorded = Natural(plan, BufferDispatch(even, written));
+	Check(recorded.ok && recorded.specialization.images.size() == 8u,
+	      "fallback once: the recorded dispatch has six candidates in seven slots");
+	if (!recorded.ok) return;
+	const std::array<const IR::ResourceSpecialization*, 1> known {&recorded.specialization};
+
+	FillTable(Textures(2), {});
+	const BufferDispatch first(even, Sharp {});
+	const auto           narrow = Natural(plan, first);
+	const auto           alone  = Fallback(plan, first, {});
+	Check(narrow.ok && narrow.specialization.images.size() == 4u && alone.ok && alone.specialization.images.size() == 4u,
+	      "fallback once: without the recorded candidates, two candidates take three slots in the fallback");
+	FillTable(Textures(TableEntries), {});
+	Check(alone.ok && !Serves(plan, BufferDispatch(even, written), alone.specialization),
+	      "fallback once: that fallback refuses a dispatch with six candidates");
+
+	FillTable(Textures(2), {});
+	const auto built = Fallback(plan, first, known);
+	Check(built.ok && built.specialization.images.size() == recorded.specialization.images.size(),
+	      "fallback once: the fallback has the slots of the widest recorded candidate list");
+	if (!built.ok) return;
+
+	struct Step {
+		const char* name;
+		Sharp       read;
+		Sharp       write;
+		uint32_t    distinct;
+	};
+	const std::array steps {
+	    Step {"even 16-bit elements, written buffer unbound, two candidates", even, Sharp {}, 2u},
+	    Step {"odd 16-bit elements, written buffer bound, two candidates", odd, written, 2u},
+	    Step {"even 16-bit elements, written buffer bound, six candidates", even, written, TableEntries},
+	    Step {"odd 16-bit elements, written buffer unbound, four candidates", odd, Sharp {}, 4u},
+	    Step {"even 16-bit elements, written buffer bound, one candidate", even, written, 1u},
+	};
+	uint32_t built_count = 1;
+	uint32_t served      = 0;
+	for (const auto& step: steps) {
+		FillTable(Textures(step.distinct), {});
+		const BufferDispatch dispatch(step.read, step.write);
+		const auto           again = Fallback(plan, dispatch, known);
+		const bool           same  = again.ok && again.specialization == built.specialization;
+		built_count += same ? 0u : 1u;
+		Check(same, std::string("fallback once: ") + step.name + ": the fallback key is the one already built");
+		const bool bound = Serves(plan, dispatch, built.specialization);
+		served += bound ? 1u : 0u;
+		Check(bound, std::string("fallback once: ") + step.name + ": the dispatch binds the fallback already built");
+	}
+	Check(built_count == 1u && served == steps.size(), "fallback once: one construction serves the whole sequence");
+	std::printf("fallback once: %u construction(s), %u of %zu dispatches bound\n", built_count, served, steps.size());
+}
+
 }
 
 int main() {
@@ -732,6 +797,7 @@ int main() {
 	CandidateOrder(program);
 	MixedComputeTables(program);
 	FallbackBufferForms();
+	FallbackOnce();
 
 	std::printf("variant key coverage: %u of %zu requests are the prepared variant\n", covered, bound.size());
 	if (g_failures != 0) {

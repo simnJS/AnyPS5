@@ -53,10 +53,17 @@ struct RecordBlocks {
 thread_local std::vector<RecordBlocks> t_record_blocks;
 thread_local std::span<const ResourceSpecialization::Image> t_slot_views;
 thread_local bool t_fallback_forms = false;
+thread_local std::span<const uint32_t> t_fallback_slots;
 
 struct FallbackForms {
-	FallbackForms() { t_fallback_forms = true; }
-	~FallbackForms() { t_fallback_forms = false; }
+	explicit FallbackForms(std::span<const uint32_t> slots) {
+		t_fallback_forms = true;
+		t_fallback_slots = slots;
+	}
+	~FallbackForms() {
+		t_fallback_forms = false;
+		t_fallback_slots = {};
+	}
 	FallbackForms(const FallbackForms&)            = delete;
 	FallbackForms& operator=(const FallbackForms&) = delete;
 };
@@ -74,7 +81,9 @@ bool DenseRoot(const ResourceSpecialization::Image& image, uint32_t root) {
 
 uint32_t ForcedSlots(uint32_t root) {
 	const auto views = t_slot_views;
-	if (root >= views.size() || !DenseRoot(views[root], root)) return 0u;
+	if (root >= views.size() || !DenseRoot(views[root], root)) {
+		return t_fallback_forms && root < t_fallback_slots.size() ? t_fallback_slots[root] : 0u;
+	}
 	uint32_t slots = 0;
 	for (uint32_t index = 0; index < views.size(); ++index) slots += index != root && views[index].indirect_root == root;
 	return slots;
@@ -3576,12 +3585,33 @@ static void ChooseFallbackBuffer(const ResourcePlan& plan, const ResourceSnapsho
 }
 #endif
 
+static std::vector<uint32_t> RecordedCandidateSlots(const ResourcePlan& program,
+                                                    std::span<const ResourceSpecialization* const> known) {
+	const auto            roots = program.info.images.size();
+	std::vector<uint32_t> slots(roots, 0u);
+	for (const auto* other: known) {
+		if (other == nullptr || other->images.size() < roots) continue;
+		const auto children = std::span(other->images).subspan(roots);
+		for (uint32_t root = 0; root < roots; ++root) {
+			const auto& image = other->images[root];
+			if (image.indirect_root != root || image.heap || image.table_capacity != 0u) continue;
+			const auto count = std::ranges::count(children, root, &ResourceSpecialization::Image::indirect_root);
+			slots[root] = std::max(slots[root], static_cast<uint32_t>(count));
+		}
+	}
+	for (auto& count: slots) {
+		if (count != 0u) count = static_cast<uint32_t>(std::bit_ceil(uint64_t {count} + 1u) - 1u);
+	}
+	return slots;
+}
+
 bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime& runtime,
                                   ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                                   std::span<const ResourceSpecialization* const> known) {
 	const bool buffer_failure  = t_indirect_buffer_failure;
 	const bool sampler_failure = t_indirect_sampler_failure;
-	const FallbackForms fallback;
+	const auto          slots = RecordedCandidateSlots(program, known);
+	const FallbackForms fallback(slots);
 	auto fallback_runtime = runtime;
 	fallback_runtime.runtime_stride = true;
 	const bool ok = MaterializeResourcesForViews(program, fallback_runtime, snapshot, specialization, {});
