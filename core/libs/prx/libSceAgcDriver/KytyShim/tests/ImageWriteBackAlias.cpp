@@ -942,6 +942,22 @@ const char* CheckLayerTransfers(GraphicContext& graphics, uint64_t address) {
 	for (uint32_t i = 0; i < Width * Layers; ++i) {
 		if (pixels[i] != expected[i / Width]) return "layer transfer changed the wrong texels";
 	}
+	if (graphics.unified_image_layouts_enabled) {
+		constexpr auto layout = vk::ImageLayout::eGeneral;
+		constexpr auto shader_read = vk::AccessFlagBits2::eShaderRead;
+		constexpr auto compute = vk::PipelineStageFlagBits2::eComputeShader;
+		constexpr auto transfer = vk::PipelineStageFlagBits2::eTransfer;
+		const auto sample = to.GetBarriers(layout, shader_read, compute, ImageSubresourceRange {0, 1, 1, 1});
+		const auto copy = to.GetBarriers(layout, vk::AccessFlagBits2::eTransferRead, transfer, {});
+		if (!sample.empty() || !copy.empty()) return "compatible image readers produced a barrier";
+		const auto write = to.GetBarriers(layout, vk::AccessFlagBits2::eTransferWrite, transfer, {});
+		if (write.size() != 1 || write[0].oldLayout != layout || write[0].newLayout != layout ||
+		    (write[0].srcStageMask & (compute | transfer)) != (compute | transfer) ||
+		    (write[0].srcAccessMask & (shader_read | vk::AccessFlagBits2::eTransferRead)) !=
+		        (shader_read | vk::AccessFlagBits2::eTransferRead)) {
+			return "the next writer did not wait for readers of every layer";
+		}
+	}
 	return nullptr;
 }
 

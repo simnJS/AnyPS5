@@ -48,6 +48,7 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               present_fences_enabled                = false;
+	bool                               unified_image_layouts_enabled          = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               shader_resource_min_lod_enabled       = false;
 	bool                               robust_buffer_access_enabled          = false;

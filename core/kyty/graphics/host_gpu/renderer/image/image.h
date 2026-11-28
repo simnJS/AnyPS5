@@ -54,7 +54,8 @@ struct ImageUsage {
 };
 
 struct ImageBinding {
-	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
+	vk::ImageLayout  attachment_layout      = vk::ImageLayout::eUndefined;
+	vk::ImageLayout  attachment_host_layout = vk::ImageLayout::eUndefined;
 	vk::AccessFlags2 attachment_access;
 	bool             is_bound      = false;
 	bool             is_target     = false;
@@ -207,8 +208,17 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
+	[[nodiscard]] vk::ImageLayout PreferredLayout(vk::ImageLayout optimal) const noexcept {
+		return m_graphics.unified_image_layouts_enabled ? vk::ImageLayout::eGeneral : optimal;
+	}
+	[[nodiscard]] vk::ImageLayout TransferSrcLayout() const noexcept {
+		return PreferredLayout(vk::ImageLayout::eTransferSrcOptimal);
+	}
+	[[nodiscard]] vk::ImageLayout TransferDstLayout() const noexcept {
+		return PreferredLayout(vk::ImageLayout::eTransferDstOptimal);
+	}
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
-		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eGeneral;
+		return info.IsDepth() ? PreferredLayout(vk::ImageLayout::eDepthStencilReadOnlyOptimal) : vk::ImageLayout::eGeneral;
 	}
 	[[nodiscard]] bool Settled(vk::ImageLayout layout, vk::AccessFlags2 access) const noexcept {
 		return backing.subresource_states.empty() && backing.state.layout == layout &&

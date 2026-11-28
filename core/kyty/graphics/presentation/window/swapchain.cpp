@@ -218,10 +218,10 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source, co
 	auto command = command_buffer.Handle();
 	const ImageSubresourceRange range {copy.srcSubresource.mipLevel, 1,
 	                                   copy.srcSubresource.baseArrayLayer, 1};
-	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range,
+	source.Transit(source.TransferSrcLayout(), vk::AccessFlagBits2::eTransferRead, range,
 	               command);
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+	command.copyImage(source.backing.image, source.TransferSrcLayout(), image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 }
 

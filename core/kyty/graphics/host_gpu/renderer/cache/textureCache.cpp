@@ -663,8 +663,8 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 		}
 	}
 	if (!copies.empty()) {
-		command.copyImage(depth.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-		                  copy.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		command.copyImage(depth.backing.image, depth.TransferSrcLayout(),
+		                  copy.backing.image, copy.TransferDstLayout(),
 		                  static_cast<uint32_t>(copies.size()), copies.data());
 	}
 	return entry->second;
@@ -3154,7 +3154,7 @@ void TextureCache::ClearImageLayers(CommandBuffer& command, ImageId id, vk::Form
 		for (const auto& run: runs) {
 			const ImageSubresourceRange cleared {range.baseMipLevel, range.levelCount, run.first, run.count};
 			const auto run_barriers =
-			    image.GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+			    image.GetBarriers(image.TransferDstLayout(), vk::AccessFlagBits2::eTransferWrite,
 			                      vk::PipelineStageFlagBits2::eTransfer, cleared);
 			barriers.insert(barriers.end(), run_barriers.begin(), run_barriers.end());
 			if (image.info.IsVolume()) {
@@ -3171,10 +3171,10 @@ void TextureCache::ClearImageLayers(CommandBuffer& command, ImageId id, vk::Form
 			native_range.baseArrayLayer = image.info.IsVolume() ? 0 : run.first;
 			native_range.layerCount = image.info.IsVolume() ? 1 : run.count;
 			if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-				command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+				command.Handle().clearColorImage(image.backing.image, image.TransferDstLayout(),
 				                                 &run.clear.color, 1, &native_range);
 			} else {
-				command.Handle().clearDepthStencilImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+				command.Handle().clearDepthStencilImage(image.backing.image, image.TransferDstLayout(),
 				                                        &run.clear.depthStencil, 1, &native_range);
 			}
 		}
@@ -3193,13 +3193,13 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 	view.base_layer  = layer;
 	view.layer_count = layers;
 	view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	image.Transit(image.PreferredLayout(vk::ImageLayout::eColorAttachmentOptimal),
 	              vk::AccessFlagBits2::eColorAttachmentRead |
 	                  vk::AccessFlagBits2::eColorAttachmentWrite,
 	              {}, command);
 	vk::RenderingAttachmentInfo attachment {};
 	attachment.imageView   = image.FindView(view);
-	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.imageLayout = image.PreferredLayout(vk::ImageLayout::eColorAttachmentOptimal);
 	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
 	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
 	if (clear != nullptr) {

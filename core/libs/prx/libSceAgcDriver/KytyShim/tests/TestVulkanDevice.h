@@ -101,6 +101,11 @@ private:
 		vk::PhysicalDeviceVulkan12Features supported12 {.pNext = &supported_robustness};
 		vk::PhysicalDeviceVulkan11Features supported11 {.pNext = &supported12};
 		vk::PhysicalDeviceVulkan13Features supported13 {.pNext = &supported11};
+		vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR layouts {};
+		if (has_extension(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
+			layouts.pNext = supported_robustness.pNext;
+			supported_robustness.pNext = &layouts;
+		}
 		vk::PhysicalDeviceFeatures2 supported {.pNext = &supported13};
 		physical.getFeatures2(&supported);
 		if (sparse && (!supported.features.sparseBinding || !supported.features.sparseResidencyBuffer)) {
@@ -188,6 +193,12 @@ private:
 			structures = vk::PhysicalDeviceAccelerationStructureFeaturesKHR {.accelerationStructure = VK_TRUE};
 			robustness.pNext = &structures;
 		}
+		if (layouts.unifiedImageLayouts) {
+			enabled_extensions.push_back(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
+			layouts.unifiedImageLayoutsVideo = VK_FALSE;
+			layouts.pNext = robustness.pNext;
+			robustness.pNext = &layouts;
+		}
 		if (host_memory) enabled_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 		const vk::DeviceCreateInfo device_info {
 		    .pNext = &features13, .queueCreateInfoCount = queue_count, .pQueueCreateInfos = queue_infos.data(),
@@ -200,6 +211,7 @@ private:
 		VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
 		graphics.physical_device = physical;
 		graphics.memory_budget_ext_enabled = budget;
+		graphics.unified_image_layouts_enabled = layouts.unifiedImageLayouts;
 		graphics.physical_device_properties = properties.properties;
 		graphics.subgroup_supported_stages = properties11.subgroupSupportedStages;
 		graphics.subgroup_supported_operations = properties11.subgroupSupportedOperations;
