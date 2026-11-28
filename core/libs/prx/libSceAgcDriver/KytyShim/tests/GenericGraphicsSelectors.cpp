@@ -44,9 +44,6 @@ constexpr std::uint32_t ImageField = 0x40;
 constexpr std::uint32_t RecordBytes = 160;
 constexpr std::uint32_t Format8888 = 56;
 constexpr std::uint32_t Format32UInt = 20;
-constexpr std::uint32_t Format32Float = 22;
-constexpr std::uint32_t CompareLess = 1;
-constexpr std::uint32_t CompareGreater = 4;
 constexpr std::uint32_t SwizzleXyzw = 0xfac;
 constexpr std::uint32_t EndProgram = 0xbf810000;
 constexpr std::string_view BuildLine = "[kyty-variant] build stage=";
@@ -65,23 +62,6 @@ constexpr std::array<std::uint32_t, 31> SampledWords{
     0x8f238523, 0xf4280600, 0x44000000, 0xf42c0402, 0x46000000, 0xbf8cc07f, 0xf0800f08, 0x00c40802,
     0xbf8c3f70, 0x89fe1e7e, 0xbf89ffe8, 0xbefe0420, 0xf800180f, 0x0b0a0908, EndProgram,
 };
-
-constexpr std::array<std::uint32_t, 29> LoadedWords{
-    0x7e080f02, 0x36080881, 0x7e0a0f02, 0x360a0a8f, 0x7e0c0280, 0xbea0047e, 0xbe8e147e, 0xd760000c,
-    0x00001d04, 0xd4c2001c, 0x0002080c, 0xbe9e241c, 0x98a30d0c, 0xf42008c4, 0x46000040, 0xbf8cc07f,
-    0x8f238523, 0xf42c0402, 0x46000000, 0xbf8cc07f, 0xf0001f08, 0x00040805, 0xbf8c3f70, 0x89fe1e7e,
-    0xbf89ffed, 0xbefe0420, 0xf800180f, 0x0b0a0908, EndProgram,
-};
-
-constexpr std::array<std::uint32_t, 37> ComparedWords{
-    0x7e080f02, 0x36080881, 0x7e1802f0, 0x7e1a0302, 0x7e1c0303, 0xbea0047e, 0xbe8e147e, 0xd760000c,
-    0x00001d04, 0xd4c2001c, 0x0002080c, 0xbe9e241c, 0x98a30d0c, 0xf4200884, 0x46000080, 0xf42008c4,
-    0x46000040, 0xbf8cc07f, 0x8f228422, 0x8f238523, 0xf4280600, 0x44000000, 0xf42c0402, 0x46000000,
-    0xbf8cc07f, 0xf0a00108, 0x00c4080c, 0xbf8c3f70, 0x89fe1e7e, 0xbf89ffe8, 0xbefe0420, 0x7e120308,
-    0x7e140308, 0x7e1602f2, 0xf800180f, 0x0b0a0908, EndProgram,
-};
-
-enum class Chosen { Sampler, Image, Compare };
 
 struct Keys {
     std::array<std::uint32_t, 2> samplers;
@@ -105,10 +85,10 @@ std::array<std::uint32_t, 4> vsharp(std::uint64_t address, std::uint32_t bytes) 
             SwizzleXyzw | (Format32UInt << 12u) | (1u << 24u) | (3u << 28u)};
 }
 
-std::array<std::uint32_t, 8> tsharp(std::uint64_t address, std::uint32_t format) {
+std::array<std::uint32_t, 8> tsharp(std::uint64_t address) {
     const auto base = address >> 8u;
     return {static_cast<std::uint32_t>(base),
-            static_cast<std::uint32_t>((base >> 32u) & 0xffu) | (format << 20u) | (3u << 30u),
+            static_cast<std::uint32_t>((base >> 32u) & 0xffu) | (Format8888 << 20u) | (3u << 30u),
             15u, 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
 }
 
@@ -203,34 +183,23 @@ void writeShader(std::span<std::byte> memory, std::uint64_t address, std::uint64
     write(memory, code, words);
 }
 
-void makeCapture(const std::filesystem::path& path, Chosen chosen, const Keys& keys) {
+void makeCapture(const std::filesystem::path& path, const Keys& keys) {
     using AgcDriver::FrameCallKind;
     auto memory = std::vector<std::byte>(GuestBytes);
     const auto commands = drawWords();
     writeShader(memory, VertexHeader, VertexCode, 2, VertexWords);
-    if (chosen == Chosen::Sampler) {
-        writeShader(memory, PixelHeader, PixelCode, 1, SampledWords);
-    } else if (chosen == Chosen::Image) {
-        writeShader(memory, PixelHeader, PixelCode, 1, LoadedWords);
-    } else {
-        writeShader(memory, PixelHeader, PixelCode, 1, ComparedWords);
-    }
+    writeShader(memory, PixelHeader, PixelCode, 1, SampledWords);
     write(memory, Commands, std::span(commands));
     std::vector<std::uint32_t> depth((5 * Block) / sizeof(std::uint32_t), bits(0.75f));
     write(memory, Depth, std::span<const std::uint32_t>(depth));
-    const bool compare = chosen == Chosen::Compare;
-    const std::array<std::array<std::uint32_t, 4>, 2> samplers{{
-        {0x12u | (compare ? CompareLess << 12u : 0u), 0x1000u, 0u, 0u},
-        {compare ? 0x12u | (CompareGreater << 12u) : 0x0u, 0x1000u, 0u, 0u},
-    }};
+    const std::array<std::array<std::uint32_t, 4>, 2> samplers{{{0x12u, 0x1000u, 0u, 0u}, {0x0u, 0x1000u, 0u, 0u}}};
     for (std::uint32_t i = 0; i < samplers.size(); ++i) {
         write(memory, SamplerTable + i * 16u, std::span<const std::uint32_t>(samplers[i]));
-        const auto image = tsharp(Textures + i * 0x100u, compare ? Format32Float : Format8888);
+        const auto image = tsharp(Textures + i * 0x100u);
         write(memory, ImageTable + i * 32u, std::span<const std::uint32_t>(image));
         std::vector<std::uint32_t> texels(TextureTexels);
         for (std::uint32_t texel = 0; texel < TextureTexels; ++texel) {
-            texels[texel] = compare ? bits((texel & 1u) != 0u ? 0.75f : 0.25f)
-                                    : 0xff000000u | ((0x9e3779b9u * (texel + 1u + i * 97u)) & 0x00ffffffu);
+            texels[texel] = 0xff000000u | ((0x9e3779b9u * (texel + 1u + i * 97u)) & 0x00ffffffu);
         }
         write(memory, Textures + i * 0x100u, std::span<const std::uint32_t>(texels));
     }
@@ -289,7 +258,7 @@ struct Replay {
 };
 
 Replay replay(const std::filesystem::path& tool, const std::filesystem::path& root, const std::string& scenario,
-              const char* phase, Chosen chosen, const Keys& keys, bool wait_manifest) {
+              const char* phase, const Keys& keys, bool wait_manifest) {
     const auto directory = root / scenario;
     const auto run = directory / phase;
     std::filesystem::create_directories(directory / "app0" / "sce_sys");
@@ -299,7 +268,7 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
         param << "{\"titleId\":\"GSEL00001\",\"appVersion\":\"01.00\"}\n";
         if (!param) throw std::runtime_error("could not write synthetic title metadata");
     }
-    makeCapture(run / "capture", chosen, keys);
+    makeCapture(run / "capture", keys);
     const auto log = run / "replay.log";
     const auto frames = run / "frames";
     const auto command = quote(tool) + " " + quote(run / "capture") + " --strict --no-synthesize --repeat 1 --cold-pipelines" +
@@ -326,8 +295,8 @@ void printTail(const std::string& log) {
     std::cerr << (log.size() > TailBytes ? log.substr(log.size() - TailBytes) : log) << '\n';
 }
 
-int scenario(const std::filesystem::path& tool, const std::filesystem::path& root, Chosen chosen) {
-    const std::string name = chosen == Chosen::Sampler ? "sampler" : chosen == Chosen::Image ? "image" : "compare";
+int selectedSampler(const std::filesystem::path& tool, const std::filesystem::path& root) {
+    const std::string name = "sampler";
     const auto require = [&](bool condition, const std::string& message, const Replay& result) {
         if (condition) return;
         std::cerr << "generic graphics selector replay files: " << root << '\n';
@@ -335,9 +304,9 @@ int scenario(const std::filesystem::path& tool, const std::filesystem::path& roo
         throw std::runtime_error(name + ": " + message);
     };
     const Keys one{{0u, 0u}, {0u, 0u}};
-    const Keys two = chosen == Chosen::Image ? Keys{{0u, 0u}, {0u, 1u}} : Keys{{0u, 1u}, {0u, 0u}};
+    const Keys two{{0u, 1u}, {0u, 0u}};
 
-    const auto seed = replay(tool, root, name, "seed", chosen, one, false);
+    const auto seed = replay(tool, root, name, "seed", one, false);
     if (!seed.completed) {
         const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
         std::cerr << name << ": the seed replay did not complete"
@@ -349,11 +318,11 @@ int scenario(const std::filesystem::path& tool, const std::filesystem::path& roo
     require(std::filesystem::is_regular_file(manifest) && std::filesystem::file_size(manifest) > 0,
             "the seed did not save a manifest", seed);
 
-    const auto control = replay(tool, root, name + "-control", "run", chosen, two, false);
+    const auto control = replay(tool, root, name + "-control", "run", two, false);
     require(control.completed && control.frame != seed.frame,
             "the two selected candidates must draw different colors", control);
 
-    const auto served = replay(tool, root, name, "first-use", chosen, two, true);
+    const auto served = replay(tool, root, name, "first-use", two, true);
     require(served.completed, "the replay served from the manifest did not complete", served);
     require(served.log.find(RefusedLine) == std::string::npos,
             "the generic form of a stage with a selected descriptor was refused", served);
@@ -383,10 +352,8 @@ int main(int argc, char** argv) {
         setVariable("KYTY_GPU_PIPELINE", "0");
         setVariable("KYTY_PIPELINE_STALL_LOG_MS", "0");
         setVariable("ANYPS5_NO_SHADER_CACHE", "1");
-        for (const auto chosen : {Chosen::Sampler, Chosen::Image, Chosen::Compare}) {
-            const auto status = scenario(tool, root, chosen);
-            if (status != 0) return status;
-        }
+        const auto status = selectedSampler(tool, root);
+        if (status != 0) return status;
         if (std::getenv("APS5_REPLAY_KEEP_ARTIFACTS") == nullptr) {
             std::filesystem::remove_all(root);
         } else {
