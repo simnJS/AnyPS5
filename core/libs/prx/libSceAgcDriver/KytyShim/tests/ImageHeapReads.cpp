@@ -934,8 +934,8 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	const uint64_t wanted   = two_cold - std::min(charges[ColdFirst], charges[ColdSecond]) / 2u;
 	const uint64_t unit     = wanted / 5u;
 	const uint64_t budget   = unit * 100u;
-	const uint64_t usage    = unit * 80u + wanted;
-	Check(usage >= GraphicContext::BudgetShare(budget, GraphicContext::CrowdedPercent), "the test usage is past the crowded mark");
+	const uint64_t usage    = GraphicContext::HeapImageThreshold(budget, true) + wanted;
+	Check(usage >= GraphicContext::HeapImageThreshold(budget), "the test usage is past the crowded mark");
 	heap.BeginDraw();
 	Check(heap.Acquire(request, view), "the table is drawn again before the crowded check");
 	heap.Rebind(executor);
@@ -944,7 +944,7 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	Access::Pressure(graphics, budget, usage);
 	Check(graphics.LocalMemoryCrowded(), "the context reports crowded device-local memory");
 	Access::Collect(heap, at(4800));
-	Check(Access::Crowded(heap), "the heap enters the crowded state at 85 % of the budget");
+	Check(Access::Crowded(heap), "the heap enters the crowded state at the high watermark");
 	Check(Access::Parking(heap) == 2u, "the crowded heap parks the two least read textures and no more than the bytes it needs");
 	const auto pending = Access::PendingProbes(heap);
 	std::string probes = Access::Views(heap, slots[ColdFirst]) + ";";
@@ -1030,6 +1030,10 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	heap_info.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
 	heap_info.sharingMode   = vk::SharingMode::eExclusive;
 	heap_info.initialLayout = vk::ImageLayout::eUndefined;
+	Check(GraphicContext::HeapImageThreshold(100ull << 30u) == (83ull << 30u), "large heaps reserve at most two extra GiB");
+	Access::Pressure(graphics, 100ull << 20u, 69ull << 20u);
+	Check(!graphics.LocalMemoryCrowded(), "heap allocation still prefers local memory at 69 percent");
+	Access::Pressure(graphics, 100ull << 20u, 70ull << 20u);
 	VulkanImage crowded_image {};
 	Check(graphics.CreateImage(heap_info, crowded_image, true) && crowded_image.spilled == Access::CanSpill(graphics) &&
 	          crowded_image.charge.local != Access::CanSpill(graphics),
@@ -1038,9 +1042,9 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	Run(heap, scheduler, kernel, kernel.marked, back, back, 1, 1);
 	Wait(scheduler);
 	Check(SameTexel(Lanes0(kernel)[3], texels[ColdFirst][3]), "the shader reads the texture again through its new slot");
-	Access::Pressure(graphics, budget, unit * 79u);
+	Access::Pressure(graphics, budget, GraphicContext::HeapImageThreshold(budget, true) - 1u);
 	Access::Collect(heap, at(6100));
-	Check(!Access::Crowded(heap) && !graphics.LocalMemoryCrowded(), "the crowded state ends below 80 % of the budget");
+	Check(!Access::Crowded(heap) && !graphics.LocalMemoryCrowded(), "the crowded state ends below the low watermark");
 	graphics.TrimRecycledImages();
 	VulkanImage relaxed_image {};
 	Check(graphics.CreateImage(heap_info, relaxed_image, true) && !relaxed_image.spilled && relaxed_image.charge.local,
@@ -1140,8 +1144,8 @@ void MeasureCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) 
 	const auto before = real();
 	for (uint32_t texture = 0; texture < Hot; ++texture) Access::MarkRead(heap, slots[texture]);
 	const uint64_t budget = live * 10u;
-	const uint64_t usage  = GraphicContext::BudgetShare(budget, GraphicContext::CrowdedPercent);
-	const uint64_t wanted = usage - GraphicContext::BudgetShare(budget, GraphicContext::CrowdedStopPercent);
+	const uint64_t usage  = GraphicContext::HeapImageThreshold(budget);
+	const uint64_t wanted = usage - GraphicContext::HeapImageThreshold(budget, true);
 	Access::Pressure(graphics, budget, usage);
 	const auto check_start = Clock::now();
 	Access::Collect(heap, at(4800));
