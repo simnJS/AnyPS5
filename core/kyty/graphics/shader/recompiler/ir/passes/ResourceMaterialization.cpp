@@ -50,9 +50,25 @@ struct RecordBlocks {
 	std::vector<uint32_t> blocks;
 };
 thread_local std::vector<RecordBlocks> t_record_blocks;
+thread_local std::span<const ResourceSpecialization::Image> t_slot_views;
+
+struct SlotViews {
+	explicit SlotViews(std::span<const ResourceSpecialization::Image> views) { t_slot_views = views; }
+	~SlotViews() { t_slot_views = {}; }
+	SlotViews(const SlotViews&)            = delete;
+	SlotViews& operator=(const SlotViews&) = delete;
+};
 
 bool DenseRoot(const ResourceSpecialization::Image& image, uint32_t root) {
 	return image.indirect_root == root && !image.heap && image.table_capacity == 0u && image.indirect_search_iterations == 0u;
+}
+
+uint32_t ForcedSlots(uint32_t root) {
+	const auto views = t_slot_views;
+	if (root >= views.size() || !DenseRoot(views[root], root)) return 0u;
+	uint32_t slots = 0;
+	for (uint32_t index = 0; index < views.size(); ++index) slots += index != root && views[index].indirect_root == root;
+	return slots;
 }
 
 void FlushRecordBlocks(std::vector<uint32_t>& flattened_srt) {
@@ -975,6 +991,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				return failed("indexed pointer geometry", fmt::format("rows={}", domain));
 			const bool affine = indirect.table_stride != 0u || indexed_pointer;
 			const bool image_heap = dword_count == 8u && pointer == nullptr;
+			uint32_t   forced_slots = 0;
+			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+				forced_slots = ForcedSlots(resource_index);
+			}
 			const uint64_t step = indexed_pointer ? table.Stride()
 			    : indirect.table_maximum ? indirect.table_stride
 			    : affine ? std::max(uint64_t {1} << std::countr_zero(indirect.table_stride), uint64_t {4})
@@ -991,7 +1011,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 				const auto& image = program.info.images[resource_index];
 				ImageHeapView view;
-				if (image_heap && runtime.image_heap != nullptr &&
+				if (image_heap && forced_slots == 0u && runtime.image_heap != nullptr &&
 				    image.resource_class == ImageResourceClass::Sampled &&
 				    image.mip_mode != ImageMipMode::Dynamic &&
 				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
@@ -1015,7 +1035,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 #if defined(ANYPS5_KYTY)
 			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 				const auto& image = program.info.images[resource_index];
-				if (pointer != nullptr && dword_count == 8u && runtime.image_heap != nullptr && child_count != 0u &&
+				if (pointer != nullptr && forced_slots == 0u && dword_count == 8u && runtime.image_heap != nullptr && child_count != 0u &&
 				    image.resource_class == ImageResourceClass::Sampled && image.mip_mode != ImageMipMode::Dynamic &&
 				    count * child_count <= MaxIndirectDescriptorProbes) {
 					std::vector<DescriptorValue> values(count * child_count, DescriptorValue {.dword_count = dword_count});
@@ -1120,8 +1140,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				if (g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
 					const auto children = descriptors.size() - children_begin;
 					const auto total    = std::max<size_t>(
-					    program.stage == ShaderType::Compute ? g_compute_indirect_images.load(std::memory_order_relaxed) : 1u,
-					    std::bit_ceil(children + 1u));
+					    {program.stage == ShaderType::Compute ? g_compute_indirect_images.load(std::memory_order_relaxed) : 1u,
+					     std::bit_ceil(children + 1u), forced_slots >= children ? size_t {forced_slots} + 1u : size_t {0}});
 					for (auto padded = children; padded + 1u < total; ++padded) {
 						descriptors.push_back(descriptors.back());
 						specializations.push_back(specializations.back());
@@ -2903,6 +2923,7 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 	t_indirect_buffer_failure = false;
 	t_indirect_sampler_failure = false;
 	t_record_blocks.clear();
+	const SlotViews slot_views(program.stage == ShaderType::Compute ? views : std::span<const ResourceSpecialization::Image> {});
 	for (auto& keys: PlanScratch(program).selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) {
 		const auto indirect = std::ranges::count_if(program.descriptor_sources, [](const DescriptorSource& source) {
@@ -4234,14 +4255,30 @@ bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecializ
 	for (uint32_t index = 0; index < roots; ++index) {
 		const auto& live = specialization.images[index];
 		const auto& served = target.images[index];
-		if (ImageViewForm(live) != ImageViewForm(served)) return RefuseServe(ServeRefusal::Step::ImageView, index);
 		const auto from = Addressing(live);
 		const auto to = Addressing(served);
+		const bool to_slots = from == ImageAddressing::Heap && DenseRoot(served, index);
+		if (!to_slots && ImageViewForm(live) != ImageViewForm(served)) return RefuseServe(ServeRefusal::Step::ImageView, index);
 		if (from == to) continue;
+		const auto* source = Source(program, program.info.images[index].source);
+		if (to_slots) {
+			if (source == nullptr || !source->indirect_descriptor || source->indirect_descriptor->table_array) {
+				return RefuseServe(ServeRefusal::Step::ImageAddressing, index);
+			}
+			const auto holds = [&](const ResourceSpecialization::Image& kind) {
+				return std::ranges::any_of(std::span(target.images).subspan(roots), [&](const auto& slot) {
+					return slot.indirect_root == index && ImageViewForm(slot) == ImageViewForm(kind);
+				});
+			};
+			for (const auto& kind: std::span(specialization.images).subspan(roots)) {
+				if (kind.indirect_root == index && !holds(kind)) return RefuseServe(ServeRefusal::Step::HeapKinds, index);
+			}
+			changes_addressing = true;
+			continue;
+		}
 		const bool to_table = to == ImageAddressing::Table && from == ImageAddressing::Heap;
 		const bool to_heap = from == ImageAddressing::Table && to == ImageAddressing::Heap;
 		if (!to_table && !to_heap) return RefuseServe(ServeRefusal::Step::ImageAddressing, index);
-		const auto* source = Source(program, program.info.images[index].source);
 		if (source == nullptr || !source->indirect_descriptor || !source->indirect_descriptor->table_array ||
 		    program.info.images[index].resource_class != ImageResourceClass::Sampled ||
 		    program.info.images[index].mip_mode == ImageMipMode::Dynamic ||

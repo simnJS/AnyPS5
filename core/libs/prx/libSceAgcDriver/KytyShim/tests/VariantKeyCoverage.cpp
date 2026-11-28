@@ -202,6 +202,17 @@ IR::DescriptorValue TextureAt(uint32_t address, bool integer) {
 	return value;
 }
 
+struct TableHeap final: IR::ImageHeapSource {
+	std::vector<IR::DescriptorValue> kinds;
+
+	bool Acquire(const IR::ImageHeapRequest&, IR::ImageHeapView& view) override {
+		view.slots      = 0x300000000ull;
+		view.slot_count = TableEntries;
+		view.kinds      = kinds;
+		return !kinds.empty();
+	}
+};
+
 void FillTable(const std::array<uint32_t, TableEntries>& textures, const std::array<bool, TableEntries>& integer) {
 	for (uint32_t entry = 0; entry < TableEntries; ++entry) {
 		const auto value = TextureAt(textures[entry], integer[entry]);
@@ -209,11 +220,11 @@ void FillTable(const std::array<uint32_t, TableEntries>& textures, const std::ar
 	}
 }
 
-Candidates Choose(const IR::ResourcePlan& plan, const std::array<bool, TableEntries>& integer) {
+Candidates Choose(const IR::ResourcePlan& plan, const std::array<bool, TableEntries>& integer, TableHeap* heap = nullptr) {
 	std::array<uint32_t, TableEntries> textures {};
 	for (uint32_t entry = 0; entry < TableEntries; ++entry) textures[entry] = TextureAddress(entry);
 	FillTable(textures, integer);
-	const IR::SrtRuntime runtime {.read_specialization_memory = ReadTable};
+	const IR::SrtRuntime runtime {.read_specialization_memory = ReadTable, .image_heap = heap};
 	Candidates           result;
 	result.ok = IR::MaterializeResources(plan, runtime, result.snapshot, result.specialization);
 	return result;
@@ -276,6 +287,56 @@ void CandidateOrder(const Plan& program) {
 		Check(Identity(Recipe(program, second.specialization)) == Identity(loaded[0]) &&
 		          Identity(Recipe(program, last.specialization)) == Identity(loaded[1]),
 		      "a dispatch whose candidates have their kinds at other positions requests the variant the manifest prepared");
+	}
+
+	TableHeap heap;
+	heap.kinds = {TextureAt(TextureAddress(0), false), TextureAt(TextureAddress(1), true)};
+	const auto on_heap = Choose(plan, first_order, &heap);
+	Check(on_heap.ok && on_heap.specialization.images.size() == 3u && on_heap.specialization.images[0].heap,
+	      "the same table read through the image heap takes one slot per kind");
+	if (on_heap.ok && on_heap.specialization.images.size() == 3u) {
+		const IR::SrtRuntime runtime {.read_specialization_memory = ReadTable, .image_heap = &heap};
+		IR::ResourceSnapshot rebound;
+		Check(!(on_heap.specialization == first.specialization) &&
+		          IR::CanRebindComputeImages(plan, on_heap.specialization, first.specialization),
+		      "a variant prepared with one slot per candidate can stand in for the heap form");
+		Check(IR::RebindComputeImages(plan, runtime, on_heap.snapshot, on_heap.specialization, first.specialization, rebound) &&
+		          rebound.images == first.snapshot.images && rebound.flattened_srt == first.snapshot.flattened_srt,
+		      "a dispatch that reads the heap binds the variant prepared with one slot per candidate");
+
+		const std::array<uint32_t, TableEntries> few {TextureAddress(0), TextureAddress(0), TextureAddress(1),
+		                                             TextureAddress(1), TextureAddress(0), TextureAddress(1)};
+		const std::array<bool, TableEntries>     plain {};
+		FillTable(few, plain);
+		Candidates narrow;
+		const IR::SrtRuntime no_heap {.read_specialization_memory = ReadTable};
+		narrow.ok = IR::MaterializeResources(plan, no_heap, narrow.snapshot, narrow.specialization);
+		std::array<uint32_t, TableEntries> every {};
+		for (uint32_t entry = 0; entry < TableEntries; ++entry) every[entry] = TextureAddress(entry);
+		FillTable(every, plain);
+		Candidates wide;
+		wide.ok = IR::MaterializeResources(plan, no_heap, wide.snapshot, wide.specialization);
+		Check(narrow.ok && wide.ok && narrow.specialization.images.size() == 4u && wide.specialization.images.size() == 8u,
+		      "two and six textures of one kind take three and seven slots");
+		heap.kinds = {TextureAt(TextureAddress(0), false)};
+		FillTable(few, plain);
+		Candidates few_on_heap;
+		few_on_heap.ok = IR::MaterializeResources(plan, runtime, few_on_heap.snapshot, few_on_heap.specialization);
+		if (narrow.ok && wide.ok && few_on_heap.ok) {
+			Check(IR::RebindComputeImages(plan, runtime, few_on_heap.snapshot, few_on_heap.specialization, wide.specialization,
+			                              rebound) &&
+			          rebound.images.size() == 8u && rebound.flattened_srt == narrow.snapshot.flattened_srt,
+			      "a table with fewer textures fills the slots of the prepared variant");
+			FillTable(every, plain);
+			Candidates all_on_heap;
+			all_on_heap.ok = IR::MaterializeResources(plan, runtime, all_on_heap.snapshot, all_on_heap.specialization);
+			Check(all_on_heap.ok &&
+			          !IR::RebindComputeImages(plan, runtime, all_on_heap.snapshot, all_on_heap.specialization,
+			                                   narrow.specialization, rebound),
+			      "a table with more textures than the prepared variant has slots is not served by it");
+			Check(!IR::CanRebindComputeImages(plan, on_heap.specialization, wide.specialization),
+			      "a prepared variant without a slot of one of the kinds on the heap is refused");
+		}
 	}
 
 	const auto pixel_plan   = CandidatePlan(ShaderType::Pixel);
