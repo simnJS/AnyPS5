@@ -1234,11 +1234,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
-	if (source.IsGpuModified()) {
-		const uint64_t own = destination.IsGpuModified() ? destination.gpu_write_sequence : 0;
-		destination.MarkGpuModified();
-		destination.gpu_write_sequence = std::max(own, source.gpu_write_sequence);
-	}
+	FinishReplacementCopy(destination, source_id);
 	destination.ClearBufferModified();
 }
 
@@ -1255,10 +1251,19 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
 	}
 	destination.CopyMip(source, mip, layer);
-	if (source.IsGpuModified()) {
-		const uint64_t own = destination.IsGpuModified() ? destination.gpu_write_sequence : 0;
-		destination.MarkGpuModified();
-		destination.gpu_write_sequence = std::max(own, source.gpu_write_sequence);
+	FinishReplacementCopy(destination, source_id);
+}
+
+void TextureCache::FinishReplacementCopy(Image& destination, ImageId source_id) {
+	const auto& source = m_slot_images[source_id];
+	if (!source.IsGpuModified()) {
+		return;
+	}
+	const uint64_t own = destination.IsGpuModified() ? destination.gpu_write_sequence : 0;
+	destination.MarkGpuModified();
+	destination.gpu_write_sequence = std::max(own, source.gpu_write_sequence);
+	if (source.readback_begin != 0 || m_download_images.contains(source_id)) {
+		(void)DownloadImageMemory(source_id);
 	}
 }
 
