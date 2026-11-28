@@ -1406,6 +1406,12 @@ void PipelineCache::NoteInstalledComputeReady(uint64_t module_id, const Pipeline
 	m_installed_compute_ready.insert(module_id);
 }
 
+thread_local ComputeServeMiss t_compute_serve_miss;
+
+ComputeServeMiss LastComputeServeMiss() {
+	return t_compute_serve_miss;
+}
+
 size_t PipelineCache::FindReadyComputeVariant(const Program& program,
                                               ShaderRecompiler::IR::ResourceSnapshot& resources,
                                               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
@@ -1415,9 +1421,16 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 	const auto& plan = program.resource_plan;
 	const auto compatible = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
-		if (&candidate == exact || candidate.shared_variant || !candidate.module ||
-		    layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) ||
-		    !ComputePipelineReady(candidate, ahead)) return false;
+		if (&candidate == exact || candidate.shared_variant || !candidate.module) return false;
+		using Step = ShaderRecompiler::IR::ServeRefusal::Step;
+		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords())) {
+			ShaderRecompiler::IR::NoteServeRefusal(Step::PushLayout);
+			return false;
+		}
+		if (!ComputePipelineReady(candidate, ahead)) {
+			ShaderRecompiler::IR::NoteServeRefusal(Step::PipelineNotReady);
+			return false;
+		}
 		if (runtime != nullptr)
 			return ShaderRecompiler::IR::RebindComputeImages(plan, *runtime, resources, specialization,
 			                                                 candidate.specialization, resources);
@@ -1442,16 +1455,34 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 
 ShaderModule* PipelineCache::ServeComputeVariant(Program& program, const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor, const ShaderModule* exact) {
+	ShaderRecompiler::IR::ClearServeRefusal();
 	auto best_index = FindReadyComputeVariant(program, program.resources, program.specialization,
 	                                          push_data_cursor, exact, false);
 	const auto& plan = program.resource_plan;
+	const auto unserved = [&]() -> ShaderModule* {
+		auto refusal = ShaderRecompiler::IR::ClosestServeRefusal();
+		if (refusal.step == ShaderRecompiler::IR::ServeRefusal::Step::None) {
+			refusal.step = ShaderRecompiler::IR::ServeRefusal::Step::NoCandidate;
+		}
+		t_compute_serve_miss = {.shader = plan.shader_hash, .refusal = refusal};
+		const auto natural = ResourceShapeFingerprint(program.specialization);
+		if (program.unserved_logged != natural) {
+			program.unserved_logged = natural;
+			PipelineCacheLog("[kyty-gpl] unserved compute 0x{:016x} variants {} closest {}{}{} @{}", plan.shader_hash,
+			                 program.modules.size(), ShaderRecompiler::IR::ServeRefusalName(refusal.step),
+			                 refusal.index != UINT32_MAX ? fmt::format(" slot {}", refusal.index) : std::string {},
+			                 refusal.rebound ? " after-rebind" : "",
+			                 std::chrono::steady_clock::now().time_since_epoch().count());
+		}
+		return nullptr;
+	};
 	if (best_index == SIZE_MAX) {
 		best_index = FindReadyComputeVariant(program, program.resources, program.specialization,
 		                                    push_data_cursor, exact, false, true, &runtime);
-		if (best_index == SIZE_MAX) return nullptr;
+		if (best_index == SIZE_MAX) return unserved();
 	} else if (!ShaderRecompiler::IR::AlignResources(plan, program.resources, program.specialization,
 	                                                 program.modules[best_index].specialization, &program.resources)) {
-		return nullptr;
+		return unserved();
 	}
 	auto* best = &program.modules[best_index];
 	program.served_module = best_index;

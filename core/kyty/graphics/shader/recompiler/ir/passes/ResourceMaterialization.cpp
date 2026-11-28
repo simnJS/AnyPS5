@@ -3903,6 +3903,54 @@ bool CompatibleComputeBuffer(const ResourcePlan& plan, uint32_t index, ResourceS
 
 }
 
+static thread_local ServeRefusal t_serve_refusal;
+static thread_local bool         t_serve_rebound = false;
+
+static bool RefuseServe(ServeRefusal::Step step, uint32_t index = UINT32_MAX) {
+	if (t_serve_refusal.step == ServeRefusal::Step::None || t_serve_rebound > t_serve_refusal.rebound ||
+	    (t_serve_rebound == t_serve_refusal.rebound && step >= t_serve_refusal.step)) {
+		t_serve_refusal = {.step = step, .index = index, .rebound = t_serve_rebound};
+	}
+	return false;
+}
+
+void ClearServeRefusal() {
+	t_serve_refusal = {};
+}
+
+void NoteServeRefusal(ServeRefusal::Step step) {
+	RefuseServe(step);
+}
+
+ServeRefusal ClosestServeRefusal() {
+	return t_serve_refusal;
+}
+
+const char* ServeRefusalName(ServeRefusal::Step step) {
+	switch (step) {
+		case ServeRefusal::Step::None: return "none";
+		case ServeRefusal::Step::NoCandidate: return "no-candidate";
+		case ServeRefusal::Step::PushLayout: return "push-layout";
+		case ServeRefusal::Step::PipelineNotReady: return "pipeline-not-ready";
+		case ServeRefusal::Step::ResourceCount: return "resource-count";
+		case ServeRefusal::Step::Buffer: return "buffer";
+		case ServeRefusal::Step::Sampler: return "sampler";
+		case ServeRefusal::Step::ImageView: return "image-view";
+		case ServeRefusal::Step::ImageAddressing: return "image-addressing";
+		case ServeRefusal::Step::TableConversion: return "table-conversion";
+		case ServeRefusal::Step::HeapKinds: return "heap-kinds";
+		case ServeRefusal::Step::SameAddressing: return "same-addressing";
+		case ServeRefusal::Step::TableView: return "table-view";
+		case ServeRefusal::Step::TableViewCount: return "table-view-count";
+		case ServeRefusal::Step::UnstableLayout: return "unstable-layout";
+		case ServeRefusal::Step::RootShapes: return "root-shapes";
+		case ServeRefusal::Step::Layout: return "layout";
+		case ServeRefusal::Step::Placement: return "placement";
+		case ServeRefusal::Step::Rematerialize: return "rematerialize";
+	}
+	return "unknown";
+}
+
 bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                     const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                     ResourceSnapshot* aligned) {
@@ -3911,7 +3959,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	    snapshot.buffers.size() != specialization.buffers.size() ||
 	    snapshot.images.size() != specialization.images.size() ||
 	    snapshot.samplers.size() != specialization.samplers.size()) {
-		return false;
+		return RefuseServe(ServeRefusal::Step::ResourceCount);
 	}
 	for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
 		const auto& wanted = specialization.buffers[index];
@@ -3919,7 +3967,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 		if (!CompatibleComputeBuffer(program, index, wanted, served) &&
 		    (wanted.indirect_root != BufferResource::NoIndirectBuffer || served.indirect_root != BufferResource::NoIndirectBuffer ||
 		     !EmptyBufferServes(program, snapshot, index, wanted, served))) {
-			return false;
+			return RefuseServe(ServeRefusal::Step::Buffer, index);
 		}
 	}
 	if (specialization.images == target.images && specialization.samplers == target.samplers) {
@@ -3928,29 +3976,34 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	}
 	if (!snapshot.image_tables.empty() && specialization.images.size() == target.images.size() &&
 	    specialization.samplers == target.samplers) {
-		bool fits = true;
-		for (size_t index = 0; fits && index < specialization.images.size(); ++index) {
+		uint32_t mismatch = UINT32_MAX;
+		for (uint32_t index = 0; mismatch == UINT32_MAX && index < specialization.images.size(); ++index) {
 			auto view = specialization.images[index];
 			const auto& served = target.images[index];
 			if (view.table_capacity != 0 && view.table < snapshot.image_tables.size() &&
 			    served.table_capacity >= snapshot.image_tables[view.table]->slots.size()) {
 				view.table_capacity = served.table_capacity;
 			}
-			fits = view == served;
+			if (!(view == served)) mismatch = index;
 		}
-		if (fits) {
+		if (mismatch == UINT32_MAX) {
 			if (aligned != nullptr && aligned != &snapshot) *aligned = snapshot;
 			return true;
 		}
+		return RefuseServe(ServeRefusal::Step::TableView, mismatch);
 	}
-	if (!g_stable_indirect_layouts.load(std::memory_order_relaxed) || !snapshot.image_tables.empty()) return false;
+	if (!snapshot.image_tables.empty()) {
+		return RefuseServe(specialization.samplers == target.samplers ? ServeRefusal::Step::TableViewCount
+		                                                             : ServeRefusal::Step::Sampler);
+	}
+	if (!g_stable_indirect_layouts.load(std::memory_order_relaxed)) return RefuseServe(ServeRefusal::Step::UnstableLayout);
 	std::vector<RootShape> images_from, images_to, samplers_from, samplers_to;
 	std::vector<uint8_t>   deferred_from, deferred_to;
 	if (!ImageShapes(program, specialization.images, images_from, deferred_from) ||
 	    !ImageShapes(program, target.images, images_to, deferred_to) || deferred_from != deferred_to ||
 	    !SamplerShapes(program, specialization.samplers, samplers_from) ||
 	    !SamplerShapes(program, target.samplers, samplers_to)) {
-		return false;
+		return RefuseServe(ServeRefusal::Step::RootShapes);
 	}
 	std::vector<SrtRegion> regions_from, regions_to;
 	AddRegions(images_from, regions_from);
@@ -3964,7 +4017,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	    std::ranges::any_of(snapshot.gpu_flat_loads, [&](const GpuFlatLoad& load) {
 		    return size_t {load.slot} + load.count > prefix;
 	    })) {
-		return false;
+		return RefuseServe(ServeRefusal::Step::Layout);
 	}
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
@@ -3982,7 +4035,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	    !PlaceRoots(samplers_from, samplers_to, specialization.samplers, target.samplers,
 	                std::span<const DescriptorValue>(snapshot.samplers), source,
 	                aligned != nullptr ? &samplers : nullptr, aligned != nullptr ? &flat : nullptr)) {
-		return false;
+		return RefuseServe(ServeRefusal::Step::Placement);
 	}
 	if (aligned != nullptr) {
 		aligned->buffers              = snapshot.buffers;
@@ -4025,36 +4078,39 @@ bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecializ
 	const auto roots = program.info.images.size();
 	if (!GenericComputeVariants() || program.stage != ShaderType::Compute ||
 	    specialization.images.size() < roots || target.images.size() < roots ||
-	    specialization.buffers.size() != target.buffers.size() || specialization.samplers != target.samplers) return false;
+	    specialization.buffers.size() != target.buffers.size()) return RefuseServe(ServeRefusal::Step::ResourceCount);
+	if (specialization.samplers != target.samplers) return RefuseServe(ServeRefusal::Step::Sampler);
 	for (uint32_t i = 0; i < specialization.buffers.size(); ++i) {
-		if (!CompatibleComputeBuffer(program, i, specialization.buffers[i], target.buffers[i])) return false;
+		if (!CompatibleComputeBuffer(program, i, specialization.buffers[i], target.buffers[i]))
+			return RefuseServe(ServeRefusal::Step::Buffer, i);
 	}
 	bool changes_addressing = false;
-	for (size_t index = 0; index < roots; ++index) {
+	for (uint32_t index = 0; index < roots; ++index) {
 		const auto& live = specialization.images[index];
 		const auto& served = target.images[index];
-		if (ImageViewForm(live) != ImageViewForm(served)) return false;
+		if (ImageViewForm(live) != ImageViewForm(served)) return RefuseServe(ServeRefusal::Step::ImageView, index);
 		const auto from = Addressing(live);
 		const auto to = Addressing(served);
 		if (from == to) continue;
 		const bool to_table = to == ImageAddressing::Table && from == ImageAddressing::Heap;
 		const bool to_heap = from == ImageAddressing::Table && to == ImageAddressing::Heap;
-		if (!to_table && !to_heap) return false;
+		if (!to_table && !to_heap) return RefuseServe(ServeRefusal::Step::ImageAddressing, index);
 		const auto* source = Source(program, program.info.images[index].source);
 		if (source == nullptr || !source->indirect_descriptor || !source->indirect_descriptor->table_array ||
 		    program.info.images[index].resource_class != ImageResourceClass::Sampled ||
 		    program.info.images[index].mip_mode == ImageMipMode::Dynamic ||
-		    (to_table ? served : live).table_entry_mask != (source->indirect_descriptor->table_mask >> 5u)) return false;
+		    (to_table ? served : live).table_entry_mask != (source->indirect_descriptor->table_mask >> 5u))
+			return RefuseServe(ServeRefusal::Step::TableConversion, index);
 		const auto& heap = to_table ? specialization.images : target.images;
 		const auto children = std::span(heap).subspan(roots);
 		const auto child = std::ranges::find(children, index, &ResourceSpecialization::Image::indirect_root);
 		if (child == children.end() || ImageViewForm(*child) != ImageViewForm(to_table ? served : live) ||
 		    std::find_if(std::next(child), children.end(), [&](const auto& other) {
 			    return other.indirect_root == index;
-		    }) != children.end()) return false;
+		    }) != children.end()) return RefuseServe(ServeRefusal::Step::HeapKinds, index);
 		changes_addressing = true;
 	}
-	return changes_addressing;
+	return changes_addressing || RefuseServe(ServeRefusal::Step::SameAddressing);
 }
 
 bool RebindComputeImages(const ResourcePlan& program, const SrtRuntime& runtime, const ResourceSnapshot& snapshot,
@@ -4063,10 +4119,13 @@ bool RebindComputeImages(const ResourcePlan& program, const SrtRuntime& runtime,
 	if (!CanRebindComputeImages(program, specialization, target)) return false;
 	ResourceSnapshot rebound;
 	ResourceSpecialization shape;
-	if (!MaterializeResourcesForViews(program, runtime, rebound, shape, target.images, &snapshot, &specialization) ||
-	    !AlignResources(program, rebound, shape, target, &rebound)) {
-		return false;
+	if (!MaterializeResourcesForViews(program, runtime, rebound, shape, target.images, &snapshot, &specialization)) {
+		return RefuseServe(ServeRefusal::Step::Rematerialize);
 	}
+	t_serve_rebound = true;
+	const bool fits = AlignResources(program, rebound, shape, target, &rebound);
+	t_serve_rebound = false;
+	if (!fits) return false;
 	aligned = std::move(rebound);
 	return true;
 }

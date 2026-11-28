@@ -404,23 +404,40 @@ void RebindTableAndHeap(bool on) {
 	output.packed_stride ^= IR::ExactBufferBounds;
 	Check(IR::RebindComputeImages(plan, runtime, table.snapshot, table.specialization, dynamic_heap, rebound) == on,
 	      "a table dispatch can bind a ready heap with a different dynamic output bound");
+	using Step = IR::ServeRefusal::Step;
+	const auto refused = [&](Step step, uint32_t index = UINT32_MAX, bool after_rebind = false) {
+		const auto refusal = IR::ClosestServeRefusal();
+		IR::ClearServeRefusal();
+		return !on || (refusal.step == step && refusal.index == index && refusal.rebound == after_rebind);
+	};
+	IR::ClearServeRefusal();
 	auto invalid = native_heap.specialization;
 	invalid.images.back().numeric_class = Prospero::TextureNumericClass::Uint;
 	Check(!IR::CanRebindComputeImages(plan, table.specialization, invalid), "heap bridge rejects different child types");
+	Check(refused(Step::HeapKinds, 0), "a heap with other child types is named as the refusal");
 	invalid = table.specialization;
 	invalid.images[0].table_entry_mask ^= 1u;
 	Check(!IR::CanRebindComputeImages(plan, native_heap.specialization, invalid), "table bridge rejects different masks");
+	Check(refused(Step::TableConversion, 0), "a table with another mask is named as the refusal");
 	heap.allow_rebind = false;
 	Check(!IR::RebindComputeImages(plan, runtime, table.snapshot, table.specialization, native_heap.specialization, rebound),
 	      "heap allocation rejection never installs an incompatible snapshot");
+	Check(refused(Step::TableViewCount, UINT32_MAX, true),
+	      "a heap that refuses the rebound views leaves a table of another view count, named as the refusal after the rebind");
+	Check(!IR::AlignResources(plan, table.snapshot, table.specialization, native_heap.specialization, nullptr),
+	      "a table dispatch does not align with a heap variant of another view count");
+	Check(refused(Step::TableViewCount), "a table dispatch with another view count is named as the refusal");
 
 	auto widened = table.specialization;
 	widened.images[0].table_capacity *= 2;
 	Check(IR::AlignResources(plan, table.snapshot, table.specialization, widened, nullptr) == on,
 	      "an otherwise identical wider table accepts the existing slots");
+	Check(IR::ClosestServeRefusal().step == (on ? Step::None : Step::ResourceCount), "a variant that serves names no refusal");
+	IR::ClearServeRefusal();
 	widened.images[0].table_capacity = 1;
 	Check(!IR::AlignResources(plan, table.snapshot, table.specialization, widened, nullptr),
 	      "an undersized table rejects the existing slots");
+	Check(refused(Step::TableView, 0), "an undersized table is named as the refusal");
 	CheckImageTableWidths(plan, runtime, heap, on);
 }
 
