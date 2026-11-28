@@ -1482,7 +1482,8 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 			walked ? RewriteWalk(program, walk) : Rewrite(program, traversal);
 			program.info.ray_query_tlas = tlas;
 			++traced;
-		} else if (EnclosingLoop(program, bvh->Parent()) != nullptr) {
+		} else if ((bvh->Flags<uint32_t>() & (BvhIntersectEmpty | BvhIntersectOracle)) == 0 &&
+		           EnclosingLoop(program, bvh->Parent()) != nullptr) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("ShaderRecompiler BVH traversal left to emulation: hash=0x{:016x}\n",
 				            program.shader_hash));
