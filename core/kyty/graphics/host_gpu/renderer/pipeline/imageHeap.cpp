@@ -272,17 +272,18 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 		    })) return false;
 	}
 	const auto profile = Profile(table != nullptr ? *list.root : IR::ImageHeapResource(*list.root, 0u), table != nullptr);
+	const ListKey key {list.owner, list.resource};
 	auto memory = std::ranges::find_if(m_list_memories, [&](const auto& candidate) {
-		return candidate->views.front()->profile == profile;
+		return candidate->list_owner == key && candidate->views.front()->profile == profile;
 	});
 	if (memory == m_list_memories.end()) {
 		auto created = std::make_unique<Memory>();
+		created->list_owner = key;
 		created->views.push_back(
 		    std::make_unique<View>(View {.memory = *created, .profile = profile}));
 		memory = m_list_memories.insert(m_list_memories.end(), std::move(created));
 	}
 	auto& view = *(*memory)->views.front();
-	const ListKey key {list.owner, list.resource};
 	const auto slots = first + (count == 0 ? 0 : (count - 1u) * step + 1u) + 1u;
 	if (table != nullptr) {
 		size_t total = slots;
@@ -299,7 +300,7 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 		const auto kind = table != nullptr ? IR::ImageTableHeapKind(m_profiles[profile], value)
 		                                   : IR::ImageHeapKind(m_profiles[profile], value);
 		if (kind == 0u) continue;
-		const auto element = Intern(view, kind, {.value = value, .profile = m_key_profiles[profile]});
+		const auto element = Intern(view, kind, {.value = value, .profile = m_key_profiles[profile]}, m_scratch);
 		if (table != nullptr && element == 0u) {
 			for (const auto pending: m_scratch) Release(pending);
 			return false;
@@ -446,7 +447,8 @@ bool ImageHeap::UpdateProbes(View& view, uint64_t begin, uint64_t end) {
 	if (check) m_scratch.resize(count);
 	for (auto probe = first; probe < last; ++probe) {
 		const auto [key, kind] = ReadProbe(view, probe, true);
-		const auto entry = kind == 0u ? 0u : Intern(view, kind, key);
+		const auto pending     = check ? std::span(m_scratch).first(probe - first) : std::span<uint32_t> {};
+		const auto entry       = kind == 0u ? 0u : Intern(view, kind, key, pending);
 		if (check) {
 			m_scratch[probe - first] = entry;
 		} else {
@@ -544,7 +546,37 @@ void ImageHeap::Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots
 	dirty_begin = dirty_end = 0;
 }
 
-uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
+void ImageHeap::ShiftArms(View& view, uint32_t arm, std::span<uint32_t> pending) {
+	const auto shift = [&](std::vector<uint32_t>& slots, size_t& dirty_begin, size_t& dirty_end) {
+		bool updated = false;
+		for (size_t slot = 0; slot < slots.size(); ++slot) {
+			const auto entry = slots[slot];
+			if (entry != 0u && (entry >> IR::ImageHeapKindShift) >= arm) {
+				slots[slot] = entry + (1u << IR::ImageHeapKindShift);
+				Widen(dirty_begin, dirty_end, slot, slot + 1u);
+				updated = true;
+			}
+		}
+		return updated;
+	};
+	if (shift(view.slots, view.dirty_begin, view.dirty_end) && view.buffer != nullptr &&
+	    std::ranges::find(m_active, &view) == m_active.end()) {
+		m_active.push_back(&view);
+	}
+	for (auto& [list_key, list]: m_lists) {
+		if (list.view == &view && shift(list.slots, list.dirty_begin, list.dirty_end) &&
+		    list.buffer != nullptr && std::ranges::find(m_active_lists, &list) == m_active_lists.end()) {
+			m_active_lists.push_back(&list);
+		}
+	}
+	for (auto& entry: pending) {
+		if (entry != 0u && (entry >> IR::ImageHeapKindShift) >= arm) {
+			entry += 1u << IR::ImageHeapKindShift;
+		}
+	}
+}
+
+uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key, std::span<uint32_t> pending) {
 	const bool table           = m_table_profiles[view.profile];
 	auto [found, inserted] = m_index.try_emplace(key, 0u);
 	if (inserted) {
@@ -560,11 +592,13 @@ uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
 		element.kind  = kind;
 		m_pending.push_back(found->second);
 	}
-	const auto arm = static_cast<uint32_t>(std::ranges::find(view.kind_keys, kind) -
-	                                       view.kind_keys.begin());
-	if (arm == view.kind_keys.size()) {
-		view.kind_keys.push_back(kind);
-		view.kinds.push_back(key.value);
+	const auto it  = std::ranges::lower_bound(view.kind_keys, kind);
+	const auto arm = static_cast<uint32_t>(it - view.kind_keys.begin());
+	if (it == view.kind_keys.end() || *it != kind) {
+		const bool shifted = arm < view.kind_keys.size();
+		view.kind_keys.insert(it, kind);
+		view.kinds.insert(view.kinds.begin() + arm, key.value);
+		if (shifted) ShiftArms(view, arm, pending);
 	} else if (table && !IR::ImageTableHeapExemplar(m_profiles[view.profile], view.kinds[arm]) &&
 	           IR::ImageTableHeapExemplar(m_profiles[view.profile], key.value)) {
 		view.kinds[arm] = key.value;

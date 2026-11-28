@@ -15,12 +15,13 @@ void Require(bool condition, const char* message) {
     std::exit(1);
 }
 
-IR::DescriptorValue MakeTextureDescriptor(Prospero::BufferFormat format) {
+IR::DescriptorValue MakeTextureDescriptor(Prospero::BufferFormat format, uint32_t swizzle = 0xfacu,
+                                          uint32_t tile_mode = 0u) {
     IR::DescriptorValue value {.dword_count = 8u};
     value.dwords[0] = 0x1000u;
     value.dwords[1] = (static_cast<uint32_t>(format) << 20u) | (3u << 30u);
     value.dwords[2] = 15u;
-    value.dwords[3] = 0xfacu | (9u << 28u);
+    value.dwords[3] = (swizzle & 0xfffu) | (tile_mode << 20u) | (9u << 28u);
     return value;
 }
 
@@ -48,7 +49,7 @@ IR::DescriptorSource MakeImmediateSource(std::span<const uint32_t> words) {
     return source;
 }
 
-IR::ResourcePlan MakeHeapPlan() {
+IR::ResourcePlan MakeHeapPlan(bool unfiltered = false) {
     IR::ResourcePlan plan;
     plan.stage                      = Libs::Graphics::ShaderType::Compute;
     plan.resource_tracking_complete = true;
@@ -72,10 +73,11 @@ IR::ResourcePlan MakeHeapPlan() {
     plan.descriptor_sources.push_back(MakeImmediateSource(sampler_words));
 
     IR::ImageResource image;
-    image.resource_class = IR::ImageResourceClass::Sampled;
-    image.read           = true;
-    image.dimension      = Decoder::ImageDimension::Dim2D;
-    image.source         = 1u;
+    image.resource_class         = IR::ImageResourceClass::Sampled;
+    image.read                   = true;
+    image.unfiltered_access_only = unfiltered;
+    image.dimension              = Decoder::ImageDimension::Dim2D;
+    image.source                 = 1u;
     plan.info.images.push_back(image);
 
     IR::SamplerResource sampler;
@@ -149,6 +151,25 @@ int main() {
             "direct UNorm image failed materialization");
     Require(direct_spec_srgb.images[0].skip_degamma && !direct_spec_unorm.images[0].skip_degamma,
             "direct sampled image must preserve skip_degamma");
+
+    const auto unfiltered_plan = MakeHeapPlan(true);
+    const auto depth16_t = MakeTextureDescriptor(
+        Prospero::BufferFormat::k16UInt, 0x040u, static_cast<uint32_t>(Prospero::TileMode::kDepth));
+    const auto u32_t = MakeTextureDescriptor(Prospero::BufferFormat::k32UInt, 0xfacu, 0u);
+    MockImageHeapSource        heap_depth16(depth16_t);
+    MockImageHeapSource        heap_u32(u32_t);
+    IR::SrtRuntime             runtime_depth16 {.image_heap = &heap_depth16};
+    IR::SrtRuntime             runtime_u32 {.image_heap = &heap_u32};
+    IR::ResourceSnapshot       snap_depth16, snap_u32;
+    IR::ResourceSpecialization spec_depth16, spec_u32;
+    Require(IR::MaterializeResources(unfiltered_plan, runtime_depth16, snap_depth16, spec_depth16),
+            "depth16 heap exemplar failed materialization");
+    Require(IR::MaterializeResources(unfiltered_plan, runtime_u32, snap_u32, spec_u32),
+            "u32 heap exemplar failed materialization");
+    Require(spec_depth16 == spec_u32 &&
+                spec_depth16.images[1].conversion_format == Prospero::BufferFormat::kInvalid &&
+                spec_depth16.images[1].shader_swizzle == IR::ShaderImageIdentitySwizzle,
+            "image heap child must not record exemplar conversion_format or shader_swizzle");
 
     std::puts("kyty_shim_image_heap_variant_key: ok");
     return 0;
