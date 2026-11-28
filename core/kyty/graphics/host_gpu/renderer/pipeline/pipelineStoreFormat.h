@@ -12,6 +12,8 @@ struct ShaderProgramKey;
 
 namespace Libs::Graphics::ShaderStoreFormat {
 
+inline constexpr uint32_t ShaderStoreFormatVersion = 1;
+
 enum class Record : uint8_t { Module, GraphicsPipeline, TessellationLayout, TableModule, NativeGraphicsPipeline };
 
 struct Frame {

@@ -726,17 +726,7 @@ const ShaderModule* PipelineCache::FindCompiledModule(
 
 PipelineCache::ProgramKey PipelineCache::ManifestProgramKey(const ManifestModule& record, bool guest_traversal,
                                                           const ShaderComputeInputInfo* compute_input) {
-	ProgramKey key {.stage = record.stage, .hash = record.ProgramHash(),
-	                .user_data_count = record.user_data_count, .guest_traversal = guest_traversal};
-	if (compute_input != nullptr) {
-		BuildStageStaticKey(*compute_input, key.static_state);
-	} else {
-		key.static_state = StaticKey(record);
-	}
-	if (record.generic_graphics) key.static_state.push_back(GenericGraphicsKey);
-	if (record.runtime_buffers) key.static_state.push_back(RuntimeBuffersKey);
-	if (record.runtime_samplers) key.static_state.push_back(RuntimeSamplersKey);
-	return key;
+	return ManifestShaderProgramKey(record, guest_traversal, compute_input);
 }
 
 std::string PipelineCacheTitleStem(const std::string& title) {
@@ -3244,22 +3234,13 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	ShaderRecompiler::CompileOptions options;
 	const bool native = RayTracing::NativeTraversals() && !guest_traversal;
 	auto* compute = std::get_if<ShaderComputeInputInfo>(&input);
-	if (compute != nullptr) {
-		compute->async_compute = compute->async_compute && ShaderRecompiler::Decoder::ComputeShaderDependsOnQueue(code);
-	}
+	if (compute != nullptr) KeepQueueDependence(*compute, code);
 	const auto key = ManifestProgramKey(record, guest_traversal, compute);
 	std::visit([&](const auto& info) { options = StageCompileOptions(info); }, input);
-	options.generic_graphics = record.generic_graphics;
-	options.runtime_buffer_descriptors = record.runtime_buffers;
-	options.runtime_sampler_descriptors = record.runtime_samplers;
-	options.shader_hash        = key.hash;
-	options.user_data          = user_data;
-	options.back_code          = back_code;
-	options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
-	options.native_ray_tracing = native;
-	options.rt_oracle          = native ? Config::RayTracingOracle() : 0u;
-	options.rt_emulation       = Config::RayTracingEmulation();
+	SetShaderCompileOptions(options, key.hash, user_data, back_code, native,
+	                        {.generic_graphics = record.generic_graphics,
+	                         .runtime_buffers  = record.runtime_buffers,
+	                         .runtime_samplers = record.runtime_samplers});
 	std::vector<uint32_t> spirv;
 	std::vector<uint32_t> plain_spirv;
 	std::string           refusal;

@@ -5,6 +5,7 @@
 
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 
+#include <cstddef>
 #include <istream>
 #include <string>
 #include <utility>
@@ -13,6 +14,28 @@ namespace Libs::Graphics {
 
 namespace ShaderStoreFormat {
 namespace {
+
+constexpr bool StoredPipelineKeyLayout(uint32_t version) {
+	switch (version) {
+		case 1:
+			return sizeof(PipelineRenderingState) == 44 && sizeof(PipelineVertexInputState) == 322 &&
+#if defined(ANYPS5_KYTY)
+			       sizeof(PipelineStaticParameters) == 122 && sizeof(GraphicsPipelineKey) == 520 &&
+#else
+			       sizeof(PipelineStaticParameters) == 118 && sizeof(GraphicsPipelineKey) == 516 &&
+#endif
+			       offsetof(GraphicsPipelineKey, rendering) == 32 && offsetof(GraphicsPipelineKey, vertex_input) == 76 &&
+			       offsetof(GraphicsPipelineKey, static_params) == 398 &&
+			       offsetof(PipelineStaticParameters, color_mask) == 17 &&
+			       offsetof(PipelineStaticParameters, color_srcblend) == 54 &&
+			       offsetof(PipelineStaticParameters, blend_enable) == 110;
+		default: return false;
+	}
+}
+
+static_assert(StoredPipelineKeyLayout(ShaderStoreFormatVersion),
+              "stored graphics pipeline keys changed their layout: bump ShaderStoreFormatVersion and give the new "
+              "version its layout");
 
 bool ValidTableModule(const ShaderProgramKey& key, uint32_t cursor, const ShaderModule& module,
                       std::span<const uint32_t> spirv, std::span<const uint32_t> plain_spirv) {

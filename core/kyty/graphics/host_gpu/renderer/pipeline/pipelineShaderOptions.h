@@ -8,9 +8,29 @@
 
 namespace Libs::Graphics {
 
+struct ManifestModule;
+
 bool LdsLaneSyncEnabled();
 bool F32ProductNoContractionEnabled();
 void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native);
+
+struct ShaderKeySwitches {
+	bool lane_pairs       = false;
+	bool generic_graphics = false;
+	bool runtime_buffers  = false;
+	bool runtime_samplers = false;
+};
+
+void AppendShaderKeySwitches(std::vector<uint32_t>& static_state, const ShaderKeySwitches& switches);
+[[nodiscard]] ShaderKeySwitches RuntimeDescriptorSwitches(std::span<const uint32_t> static_state);
+
+template <typename Programs>
+auto FindGenericGraphicsProgram(Programs& programs, ShaderProgramKey& key) {
+	key.static_state.push_back(GenericGraphicsKey);
+	auto found = programs.find(key);
+	key.static_state.pop_back();
+	return found;
+}
 
 template <typename InputInfo>
 ShaderType ShaderStageForInput(const InputInfo& input) {
@@ -52,14 +72,32 @@ void SetShaderProgramKey(ShaderProgramKey& key, const ShaderParams& params, cons
 	key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input, key.static_state);
 	AppendNativeRayTracingKey(key.stage, key.static_state, native);
-	if (lane_pairs) {
-		constexpr uint32_t LanePairsKey = 0x574c5052u;
-		key.static_state.push_back(LanePairsKey);
-	}
+	AppendShaderKeySwitches(key.static_state, {.lane_pairs = lane_pairs});
 }
+
+template <typename InputInfo>
+void SetTableShaderProgramKey(ShaderProgramKey& key, const ShaderParams& params, const InputInfo& input) {
+	SetShaderProgramKey(key, params, input, false);
+	key.static_state.push_back(TableShaderKeyMarker);
+}
+
+template <typename InputInfo>
+void SetShaderLookupKey(ShaderProgramKey& key, const ShaderParams& params, const InputInfo& input,
+                        bool guest_traversal, const ShaderKeySwitches& switches) {
+	key.stage           = ShaderStageForInput(input);
+	key.hash            = params.hash;
+	key.user_data_count = params.user_data_count;
+	BuildStageStaticKey(input, key.static_state);
+	key.guest_traversal = guest_traversal;
+	AppendShaderKeySwitches(key.static_state, switches);
+}
+
+[[nodiscard]] ShaderProgramKey ManifestShaderProgramKey(const ManifestModule& record, bool guest_traversal,
+                                                        const ShaderComputeInputInfo* compute_input);
+void KeepQueueDependence(ShaderComputeInputInfo& input, std::span<const uint32_t> code);
 
 void SetShaderCompileOptions(ShaderRecompiler::CompileOptions& options, uint64_t hash,
                              std::span<const uint32_t> user_data, std::span<const uint32_t> back_code,
-                             bool native, bool lane_pairs = false);
+                             bool native, const ShaderKeySwitches& switches);
 
 }

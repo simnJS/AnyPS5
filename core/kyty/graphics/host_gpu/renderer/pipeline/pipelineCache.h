@@ -1010,10 +1010,6 @@ private:
 	[[nodiscard]] uint32_t    UseRank(uint64_t program_hash) const;
 };
 
-inline constexpr uint32_t RuntimeBuffersKey = 0x52425546u;
-inline constexpr uint32_t GenericGraphicsKey = 0x47465847u;
-inline constexpr uint32_t RuntimeSamplersKey = 0x53414d50u;
-
 uint32_t RayTracingModuleMode(ShaderBvh bvh, ShaderType stage, bool native, bool emulation, uint32_t oracle);
 
 std::string PipelineCacheTitleId();

@@ -33,6 +33,10 @@ foreach(source IN LISTS candidates)
            OR code MATCHES "(^|[^A-Za-z0-9_])(StoreLayout|AnalyzeTessellationPrograms)[ \t\r\n]*\\(")
             message(FATAL_ERROR "Shader store layout accessed in an unstamped pipeline source: ${source}")
         endif()
+        if(code MATCHES "static_state${member}(push_back|emplace_back|pop_back|insert|assign|resize|clear|erase)[ \t\r\n]*\\("
+           OR code MATCHES "static_state(\\[[^]]*\\])?${assignment}")
+            message(FATAL_ERROR "Shader program key written in an unstamped pipeline source: ${source}")
+        endif()
     endif()
 endforeach()
 
