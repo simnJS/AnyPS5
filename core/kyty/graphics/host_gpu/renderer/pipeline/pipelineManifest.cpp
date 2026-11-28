@@ -297,6 +297,7 @@ struct PipelineCache::ManifestState {
 	std::vector<std::string>           module_failure;
 	std::unordered_map<uint64_t, std::string> refused_generics;
 	std::unordered_map<uint64_t, std::string> refused_recipes;
+	std::unordered_multimap<uint64_t, uint32_t> sampler_plan_modules;
 	std::unordered_set<uint64_t>       known_code;
 	bool                               known_code_read = false;
 	std::vector<uint8_t>               module_refused;
@@ -995,8 +996,10 @@ void PipelineCache::OpenManifest() {
 #endif
 	state.startup_total = static_cast<uint32_t>(state.warm_modules.size() + state.warm_pipelines.size() +
 	                                            m_restore_jobs.size());
+	const bool prepare_samplers = !state.sampler_plan_modules.empty();
+	state.startup_total += prepare_samplers ? 1u : 0u;
 	state.startup_done = state.found;
-	state.scanning.store(!state.code.empty(), std::memory_order_relaxed);
+	state.scanning.store(!state.code.empty() || prepare_samplers, std::memory_order_relaxed);
 	state.startup = state.startup_total != state.startup_done && Config::StartupWaitSeconds() != 0;
 	const auto workers = ManifestWorkerCount();
 	state.admission.SetLimit(static_cast<uint32_t>(workers));
@@ -1085,11 +1088,25 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 	{
 		LockPrograms();
 #if defined(ANYPS5_KYTY)
-		if (state.threads.empty() && !m_program_cache.empty()) {
+		if (state.threads.empty()) {
+			std::unordered_set<ProgramKey, ProgramKeyHash> planned;
+			for (const auto i: new_modules) {
+				const auto& record = loaded.modules[i];
+				if (!record.generic_graphics && !record.runtime_samplers && !record.runtime_buffers)
+					planned.insert(ManifestProgramKey(record, false));
+			}
 			const bool native = RayTracing::NativeTraversals();
 			for (const auto i: new_modules) {
 				const auto& record = loaded.modules[i];
 				const auto key = ManifestProgramKey(record, false);
+				if (!record.generic_graphics && record.runtime_samplers && !record.runtime_buffers &&
+				    record.back_hash == 0 && record.function_code.empty() && Common::Fallback::Containable()) {
+					auto ordinary = key;
+					ordinary.static_state.pop_back();
+					if (!m_program_cache.contains(ordinary) && planned.insert(std::move(ordinary)).second) {
+						state.sampler_plan_modules.emplace(record.code_hash, indices[i]);
+					}
+				}
 				const auto* hit = FindCompiledModule(key, record.specialization, record.push_data_cursor,
 				                                     record.generic_graphics, record.function_code);
 				if (!hit && !record.generic_graphics && record.stage != ShaderType::Compute &&
@@ -2959,6 +2976,44 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 	return true;
 }
 
+#if defined(ANYPS5_KYTY)
+void PipelineCache::PrepareSamplerCandidatePlan(uint32_t index, std::span<const uint32_t> code, const std::stop_token& stop) {
+	auto& state = *m_manifest;
+	std::unique_lock lock(state.mutex);
+	const auto& record = state.warm_modules[index];
+	auto input = record.input;
+	lock.unlock();
+	auto admitted = state.Admit(stop, code.size(), false);
+	if (!admitted) return;
+	auto* compute = std::get_if<ShaderComputeInputInfo>(&input);
+	if (compute && compute->async_compute) compute->async_compute = ShaderRecompiler::Decoder::ComputeShaderDependsOnQueue(code);
+	auto key = ManifestProgramKey(record, false, compute);
+	key.static_state.pop_back();
+	LockPrograms();
+	const bool known = m_program_cache.contains(key);
+	UnlockPrograms();
+	if (known) return;
+	ShaderRecompiler::CompileOptions options;
+	std::visit([&](const auto& info) { options = StageCompileOptions(info); }, input);
+	const std::vector<uint32_t> user_data(record.user_data_count);
+	SetShaderCompileOptions(options, key.hash, user_data, {}, RayTracing::NativeTraversals());
+	options.rt_emulation = Config::RayTracingEmulation();
+	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+	const bool prepared = Common::Fallback::Run("sampler candidate plan could not be prepared",
+	    "PipelineCache::PrepareSamplerCandidatePlan", key.hash, 0, true, [&] {
+		    auto source = ShaderRecompiler::PrepareShaderSource(code, options);
+		    if (source.HasCalls() || source.unsupported_call_pc != UINT32_MAX) return;
+		    auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		    plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+	    });
+	if (prepared && plan) {
+		LockPrograms();
+		m_program_cache.try_emplace(std::move(key), Program {.resource_plan = std::move(*plan)});
+		UnlockPrograms();
+	}
+}
+#endif
+
 void PipelineCache::CodeStoreThread(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("Thread_PipelineManifestCode");
 	auto& state = *m_manifest;
@@ -3002,9 +3057,13 @@ void PipelineCache::CodeStoreThread(const std::stop_token& stop) {
 				const auto       found = state.code.find(record.hash);
 				wanted = found != state.code.end() && !found->second.mapped;
 			}
-			if (wanted && !stop.stop_requested() && ReadCodeRecord(record, compressed, code) &&
-			    XXH3_64bits(code.data(), code.size() * sizeof(uint32_t)) == record.hash) {
+			if ((wanted || state.sampler_plan_modules.contains(record.hash)) && !stop.stop_requested() &&
+			    ReadCodeRecord(record, compressed, code) && XXH3_64bits(code.data(), code.size() * sizeof(uint32_t)) == record.hash) {
 				provided += ProvideCode(record.hash, code, false) ? 1u : 0u;
+#if defined(ANYPS5_KYTY)
+				const auto [first, last] = state.sampler_plan_modules.equal_range(record.hash);
+				for (auto plan = first; plan != last; ++plan) PrepareSamplerCandidatePlan(plan->second, code, stop);
+#endif
 			}
 		}
 		if (provided != 0) {
@@ -3014,6 +3073,7 @@ void PipelineCache::CodeStoreThread(const std::stop_token& stop) {
 		std::scoped_lock lock(state.mutex);
 		state.known_code      = stored;
 		state.known_code_read = true;
+		if (state.startup && !state.sampler_plan_modules.empty()) ++state.startup_done;
 	}
 	Common::File file;
 	bool         opened = false;

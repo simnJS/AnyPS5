@@ -42,6 +42,7 @@ constexpr std::uint32_t RecordBias = 5;
 constexpr std::uint32_t SamplerField = 0x80;
 constexpr std::uint32_t ImageField = 0x40;
 constexpr std::uint32_t RecordBytes = 160;
+constexpr std::uint32_t LongRecordBytes = 65536u * 16u + RecordBytes;
 constexpr std::uint32_t Format8888 = 56;
 constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t SwizzleXyzw = 0xfac;
@@ -66,6 +67,8 @@ constexpr std::array<std::uint32_t, 31> SampledWords{
 struct Keys {
     std::array<std::uint32_t, 2> samplers;
     std::array<std::uint32_t, 2> images;
+    bool long_records = false;
+    bool fixed_image = false;
 };
 
 std::uint32_t low(std::uint64_t address) {
@@ -97,7 +100,7 @@ void append(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::initia
     words.insert(words.end(), payload);
 }
 
-std::vector<std::uint32_t> drawWords() {
+std::vector<std::uint32_t> drawWords(bool long_records) {
     std::vector<std::uint32_t> words;
     const std::pair<std::uint32_t, std::uint32_t> context[]{
         {0x2d5, 0x2000},
@@ -133,7 +136,7 @@ std::vector<std::uint32_t> drawWords() {
     std::array<std::uint32_t, 16> user{};
     const auto samplers = vsharp(SamplerTable, 2u * 16u);
     const auto images = vsharp(ImageTable, 2u * 32u);
-    const auto records = vsharp(Records, RecordBytes);
+    const auto records = long_records ? vsharp(GuestBase + GuestBytes, LongRecordBytes) : vsharp(Records, RecordBytes);
     std::copy(samplers.begin(), samplers.end(), user.begin());
     std::copy(images.begin(), images.end(), user.begin() + 4);
     std::copy(records.begin(), records.end(), user.begin() + 8);
@@ -185,10 +188,12 @@ void writeShader(std::span<std::byte> memory, std::uint64_t address, std::uint64
 
 void makeCapture(const std::filesystem::path& path, const Keys& keys) {
     using AgcDriver::FrameCallKind;
-    auto memory = std::vector<std::byte>(GuestBytes);
-    const auto commands = drawWords();
+    auto memory = std::vector<std::byte>(GuestBytes + (keys.long_records ? LongRecordBytes : 0u));
+    const auto commands = drawWords(keys.long_records);
     writeShader(memory, VertexHeader, VertexCode, 2, VertexWords);
-    writeShader(memory, PixelHeader, PixelCode, 1, SampledWords);
+    auto pixel = SampledWords;
+    if (keys.fixed_image) pixel[16] = 0xbea30380;
+    writeShader(memory, PixelHeader, PixelCode, 1, pixel);
     write(memory, Commands, std::span(commands));
     std::vector<std::uint32_t> depth((5 * Block) / sizeof(std::uint32_t), bits(0.75f));
     write(memory, Depth, std::span<const std::uint32_t>(depth));
@@ -204,7 +209,7 @@ void makeCapture(const std::filesystem::path& path, const Keys& keys) {
         write(memory, Textures + i * 0x100u, std::span<const std::uint32_t>(texels));
     }
     for (std::uint32_t record = 0; record < 2u; ++record) {
-        const auto base = Records + record * 16u + (RecordBias & ~3u);
+        const auto base = (keys.long_records ? GuestBase + GuestBytes : Records) + record * 16u + (RecordBias & ~3u);
         writeWord(memory, base + SamplerField, keys.samplers[record]);
         writeWord(memory, base + ImageField, keys.images[record]);
     }
@@ -332,6 +337,22 @@ int selectedSampler(const std::filesystem::path& tool, const std::filesystem::pa
     require(first_draw != std::string::npos && served.log.find(BuildLine, first_draw) == std::string::npos &&
                 served.log.find(PipelineLine) == std::string::npos,
             "the generic pipeline must draw a new selection without building a stage or a pipeline", served);
+    const Keys long_records{{0u, 1u}, {0u, 0u}, true, true};
+    const auto runtime_seed = replay(tool, root, "runtime-sampler", "seed", long_records, false);
+    const auto runtime_manifest = root / "runtime-sampler" / "_PipelineCache" / manifest.filename();
+    require(runtime_seed.completed && runtime_seed.frame == control.frame &&
+                readFile(runtime_manifest).find(" rs ") != std::string::npos &&
+                runtime_seed.log.find("cause=other-key:rs") != std::string::npos,
+            "a selector beyond the candidate limit must draw through the runtime sampler recipe", runtime_seed);
+    const auto runtime = replay(tool, root, "runtime-sampler", "prepared", long_records, true);
+    require(runtime.completed && runtime.frame == control.frame &&
+                runtime.log.find("[kyty-gpl] translate ") == std::string::npos,
+            "an existing runtime sampler recipe must serve a failed candidate lookup without translating the ordinary program", runtime);
+    const Keys short_records{{0u, 1u}, {0u, 0u}, false, true};
+    const auto ordinary = replay(tool, root, "runtime-sampler", "ordinary", short_records, true);
+    require(ordinary.completed && ordinary.frame == control.frame &&
+                ordinary.log.find("served from a fixed set of samplers") == std::string::npos,
+            "a prepared runtime sampler recipe must still let a finite selection use its ordinary samplers", ordinary);
     return 0;
 }
 

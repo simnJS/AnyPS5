@@ -1006,6 +1006,7 @@ private:
 	void RecordLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
 	static void OnShaderMapped(void* userdata, uint64_t hash, std::span<const uint32_t> code);
 	bool ProvideCode(uint64_t hash, std::span<const uint32_t> code, bool from_guest);
+	void PrepareSamplerCandidatePlan(uint32_t index, std::span<const uint32_t> code, const std::stop_token& stop);
 	void CodeStoreThread(const std::stop_token& stop);
 	bool ScanGameFiles(const std::stop_token&                                          stop,
 	                   const std::function<void(uint64_t, std::span<const uint32_t>)>& append);
