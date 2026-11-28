@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineShaderOptions.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/manifestAdmission.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
@@ -172,8 +173,7 @@ std::string PipelineCache::ProgramWaitCause(const ProgramKey& key, const Program
 	facts.other_variant = closest != SIZE_MAX;
 	if (!facts.compute) {
 		auto generic_key = key;
-		generic_key.static_state.push_back(GenericGraphicsKey);
-		const auto generic     = m_program_cache.find(generic_key);
+		const auto generic     = FindGenericGraphicsProgram(m_program_cache, generic_key);
 		facts.generic_prepared = generic != m_program_cache.end() && !generic->second.modules.empty();
 		facts.generic_refusal  = StartupRefusal(key.hash, true);
 	}

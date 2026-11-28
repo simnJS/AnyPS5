@@ -764,17 +764,7 @@ int PipelineCache::KnownProgram(uint64_t program) const {
 
 PipelineCache::ProgramKey PipelineCache::ManifestProgramKey(const ManifestModule& record, bool guest_traversal,
                                                           const ShaderComputeInputInfo* compute_input) {
-	ProgramKey key {.stage = record.stage, .hash = record.ProgramHash(),
-	                .user_data_count = record.user_data_count, .guest_traversal = guest_traversal};
-	if (compute_input != nullptr) {
-		BuildStageStaticKey(*compute_input, key.static_state);
-	} else {
-		key.static_state = StaticKey(record);
-	}
-	if (record.generic_graphics) key.static_state.push_back(GenericGraphicsKey);
-	if (record.runtime_buffers) key.static_state.push_back(RuntimeBuffersKey);
-	if (record.runtime_samplers) key.static_state.push_back(RuntimeSamplersKey);
-	return key;
+	return ManifestShaderProgramKey(record, guest_traversal, compute_input);
 }
 
 std::string PipelineCacheTitleStem(const std::string& title) {
@@ -1109,8 +1099,7 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 				const auto key = ManifestProgramKey(record, false);
 				if (!record.generic_graphics && record.runtime_samplers && !record.runtime_buffers &&
 				    record.back_hash == 0 && record.function_code.empty() && Common::Fallback::Containable()) {
-					auto ordinary = key;
-					ordinary.static_state.pop_back();
+					auto ordinary = WithoutRuntimeSamplers(key);
 					if (!m_program_cache.contains(ordinary) && planned.insert(std::move(ordinary)).second) {
 						state.sampler_plan_modules.emplace(record.code_hash, indices[i]);
 					}
@@ -2994,9 +2983,8 @@ void PipelineCache::PrepareSamplerCandidatePlan(uint32_t index, std::span<const 
 	auto admitted = state.Admit(stop, code.size(), false);
 	if (!admitted) return;
 	auto* compute = std::get_if<ShaderComputeInputInfo>(&input);
-	if (compute && compute->async_compute) compute->async_compute = ShaderRecompiler::Decoder::ComputeShaderDependsOnQueue(code);
-	auto key = ManifestProgramKey(record, false, compute);
-	key.static_state.pop_back();
+	if (compute) KeepQueueDependence(*compute, code);
+	auto key = WithoutRuntimeSamplers(ManifestProgramKey(record, false, compute));
 	LockPrograms();
 	const bool known = m_program_cache.contains(key);
 	UnlockPrograms();
@@ -3004,8 +2992,7 @@ void PipelineCache::PrepareSamplerCandidatePlan(uint32_t index, std::span<const 
 	ShaderRecompiler::CompileOptions options;
 	std::visit([&](const auto& info) { options = StageCompileOptions(info); }, input);
 	const std::vector<uint32_t> user_data(record.user_data_count);
-	SetShaderCompileOptions(options, key.hash, user_data, {}, RayTracing::NativeTraversals());
-	options.rt_emulation = Config::RayTracingEmulation();
+	SetShaderCompileOptions(options, key.hash, user_data, {}, RayTracing::NativeTraversals(), {});
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	const bool prepared = Common::Fallback::Run("sampler candidate plan could not be prepared",
 	    "PipelineCache::PrepareSamplerCandidatePlan", key.hash, 0, true, [&] {
@@ -3352,22 +3339,13 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	ShaderRecompiler::CompileOptions options;
 	const bool native = RayTracing::NativeTraversals() && !guest_traversal;
 	auto* compute = std::get_if<ShaderComputeInputInfo>(&input);
-	if (compute != nullptr) {
-		compute->async_compute = compute->async_compute && ShaderRecompiler::Decoder::ComputeShaderDependsOnQueue(code);
-	}
+	if (compute != nullptr) KeepQueueDependence(*compute, code);
 	const auto key = ManifestProgramKey(record, guest_traversal, compute);
 	std::visit([&](const auto& info) { options = StageCompileOptions(info); }, input);
-	options.generic_graphics = record.generic_graphics;
-	options.runtime_buffer_descriptors = record.runtime_buffers;
-	options.runtime_sampler_descriptors = record.runtime_samplers;
-	options.shader_hash        = key.hash;
-	options.user_data          = user_data;
-	options.back_code          = back_code;
-	options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
-	options.native_ray_tracing = native;
-	options.rt_oracle          = native ? Config::RayTracingOracle() : 0u;
-	options.rt_emulation       = Config::RayTracingEmulation();
+	SetShaderCompileOptions(options, key.hash, user_data, back_code, native,
+	                        {.generic_graphics = record.generic_graphics,
+	                         .runtime_buffers  = record.runtime_buffers,
+	                         .runtime_samplers = record.runtime_samplers});
 	std::vector<uint32_t> spirv;
 	std::vector<uint32_t> plain_spirv;
 	std::string           refusal;

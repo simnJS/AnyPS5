@@ -16,6 +16,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryResults.h"
@@ -108,15 +109,59 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 
 void SetShaderCompileOptions(ShaderRecompiler::CompileOptions& options, uint64_t hash,
                              std::span<const uint32_t> user_data, std::span<const uint32_t> back_code,
-                             bool native, bool lane_pairs) {
-	options.shader_hash        = hash;
-	options.user_data          = user_data;
-	options.back_code          = back_code;
-	options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
-	options.native_ray_tracing = native;
-	options.rt_oracle          = native ? Config::RayTracingOracle() : 0u;
-	options.wave_lane_pairs    = lane_pairs;
+                             bool native, const ShaderKeySwitches& switches) {
+	options.generic_graphics            = switches.generic_graphics;
+	options.runtime_buffer_descriptors  = switches.runtime_buffers;
+	options.runtime_sampler_descriptors = switches.runtime_samplers;
+	options.shader_hash                 = hash;
+	options.user_data                   = user_data;
+	options.back_code                   = back_code;
+	options.dump_ir                     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+	options.emit_debug_info             = Config::GraphicsDebugDumpEnabled();
+	options.native_ray_tracing          = native;
+	options.rt_oracle                   = native ? Config::RayTracingOracle() : 0u;
+	options.rt_emulation                = Config::RayTracingEmulation();
+	options.wave_lane_pairs             = switches.lane_pairs;
+}
+
+void AppendShaderKeySwitches(std::vector<uint32_t>& static_state, const ShaderKeySwitches& switches) {
+	if (switches.lane_pairs) static_state.push_back(LanePairsKey);
+	if (switches.generic_graphics) static_state.push_back(GenericGraphicsKey);
+	if (switches.runtime_buffers) static_state.push_back(RuntimeBuffersKey);
+	if (switches.runtime_samplers) static_state.push_back(RuntimeSamplersKey);
+}
+
+ShaderProgramKey WithoutRuntimeSamplers(ShaderProgramKey key) {
+	if (!key.static_state.empty() && key.static_state.back() == RuntimeSamplersKey) key.static_state.pop_back();
+	return key;
+}
+
+ShaderKeySwitches RuntimeDescriptorSwitches(std::span<const uint32_t> static_state) {
+	ShaderKeySwitches switches;
+	switches.runtime_samplers = !static_state.empty() && static_state.back() == RuntimeSamplersKey;
+	const size_t buffers_marker = switches.runtime_samplers ? 2u : 1u;
+	switches.runtime_buffers =
+	    static_state.size() >= buffers_marker && static_state[static_state.size() - buffers_marker] == RuntimeBuffersKey;
+	return switches;
+}
+
+ShaderProgramKey ManifestShaderProgramKey(const ManifestModule& record, bool guest_traversal,
+                                          const ShaderComputeInputInfo* compute_input) {
+	ShaderProgramKey key {.stage = record.stage, .hash = record.ProgramHash(),
+	                      .user_data_count = record.user_data_count, .guest_traversal = guest_traversal};
+	if (compute_input != nullptr) {
+		BuildStageStaticKey(*compute_input, key.static_state);
+	} else {
+		std::visit([&](const auto& input) { BuildStageStaticKey(input, key.static_state); }, record.input);
+	}
+	AppendShaderKeySwitches(key.static_state, {.generic_graphics = record.generic_graphics,
+	                                           .runtime_buffers  = record.runtime_buffers,
+	                                           .runtime_samplers = record.runtime_samplers});
+	return key;
+}
+
+void KeepQueueDependence(ShaderComputeInputInfo& input, std::span<const uint32_t> code) {
+	input.async_compute = input.async_compute && ShaderRecompiler::Decoder::ComputeShaderDependsOnQueue(code);
 }
 
 void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {

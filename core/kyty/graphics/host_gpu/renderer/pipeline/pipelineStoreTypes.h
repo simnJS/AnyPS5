@@ -10,6 +10,10 @@
 namespace Libs::Graphics {
 
 inline constexpr uint32_t TableShaderKeyMarker = 0x54424c45u;
+inline constexpr uint32_t LanePairsKey         = 0x574c5052u;
+inline constexpr uint32_t RuntimeBuffersKey    = 0x52425546u;
+inline constexpr uint32_t GenericGraphicsKey   = 0x47465847u;
+inline constexpr uint32_t RuntimeSamplersKey   = 0x53414d50u;
 
 struct ShaderProgramKey {
 	ShaderType            stage           = ShaderType::Unknown;

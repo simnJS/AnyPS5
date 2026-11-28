@@ -1700,28 +1700,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		runtime.indirect_args_address = input_info.indirect_args_address;
 	}
 	runtime.runtime_stride = RuntimeStride(options.stage, params.hash);
-	m_lookup_key.stage           = options.stage;
-	m_lookup_key.hash            = params.hash;
-	m_lookup_key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	m_lookup_key.guest_traversal = m_guest_traversal;
-	if (m_lane_pairs) {
-		constexpr uint32_t LanePairsKey = 0x574c5052u;
-		m_lookup_key.static_state.push_back(LanePairsKey);
-	}
-	const bool runtime_buffers = m_runtime_buffers;
-	if (runtime_buffers) {
-		m_lookup_key.static_state.push_back(RuntimeBuffersKey);
-	}
-	const bool runtime_samplers = m_runtime_samplers;
-	if (runtime_samplers) {
-		m_lookup_key.static_state.push_back(RuntimeSamplersKey);
-	}
+	const ShaderKeySwitches switches {.lane_pairs       = m_lane_pairs,
+	                                  .runtime_buffers  = m_runtime_buffers,
+	                                  .runtime_samplers = m_runtime_samplers};
+	SetShaderLookupKey(m_lookup_key, params, input_info, m_guest_traversal, switches);
+	const bool runtime_buffers  = switches.runtime_buffers;
+	const bool runtime_samplers = switches.runtime_samplers;
 	if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		if (prefer_generic && !runtime_buffers && !runtime_samplers) {
-			m_lookup_key.static_state.push_back(GenericGraphicsKey);
-			const auto found = m_program_cache.find(m_lookup_key);
-			m_lookup_key.static_state.pop_back();
+			const auto found = FindGenericGraphicsProgram(m_program_cache, m_lookup_key);
 			if (found != m_program_cache.end()) {
 				auto& program = found->second;
 				const auto* module = program.GenericModule(push_data_cursor);
@@ -1944,17 +1931,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	           natural;
 	const auto build = [&]() KYTY_REQUIRES(m_program_lock) -> const ShaderModule* {
 #endif
-	options.shader_hash     = params.hash;
-	options.user_data       = user_data;
-	options.back_code       = params.back_code;
-	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-	options.native_ray_tracing = RayTracing::NativeTraversals() && !m_guest_traversal;
-	options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
-	options.rt_emulation       = Config::RayTracingEmulation();
-	options.wave_lane_pairs    = m_lane_pairs;
-	options.runtime_buffer_descriptors = runtime_buffers;
-	options.runtime_sampler_descriptors = runtime_samplers;
+	SetShaderCompileOptions(options, params.hash, user_data, params.back_code,
+	                        RayTracing::NativeTraversals() && !m_guest_traversal, switches);
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -2885,9 +2863,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		const ProgramLockMaybe lock(m_program_lock, unlocked);
 		auto entry = m_program_cache.end();
 		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			key.static_state.push_back(GenericGraphicsKey);
-			entry = m_program_cache.find(key);
-			key.static_state.pop_back();
+			entry = FindGenericGraphicsProgram(m_program_cache, key);
 			if (entry != m_program_cache.end()) generic = entry->second.GenericModule(push_data_cursor);
 		}
 		if (!generic) entry = m_program_cache.find(key);
@@ -3136,38 +3112,10 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	[&] {
 #endif
 		const auto user_data = std::span(job.params.user_data).first(job.params.user_data_count);
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			options.stage             = input_info.logical_stage;
-			options.input_info.vertex = &input_info;
-			options.user_data_base    = 8;
-			if (options.stage == ShaderType::Mesh ||
-			    options.stage == ShaderType::TessellationControl) {
-				options.user_data_base = 0;
-			}
-			if (options.stage == ShaderType::Mesh) {
-				options.wave_size = input_info.mesh.wave_size;
-			}
-		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			options.stage            = ShaderType::Pixel;
-			options.input_info.pixel = &input_info;
-		} else {
-			options.stage              = ShaderType::Compute;
-			options.input_info.compute = &input_info;
-		}
-		options.shader_hash     = job.params.hash;
-		options.user_data       = user_data;
-		options.back_code       = job.params.back_code;
-		options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-		options.native_ray_tracing = RayTracing::NativeTraversals() && !job.guest_traversal;
-		options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
-		options.rt_emulation       = Config::RayTracingEmulation();
-		options.wave_lane_pairs    = job.lane_pairs;
-		const auto& static_state = job.key.static_state;
-		options.runtime_sampler_descriptors = !static_state.empty() && static_state.back() == RuntimeSamplersKey;
-		const size_t buffers_marker = options.runtime_sampler_descriptors ? 2u : 1u;
-		options.runtime_buffer_descriptors =
-		    static_state.size() >= buffers_marker && static_state[static_state.size() - buffers_marker] == RuntimeBuffersKey;
+		auto switches        = RuntimeDescriptorSwitches(job.key.static_state);
+		switches.lane_pairs  = job.lane_pairs;
+		SetShaderCompileOptions(options, job.params.hash, user_data, job.params.back_code,
+		                        RayTracing::NativeTraversals() && !job.guest_traversal, switches);
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			return;
@@ -3788,8 +3736,7 @@ PipelineCache::TableProgram PipelineCache::GetTableProgram(
     const ShaderParams& params, const InputInfo& input_info,
     const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_cursor) {
 	ProgramKey key;
-	SetShaderProgramKey(key, params, input_info, false);
-	key.static_state.push_back(TableShaderKeyMarker);
+	SetTableShaderProgramKey(key, params, input_info);
 	const ProgramLockGuard lock(m_program_lock);
 	auto&                  variants = m_table_programs[key];
 	for (auto& variant: variants) {
@@ -3842,14 +3789,7 @@ void PipelineCache::RunTableJob(CompileJob& job, InputInfo& input_info) {
 			refusal = "mesh and tessellation stages are not served";
 			return;
 		}
-		options.shader_hash        = job.params.hash;
-		options.user_data          = user_data;
-		options.back_code          = job.params.back_code;
-		options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
-		options.native_ray_tracing = false;
-		options.rt_emulation       = Config::RayTracingEmulation();
-		options.table_mode         = true;
+		SetShaderCompileOptions(options, job.params.hash, user_data, job.params.back_code, false, {});
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			refusal = "GPU-selected calls";

@@ -425,6 +425,11 @@ target_include_directories(kyty_shim_shader_cache_policy_tests PRIVATE ${CMAKE_C
 add_test(NAME kyty_shim_shader_cache_policy COMMAND kyty_shim_shader_cache_policy_tests)
 set_tests_properties(kyty_shim_shader_cache_policy PROPERTIES TIMEOUT 20)
 
+add_test(NAME kyty_shim_shader_store_sources COMMAND "${CMAKE_COMMAND}"
+        "-DCHECK=${CMAKE_SOURCE_DIR}/core/kyty/cmake/check_shader_store_sources.cmake"
+        "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/shader_store_sources" -P "${CMAKE_CURRENT_SOURCE_DIR}/ShaderStoreSources.cmake")
+set_tests_properties(kyty_shim_shader_store_sources PROPERTIES TIMEOUT 20)
+
 if(NOT ANYPS5_KYTY_DLL)
     add_test_executable(kyty_shim_shader_store_encode_tests ${CMAKE_CURRENT_SOURCE_DIR}/ShaderStoreEncode.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_shader_store_encode_tests PRIVATE ${LIBS_INCLUDE_DIR})
