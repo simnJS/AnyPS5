@@ -28,7 +28,7 @@ using Gfx::ShaderType;
 
 inline Recompiler::Spirv::Profile Profile() {
 	return {.maintenance8           = true,
-	        .native_float_min_max   = false,
+	        .float_min_max          = Recompiler::Spirv::FloatMinMax::Cascade,
 	        .device_clock_period_ps = 1000,
 	        .robust_buffer_access   = true,
 	        .r8_srgb_views          = true,

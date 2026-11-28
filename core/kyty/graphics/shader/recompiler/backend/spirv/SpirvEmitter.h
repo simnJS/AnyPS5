@@ -14,9 +14,15 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 inline constexpr uint32_t MeshAllocationLengthSpecId = 0;
 inline constexpr uint32_t MeshAllocationBaseDwords   = 2;
 
+enum class FloatMinMax : uint8_t {
+	Cascade,
+	OtherNanSelect,
+	Exact,
+};
+
 struct Profile {
 	bool maintenance8         = false;
-	bool native_float_min_max = false;
+	FloatMinMax float_min_max = FloatMinMax::Cascade;
 	uint32_t device_clock_period_ps = 0;
 	bool robust_buffer_access = false;
 	bool r8_srgb_views   = false;
