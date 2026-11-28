@@ -31,6 +31,21 @@ namespace Libs::Graphics {
 struct ImageHeapTestAccess {
 	static constexpr size_t TableLimit = ShaderRecompiler::IR::ImageHeapCapacity * 7u / 8u;
 
+	static void VerifyDiscovery(ImageHeap& heap) { heap.m_verify_discovery = true; }
+
+	static ImageId BoundImage(const ImageHeap& heap, const ShaderRecompiler::IR::DescriptorValue& value) {
+		const auto index = LiveSlot(heap, value);
+		return index != 0u ? heap.m_elements[index].image : ImageId {};
+	}
+
+	static bool CanReuseDcc(ImageHeap& heap) {
+		return heap.m_dcc.size() == 1 && heap.ReuseDcc(heap.m_dcc.front());
+	}
+
+	static bool CanReuseHeld(ImageHeap& heap) {
+		return heap.m_held.size() == 1 && heap.RangeUnchanged(heap.m_held.front());
+	}
+
 	static void Fill(ImageHeap& heap) {
 		const auto occupied = heap.m_elements.size();
 		heap.m_elements.resize(TableLimit);
@@ -454,8 +469,77 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	}
 }
 
-int HeapExhaustion() {
-	g_name = "kyty_shim_image_heap_exhaustion";
+void CheckHeapDiscovery(GraphicContext& graphics, uint64_t address, uint64_t bytes, bool verify) {
+	RenderContext renderer(graphics);
+	renderer.MapMemory(address, bytes);
+	CommandProcessor processor(renderer, 0);
+	processor.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(processor.GetCtx(), processor.GetUcfg(), processor.GetShCtx());
+	auto& heap = renderer.GetImageHeap();
+	auto& executor = renderer.GetRenderExecutor();
+	if (verify) ImageHeapTestAccess::VerifyDiscovery(heap);
+	const auto data = (address + 0x1ffffu) & ~uint64_t {0xffffu};
+	const auto metadata = data + 0x10000u;
+	auto dcc = HeapTexture(data);
+	dcc.dwords[3] |= static_cast<uint32_t>(Prospero::TileMode::kRenderTarget) << 20u;
+	dcc.dwords[6] = (1u << 21u) | static_cast<uint32_t>((metadata >> 8u) << 24u);
+	dcc.dwords[7] = static_cast<uint32_t>(metadata >> 16u);
+	std::array<uint8_t, 4096> codes;
+	codes.fill(0xff);
+	Libs::LibKernel::Memory::WriteBacking(metadata, codes.data(), codes.size());
+	IR::ImageResource root;
+	root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+	const auto owner = HeapTexture(data + 0x20000u);
+	auto held = owner;
+	held.dwords[2] = 10u | (2u << 14u);
+	std::array values {dcc, owner, held};
+	IR::ImageHeapView view;
+	heap.BeginDraw();
+	Check(heap.AcquireList({.owner = &values, .root = &root, .values = values}, view), "admit discovery list");
+	heap.Rebind(executor);
+	const auto dcc_image = ImageHeapTestAccess::BoundImage(heap, dcc);
+	Check(dcc_image && ImageHeapTestAccess::BoundImage(heap, owner) && !ImageHeapTestAccess::BoundImage(heap, held),
+	      "DCC and owner bind while the incompatible extent stays null");
+	if (verify) {
+		Check(ImageHeapTestAccess::CanReuseDcc(heap), "exact DCC image with settled metadata");
+		Check(ImageHeapTestAccess::CanReuseHeld(heap), "an incompatible extent is held by the pinned image");
+	}
+	auto unrelated = HeapTexture(data + 0x30000u);
+	const auto binding = executor.ResolveTexture(IR::ImageHeapResource(root, IR::ImageHeapKind(root, unrelated)), unrelated);
+	Check(static_cast<bool>(binding.image_id), "register an image outside both ranges");
+	renderer.UnmapMemory(data + 0x40000u, 0x4000u);
+	renderer.MapMemory(data + 0x40000u, 0x4000u);
+	for (uint32_t i = 0; i < 512u; ++i) heap.Rebind(executor);
+	Check(ImageHeapTestAccess::BoundImage(heap, dcc) == dcc_image && !ImageHeapTestAccess::BoundImage(heap, held),
+	      "unrelated changes preserve both bindings");
+	if (verify) {
+		Check(ImageHeapTestAccess::CanReuseDcc(heap) && ImageHeapTestAccess::CanReuseHeld(heap),
+		      "carry both discoveries across unrelated changes");
+	}
+	codes.fill(0);
+	Libs::LibKernel::Memory::WriteBacking(metadata, codes.data(), codes.size());
+	renderer.GetBufferCache().InvalidateMemory(metadata, codes.size());
+	if (verify) {
+		Check(!ImageHeapTestAccess::CanReuseDcc(heap), "CPU-written DCC clear needs materialization");
+	}
+	heap.Rebind(executor);
+	values[1] = {};
+	heap.BeginDraw();
+	Check(heap.AcquireList({.owner = &values, .root = &root, .values = values}, view), "release the conflicting extent");
+	unrelated = HeapTexture(data + 0x38000u);
+	const auto next = executor.ResolveTexture(IR::ImageHeapResource(root, IR::ImageHeapKind(root, unrelated)), unrelated);
+	Check(static_cast<bool>(next.image_id), "trigger held discovery after unpinning");
+	heap.Rebind(executor);
+	Check(static_cast<bool>(ImageHeapTestAccess::BoundImage(heap, held)), "unpinning lets the held extent resolve");
+	renderer.UnmapMemory(data, 0x10000u);
+	Check(ImageHeapTestAccess::LiveSlot(heap, dcc) == 0u, "unmap removes the affected serial");
+	scheduler.Finish();
+	renderer.UnmapMemory(address, bytes);
+}
+
+int HeapReplay(bool discovery, bool verify = false) {
+	g_name = discovery ? "kyty_shim_image_heap_discovery" : "kyty_shim_image_heap_exhaustion";
 	Common::InitializeThreads();
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
@@ -472,7 +556,8 @@ int HeapExhaustion() {
 		return Finish();
 	}
 	const auto address = reinterpret_cast<uint64_t>(guest);
-	CheckHeapExhaustion(gpu.graphics, address, bytes);
+	if (discovery) CheckHeapDiscovery(gpu.graphics, address, bytes, verify);
+	else CheckHeapExhaustion(gpu.graphics, address, bytes);
 	Check(sceKernelMunmap(address, bytes) == 0, "unmap test backing");
 	return Finish();
 }
@@ -1453,7 +1538,9 @@ int DrawTables() {
 }
 
 extern "C" int RunKytyDescriptorTablesTest(int argc, char** argv) {
-	if (argc > 1 && std::strcmp(argv[1], "heap-exhaustion") == 0) return HeapExhaustion();
+	if (argc > 1 && std::strcmp(argv[1], "heap-exhaustion") == 0) return HeapReplay(false);
+	if (argc > 1 && std::strcmp(argv[1], "heap-discovery") == 0) return HeapReplay(true);
+	if (argc > 1 && std::strcmp(argv[1], "heap-discovery-checked") == 0) return HeapReplay(true, true);
 	if (argc > 1 && std::strcmp(argv[1], "draw") == 0) return DrawTables();
 	if (argc > 1 && std::strcmp(argv[1], "copies") == 0) return CopiesSwitch();
 	if (argc > 1 && std::strcmp(argv[1], "bad") == 0) return BadSwitch();

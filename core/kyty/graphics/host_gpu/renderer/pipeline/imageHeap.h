@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/usageBitmap.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeapSlots.h"
@@ -130,6 +131,21 @@ private:
 		bool     freed    = false;
 		bool     evicting = false;
 		bool     parked   = false;
+	};
+
+	struct Discovery {
+		uint32_t   index = 0;
+		GuestRange data;
+		GuestRange metadata;
+		uint64_t   image_epoch = 0;
+		uint64_t   mapping_epoch = 0;
+		uint64_t   backing_epoch = 0;
+		ImageId    sole_image;
+	};
+
+	struct DccEntry {
+		Discovery               last;
+		TextureCache::ImageDesc desc;
 	};
 
 	struct Readback {
@@ -284,6 +300,11 @@ private:
 	void     Settle(uint32_t index);
 	void     Free(uint32_t index);
 	void     Forget(uint32_t index);
+	void     UnpinImage(uint32_t index);
+	Discovery RecordDiscovery(uint32_t index, const TextureCache::ImageDesc& desc, ImageId image,
+	                   uint64_t mappings, uint64_t backing);
+	bool     RangeUnchanged(Discovery& last);
+	bool     ReuseDcc(DccEntry& entry);
 	void     Invalidate(uint32_t profile);
 	void     Assign(List& list, size_t slot, uint32_t entry);
 	void     Link(List& list, size_t slot, uint32_t entry);
@@ -366,12 +387,15 @@ private:
 	std::vector<uint32_t>                                               m_free;
 	std::vector<uint32_t>                                               m_pending;
 	std::vector<uint32_t>                                               m_released;
-	std::vector<uint32_t>                                               m_held;
+	std::vector<Discovery>                                              m_held;
 	std::vector<uint32_t>                                               m_declined;
-	std::vector<uint32_t>                                               m_dcc;
+	std::vector<DccEntry>                                               m_dcc;
 	std::vector<uint32_t>                                               m_requeue;
 	std::vector<std::pair<uint64_t, ImageId>>                           m_away;
 	uint64_t                                                            m_held_serial = 0;
+	std::unordered_map<uint64_t, std::vector<uint32_t>>                 m_by_serial;
+	std::vector<uint32_t>                                               m_changed;
+	bool                                                                m_verify_discovery = false;
 	std::deque<std::pair<uint64_t, uint32_t>>                           m_retired;
 	std::vector<std::pair<uint64_t, uint64_t>>                          m_runs;
 	std::vector<std::pair<uint64_t, uint64_t>>                          m_watched;
