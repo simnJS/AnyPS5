@@ -1893,7 +1893,7 @@ void ImageHeap::ParkUnread(uint32_t stamp) {
 		releasing += entry.bytes;
 		return false;
 	});
-	const auto usage = local.usage - std::min(local.usage, releasing);
+	const auto usage = local.usage - std::min(local.usage, releasing + m_context.GetGraphics().LocalBlockSpace());
 	m_pressure = usage * 100u >= local.budget * (m_pressure ? ParkStopPercent : ParkPercent);
 	m_crowded  = usage >= GraphicContext::BudgetShare(local.budget, m_crowded ? GraphicContext::CrowdedStopPercent
 	                                                                           : GraphicContext::CrowdedPercent);
