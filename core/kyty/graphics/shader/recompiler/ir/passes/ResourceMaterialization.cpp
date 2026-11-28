@@ -3273,8 +3273,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 
 bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime& runtime,
                                   ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	const bool buffer_failure  = t_indirect_buffer_failure;
+	const bool sampler_failure = t_indirect_sampler_failure;
 	const FallbackForms fallback;
-	return MaterializeResourcesForViews(program, runtime, snapshot, specialization, {});
+	const bool          ok     = MaterializeResourcesForViews(program, runtime, snapshot, specialization, {});
+	t_indirect_buffer_failure  = buffer_failure;
+	t_indirect_sampler_failure = sampler_failure;
+	return ok;
 }
 
 bool MaterializeGenericGraphics(const ResourcePlan& plan, const SrtRuntime& runtime, ResourceSnapshot& snapshot,
