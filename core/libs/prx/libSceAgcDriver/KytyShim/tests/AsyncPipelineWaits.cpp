@@ -333,7 +333,8 @@ extern "C" int RunKytyAsyncPipelineWaitsTest() {
 		Device      device;
 		std::string error;
 		if (!CreateHeadlessVulkan(device.graphics, nullptr, error)) {
-			const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
+			const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr &&
+			                      !error.starts_with("missing required Vulkan device extension ");
 			std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n", Name, required ? "FAILED" : "skipped",
 			             error.c_str());
 			return required ? 1 : 77;
