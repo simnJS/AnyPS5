@@ -8,6 +8,7 @@
 
 #include "graphics/host_gpu/driverMemoryReport.h"
 #include "graphics/host_gpu/memoryTelemetry.h"
+#include "graphics/host_gpu/localMemoryBudget.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -188,7 +189,7 @@ struct GraphicContext {
 		const auto reserve = std::min<uint64_t>(share(15), 2ull << 30u);
 		return share(low ? 80 : 85) - reserve;
 	}
-	[[nodiscard]] HeapUsage GetLocalMemoryUsage() const;
+	[[nodiscard]] LocalMemorySample GetLocalMemoryUsage() const;
 	[[nodiscard]] bool      LocalMemoryCrowded() const;
 	[[nodiscard]] uint64_t  LocalBlockSpace() const;
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
@@ -204,6 +205,7 @@ struct GraphicContext {
 
 private:
 	friend struct VramBudgetTestAccess;
+	LocalMemoryBudget m_local_memory_budget;
 	bool     m_memory_override_enabled = false;
 	uint64_t m_memory_budget_override  = 0;
 	uint64_t m_memory_usage_override   = 0;

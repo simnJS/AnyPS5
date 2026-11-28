@@ -2020,11 +2020,11 @@ void ImageHeap::ParkUnread(uint32_t stamp) {
 		return false;
 	});
 	const auto usage = local.usage - std::min(local.usage, releasing + m_context.GetGraphics().LocalBlockSpace());
-	m_pressure = usage * 100u >= local.budget * (m_pressure ? ParkStopPercent : ParkPercent);
-	m_crowded  = usage >= GraphicContext::HeapImageThreshold(local.budget, m_crowded);
+	m_pressure = usage * 100u >= local.target * (m_pressure ? ParkStopPercent : ParkPercent);
+	m_crowded  = usage >= GraphicContext::HeapImageThreshold(local.target, m_crowded);
 	if (!m_pressure) return;
 	if (m_crowded) {
-		ParkLeastRead(usage - std::min(usage, GraphicContext::HeapImageThreshold(local.budget, true)));
+		ParkLeastRead(usage - std::min(usage, GraphicContext::HeapImageThreshold(local.target, true)));
 		return;
 	}
 	uint64_t bytes = 0;

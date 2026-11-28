@@ -100,18 +100,8 @@ void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds, bool 
 	const auto start = Clock::now();
 	const auto host = pressure_only ? Common::ProcessMemory {} : Common::ReadProcessMemory();
 	vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget {};
-	if (memory_budget_ext_enabled) {
-		vk::PhysicalDeviceMemoryProperties2 properties {.pNext = &budget};
-		physical_device.getMemoryProperties2(&properties);
-	}
-	uint64_t local_usage = 0, local_budget = 0;
-	for (uint32_t i = 0; i < physical_device_memory_properties.memoryHeapCount; ++i) {
-		if (physical_device_memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
-			local_usage += budget.heapUsage[i];
-			local_budget += budget.heapBudget[i];
-		}
-	}
-	if (pressure_only && (local_budget == 0 || local_usage < HeapImageThreshold(local_budget))) return;
+	const auto sample = memory_budget_ext_enabled ? m_local_memory_budget.Read(physical_device, &budget) : LocalMemorySample {};
+	if (pressure_only && (!sample.budget || sample.usage < HeapImageThreshold(sample.target))) return;
 	auto line = fmt::format("[kyty-mem] reason={} seconds={} rss={} private={} malloc={} malloc_free={} cpu_copies={} pipeline_ram={}",
 	                        reason, seconds, Value(host.rss), Value(host.private_bytes), Value(host.malloc_bytes), Value(host.malloc_free),
 	                        cpu_copies.load(std::memory_order_relaxed), pipeline_ram.load(std::memory_order_relaxed));
@@ -132,9 +122,13 @@ void GraphicContext::LogMemoryMinute(const char* reason, uint64_t seconds, bool 
 		if (local) local_blocks += blocks;
 	}
 	line += fmt::format(" local_usage={} local_budget={} local_vma_blocks={} outside_vma={}",
-	                    memory_budget_ext_enabled ? std::to_string(local_usage) : "na",
-	                    memory_budget_ext_enabled ? std::to_string(local_budget) : "na", local_blocks,
-	                    memory_budget_ext_enabled ? std::to_string(int64_t(local_usage) - int64_t(local_blocks)) : "na");
+	                    memory_budget_ext_enabled ? std::to_string(sample.usage) : "na",
+	                    memory_budget_ext_enabled ? std::to_string(sample.budget) : "na", local_blocks,
+	                    memory_budget_ext_enabled ? std::to_string(int64_t(sample.usage) - int64_t(local_blocks)) : "na");
+	line += fmt::format(" local_target={} board_usage={} board_total={}",
+	                    memory_budget_ext_enabled ? std::to_string(sample.target) : "na",
+	                    sample.board ? std::to_string(sample.board->used) : "na",
+	                    sample.board ? std::to_string(sample.board->total) : "na");
 	for (size_t i = 0; i < Names.size(); ++i) {
 		const auto& local = totals[i][1];
 		const auto& system = totals[i][0];
