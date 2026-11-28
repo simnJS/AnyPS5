@@ -301,6 +301,7 @@ private:
 	friend struct VramTimeAgingTestAccess;
 	friend struct IndirectDispatchTestAccess;
 	friend struct BufferCacheBdaTestAccess;
+	friend struct UploadBatchFlushTestAccess;
 	friend class TextureCache;
 
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedBuffer(
@@ -335,6 +336,10 @@ private:
 	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
+	void RecordUploadBatch();
+	[[nodiscard]] bool FlushAndSubmitUploadBatch();
+	void UploadAndRecordCopies(Buffer& buffer, std::span<vk::BufferCopy> copies, uint64_t total_size,
+	                           uint64_t max_chunk = 0);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	void RecordBufferUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies,

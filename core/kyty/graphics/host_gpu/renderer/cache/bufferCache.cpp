@@ -59,15 +59,27 @@ vk::Result SubmitReadbackQueue(vk::Queue queue, const vk::SubmitInfo& submit, vk
 	return result;
 }
 
+template <typename WriteFunc, typename FlushFunc>
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
-                                        vk::BufferUsageFlags usage, const auto& write,
-                                        bool wait = true) {
-	const auto [mapped, offset] = staging.Map(size, alignment, wait);
+                                        vk::BufferUsageFlags usage, WriteFunc&& write,
+                                        bool wait, FlushFunc&& flush_batch) {
+	auto [mapped, offset] = staging.Map(size, alignment, wait);
+	bool flushed          = false;
+	if (mapped == nullptr && !wait && flush_batch()) {
+		std::tie(mapped, offset) = staging.Map(size, alignment, true);
+		flushed                  = true;
+	}
 	if (mapped != nullptr) {
 		write(mapped, offset);
 		staging.Commit();
+		if (flushed) {
+			scheduler.PopPendingOperations();
+		}
 		return {&staging, offset};
+	}
+	if (flushed) {
+		scheduler.PopPendingOperations();
 	}
 
 	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
@@ -1594,7 +1606,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    NoteUpload(address, bytes);
 	    },
 	    [&]() noexcept {
-		    RecordBufferUpload(buffer, copies, UploadCopies(buffer, copies, total_size));
+		    UploadAndRecordCopies(buffer, copies, total_size);
 		    copies.clear();
 		    total_size = 0;
 	    },
@@ -1612,6 +1624,9 @@ void BufferCache::RecordBufferUpload(Buffer& buffer, std::span<const vk::BufferC
 		    {buffer.Handle(), buffer.BufferDeviceAddress(), static_cast<uint32_t>(copies.size())});
 		m_upload_batch_copies.insert(m_upload_batch_copies.end(), copies.begin(), copies.end());
 	} else if (source) {
+		if (m_upload_batching) {
+			RecordUploadBatch();
+		}
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -1659,12 +1674,51 @@ void BufferCache::SynchronizeBuffers(std::span<Buffer* const>                   
 	    },
 	    [&]() noexcept {
 		    for (size_t index = 0; index < buffers.size(); index++) {
-			    const auto source =
-			        UploadCopies(*buffers[index], m_span_copies[index], m_span_sizes[index]);
-			    RecordBufferUpload(*buffers[index], m_span_copies[index], source);
+			    UploadAndRecordCopies(*buffers[index], m_span_copies[index], m_span_sizes[index]);
 		    }
 	    },
 	    m_device_sync_pass);
+}
+
+void BufferCache::UploadAndRecordCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+                                        uint64_t total_size, uint64_t max_chunk) {
+	if (copies.empty() || total_size == 0) {
+		return;
+	}
+	const uint64_t staging_limit =
+	    max_chunk != 0 ? max_chunk : std::max<uint64_t>(m_staging_buffer.Size() / 2, 1);
+	if (total_size <= staging_limit) {
+		RecordBufferUpload(buffer, copies, UploadCopies(buffer, copies, total_size));
+		return;
+	}
+	const uint64_t split_limit =
+	    staging_limit >= 16 ? Common::AlignDown(staging_limit, uint64_t {16}) : staging_limit;
+	std::vector<vk::BufferCopy> chunk;
+	uint64_t                    chunk_size  = 0;
+	const auto                  flush_chunk = [&] {
+		if (chunk.empty()) {
+			return;
+		}
+		RecordBufferUpload(buffer, chunk, UploadCopies(buffer, chunk, chunk_size));
+		chunk.clear();
+		chunk_size = 0;
+	};
+	for (const auto& copy: copies) {
+		uint64_t remaining = copy.size;
+		uint64_t dst       = copy.dstOffset;
+		while (remaining != 0) {
+			if (chunk_size != 0 && remaining > staging_limit - chunk_size) {
+				flush_chunk();
+			}
+			const uint64_t room = staging_limit - chunk_size;
+			const uint64_t take = remaining > room ? split_limit : remaining;
+			chunk.emplace_back(chunk_size, dst, take);
+			chunk_size += take;
+			dst += take;
+			remaining -= take;
+		}
+	}
+	flush_chunk();
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -1719,7 +1773,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			}
 			copy.srcOffset += base_offset;
 		}
-	}, !m_upload_batching);
+	}, !m_upload_batching, [this] { return FlushAndSubmitUploadBatch(); });
 	return source.first->Handle();
 }
 
@@ -2059,7 +2113,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		    !Libs::LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 			EXIT("BufferCache: failed to read mapped guest image backing\n");
 		}
-	});
+	}, true, [] { return false; });
 }
 
 void BufferCache::DrainHostCopies() {
@@ -3457,8 +3511,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-void BufferCache::FlushUploadBatch() {
-	m_upload_batching = false;
+void BufferCache::RecordUploadBatch() {
 	if (m_upload_batch_buffers.empty()) {
 		return;
 	}
@@ -3492,6 +3545,21 @@ void BufferCache::FlushUploadBatch() {
 	                       1, &after, 0, nullptr, 0, nullptr);
 	m_upload_batch_buffers.clear();
 	m_upload_batch_copies.clear();
+}
+
+void BufferCache::FlushUploadBatch() {
+	m_upload_batching = false;
+	RecordUploadBatch();
+}
+
+bool BufferCache::FlushAndSubmitUploadBatch() {
+	RecordUploadBatch();
+	if (!m_scheduler.Active() || m_scheduler.Current().IsInvalid()) {
+		return false;
+	}
+	m_scheduler.Flush();
+	m_upload_batch_tick = m_scheduler.CurrentTick();
+	return true;
 }
 
 bool BufferCache::ScatterUploadBatch(const CommandRecorder& native) {

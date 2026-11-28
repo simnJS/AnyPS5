@@ -302,6 +302,14 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_buffer_cache_pages PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_buffer_cache_pages: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/UploadBatchFlush.cpp)
+    add_test_executable(kyty_shim_upload_batch_flush_tests ${CMAKE_CURRENT_SOURCE_DIR}/UploadBatchFlushMain.cpp)
+    configure_host_test_executable(kyty_shim_upload_batch_flush_tests)
+    target_link_libraries(kyty_shim_upload_batch_flush_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_upload_batch_flush COMMAND kyty_shim_upload_batch_flush_tests)
+    set_tests_properties(kyty_shim_upload_batch_flush PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_upload_batch_flush: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/VramBudget.cpp)
     add_test_executable(kyty_shim_vram_budget_tests ${CMAKE_CURRENT_SOURCE_DIR}/VramBudgetMain.cpp)
     configure_host_test_executable(kyty_shim_vram_budget_tests)
