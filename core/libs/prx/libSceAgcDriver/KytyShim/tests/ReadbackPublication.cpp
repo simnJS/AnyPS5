@@ -7,8 +7,9 @@ int main() {
 	using Libs::Graphics::ReadbackPublication;
 	constexpr uint64_t page = 0x4000;
 	ReadbackPublication publication;
-	auto first = publication.Begin(page);
-	if (publication.Find(page + 4096) || publication.Find(page) != first) return 1;
+	auto first = publication.Begin(page, page + 8192);
+	if (publication.Find(page - 1) || publication.Find(page + 8192) || publication.Find(page + 4096) != first ||
+	    publication.Find(page) != first) return 1;
 
 	std::atomic<bool> acquired {false};
 	int backing = 0;
@@ -21,7 +22,7 @@ int main() {
 		observed = backing;
 	});
 	acquired.wait(false, std::memory_order_acquire);
-	auto second = publication.Begin(page);
+	auto second = publication.Begin(page, page + 8192);
 	backing = 42;
 	publication.Finish(first);
 	reader.join();

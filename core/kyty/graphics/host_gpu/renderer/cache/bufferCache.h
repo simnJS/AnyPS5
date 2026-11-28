@@ -472,7 +472,6 @@ private:
 	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};
 	std::atomic<uint32_t>                             m_stale_ring_next {0};
 	MemoryTracker                                     m_memory_tracker;
-	ReadbackPublication                               m_cp_publication;
 	uint64_t                                           m_gpu_write_generation = 0;
 	uint64_t                                          m_readback_count = 0;
 	WriteTicks                                        m_write_ticks;
@@ -496,6 +495,7 @@ private:
 	ReadbackQueue m_readback;
 	struct ReadbackQueueSlot {
 		ReadbackQueue     queue;
+		ReadbackPublication publication;
 		std::atomic<bool> busy {false};
 	};
 	std::array<ReadbackQueueSlot, 4> m_readback_slots;
@@ -505,7 +505,7 @@ private:
 		uint64_t                           total_size     = 0;
 		uint64_t                           needed   = 0;
 		uint64_t                           recorded = 0;
-		std::shared_ptr<std::atomic<bool>> published;
+		ReadbackPublication::Ticket        publication;
 		struct Follower {
 			uint64_t                    page = 0;
 			std::vector<vk::BufferCopy> copies;

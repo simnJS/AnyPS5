@@ -75,7 +75,7 @@ def main():
         times["async"] = int(row["async"] == "true")
         source = writer(row)
         location = "requested bytes" if row["request_dirty"] == "true" else "other bytes on page" if int(row["dirty_bytes"]) else "clean page"
-        if row["path"] in ("joined_cp", "clean_fault"):
+        if row["path"] in ("joined_cp", "joined_copy", "clean_fault"):
             source = location = "not sampled"
         keys = {
             "Thread": row["thread"],

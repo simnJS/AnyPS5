@@ -761,26 +761,29 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		stats.cp_ordered_ns.fetch_add(static_cast<uint64_t>(SteadyNs() - started), std::memory_order_relaxed);
 		stats.cp_not_waited.fetch_add(skipped, std::memory_order_relaxed);
 	}
-	const bool page_fault = guest_fault && !is_write && size == 1;
+	const bool page_fault = guest_fault && size == 1;
 	if (page_fault && !command_processor) {
 		const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-		const auto previous = m_cp_publication.Find(page);
-		if (previous) {
-			const auto start = trace ? SteadyNs() : 0;
-			ReadbackPublication::Wait(previous);
-			if (trace) trace->join = SteadyNs() - start;
+		bool joined = false;
+		for (const auto& slot: m_readback_slots) {
+			if (auto previous = slot.publication.Find(page)) {
+				const auto start = trace ? SteadyNs() : 0;
+				ReadbackPublication::Wait(previous);
+				if (trace) trace->join = SteadyNs() - start;
+				joined = true;
+				break;
+			}
 		}
 		if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 			if (trace) {
-				trace->path = previous ? "joined_cp" : "clean_fault";
+				trace->path = joined ? "joined_copy" : "clean_fault";
 				trace->total = SteadyNs() - request_start;
 			}
 			return;
 		}
 	}
-	const auto load_size = page_fault ? g_readback_replay.load_size : 0;
+	const auto load_size = page_fault && !is_write ? g_readback_replay.load_size : 0;
 	bool capture_load = false;
-	ReadbackPublication::Ticket cp_request;
 	auto&      split          = g_readback_stats;
 	const auto dispatch_start = SteadyNs();
 	const auto note_split     = [&](std::atomic<uint64_t>& counter, int64_t since) {
@@ -836,7 +839,6 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		                           guest_read && !command_processor)) {
 			if (trace) trace->path = "copy_queue";
 			tick = queue_read.recorded;
-			if (page_fault && command_processor) cp_request = m_cp_publication.Begin(pages_begin);
 			capture_load = (load_size == 4 || load_size == 8) && load_size <= pages_end - vaddr &&
 			               !m_texture_cache.IsRegionGpuModified(vaddr, load_size);
 		} else if (DownloadMemory<true>(vaddr, read_size)) {
@@ -901,7 +903,8 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 	if (queue_read.slot != nullptr) {
 		FinishReadbackQueueRead(queue_read, trace.get(), vaddr, capture_load ? load_size : 0);
 		note_split(split.other_wait_ns, wait_start);
-		release([this, vaddr, size, pages_begin, pages_end, is_write, cp_request, recorded = queue_read.recorded,
+		release([this, vaddr, size, pages_begin, pages_end, is_write, slot = queue_read.slot, publication = queue_read.publication,
+		         recorded = queue_read.recorded,
 		         followers = std::move(queue_read.followers)] {
 			const auto own = std::find_if(m_inflight_readbacks.begin(), m_inflight_readbacks.end(),
 			                              [&](const InFlightReadback& readback) {
@@ -913,7 +916,6 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 				m_inflight_readbacks.erase(own);
 			}
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, 0, is_write);
-			if (cp_request) m_cp_publication.Finish(cp_request);
 			if (!followers.empty()) {
 				std::vector<uint64_t> pages;
 				pages.reserve(followers.size());
@@ -933,6 +935,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 					}
 				}
 			}
+			slot->publication.Finish(publication);
 		});
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(tick);
@@ -1115,11 +1118,11 @@ bool BufferCache::StartReadbackQueueRead(uint64_t vaddr, uint64_t size, uint64_t
 	read.slot           = slot;
 	read.needed         = needed;
 	read.recorded       = m_scheduler.CurrentTick();
-	read.published      = std::make_shared<std::atomic<bool>>(false);
+	read.publication    = slot->publication.Begin(pages_begin, pages_end);
 	m_inflight_readbacks.push_back({pages_begin, pages_end, read.recorded});
 	if (read.followers.empty()) {
 		m_scheduler.DeferPriorityOperation(
-		    [published = read.published] { published->wait(false, std::memory_order_acquire); },
+		    [request = read.publication] { request->copied.wait(false, std::memory_order_acquire); },
 		    pages_begin, pages_end - pages_begin);
 		return true;
 	}
@@ -1131,7 +1134,7 @@ bool BufferCache::StartReadbackQueueRead(uint64_t vaddr, uint64_t size, uint64_t
 		ranges.emplace_back(follower.page, TRACKER_PAGE_SIZE);
 	}
 	m_scheduler.DeferPriorityOperation(
-	    [published = read.published] { published->wait(false, std::memory_order_acquire); }, ranges);
+	    [request = read.publication] { request->copied.wait(false, std::memory_order_acquire); }, ranges);
 	return true;
 }
 
@@ -1194,8 +1197,8 @@ void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read, ReadbackTrace
 	}
 	queue.Finish(m_graphics);
 	read.slot->busy.store(false, std::memory_order_release);
-	read.published->store(true, std::memory_order_release);
-	read.published->notify_all();
+	read.publication->copied.store(true, std::memory_order_release);
+	read.publication->copied.notify_all();
 	if (trace) trace->publish = SteadyNs() - start;
 }
 

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/readbackPublication.h"
 
 #include <algorithm>
 #include <array>
@@ -354,6 +355,43 @@ void FaultOnTheUploadingThread(PageManager& pages) {
 	memory.CheckNoWriteLost("uploading thread");
 	memory.Reset();
 }
+void WriteFaultDuringReadback(PageManager& pages) {
+	using Libs::Graphics::ReadbackPublication;
+	constexpr auto page = RegionBase + 48 * TRACKER_REGION_SIZE;
+	MemoryTracker tracker(pages);
+	ReadbackPublication publication;
+	const auto write_on_gpu = [&] {
+		tracker.ForEachUploadRange(page, TRACKER_PAGE_SIZE, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	};
+	write_on_gpu();
+	auto first = publication.Begin(page, page + TRACKER_PAGE_SIZE);
+	std::atomic<bool> joined {false};
+	std::atomic<int> backing {0};
+	int previous = 0;
+	bool needed_latest = false;
+	std::thread writer([&] {
+		auto request = publication.Find(page);
+		joined.store(true, std::memory_order_release);
+		joined.notify_one();
+		ReadbackPublication::Wait(request);
+		tracker.InvalidateRegion(page, 1, [&] {
+			needed_latest = true;
+			backing.store(2);
+			tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		});
+		tracker.InvalidateRegion(page, 1, [] {});
+		previous = backing.exchange(3);
+	});
+	joined.wait(false, std::memory_order_acquire);
+	backing.store(1);
+	tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+	write_on_gpu();
+	publication.Finish(first);
+	writer.join();
+	Check(needed_latest && previous == 2 && backing.load() == 3, "a joined write fault skipped the newer GPU writer");
+	Check(tracker.IsRegionCpuModified(page, 1), "the resumed CPU write was not tracked");
+}
+
 }
 
 int main() {
@@ -363,6 +401,7 @@ int main() {
 	NestedUploadsKeepTheirRanges(pages);
 	WrittenUploadLosesNoGuestWrite(pages);
 	FaultOnTheUploadingThread(pages);
+	WriteFaultDuringReadback(pages);
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_tracker_transitions: %d failure(s)\n", g_failures);
 		return 1;
