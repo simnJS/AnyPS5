@@ -283,6 +283,78 @@ public:
 		if (open) run(start, (BucketCount * BucketPages << PageBits) - start);
 	}
 
+	static constexpr uint8_t GpuVisible = 1;
+	static constexpr uint8_t GpuDelivered = 2;
+	static constexpr uint8_t GpuPending = 4;
+	static constexpr uint8_t GpuTracked = 8;
+
+	void UpdateGpu(uint64_t vaddr, uint64_t size, uint8_t set, uint8_t clear, bool partial_pages) {
+		if (size == 0 || UINT64_MAX - vaddr < size) return;
+		const auto first = partial_pages ? (vaddr >> PageBits) : ((vaddr & PageMask) == 0 ? (vaddr >> PageBits) : (vaddr >> PageBits) + 1u);
+		const auto last = partial_pages ? (((vaddr + size - 1u) >> PageBits) + 1u) : ((vaddr + size) >> PageBits);
+		for (auto page = first; page < last; ++page) {
+			if (page / BucketPages >= BucketCount) return;
+			auto& bucket = m_gpu[page / BucketPages];
+			auto* flags = bucket.load(std::memory_order_acquire);
+			if (flags == nullptr) {
+				if (set == 0) {
+					page = (page / BucketPages + 1u) * BucketPages - 1u;
+					continue;
+				}
+				auto* created = new std::atomic<uint8_t>[BucketPages] {};
+				if (bucket.compare_exchange_strong(flags, created, std::memory_order_acq_rel)) {
+					flags = created;
+				} else {
+					delete[] created;
+				}
+			}
+			auto& slot = flags[page % BucketPages];
+			slot.store(static_cast<uint8_t>((slot.load(std::memory_order_relaxed) & ~clear) | set), std::memory_order_relaxed);
+		}
+	}
+
+	[[nodiscard]] uint8_t Gpu(uint64_t page) const {
+		if (page / BucketPages >= BucketCount) return 0;
+		const auto* flags = m_gpu[page / BucketPages].load(std::memory_order_acquire);
+		return flags != nullptr ? flags[page % BucketPages].load(std::memory_order_relaxed) : 0;
+	}
+
+	[[nodiscard]] bool AnyGpu(uint64_t vaddr, uint64_t size, uint8_t mask) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) return false;
+		const auto end = ((vaddr + size - 1u) >> PageBits) + 1u;
+		for (auto page = vaddr >> PageBits; page < end; ++page) {
+			if (page / BucketPages >= BucketCount) return false;
+			if (m_gpu[page / BucketPages].load(std::memory_order_acquire) == nullptr) {
+				page = (page / BucketPages + 1u) * BucketPages - 1u;
+				continue;
+			}
+			if ((Gpu(page) & mask) != 0) return true;
+		}
+		return false;
+	}
+
+	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> GpuRuns(uint64_t vaddr, uint64_t size, uint8_t mask, bool untracked = false) const {
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		if (size == 0 || UINT64_MAX - vaddr < size) return runs;
+		const auto end = ((vaddr + size - 1u) >> PageBits) + 1u;
+		for (auto page = vaddr >> PageBits; page < end; ++page) {
+			if (page / BucketPages >= BucketCount) break;
+			if (!untracked && m_gpu[page / BucketPages].load(std::memory_order_acquire) == nullptr) {
+				page = (page / BucketPages + 1u) * BucketPages - 1u;
+				continue;
+			}
+			const auto flags = Gpu(page);
+			if ((flags & mask) == 0 && !(untracked && (flags & GpuTracked) == 0)) continue;
+			const auto start = page << PageBits;
+			if (!runs.empty() && runs.back().first + runs.back().second == start) {
+				runs.back().second += PageSize;
+			} else {
+				runs.emplace_back(start, PageSize);
+			}
+		}
+		return runs;
+	}
+
 private:
 	static constexpr uint8_t ProbeMask = 3;
 
@@ -300,6 +372,7 @@ private:
 	std::array<std::atomic<Bucket*>, BucketCount> m_buckets {};
 	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_exec {};
 	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_probe {};
+	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_gpu {};
 };
 
 struct ViewState {
@@ -738,6 +811,27 @@ int GuestProtectionBits(Common::VirtualMemory::Mode mode) {
 	return ((host & PROT_READ) != 0 ? 0x01 : 0) | ((host & PROT_WRITE) != 0 ? 0x02 : 0) | ((host & PROT_EXEC) != 0 ? 0x04 : 0);
 }
 
+bool UnmapHookNeeded(const PageTable& pages, uint64_t address, uint64_t bytes) {
+	return pages.AnyGpu(address, bytes, PageTable::GpuDelivered);
+}
+
+void DeliverPendingMaps(PageTable& pages, uint64_t address, uint64_t bytes) {
+	if (g_map_hook == nullptr) return;
+	for (const auto& [start, size] : pages.GpuRuns(address, bytes, PageTable::GpuPending)) {
+		g_map_hook(start, size);
+		pages.UpdateGpu(start, size, PageTable::GpuDelivered, PageTable::GpuPending, true);
+	}
+}
+
+void DeliverMapHook(PageTable& pages, uint64_t address, uint64_t bytes) {
+	pages.UpdateGpu(address, bytes, PageTable::GpuPending, PageTable::GpuDelivered, true);
+	if (g_map_hook == nullptr) return;
+	for (const auto& [start, size] : pages.GpuRuns(address, bytes, PageTable::GpuVisible, true)) {
+		g_map_hook(start, size);
+		pages.UpdateGpu(start, size, PageTable::GpuDelivered, PageTable::GpuPending, true);
+	}
+}
+
 void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offset) {
 	if (((address | bytes) & PageMask) != 0) {
 		Shim::Fail("KytyShim memory: libkernel reported a view change 0x%016" PRIx64 "+0x%zx that is not 16 KiB aligned\n", static_cast<uint64_t>(address), bytes);
@@ -747,19 +841,21 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	ForgetProbes(address, bytes);
 	if (offset == DirectMemoryViewReplacing) {
 		if (pages.AnyMapped(address, bytes)) {
-			if (g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
+			if (g_unmap_hook != nullptr && UnmapHookNeeded(pages, address, bytes)) g_unmap_hook(address, bytes);
 			ReleaseShares(address, bytes);
 			pages.Store(address, bytes, 0, false);
 			BumpBackingEpoch(address, bytes);
 		}
+		pages.UpdateGpu(address, bytes, 0, PageTable::GpuDelivered | PageTable::GpuPending, true);
 		GuestArena::GuestArenaNoteHostProtection_nid_no_patch(address, bytes, true);
 		return;
 	}
 	if (offset == DirectMemoryViewUnmapped) {
 		const bool mapped = pages.AnyMapped(address, bytes);
-		if (mapped && g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
+		if (mapped && g_unmap_hook != nullptr && UnmapHookNeeded(pages, address, bytes)) g_unmap_hook(address, bytes);
 		ReleaseShares(address, bytes);
 		pages.Store(address, bytes, 0, false);
+		pages.UpdateGpu(address, bytes, 0, PageTable::GpuDelivered | PageTable::GpuPending, true);
 		BumpBackingEpoch(address, bytes);
 		GuestArena::GuestArenaNoteHostProtection_nid_no_patch(address, bytes, true);
 		return;
@@ -781,7 +877,7 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 		}
 	}
 	BumpBackingEpoch(address, bytes);
-	if (g_map_hook != nullptr) g_map_hook(address, bytes);
+	DeliverMapHook(pages, address, bytes);
 }
 
 void OnProtectionChange(std::uintptr_t address, std::size_t bytes, int protection) {
@@ -790,6 +886,20 @@ void OnProtectionChange(std::uintptr_t address, std::size_t bytes, int protectio
 	}
 	Pages().StoreExecutable(address, address + bytes, protection >= 0 && (protection & 0x04) != 0);
 	ForgetProbes(address, bytes);
+	if (bytes == 0) return;
+	GuestDeliveryLock lock(HookMutex());
+	auto& pages = Pages();
+	if (protection < 0) {
+		pages.UpdateGpu(address, bytes, 0, PageTable::GpuVisible | PageTable::GpuTracked, false);
+		return;
+	}
+	pages.UpdateGpu(address, bytes, PageTable::GpuTracked, 0, true);
+	if ((protection & ~0x07) == 0) {
+		pages.UpdateGpu(address, bytes, 0, PageTable::GpuVisible, false);
+		return;
+	}
+	pages.UpdateGpu(address, bytes, PageTable::GpuVisible, 0, true);
+	DeliverPendingMaps(pages, address, bytes);
 }
 
 void EnableViewOnce() {
@@ -918,7 +1028,19 @@ void SetGpuRangeHooks(RangeHook map, RangeHook unmap) {
 	std::lock_guard lock(HookMutex());
 	g_map_hook = map;
 	g_unmap_hook = unmap;
-	if (map != nullptr) Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) { map(start, size); });
+	if (map == nullptr) {
+		Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) {
+			Pages().UpdateGpu(start, size, PageTable::GpuPending, PageTable::GpuDelivered, true);
+		});
+		return;
+	}
+	Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) {
+		Pages().UpdateGpu(start, size, PageTable::GpuPending, 0, true);
+		for (const auto& [run_start, run_size] : Pages().GpuRuns(start, size, PageTable::GpuVisible, true)) {
+			map(run_start, run_size);
+			Pages().UpdateGpu(run_start, run_size, PageTable::GpuDelivered, PageTable::GpuPending, true);
+		}
+	});
 }
 
 uint64_t ProbeCalls() {

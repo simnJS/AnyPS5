@@ -240,21 +240,58 @@ void TestSoleBacking() {
 }
 
 void TestGpuHooks() {
-    void* before = nullptr;
-    Require(sceKernelMapFlexibleMemory(&before, Page * 2, CpuReadWrite, 0) == 0);
+    g_hooks = HookLog{};
+    void* beforeCpu = nullptr;
+    Require(sceKernelMapFlexibleMemory(&beforeCpu, Page * 2, CpuReadWrite, 0) == 0);
+    void* beforeGpu = nullptr;
+    Require(sceKernelMapFlexibleMemory(&beforeGpu, Page * 2, CpuReadWrite | GpuReadWrite, 0) == 0);
     Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&OnMap, &OnUnmap);
-    Require(Covers(g_hooks.mapped, Address(before), Page * 2));
+    Require(!Covers(g_hooks.mapped, Address(beforeCpu), Page * 2));
+    Require(Covers(g_hooks.mapped, Address(beforeGpu), Page * 2));
 
-    void* after = nullptr;
-    Require(sceKernelMapFlexibleMemory(&after, Page * 2, CpuReadWrite, 0) == 0);
-    Require(Covers(g_hooks.mapped, Address(after), Page * 2));
-    Require(sceKernelMunmap(Address(after), Page * 2) == 0);
-    Require(Covers(g_hooks.unmapped, Address(after), Page * 2));
+    Require(sceKernelMprotect(beforeCpu, Page * 2, CpuReadWrite | GpuReadWrite) == 0);
+    Require(Covers(g_hooks.mapped, Address(beforeCpu), Page * 2));
+
+    void* afterCpu = nullptr;
+    Require(sceKernelMapFlexibleMemory(&afterCpu, Page * 2, CpuReadWrite, 0) == 0);
+    Require(!Covers(g_hooks.mapped, Address(afterCpu), Page * 2));
+    Require(sceKernelMunmap(Address(afterCpu), Page * 2) == 0);
+    Require(!Covers(g_hooks.unmapped, Address(afterCpu), Page * 2));
+
+    void* afterPromoted = nullptr;
+    Require(sceKernelMapFlexibleMemory(&afterPromoted, Page * 4, CpuReadWrite, 0) == 0);
+    Require(!Covers(g_hooks.mapped, Address(afterPromoted), Page * 4));
+    Require(sceKernelMprotect(afterPromoted, Page * 2, CpuReadWrite | GpuReadWrite) == 0);
+    Require(Covers(g_hooks.mapped, Address(afterPromoted), Page * 2));
+    Require(!Covers(g_hooks.mapped, Address(afterPromoted) + Page * 2, Page * 2));
+    Require(sceKernelMunmap(Address(afterPromoted) + Page * 2, Page * 2) == 0);
+    Require(!Covers(g_hooks.unmapped, Address(afterPromoted) + Page * 2, Page * 2));
+    Require(sceKernelMunmap(Address(afterPromoted), Page * 2) == 0);
+    Require(Covers(g_hooks.unmapped, Address(afterPromoted), Page * 2));
     Require(g_hooks.backedWhenUnmapped);
 
+    void* stripped = nullptr;
+    Require(sceKernelMapFlexibleMemory(&stripped, Page * 2, CpuReadWrite | GpuReadWrite, 0) == 0);
+    Require(Covers(g_hooks.mapped, Address(stripped), Page * 2));
+    Require(sceKernelMprotect(stripped, Page * 2, CpuReadWrite) == 0);
+    Require(sceKernelMunmap(Address(stripped), Page * 2) == 0);
+    Require(Covers(g_hooks.unmapped, Address(stripped), Page * 2));
+
+    void* replaced = nullptr;
+    Require(sceKernelMapFlexibleMemory(&replaced, Page * 2, CpuReadWrite | GpuReadWrite, 0) == 0);
+    Require(Covers(g_hooks.mapped, Address(replaced), Page * 2));
+    g_hooks = HookLog{};
+    void* replacement = replaced;
+    Require(sceKernelMapFlexibleMemory(&replacement, Page * 2, CpuReadWrite, MapFixed) == 0 && replacement == replaced);
+    Require(Covers(g_hooks.unmapped, Address(replaced), Page * 2));
+    Require(!Covers(g_hooks.mapped, Address(replaced), Page * 2));
+    Require(sceKernelMunmap(Address(replaced), Page * 2) == 0);
+    Require(g_hooks.unmapped.size() == 1);
+
     Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(nullptr, nullptr);
-    Require(sceKernelMunmap(Address(before), Page * 2) == 0);
-    std::printf("projection hooks: replayed at install, map and unmap reported, unmap seen before the backing goes\n");
+    Require(sceKernelMunmap(Address(beforeGpu), Page * 2) == 0);
+    Require(sceKernelMunmap(Address(beforeCpu), Page * 2) == 0);
+    std::printf("projection hooks: CPU-only mappings skipped until GPU-visible, delivered maps unmapped even after stripping GPU bits, replaced GPU mapping unmapped cleanly\n");
 }
 
 void TestReleaseWhileMapped() {
@@ -579,7 +616,7 @@ void WaitingViewHook(std::uint64_t, std::uint64_t) {
 
 bool MapAndUnmapPage() {
     void* mapped = nullptr;
-    if (sceKernelMapFlexibleMemory(&mapped, Page, CpuReadWrite, 0) != 0 || mapped == nullptr) return false;
+    if (sceKernelMapFlexibleMemory(&mapped, Page, CpuReadWrite | GpuReadWrite, 0) != 0 || mapped == nullptr) return false;
     return sceKernelMunmap(Address(mapped), Page) == 0;
 }
 
@@ -1049,11 +1086,18 @@ void TestNoCrossWaitWithGpuThread() {
     Require(g_crossWait.jobs > beforeUnmap);
     Require(sceKernelReleaseDirectMemory(phys, bytes) == 0);
 
+    void* cpuOnly = nullptr;
+    const auto beforeCpuOnly = g_crossWait.jobs;
+    Require(sceKernelMapFlexibleMemory(&cpuOnly, Page * 2, CpuReadWrite, 0) == 0 && cpuOnly != nullptr);
+    Require(g_crossWait.jobs == beforeCpuOnly);
+    Require(sceKernelMunmap(Address(cpuOnly), Page * 2) == 0);
+    Require(g_crossWait.jobs == beforeCpuOnly);
+
     void* flexible = nullptr;
-    Require(sceKernelMapFlexibleMemory(&flexible, Page * 2, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    Require(sceKernelMapFlexibleMemory(&flexible, Page * 2, CpuReadWrite | GpuReadWrite, 0) == 0 && flexible != nullptr);
     const auto beforeReplace = g_crossWait.jobs;
     void* replaced = flexible;
-    Require(sceKernelMapFlexibleMemory(&replaced, Page * 2, CpuReadWrite, MapFixed) == 0 && replaced == flexible);
+    Require(sceKernelMapFlexibleMemory(&replaced, Page * 2, CpuReadWrite | GpuReadWrite, MapFixed) == 0 && replaced == flexible);
     Require(g_crossWait.jobs >= beforeReplace + 2);
     Require(sceKernelMunmap(Address(flexible), Page * 2) == 0);
 
