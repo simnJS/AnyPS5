@@ -2799,15 +2799,6 @@ uint32_t FormattedReadComponents(const ResourcePlan& program, uint32_t index) {
 	return mask;
 }
 
-#if defined(ANYPS5_KYTY)
-bool SharesEmptyBuffers() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_SHARE_EMPTY_BUFFERS");
-		return value == nullptr || std::string_view(value) != "0";
-	}();
-	return on;
-}
-
 static bool DirectBufferSlot(const ResourcePlan& program, uint32_t index,
                              const ResourceSpecialization::Buffer& buffer) {
 	if (index >= program.info.buffers.size() || buffer.indirect_root != BufferResource::NoIndirectBuffer) {
@@ -2817,6 +2808,15 @@ static bool DirectBufferSlot(const ResourcePlan& program, uint32_t index,
 	return base.source < program.descriptor_sources.size() &&
 	       !program.descriptor_sources[base.source].indirect_descriptor.has_value() &&
 	       base.indirect_root == BufferResource::NoIndirectBuffer && base.indirect_resources.empty();
+}
+
+#if defined(ANYPS5_KYTY)
+bool SharesEmptyBuffers() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SHARE_EMPTY_BUFFERS");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return on;
 }
 
 static void ShareEmptyBuffer(const ResourcePlan& program, uint32_t index, bool runtime_stride,
@@ -3406,6 +3406,36 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return MaterializeResourcesForViews(program, runtime, snapshot, specialization, {});
 }
 
+static bool ReadFallbackBufferFormat(const ResourcePlan& plan, const ResourceSnapshot& snapshot, uint32_t index,
+                                     ResourceSpecialization::Buffer& buffer) {
+	if (!DirectBufferSlot(plan, index, buffer) || index >= snapshot.buffers.size() ||
+	    index >= plan.buffer_vector_access.size() || !plan.buffer_vector_access[index]) return false;
+	const auto& resource = plan.info.buffers[index];
+	if (!resource.formatted || resource.written || resource.atomic || resource.scalar ||
+	    (buffer.packed_stride & (1u << 14u)) != 0u) return false;
+	ShaderBufferResource descriptor;
+	if (!DecodeBufferDescriptor(snapshot.buffers[index], descriptor) ||
+	    ((descriptor.Base48() | descriptor.GetSize()) & 3u) != 0u ||
+	    (buffer.zero_stride_oob && descriptor.NumRecords() != 0u)) return false;
+	const auto format = Format::GetFormatInfo(descriptor.Format());
+	if (descriptor.NumRecords() != 0u && format.type == Format::ComponentType::Unknown) return false;
+	const auto components = FormattedReadComponents(plan, index);
+	if (!components) return false;
+	if (format.type != Format::ComponentType::Unknown) {
+		for (uint32_t i = 0; i < 4; ++i) {
+			if ((components & (1u << i)) != 0 &&
+			    Format::ResolveFormattedSource(format, GetDstSel(descriptor.DstSelXYZW(), i)).kind ==
+			        Format::FormattedSourceKind::Invalid) return false;
+		}
+	}
+	buffer.packed_stride = RuntimeStrideKey(buffer.packed_stride) | RuntimeBufferFormat;
+	buffer.zero_stride_oob = false;
+	buffer.scalar_empty = false;
+	buffer.descriptor_format = Prospero::BufferFormat::kInvalid;
+	buffer.descriptor_swizzle = DstSel(4, 5, 6, 7);
+	return true;
+}
+
 bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime& runtime,
                                   ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	const bool buffer_failure  = t_indirect_buffer_failure;
@@ -3414,6 +3444,10 @@ bool MaterializeFallbackResources(const ResourcePlan& program, const SrtRuntime&
 	auto fallback_runtime = runtime;
 	fallback_runtime.runtime_stride = true;
 	const bool ok = MaterializeResourcesForViews(program, fallback_runtime, snapshot, specialization, {});
+	if (ok) {
+		for (uint32_t i = 0; i < specialization.buffers.size(); ++i)
+			ReadFallbackBufferFormat(program, snapshot, i, specialization.buffers[i]);
+	}
 	t_indirect_buffer_failure  = buffer_failure;
 	t_indirect_sampler_failure = sampler_failure;
 	return ok;
@@ -4215,7 +4249,11 @@ void PlaceRoot(uint32_t root, const RootPlan<Slot>& plan, const Slot& form, std:
 }
 
 bool CompatibleComputeBuffer(const ResourcePlan& plan, uint32_t index, ResourceSpecialization::Buffer live,
-                             const ResourceSpecialization::Buffer& served) {
+                             const ResourceSpecialization::Buffer& served, const ResourceSnapshot* snapshot) {
+	if ((served.packed_stride & RuntimeBufferFormat) != 0u) {
+		if (live == served) return true;
+		return snapshot && ReadFallbackBufferFormat(plan, *snapshot, index, live) && live == served;
+	}
 	if (HasRuntimeStride(served.packed_stride) && ReadsStrideAtRunTime(plan, index, live)) {
 		constexpr uint32_t runtime = BufferStrideMask | StructuredBufferBounds | ExactBufferBounds;
 		live.packed_stride = (live.packed_stride & ~runtime) | (served.packed_stride & runtime);
@@ -4288,7 +4326,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 	for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
 		const auto& wanted = specialization.buffers[index];
 		const auto& served = target.buffers[index];
-		if (!CompatibleComputeBuffer(program, index, wanted, served) &&
+		if (!CompatibleComputeBuffer(program, index, wanted, served, &snapshot) &&
 		    (wanted.indirect_root != BufferResource::NoIndirectBuffer || served.indirect_root != BufferResource::NoIndirectBuffer ||
 		     !EmptyBufferServes(program, snapshot, index, wanted, served))) {
 			return RefuseServe(ServeRefusal::Step::Buffer, index);
@@ -4398,14 +4436,15 @@ ImageAddressing Addressing(const ResourceSpecialization::Image& image) {
 }
 
 bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecialization& specialization,
-                            const ResourceSpecialization& target) {
+                            const ResourceSpecialization& target, const ResourceSnapshot* snapshot) {
 	const auto roots = program.info.images.size();
 	if (!GenericComputeVariants() || program.stage != ShaderType::Compute ||
 	    specialization.images.size() < roots || target.images.size() < roots ||
 	    specialization.buffers.size() != target.buffers.size()) return RefuseServe(ServeRefusal::Step::ResourceCount);
 	if (specialization.samplers != target.samplers) return RefuseServe(ServeRefusal::Step::Sampler);
 	for (uint32_t i = 0; i < specialization.buffers.size(); ++i) {
-		if (!CompatibleComputeBuffer(program, i, specialization.buffers[i], target.buffers[i]))
+		if (!CompatibleComputeBuffer(program, i, specialization.buffers[i], target.buffers[i], snapshot) &&
+		    (!snapshot || !EmptyBufferServes(program, *snapshot, i, specialization.buffers[i], target.buffers[i])))
 			return RefuseServe(ServeRefusal::Step::Buffer, i);
 	}
 	bool changes_addressing = false;
@@ -4462,7 +4501,7 @@ bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecializ
 bool RebindComputeImages(const ResourcePlan& program, const SrtRuntime& runtime, const ResourceSnapshot& snapshot,
                          const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                          ResourceSnapshot& aligned) {
-	if (!CanRebindComputeImages(program, specialization, target)) return false;
+	if (!CanRebindComputeImages(program, specialization, target, &snapshot)) return false;
 	ResourceSnapshot rebound;
 	ResourceSpecialization shape;
 	if (!MaterializeResourcesForViews(program, runtime, rebound, shape, target.images, &snapshot, &specialization)) {

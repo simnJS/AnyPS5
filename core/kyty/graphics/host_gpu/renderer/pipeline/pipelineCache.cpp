@@ -1458,7 +1458,7 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 		if (runtime != nullptr)
 			return ShaderRecompiler::IR::RebindComputeImages(plan, *runtime, resources, specialization,
 			                                                 candidate.specialization, resources);
-		return rematerialize ? ShaderRecompiler::IR::CanRebindComputeImages(plan, specialization, candidate.specialization)
+		return rematerialize ? ShaderRecompiler::IR::CanRebindComputeImages(plan, specialization, candidate.specialization, &resources)
 		                     : ShaderRecompiler::IR::AlignResources(plan, resources, specialization, candidate.specialization, nullptr);
 	};
 	if (program.served_module < program.modules.size() && compatible(program.modules[program.served_module])) {
@@ -1602,7 +1602,10 @@ bool PipelineCache::FallbackComputeVariant(const ProgramKey& key, Program& progr
                                                                    ShaderRecompiler::IR::ResourceSnapshot>>* natural) {
 	using Image = ShaderRecompiler::IR::ResourceSpecialization::Image;
 	if (program.call_source != nullptr || !ShaderRecompiler::IR::GenericComputeVariants() ||
-	    std::ranges::none_of(program.specialization.images, &Image::heap)) {
+	    (std::ranges::none_of(program.specialization.images, &Image::heap) &&
+	     std::ranges::none_of(program.resource_plan.info.buffers, [](const auto& buffer) {
+		     return buffer.formatted && !buffer.written && !buffer.atomic && !buffer.scalar;
+	     }))) {
 		return true;
 	}
 	if (natural == nullptr) {

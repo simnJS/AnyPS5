@@ -92,13 +92,14 @@ struct Materialized {
 };
 
 Materialized Materialize(const IR::ResourcePlan& plan, const Sharp& source, const Sharp& target,
-                         bool runtime_stride) {
+                         bool runtime_stride, bool fallback = false) {
 	std::array<uint32_t, 16> user_data {};
 	std::copy(source.begin(), source.end(), user_data.begin());
 	std::copy(target.begin(), target.end(), user_data.begin() + 4);
 	const IR::SrtRuntime runtime {.user_data = user_data, .runtime_stride = runtime_stride};
 	Materialized         result;
-	result.ok = IR::MaterializeResources(plan, runtime, result.snapshot, result.specialization);
+	result.ok = fallback ? IR::MaterializeFallbackResources(plan, runtime, result.snapshot, result.specialization)
+	                     : IR::MaterializeResources(plan, runtime, result.snapshot, result.specialization);
 	return result;
 }
 
@@ -282,6 +283,14 @@ void FormattedSlot(bool sharing) {
 		                               MakeSharp(SourceAddress, Records, Format32UInt, SwizzleXyzw, 3, 4), target, true);
 		Check(bound.ok && zero.ok && other.ok, name + ": every variant materializes");
 		if (!bound.ok || !zero.ok || !other.ok) continue;
+		const auto fallback = Materialize(program.plan, Sharp {}, target, false, true);
+		const auto other_fallback = Materialize(program.plan, MakeSharp(SourceAddress, Records, Format32UInt, SwizzleXyzw, 3, 4),
+		                                        target, false, true);
+		Check(fallback.ok && other_fallback.ok && fallback.specialization == other_fallback.specialization &&
+		          (fallback.specialization.buffers[slot].packed_stride & IR::RuntimeBufferFormat) != 0u &&
+		          IR::AlignResources(program.plan, bound.snapshot, bound.specialization, fallback.specialization, nullptr) &&
+		          IR::AlignResources(program.plan, zero.snapshot, zero.specialization, fallback.specialization, nullptr),
+		      name + ": a prepared formatted read serves live formats and an empty buffer");
 		Check(zero.specialization != bound.specialization, name + ": the null and bound keys differ");
 		Check(zero.specialization.buffers[slot].scalar_empty == sharing, name + ": the null slot is marked empty in the key");
 		Check(IR::EmptyBuffersServe(program.plan, zero.snapshot, zero.specialization, bound.specialization) ==

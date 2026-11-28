@@ -148,7 +148,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
                     const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                     ResourceSnapshot* aligned);
 bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecialization& specialization,
-                            const ResourceSpecialization& target);
+                            const ResourceSpecialization& target, const ResourceSnapshot* snapshot = nullptr);
 bool RebindComputeImages(const ResourcePlan& program, const SrtRuntime& runtime, const ResourceSnapshot& snapshot,
                          const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                          ResourceSnapshot& aligned);
