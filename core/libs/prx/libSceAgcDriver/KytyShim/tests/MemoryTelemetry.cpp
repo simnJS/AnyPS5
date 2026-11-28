@@ -41,6 +41,14 @@ void CheckResources() {
 		Require(pipeline_ram == 7 + words.capacity() * sizeof(uint32_t), "cache allocation and move");
 	}
 	Require(pipeline_ram == 0, "cache release");
+	{
+		std::vector<ScopedBytes<parked_local>> reserve;
+		reserve.emplace_back(128);
+		reserve.emplace_back(512);
+		reserve.erase(reserve.begin());
+		Require(parked_local == 512, "only the remaining parked allocation is charged");
+	}
+	Require(parked_local == 0, "parked allocations released on shutdown");
 }
 
 void CheckDriver() {

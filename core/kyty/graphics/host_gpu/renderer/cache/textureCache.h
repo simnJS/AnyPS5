@@ -535,7 +535,13 @@ private:
 	std::unordered_map<ImageId, std::vector<ImageId>> m_depth_copies;
 	std::unordered_map<ImageId, ImageId>              m_depth_feedback_copies;
 	std::unordered_map<ImageId, std::vector<ImageId>> m_stencil_copies;
-	std::vector<std::pair<ImageId, uint64_t>>         m_parked_images;
+	struct ParkedImage {
+		ParkedImage(ImageId image, uint64_t when, uint64_t size): id(image), tick(when), bytes(size) {}
+		ImageId id;
+		uint64_t tick;
+		MemoryTelemetry::ScopedBytes<MemoryTelemetry::parked_local> bytes;
+	};
+	std::vector<ParkedImage>                          m_parked_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	Common::AnnotatedMutex                            m_pending_meta_lock;
 	PendingMetaClears                                 m_pending_meta_clears KYTY_GUARDED_BY(m_pending_meta_lock);

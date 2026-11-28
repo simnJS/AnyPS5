@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/driverMemoryReport.h"
 #include "graphics/host_gpu/memoryTelemetry.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -158,7 +159,7 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
-	void               LogMemoryMinute(const char* reason, uint64_t seconds) const;
+	void               LogMemoryMinute(const char* reason, uint64_t seconds, bool pressure_only = false) const;
 	void               StartMemoryMinutes();
 	void               StopMemoryMinutes();
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept {
@@ -173,10 +174,10 @@ struct GraphicContext {
 		uint32_t allocations  = 0;
 		bool     device_local = false;
 	};
-	static constexpr uint64_t CrowdedPercent     = 85;
-	static constexpr uint64_t CrowdedStopPercent = 80;
-	[[nodiscard]] static uint64_t BudgetShare(uint64_t budget, uint64_t percent) noexcept {
-		return budget / 100u * percent + budget % 100u * percent / 100u;
+	[[nodiscard]] static uint64_t HeapImageThreshold(uint64_t budget, bool low = false) noexcept {
+		const auto share = [budget](uint64_t percent) { return budget / 100u * percent + budget % 100u * percent / 100u; };
+		const auto reserve = std::min<uint64_t>(share(15), 2ull << 30u);
+		return share(low ? 80 : 85) - reserve;
 	}
 	[[nodiscard]] HeapUsage GetLocalMemoryUsage() const;
 	[[nodiscard]] bool      LocalMemoryCrowded() const;

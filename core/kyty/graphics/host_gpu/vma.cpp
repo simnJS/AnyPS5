@@ -371,12 +371,12 @@ bool GraphicContext::LocalMemoryCrowded() const {
 				budget += budgets[heap].budget;
 			}
 		}
-		if (usage - std::min(usage, space) < BudgetShare(budget, CrowdedPercent)) {
+		if (usage - std::min(usage, space) < HeapImageThreshold(budget)) {
 			return false;
 		}
 	}
 	const auto local = GetLocalMemoryUsage();
-	return local.budget != 0 && local.usage - std::min(local.usage, space) >= BudgetShare(local.budget, CrowdedPercent);
+	return local.budget != 0 && local.usage - std::min(local.usage, space) >= HeapImageThreshold(local.budget);
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {

@@ -862,9 +862,11 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	auto& executor = renderer.GetRenderExecutor();
 	RenderExecutorTestAccess::Reset(executor);
 
-	std::array<IR::DescriptorValue, Textures>             values {};
-	std::array<std::array<uint8_t, TexelCount>, Textures> texels {};
-	for (uint32_t texture = 0; texture < Textures; ++texture) {
+	constexpr uint32_t Hot = 0, Once = 1, ColdFirst = 2, ColdSecond = 3, HotAlias = 4, ColdAlias = 5;
+	constexpr uint32_t TableSize = ColdAlias + 1;
+	std::array<IR::DescriptorValue, TableSize>             values {};
+	std::array<std::array<uint8_t, TexelCount>, TableSize> texels {};
+	for (uint32_t texture = 0; texture < TableSize; ++texture) {
 		const auto base = address + 0x10000u + uint64_t {texture} * 0x4000u;
 		values[texture] = HeapTexture(base);
 		for (uint32_t texel = 0; texel < TexelCount; ++texel) {
@@ -872,6 +874,10 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 		}
 		Libs::LibKernel::Memory::WriteBacking(base, texels[texture].data(), TexelCount);
 		buffers.InvalidateMemory(base, TexelCount);
+		if (texture == HotAlias || texture == ColdAlias) {
+			values[texture] = values[texture == HotAlias ? Hot : ColdFirst];
+			values[texture].dwords[3] ^= 1u << 3u;
+		}
 		Libs::LibKernel::Memory::WriteBacking(address + uint64_t {texture} * 32u, values[texture].dwords.data(),
 		                                      sizeof(values[texture].dwords));
 		buffers.InvalidateMemory(address + uint64_t {texture} * 32u, sizeof(values[texture].dwords));
@@ -880,29 +886,32 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
 	const auto                 profile = IR::ImageTableHeapProfile(root, false);
 	const IR::ImageHeapRequest request {.base  = address,
-	                                    .size  = Textures * 32u,
+	                                    .size  = TableSize * 32u,
 	                                    .step  = 32u,
-	                                    .count = Textures,
+	                                    .count = TableSize,
 	                                    .root  = &profile,
 	                                    .table = true};
 	IR::ImageHeapView view;
 	heap.BeginDraw();
 	if (!heap.Acquire(request, view)) {
-		Check(false, "the heap admits a table of four textures");
+		Check(false, "the heap admits the table with aliased views");
 		return;
 	}
 	heap.Rebind(executor);
-	constexpr uint32_t Hot = 0, Once = 1, ColdFirst = 2, ColdSecond = 3;
-	std::array<uint32_t, Textures> slots {};
-	std::array<ImageId, Textures>  images {};
-	for (uint32_t texture = 0; texture < Textures; ++texture) {
+
+	std::array<uint32_t, TableSize> slots {};
+	std::array<ImageId, TableSize>  images {};
+	for (uint32_t texture = 0; texture < TableSize; ++texture) {
 		slots[texture]  = Access::Slot(heap, values[texture]);
 		images[texture] = slots[texture] != 0u ? Access::ImageOf(heap, slots[texture]) : ImageId {};
 		Check(slots[texture] != 0u && static_cast<bool>(images[texture]), "each texture resolves to a heap slot and an image");
 	}
 	if (!std::ranges::all_of(images, [](ImageId id) { return static_cast<bool>(id); })) return;
-	std::array<uint64_t, Textures> charges {};
-	for (uint32_t texture = 0; texture < Textures; ++texture) {
+	Check(images[Hot] == images[HotAlias] && slots[Hot] != slots[HotAlias] &&
+	          images[ColdFirst] == images[ColdAlias] && slots[ColdFirst] != slots[ColdAlias],
+	      "different component mappings pin the same allocation through distinct slots");
+	std::array<uint64_t, TableSize> charges {};
+	for (uint32_t texture = 0; texture < TableSize; ++texture) {
 		const auto& charge = Access::Find(textures, images[texture])->backing.charge;
 		charges[texture]   = charge.bytes;
 		Check(charge.local && charge.bytes != 0u, "each texture is charged to device-local memory");
@@ -934,8 +943,8 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	const uint64_t wanted   = two_cold - std::min(charges[ColdFirst], charges[ColdSecond]) / 2u;
 	const uint64_t unit     = wanted / 5u;
 	const uint64_t budget   = unit * 100u;
-	const uint64_t usage    = unit * 80u + wanted;
-	Check(usage >= GraphicContext::BudgetShare(budget, GraphicContext::CrowdedPercent), "the test usage is past the crowded mark");
+	const uint64_t usage    = GraphicContext::HeapImageThreshold(budget, true) + wanted;
+	Check(usage >= GraphicContext::HeapImageThreshold(budget), "the test usage is past the crowded mark");
 	heap.BeginDraw();
 	Check(heap.Acquire(request, view), "the table is drawn again before the crowded check");
 	heap.Rebind(executor);
@@ -944,26 +953,28 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	Access::Pressure(graphics, budget, usage);
 	Check(graphics.LocalMemoryCrowded(), "the context reports crowded device-local memory");
 	Access::Collect(heap, at(4800));
-	Check(Access::Crowded(heap), "the heap enters the crowded state at 85 % of the budget");
-	Check(Access::Parking(heap) == 2u, "the crowded heap parks the two least read textures and no more than the bytes it needs");
+	Check(Access::Crowded(heap), "the heap enters the crowded state at the high watermark");
+	Check(Access::Parking(heap) == 3u, "both cold images and the second view of the first image are parked");
+	Check(heap.Reads().crowded_bytes == two_cold && heap.Reads().live == 4u, "aliases count once toward the release target");
 	const auto pending = Access::PendingProbes(heap);
 	std::string probes = Access::Views(heap, slots[ColdFirst]) + ";";
 	for (const auto probe: pending) probes += " " + std::to_string(probe);
 	Check(std::ranges::binary_search(pending, ColdFirst) && std::ranges::binary_search(pending, ColdSecond) &&
+	          std::ranges::binary_search(pending, ColdAlias) && !std::ranges::binary_search(pending, HotAlias) &&
 	          !std::ranges::binary_search(pending, Hot) && !std::ranges::binary_search(pending, Once),
 	      "the batched repend queues the probes of the parked textures only (pending:" + probes + ")");
-	for (const auto texture: {ColdFirst, ColdSecond}) {
+	for (const auto texture: {ColdFirst, ColdSecond, ColdAlias}) {
 		Check(Access::Find(textures, images[texture])->heap_refs.load() == 0u, "a parked texture is no longer pinned");
 	}
 	heap.BeginDraw();
 	Check(heap.Acquire(request, view), "the table stays on the heap while slots are parked");
 	heap.Rebind(executor);
-	for (const auto texture: {ColdFirst, ColdSecond}) {
+	for (const auto texture: {ColdFirst, ColdSecond, ColdAlias}) {
 		const auto slot = Access::Slot(heap, values[texture]);
 		Check(slot != 0u && slot != slots[texture] && Access::Parked(heap, slot) && !Access::ImageOf(heap, slot),
 		      "a cold texture moves to a parked slot with a null descriptor");
 	}
-	for (const auto texture: {Hot, Once}) {
+	for (const auto texture: {Hot, Once, HotAlias}) {
 		const auto slot = Access::Slot(heap, values[texture]);
 		Check(slot == slots[texture] && !Access::Parked(heap, slot) && Access::ImageOf(heap, slot) == images[texture],
 		      "the hot and the once read textures keep their slot and image");
@@ -971,13 +982,13 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	Common::DebugCounters::SetEnabled(true);
 	const auto evictions = Common::DebugCounters::Get(Common::DebugCounters::Counter::TextureEvictions);
 	textures.RunGarbageCollector();
-	for (const auto texture: {ColdFirst, ColdSecond}) {
+	for (const auto texture: {ColdFirst, ColdSecond, ColdAlias}) {
 		const auto* image = Access::Find(textures, images[texture]);
 		Check(image == nullptr || !image->registered, "the texture cache frees a parked texture in the same pass");
 	}
 	Check(Common::DebugCounters::Get(Common::DebugCounters::Counter::TextureEvictions) >= evictions + 2u,
 	      "the two evictions are counted");
-	for (const auto texture: {Hot, Once}) {
+	for (const auto texture: {Hot, Once, HotAlias}) {
 		const auto* image = Access::Find(textures, images[texture]);
 		Check(image != nullptr && image->registered, "the hot and the once read textures stay");
 	}
@@ -1030,6 +1041,10 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	heap_info.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
 	heap_info.sharingMode   = vk::SharingMode::eExclusive;
 	heap_info.initialLayout = vk::ImageLayout::eUndefined;
+	Check(GraphicContext::HeapImageThreshold(100ull << 30u) == (83ull << 30u), "large heaps reserve at most two extra GiB");
+	Access::Pressure(graphics, 100ull << 20u, 69ull << 20u);
+	Check(!graphics.LocalMemoryCrowded(), "heap allocation still prefers local memory at 69 percent");
+	Access::Pressure(graphics, 100ull << 20u, 70ull << 20u);
 	VulkanImage crowded_image {};
 	Check(graphics.CreateImage(heap_info, crowded_image, true) && crowded_image.spilled == Access::CanSpill(graphics) &&
 	          crowded_image.charge.local != Access::CanSpill(graphics),
@@ -1038,9 +1053,9 @@ void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	Run(heap, scheduler, kernel, kernel.marked, back, back, 1, 1);
 	Wait(scheduler);
 	Check(SameTexel(Lanes0(kernel)[3], texels[ColdFirst][3]), "the shader reads the texture again through its new slot");
-	Access::Pressure(graphics, budget, unit * 79u);
+	Access::Pressure(graphics, budget, GraphicContext::HeapImageThreshold(budget, true) - 1u);
 	Access::Collect(heap, at(6100));
-	Check(!Access::Crowded(heap) && !graphics.LocalMemoryCrowded(), "the crowded state ends below 80 % of the budget");
+	Check(!Access::Crowded(heap) && !graphics.LocalMemoryCrowded(), "the crowded state ends below the low watermark");
 	graphics.TrimRecycledImages();
 	VulkanImage relaxed_image {};
 	Check(graphics.CreateImage(heap_info, relaxed_image, true) && !relaxed_image.spilled && relaxed_image.charge.local,
@@ -1140,8 +1155,8 @@ void MeasureCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) 
 	const auto before = real();
 	for (uint32_t texture = 0; texture < Hot; ++texture) Access::MarkRead(heap, slots[texture]);
 	const uint64_t budget = live * 10u;
-	const uint64_t usage  = GraphicContext::BudgetShare(budget, GraphicContext::CrowdedPercent);
-	const uint64_t wanted = usage - GraphicContext::BudgetShare(budget, GraphicContext::CrowdedStopPercent);
+	const uint64_t usage  = GraphicContext::HeapImageThreshold(budget);
+	const uint64_t wanted = usage - GraphicContext::HeapImageThreshold(budget, true);
 	Access::Pressure(graphics, budget, usage);
 	const auto check_start = Clock::now();
 	Access::Collect(heap, at(4800));
