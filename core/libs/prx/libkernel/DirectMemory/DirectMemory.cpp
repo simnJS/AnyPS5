@@ -26,6 +26,8 @@
 #include <vector>
 #if defined(ANYPS5_KYTY)
 #include <atomic>
+
+static thread_local int t_pendingProtection = -2;
 #endif
 
 #if defined(__linux__)
@@ -125,6 +127,9 @@ static bool InGuestFile(std::uintptr_t address, std::size_t bytes) {
 
 static void NoteView(std::uintptr_t address, std::size_t bytes, std::uint64_t offset) {
     if (bytes == 0) return;
+    if (offset != DirectMemoryViewReplacing && offset != DirectMemoryViewUnmapped && t_pendingProtection != -2) {
+        if (const auto protection = View().protectionObserver.load(std::memory_order_acquire)) protection(address, bytes, t_pendingProtection);
+    }
     if (const auto observer = View().observer.load(std::memory_order_acquire)) observer(address, bytes, offset);
 }
 
@@ -802,6 +807,9 @@ bool InGuestFile(std::uintptr_t address, std::size_t bytes) {
 
 void NoteView(std::uintptr_t address, std::size_t bytes, std::uint64_t offset) {
     if (bytes == 0) return;
+    if (offset != DirectMemoryViewReplacing && offset != DirectMemoryViewUnmapped && t_pendingProtection != -2) {
+        if (const auto protection = View().protectionObserver.load(std::memory_order_acquire)) protection(address, bytes, t_pendingProtection);
+    }
     if (const auto observer = View().observer.load(std::memory_order_acquire)) observer(address, bytes, offset);
 }
 
@@ -1836,6 +1844,22 @@ int ReportedProtection(int prot) {
     return prot;
 }
 
+#if defined(ANYPS5_KYTY)
+struct PendingProtection {
+    int previous;
+    explicit PendingProtection(int prot) : previous(t_pendingProtection) {
+        t_pendingProtection = prot >= 0 ? ReportedProtection(prot) : -1;
+    }
+    ~PendingProtection() { t_pendingProtection = previous; }
+    PendingProtection(const PendingProtection&) = delete;
+    PendingProtection& operator=(const PendingProtection&) = delete;
+};
+#else
+struct PendingProtection {
+    explicit PendingProtection(int) {}
+};
+#endif
+
 void RecordProtection(const void* addr, size_t len, int prot) {
     const auto start = reinterpret_cast<std::uintptr_t>(addr);
     std::lock_guard lock(g_protectionLock);
@@ -1927,6 +1951,7 @@ int MapDirectRecorded(void** addr, size_t len, int prot, int flags, int64_t phys
     GuestAllocations::Mutation mutation;
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+    const PendingProtection pending(prot);
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
         EraseReservations(*addr, len);
         RecordProtection(*addr, len, prot);
@@ -2035,6 +2060,7 @@ static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t ali
     if (exclusive && mutation.Overlaps(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+    const PendingProtection pending(prot);
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, -1, zero)) {
         EraseReservations(*addr, len);
         RecordProtection(*addr, len, prot);
@@ -2161,6 +2187,7 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
     const int placementFlags = flags & (GuestMapFixedFlag | 0x80 | 0x400000);
     flags = PlaceHintInReservation(*addr, len, placementFlags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+    const PendingProtection pending(prot);
     ReplaceFixedOverlap(mutation, *addr, len, flags);
     void* mapped = MapPlaced(*addr, len, PROT_NONE, flags, alignment);
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(mapped, len);
@@ -2235,6 +2262,7 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
             CloseHandle(section);
             return SCE_KERNEL_ERROR_ENOMEM;
         }
+        const PendingProtection pending(prot);
         ReplaceFixedOverlap(mutation, *addr, len, flags);
         mapped = MapPlaced(*addr, len, PROT_NONE, flags, alignment);
 #if defined(ANYPS5_KYTY)
@@ -2266,6 +2294,7 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     const auto nativeProtection = LinuxProtFromSce(prot);
     if (*addr != nullptr) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(*addr, len);
+    const PendingProtection pending(prot);
     GuestAllocations::Mutation mutation;
     void* mapped = MapPlaced(*addr, len, PROT_NONE, 0, PS5_PAGE_SIZE);
     try {
@@ -2461,6 +2490,7 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
     if (requireMappedStart && (spans.empty() || spans.front().first != pointer)) return SCE_KERNEL_ERROR_EINVAL;
     for (const auto& [span, spanBytes] : spans) mutation.RequireUnpinned(span, spanBytes);
     for (const auto& [span, spanBytes] : spans) {
+        const PendingProtection pending(prot);
         mutation.Protect(span, spanBytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, (prot & GuestProtGpuWrite) != 0, [&] {
 #if defined(__APPLE__) || defined(__linux__)
             if (const int error = GuestWriteWatch::GuestWriteWatchProtect_nid_postfix(const_cast<void*>(span), spanBytes, nativeProtection); error != 0)
@@ -2519,6 +2549,7 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
         if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
         if (mutation.Covers(*addr, len)) {
             constexpr int GuestMapNoOverwrite = 0x80;
+            const PendingProtection pending(0);
             if (((flags & GuestMapNoOverwrite) == 0 || Reserved(*addr, len)) && RemapFixedIntoRegistered(mutation, *addr, len, 0, GuestMapFixedFlag)) {
                 RecordProtection(*addr, len, -1);
                 RecordReservation(*addr, len);

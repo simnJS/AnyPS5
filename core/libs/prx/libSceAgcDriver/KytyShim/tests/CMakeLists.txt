@@ -227,6 +227,18 @@ if(NOT ANYPS5_KYTY_DLL)
     add_test(NAME kyty_shim_write_fault_tracking COMMAND kyty_shim_write_fault_tracking_tests)
     set_tests_properties(kyty_shim_write_fault_tracking PROPERTIES TIMEOUT 60
             PASS_REGULAR_EXPRESSION "kyty_shim_write_fault_tracking: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/CpuOnlyMapHooks.cpp)
+    if(WIN32)
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/CpuOnlyMapHooks.cpp
+                TARGET_DIRECTORY libSceAgcDriver PROPERTIES COMPILE_OPTIONS "-fno-extern-tls-init")
+    endif()
+    add_test_executable(kyty_shim_cpu_only_map_hooks_tests ${CMAKE_CURRENT_SOURCE_DIR}/CpuOnlyMapHooksMain.cpp)
+    configure_host_test_executable(kyty_shim_cpu_only_map_hooks_tests)
+    target_link_libraries(kyty_shim_cpu_only_map_hooks_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_cpu_only_map_hooks COMMAND kyty_shim_cpu_only_map_hooks_tests)
+    set_tests_properties(kyty_shim_cpu_only_map_hooks PROPERTIES TIMEOUT 60
+            ENVIRONMENT "KYTY_DIRECT_MEMORY_PAGES=demand"
+            PASS_REGULAR_EXPRESSION "kyty_shim_cpu_only_map_hooks: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 endif()
 
 if(NOT WIN32)
