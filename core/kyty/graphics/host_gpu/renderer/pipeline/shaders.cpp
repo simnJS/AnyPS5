@@ -555,23 +555,6 @@ bool CanUseComputeBinaries(const GraphicContext& graphics, const ShaderModule& m
 	return module.spirv_words >= MinComputeBinaryWords && PipelineBinariesUsable(graphics);
 }
 
-bool CanUseGraphicsBinaries(const GraphicContext& graphics, const std::array<const ShaderModule*, 4>& stages) {
-	uint64_t words = 0;
-	for (const auto* stage: stages) {
-		if (stage != nullptr) {
-			words += stage->spirv_words;
-		}
-	}
-	return words >= MinComputeBinaryWords && PipelineBinariesUsable(graphics);
-}
-
-std::optional<vk::Result> CreateGraphicsPipelineWithBinary(const GraphicContext&                 graphics,
-                                                           const vk::GraphicsPipelineCreateInfo& info,
-                                                           vk::PipelineCache                     driver_cache,
-                                                           ComputePipelineCacheMode              cache_mode,
-                                                           vk::Pipeline& pipeline, const char*& mode) {
-	return CreatePipelineWithBinary(graphics, info, driver_cache, cache_mode, pipeline, mode);
-}
 #endif
 
 DriverCreations GetDriverCreations(double slow_seconds) {
@@ -1047,18 +1030,7 @@ public:
 		for (const auto* stage: m_stages) {
 			t_driver_creation.words += stage != nullptr ? stage->spirv_words : 0;
 		}
-		const bool lookup     = static_cast<bool>(flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
-		const bool mesh_pad   = m_graphics.fn_get_shader_info && mesh;
-		const bool use_binary = !mesh_pad && CanUseGraphicsBinaries(m_graphics, m_stages);
-		if (use_binary) {
-			const char* mode   = nullptr;
-			pipeline_info.flags = flags;
-			if (const auto binary = CreateGraphicsPipelineWithBinary(
-			        m_graphics, pipeline_info, cache,
-			        lookup ? ComputePipelineCacheMode::Lookup : ComputePipelineCacheMode::Full, out, mode)) {
-				return *binary;
-			}
-		}
+		const bool lookup = static_cast<bool>(flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
 		const auto create = [&](vk::PipelineCreateFlags create_flags) {
 			pipeline_info.flags = create_flags;
 			const auto result = MemoryTelemetry::Create(m_graphics.device, cache, pipeline_info, out);
@@ -1071,11 +1043,7 @@ public:
 		const auto result  = CreateAuditedPipeline(m_graphics, "graphics", PipelineCache::GraphicsPipelineKeyHash {}(m_key),
 		                                           flags, out, create);
 		if (!lookup) {
-			const char* binary_state = mesh_pad                              ? "mesh-lds"
-			                           : !PipelineBinariesUsable(m_graphics) ? "off"
-			                           : use_binary                          ? "failed"
-			                                                                 : "small";
-			LogDriverCompile("graphics", "-", binary_state, cache ? "direct" : "none",
+			LogDriverCompile("graphics", "-", "off", cache ? "direct" : "none",
 			                 std::chrono::steady_clock::now() - started, result, false);
 		}
 		return result;

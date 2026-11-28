@@ -399,13 +399,6 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     add_test(NAME kyty_shim_compute_pipeline_binaries COMMAND kyty_shim_compute_pipeline_binaries_tests)
     set_tests_properties(kyty_shim_compute_pipeline_binaries PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "kyty_shim_compute_pipeline_binaries: ok" FAIL_REGULAR_EXPRESSION "FAILED")
-    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/GraphicsPipelineBinaries.cpp)
-    add_test_executable(kyty_shim_graphics_pipeline_binaries_tests ${CMAKE_CURRENT_SOURCE_DIR}/GraphicsPipelineBinariesMain.cpp)
-    configure_host_test_executable(kyty_shim_graphics_pipeline_binaries_tests)
-    target_link_libraries(kyty_shim_graphics_pipeline_binaries_tests PRIVATE libSceAgcDriver libkernel libc)
-    add_test(NAME kyty_shim_graphics_pipeline_binaries COMMAND kyty_shim_graphics_pipeline_binaries_tests)
-    set_tests_properties(kyty_shim_graphics_pipeline_binaries PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
-            PASS_REGULAR_EXPRESSION "kyty_shim_graphics_pipeline_binaries: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/AsyncPipelineWaits.cpp)
     add_test_executable(kyty_shim_async_pipeline_waits_tests ${CMAKE_CURRENT_SOURCE_DIR}/AsyncPipelineWaitsMain.cpp)
     configure_host_test_executable(kyty_shim_async_pipeline_waits_tests)
