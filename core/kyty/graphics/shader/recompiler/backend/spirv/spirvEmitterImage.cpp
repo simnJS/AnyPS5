@@ -765,7 +765,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	const auto& image = state.program.info.images.at(view);
 	if (image.table_capacity != 0u) return emit(view, ImageTableElement(ctx, inst, view, key_override));
 	if (image.indirect_root != view) return emit(view, 0u);
-	if (state.program.generic_graphics) {
+	if (state.program.generic_graphics && image.indirect_search_iterations == 0u) {
 		const auto bank = EmitShaderDataDwordLoad(state, state.program.bindings.ImageBankDword() + view);
 		return EmitIndexSwitch(state, bank, static_cast<uint32_t>(image.indirect_resources.size()), result_type,
 		                       [&](uint32_t index) { return emit(image.indirect_resources[index], 0u); });

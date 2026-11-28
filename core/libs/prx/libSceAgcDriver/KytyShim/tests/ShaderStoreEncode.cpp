@@ -426,6 +426,103 @@ void GenericShapeRefusalsNameTheirReason() {
     Require(refusal(table_image(true, false)) == "accepted", "a compared table image was refused");
     Require(refusal(table_image(false, true)) == "table_image_not_plain_sampled",
             "a written table image was not named");
+
+    const auto selected = [&] {
+        auto source = table(false);
+        source.indirect_descriptor->selector.emplace();
+        source.indirect_descriptor->selector->source = 1;
+        return source;
+    };
+    auto chosen = table_image(false, false);
+    chosen.descriptor_sources.push_back(selected());
+    auto& chosen_image = chosen.info.images.emplace_back(chosen.info.images.front());
+    chosen_image.source = 1;
+    Require(refusal(chosen) == "accepted", "a table with an image chosen by a selector was refused");
+
+    auto chosen_buffer = graphics();
+    chosen_buffer.descriptor_sources.push_back(selected());
+    chosen_buffer.info.buffers.emplace_back().source = 0;
+    Require(refusal(chosen_buffer) == "indirect_descriptor_not_table_array",
+            "a buffer chosen by a selector was not named");
+}
+
+void GenericSelectedCandidates() {
+    ResourcePlan plan;
+    plan.stage = ShaderType::Pixel;
+    plan.resource_tracking_complete = true;
+    plan.srt_plan_complete = true;
+    plan.srt_reads.resize(5);
+    plan.descriptor_sources.resize(3);
+    for (const uint32_t chosen: {1u, 2u}) {
+        plan.descriptor_sources[chosen].dword_count = chosen == 1u ? 8u : 4u;
+        auto& indirect = plan.descriptor_sources[chosen].indirect_descriptor.emplace();
+        indirect.selector.emplace();
+        indirect.selector->source = 0;
+    }
+    for (const uint32_t source: {0u, 1u}) {
+        auto& image = plan.info.images.emplace_back();
+        image.source = source;
+        image.resource_class = ImageResourceClass::Sampled;
+        image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    }
+    plan.info.samplers.emplace_back().source = 2;
+    ResourceSpecialization shape;
+    Require(GenericGraphicsShape(plan, shape), "images and samplers chosen by a selector were refused");
+    Require(shape.images.size() == 7 && shape.samplers.size() == 16, "wrong count of selected candidates");
+    Require(shape.images[1].indirect_root == 1 && shape.images[1].indirect_mapping_offset == 5 &&
+                shape.images[1].indirect_search_iterations == 4,
+            "the selected image does not search a mapping placed after the walked table");
+    for (uint32_t child = 2; child < 5; ++child) {
+        Require(shape.images[child].indirect_root == 1 && shape.images[child].indirect_search_iterations == 0 &&
+                    shape.images[child].numeric_class == Prospero::TextureNumericClass::Float,
+                "a selected image candidate has the wrong shape");
+    }
+    Require(shape.images[0].indirect_root == 0 && shape.images[5].indirect_root == 0 &&
+                shape.images[6].indirect_root == 0,
+            "the direct image lost its typed banks after the selected candidates");
+    Require(shape.samplers[0].indirect_root == 0 && shape.samplers[0].indirect_mapping_offset == 5 + 17 &&
+                shape.samplers[0].indirect_search_iterations == 9,
+            "the selected sampler does not search the mapping after the image mapping");
+
+    const auto live_of = [&] {
+        ResourceSpecialization live;
+        live.images.assign(shape.images.begin(), shape.images.begin() + 5);
+        live.images[0].indirect_root = ImageResource::NoIndirectImage;
+        live.samplers = shape.samplers;
+        return live;
+    };
+    const auto snapshot_of = [](size_t images, size_t samplers) {
+        ResourceSnapshot snapshot;
+        snapshot.images.resize(images, {.dword_count = 8});
+        for (size_t i = 0; i < images; ++i) snapshot.images[i].dwords[0] = static_cast<uint32_t>(i + 1u);
+        snapshot.samplers.resize(samplers, {.dword_count = 4});
+        return snapshot;
+    };
+    auto snapshot = snapshot_of(5, 16);
+    Require(BindGenericGraphics(plan, snapshot, live_of(), shape), "fixed selected candidates were refused");
+    Require(snapshot.images.size() == shape.images.size() && snapshot.images[1].dwords[0] == 2 &&
+                snapshot.images[4].dwords[0] == 5 && snapshot.images[0].dwords[0] == 1,
+            "selected candidates moved during the generic binding");
+
+    auto moved = live_of();
+    moved.images[1].indirect_mapping_offset = 6;
+    snapshot = snapshot_of(5, 16);
+    Require(!BindGenericGraphics(plan, snapshot, moved, shape), "a mapping at another offset was bound");
+
+    auto fewer = live_of();
+    fewer.images.pop_back();
+    snapshot = snapshot_of(4, 16);
+    Require(!BindGenericGraphics(plan, snapshot, fewer, shape), "a missing candidate was bound");
+
+    auto typed = live_of();
+    typed.images[3].numeric_class = Prospero::TextureNumericClass::Uint;
+    snapshot = snapshot_of(5, 16);
+    Require(!BindGenericGraphics(plan, snapshot, typed, shape), "an integer candidate was bound as float");
+
+    auto sampler_moved = live_of();
+    sampler_moved.samplers[0].indirect_mapping_offset = 5;
+    snapshot = snapshot_of(5, 16);
+    Require(!BindGenericGraphics(plan, snapshot, sampler_moved, shape), "a sampler mapping at another offset was bound");
 }
 
 }
@@ -440,6 +537,7 @@ int main() {
     GenericStageDataRoundTrips();
     GenericSampledImageBanks();
     GenericShapeRefusalsNameTheirReason();
+    GenericSelectedCandidates();
     TableGraphicsModuleRoundTrips();
     NativeGraphicsRequiresExactTableStages();
     StoredComputeModuleSelection();
