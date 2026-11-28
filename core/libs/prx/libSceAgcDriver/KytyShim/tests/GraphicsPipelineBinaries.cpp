@@ -476,25 +476,56 @@ int Run(GraphicContext& graphics) {
 			Check(fs::last_write_time(path) == old_time, "a full creation compiled although a valid binary exists");
 
 			auto other_state = Create(graphics, culled, ComputePipelineCacheMode::Lookup);
-			Check(!other_state.result.has_value() && !other_state.pipeline,
-			      "the binary of one rasterizer state served the same shaders with another state");
+			const bool same_key = other_state.result.has_value();
+			if (same_key) {
+				Check(other_state.result == vk::Result::eSuccess && other_state.mode == "binary" && other_state.pipeline,
+				      "the culled pipeline shares the drawn pipeline's key but was not restored");
+				Check(other_state.pipeline && renderer.Run(other_state.pipeline, big.layout, 43u) == 0u,
+				      "the culled pipeline restored from the shared binary drew: the binary overrode its rasterizer state");
+				Check(ListFiles(directory).binaries == 1, "a restore wrote a binary file");
+			}
 			Destroy(graphics, other_state);
-			auto culled_capture = Create(graphics, culled, ComputePipelineCacheMode::Full);
-			Check(culled_capture.result == vk::Result::eSuccess && culled_capture.mode == "binary-capture",
-			      "the culled pipeline was not compiled and captured");
-			Destroy(graphics, culled_capture);
-			Check(ListFiles(directory).binaries == 2, "two rasterizer states did not give two binary files");
+			if (!same_key) {
+				auto culled_capture = Create(graphics, culled, ComputePipelineCacheMode::Full);
+				Check(culled_capture.result == vk::Result::eSuccess && culled_capture.mode == "binary-capture",
+				      "the culled pipeline was not compiled and captured");
+				Destroy(graphics, culled_capture);
+				Check(ListFiles(directory).binaries == 2, "two rasterizer states with two keys did not give two files");
+			}
 			auto culled_restore = Create(graphics, culled, ComputePipelineCacheMode::Lookup);
 			Check(culled_restore.result == vk::Result::eSuccess && culled_restore.mode == "binary",
-			      "the culled pipeline was not restored from its own binary");
-			Check(culled_restore.pipeline && renderer.Run(culled_restore.pipeline, big.layout, 43u) == 0u,
-			      "the restored culled pipeline drew: it was served the binary of the drawn pipeline");
+			      "the culled pipeline was not restored from a binary");
+			Check(culled_restore.pipeline && renderer.Run(culled_restore.pipeline, big.layout, 45u) == 0u,
+			      "the restored culled pipeline drew");
 			Destroy(graphics, culled_restore);
 			auto drawn_again = Create(graphics, drawn, ComputePipelineCacheMode::Lookup);
 			Check(drawn_again.result == vk::Result::eSuccess && drawn_again.pipeline &&
 			          renderer.Run(drawn_again.pipeline, big.layout, 47u) == Expected(47u, BigSteps),
 			      "the drawn pipeline restored after the culled one computes a wrong value");
 			Destroy(graphics, drawn_again);
+
+			const auto files_before_other = ListFiles(directory).binaries;
+			{
+				Program            changed(graphics, vertex_code, ChainFragmentShader(BigSteps + 1));
+				const PipelineInfo changed_info(changed, vk::CullModeFlagBits::eNone);
+				auto stale = Create(graphics, changed_info, ComputePipelineCacheMode::Lookup);
+				Check(!stale.result.has_value() && !stale.pipeline,
+				      "a pipeline whose fragment SPIR-V changed was served an existing binary");
+				Destroy(graphics, stale);
+				auto fresh = Create(graphics, changed_info, ComputePipelineCacheMode::Full);
+				Check(fresh.result == vk::Result::eSuccess && fresh.mode == "binary-capture",
+				      "the pipeline with changed SPIR-V was not compiled and captured");
+				Check(fresh.pipeline && renderer.Run(fresh.pipeline, changed.layout, 53u) == Expected(53u, BigSteps + 1),
+				      "the pipeline with changed SPIR-V computes a wrong value");
+				Destroy(graphics, fresh);
+				auto changed_restore = Create(graphics, changed_info, ComputePipelineCacheMode::Lookup);
+				Check(changed_restore.result == vk::Result::eSuccess && changed_restore.pipeline &&
+				          renderer.Run(changed_restore.pipeline, changed.layout, 59u) == Expected(59u, BigSteps + 1),
+				      "the pipeline with changed SPIR-V is not restored from its own binary");
+				Destroy(graphics, changed_restore);
+			}
+			Check(ListFiles(directory).binaries == files_before_other + 1,
+			      "changed SPIR-V did not give exactly one more binary file");
 
 			const auto valid = ReadFile(path);
 			Require(valid.size() == file_size, "the binary file changed size");
@@ -514,9 +545,10 @@ int Run(GraphicContext& graphics) {
 			Check(ListFiles(directory).temporary == 0, "temporary files were left behind");
 
 			if (g_failures == 0) {
-				std::printf("%s: ok (%s, %u words, file %ju bytes, compile %.1f ms, restore %.1f ms)\n", Name,
+				std::printf("%s: ok (%s, %u words, file %ju bytes, compile %.1f ms, restore %.1f ms, culling %s)\n", Name,
 				            graphics.physical_device_properties.deviceName.data(), big.words,
-				            static_cast<uintmax_t>(file_size), compile_ms, restore_ms);
+				            static_cast<uintmax_t>(file_size), compile_ms, restore_ms,
+				            same_key ? "outside the driver key" : "inside the driver key");
 			}
 			result = g_failures == 0 ? 0 : 1;
 		}
