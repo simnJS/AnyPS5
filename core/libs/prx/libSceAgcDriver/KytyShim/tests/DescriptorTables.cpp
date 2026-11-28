@@ -556,6 +556,14 @@ int HeapReplay(bool discovery, bool verify = false) {
 		return Finish();
 	}
 	const auto address = reinterpret_cast<uint64_t>(guest);
+	if (discovery && ClassifyGuestMapping(address, bytes) == GuestMappingSpace::CpuOnly) {
+		if (sceKernelMunmap(address, bytes) != 0) {
+			Check(false, "release the CPU-only guest allocation");
+			return Finish();
+		}
+		std::fprintf(stderr, "%s: guest allocation at %p lies outside the GPU address ranges\n", g_name, guest);
+		return 77;
+	}
 	if (discovery) CheckHeapDiscovery(gpu.graphics, address, bytes, verify);
 	else CheckHeapExhaustion(gpu.graphics, address, bytes);
 	Check(sceKernelMunmap(address, bytes) == 0, "unmap test backing");
