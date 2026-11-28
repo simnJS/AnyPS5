@@ -5892,6 +5892,27 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 				if (InLoop(program, bvh->Parent(), walk.header, walk.latch)) served.push_back(bvh);
 			}
 			if (!walk.foreign && RewriteResultsWalk(program, options, walk.header, walk.latch, served, result, site)) { ++result.sites; hypotheses.clear(); improvements.clear(); continue; }
+			if (walk.foreign && walk.headers.size() == 1 && walk.headers.front().program.empty()) {
+				const auto& named = walk.headers.front();
+				const auto  bound = std::ranges::find_if(result.extra_sources, [&](const RayQueryExtraSource& extra) {
+					return extra.user_sgpr == named.user_sgpr && extra.header_offset == named.header_offset &&
+					       extra.header_vsharp == named.header_vsharp && extra.program.empty();
+				});
+				if (bound != result.extra_sources.end()) {
+					NativeTraversals own;
+					own.source_valid  = true;
+					own.user_sgpr     = bound->user_sgpr;
+					own.header_offset = bound->header_offset;
+					own.header_vsharp = bound->header_vsharp;
+					own.root          = bound->root;
+					own.layout        = bound->layout;
+					if (RewriteResultsWalk(program, options, walk.header, walk.latch, served, own, site)) {
+						bound->layout = own.layout;
+						++result.sites;
+						continue;
+					}
+				}
+			}
 			if (const auto flags = options.emulation ? MarkOracleWalk(served) : 0u; flags != 0) {
 				if (walk.foreign) {
 					for (auto* bvh: served) bvh->SetFlags(bvh->Flags<uint32_t>() | BvhIntersectOracleMulti);
