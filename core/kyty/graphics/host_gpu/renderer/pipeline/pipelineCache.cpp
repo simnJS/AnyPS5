@@ -17,6 +17,7 @@
 #endif
 #include "common/file.h"
 #include "common/hackNotice.h"
+#include "common/hostStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -29,6 +30,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/manifestAdmission.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineChainThreads.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/programLock.h"
@@ -2137,7 +2139,6 @@ PipelineCache::~PipelineCache() {
 		MemoryTelemetry::Destroy(m_graphics.device, retired);
 	}
 #endif
-	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
 			MemoryTelemetry::Destroy(m_graphics.device, pipeline.pipeline);
@@ -2173,6 +2174,7 @@ PipelineCache::~PipelineCache() {
 #if defined(ANYPS5_KYTY)
 	m_libraries.reset();
 #endif
+	Save();
 	MemoryTelemetry::Destroy(m_graphics.device, m_driver_cache);
 }
 
@@ -2305,7 +2307,7 @@ void PipelineCache::PostDueDriverCache(bool force) {
 		m_driver_cache_dirty     = false;
 		m_driver_cache_posted    = now;
 		m_next_driver_cache_save = now + DriverCacheSaveInterval;
-		m_store.Post([this] { WriteDriverCache(); });
+		m_store.Post([this] { WriteDriverCache(true); });
 	}
 }
 
@@ -2318,14 +2320,14 @@ void PipelineCache::Save() {
 		dirty = std::exchange(m_driver_cache_dirty, false);
 	}
 	if (dirty) {
-		WriteDriverCache();
+		WriteDriverCache(false);
 	}
 }
 
-void PipelineCache::WriteDriverCache() {
-	size_t               size = 0;
-	vk::Result           result;
-	std::vector<uint8_t> payload;
+void PipelineCache::WriteDriverCache(bool checkpoint) {
+	size_t                     size = 0;
+	vk::Result                 result;
+	std::unique_ptr<uint8_t[]> payload;
 	MemoryTelemetry::PipelineBytes tracked_bytes;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
@@ -2334,12 +2336,22 @@ void PipelineCache::WriteDriverCache() {
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
-		payload.resize(size);
-		tracked_bytes.Set(payload.capacity());
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
+		if (checkpoint) {
+			const auto memory = Common::ReadSystemMemory();
+			if (memory && !ManifestAdmission::CheckpointFits(size, memory->total, memory->available)) {
+				std::lock_guard lock(m_driver_cache_mutex);
+				m_driver_cache_dirty = true;
+				return;
+			}
+		}
+		payload = std::make_unique_for_overwrite<uint8_t[]>(size);
+		tracked_bytes.Set(size);
+		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.get());
 		if (result != vk::Result::eIncomplete) {
 			break;
 		}
+		payload.reset();
+		tracked_bytes.Set(0);
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
@@ -2347,9 +2359,8 @@ void PipelineCache::WriteDriverCache() {
 		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return;
 	}
-	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	const auto payload_hash = XXH3_64bits(payload.get(), size);
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
@@ -2362,11 +2373,11 @@ void PipelineCache::WriteDriverCache() {
 	uint32_t     payload_written = 0;
 	if (file.Create(temp_path)) {
 		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+		file.Write(payload.get(), static_cast<uint32_t>(size), &payload_written);
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
-	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
+	const bool written = prefix_written == prefix.size() && payload_written == size && flushed;
 	std::error_code error;
 	if (written) {
 		std::filesystem::rename(temp_path, m_driver_cache_path, error);
@@ -2377,7 +2388,7 @@ void PipelineCache::WriteDriverCache() {
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
-	                 static_cast<double>(payload.size()) / 1'000'000.0,
+	                 static_cast<double>(size) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
 }
 

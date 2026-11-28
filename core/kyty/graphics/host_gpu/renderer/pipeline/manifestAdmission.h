@@ -182,6 +182,11 @@ public:
 
 	[[nodiscard]] uint64_t Reserve() const { return Reserve(m_sample.total); }
 
+	[[nodiscard]] static bool CheckpointFits(uint64_t size, uint64_t total, uint64_t available) {
+		const auto margin = std::min(LoneMargin, total / 5);
+		return size <= available && available - size >= margin;
+	}
+
 	[[nodiscard]] uint64_t Committed() const {
 		uint64_t total = 0;
 		for (const auto& job: m_jobs | std::views::values) total += job.estimate;

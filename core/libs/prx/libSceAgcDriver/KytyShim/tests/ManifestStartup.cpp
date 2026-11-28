@@ -150,6 +150,15 @@ void MemoryAdmission() {
 	      "a closed admission takes no new work");
 }
 
+void DriverCheckpointAdmission() {
+	constexpr auto GiB = ManifestAdmission::GiB;
+	constexpr auto payload = GiB + GiB / 4;
+	Check(!ManifestAdmission::CheckpointFits(payload, 44 * GiB, GiB), "a checkpoint larger than the scope headroom waits");
+	Check(!ManifestAdmission::CheckpointFits(payload, 44 * GiB, payload + 2 * GiB - 1), "a checkpoint leaves room for a lone compilation");
+	Check(ManifestAdmission::CheckpointFits(payload, 44 * GiB, payload + 2 * GiB), "a deferred checkpoint fits when the headroom returns");
+	Check(ManifestAdmission::CheckpointFits(GiB / 2, GiB, GiB), "a small scope keeps a proportional checkpoint margin");
+}
+
 void OptimizationAdmission() {
 	constexpr size_t Words = 200'000;
 	const auto now = ManifestAdmission::Clock::time_point {};
@@ -454,6 +463,7 @@ int main() {
 	ModuleScheduling();
 	VideoWait();
 	MemoryAdmission();
+	DriverCheckpointAdmission();
 	OptimizationAdmission();
 	CpuAdmission();
 	LearnedEstimate();

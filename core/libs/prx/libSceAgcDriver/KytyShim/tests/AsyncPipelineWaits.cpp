@@ -12,6 +12,7 @@
 #include "graphics/presentation/window.h"
 
 #include <spirv-tools/libspirv.hpp>
+#include <xxhash.h>
 
 #include <algorithm>
 #include <chrono>
@@ -20,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -46,6 +49,15 @@ struct PipelineCacheTestAccess {
 	static auto HoldCompilationSlot(PipelineCache& cache) { return cache.AdmitWorker({}, 0, false); }
 	static bool WaitForOptimization(PipelineCache& cache, std::stop_token stop) {
 		return static_cast<bool>(cache.AdmitOptimization(stop, 100'000));
+	}
+	static vk::PipelineCache CheckpointTo(PipelineCache& cache, const std::filesystem::path& path) {
+		if (!cache.m_driver_cache &&
+		    MemoryTelemetry::Create(cache.m_graphics.device, vk::PipelineCacheCreateInfo {}, cache.m_driver_cache) != vk::Result::eSuccess) {
+			return {};
+		}
+		cache.m_driver_cache_path = path;
+		cache.CheckpointDriverCache();
+		return cache.m_driver_cache;
 	}
 	static bool AsyncWorkersRunning(const PipelineCache& cache) { return !cache.m_async_threads.empty(); }
 	static void QueueComputeAhead(PipelineCache& cache, const ShaderModule& module) {
@@ -365,6 +377,35 @@ struct Device {
 	}
 };
 
+void SaveDriverCache(PipelineCache& cache, GraphicContext& graphics) {
+	const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto root = std::filesystem::temp_directory_path() / ("kyty_driver_cache_" + std::to_string(stamp));
+	Require(std::filesystem::create_directory(root), "could not create the checkpoint fixture directory");
+	const auto path = root / "driver.bin";
+	const auto handle = Access::CheckpointTo(cache, path);
+	Require(static_cast<bool>(handle), "could not initialize the driver cache");
+	size_t size = 0;
+	Require(graphics.device.getPipelineCacheData(handle, &size, nullptr) == vk::Result::eSuccess && size != 0,
+	        "the driver returned no cache data");
+	std::vector<uint8_t> expected(size);
+	Require(graphics.device.getPipelineCacheData(handle, &size, expected.data()) == vk::Result::eSuccess,
+	        "the driver could not read its cache");
+	expected.resize(size);
+	cache.Save();
+	std::ifstream saved(path, std::ios::binary);
+	std::string signature;
+	std::getline(saved, signature);
+	uint64_t hash = 0;
+	saved.read(reinterpret_cast<char*>(&hash), sizeof(hash));
+	std::vector<uint8_t> payload(size);
+	saved.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(size));
+	Check(signature.starts_with("KytyPC2:") && saved && payload == expected && hash == XXH3_64bits(payload.data(), size) &&
+	      saved.peek() == std::ifstream::traits_type::eof(),
+	      "the checkpoint must contain the complete driver payload after its signature and hash");
+	saved.close();
+	std::filesystem::remove_all(root);
+}
+
 int Run(GraphicContext& graphics) {
 	Require(Config::AsyncPipelinesEnabled(), "the test needs KYTY_ASYNC_PIPELINES on");
 	const auto code = EmptyComputeShader();
@@ -381,6 +422,7 @@ int Run(GraphicContext& graphics) {
 		ComputeWaitWokenByWorker(cache, graphics, code);
 		GraphicsWaitWokenAtTheEnd(cache);
 		StopWakesEveryWait(cache, graphics, code);
+		SaveDriverCache(cache, graphics);
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateComputePipelines = g_gate.real;
 	VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShaderModule = g_create_shader_module;

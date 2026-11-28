@@ -960,7 +960,7 @@ private:
 	void CheckpointDriverCache(bool slow_creation = false);
 	void NoteCreatedPipeline(std::chrono::steady_clock::time_point started);
 	void PostDueDriverCache(bool force = false);
-	void WriteDriverCache();
+	void WriteDriverCache(bool checkpoint);
 
 	void WarmUp(const std::filesystem::path& path, bool driver_cache_restored);
 	void WarmUpNativePipelines() KYTY_REQUIRES(m_program_lock);
