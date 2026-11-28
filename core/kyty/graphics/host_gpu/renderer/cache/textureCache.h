@@ -486,10 +486,11 @@ private:
 	void                  ReleaseStencilCopies(ImageId association);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	[[nodiscard]] bool CopyDepthColor(Image& destination, Image& source);
-	void               CopyImage(ImageId destination, ImageId source);
+	void               CopyImage(ImageId destination, ImageId source) KYTY_REQUIRES(m_lock);
 	[[nodiscard]] ImageId FindStencilPlane(const Image& depth, GuestRange range) const;
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil) KYTY_REQUIRES(m_lock);
-	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
+	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer) KYTY_REQUIRES(m_lock);
+	void FinishReplacementCopy(Image& destination, ImageId source_id) KYTY_REQUIRES(m_lock);
 	void ValidateImageViewDesc(const ImageDesc& desc) const;
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);

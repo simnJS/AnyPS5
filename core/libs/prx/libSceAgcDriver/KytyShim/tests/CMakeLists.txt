@@ -356,7 +356,8 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     target_link_libraries(kyty_shim_vram_budget_tests PRIVATE libSceAgcDriver libkernel libc)
     add_test(NAME kyty_shim_vram_budget COMMAND kyty_shim_vram_budget_tests)
     add_test(NAME kyty_shim_vram_budget_guest_eviction COMMAND kyty_shim_vram_budget_tests guest-eviction)
-    set_tests_properties(kyty_shim_vram_budget kyty_shim_vram_budget_guest_eviction
+    add_test(NAME kyty_shim_texture_spill_content COMMAND kyty_shim_vram_budget_tests spill-content)
+    set_tests_properties(kyty_shim_vram_budget kyty_shim_vram_budget_guest_eviction kyty_shim_texture_spill_content
             PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77 ENVIRONMENT "KYTY_GPU_PIPELINE=0")
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/StaleTextureBinding.cpp)
     add_test_executable(kyty_shim_stale_texture_binding_tests ${CMAKE_CURRENT_SOURCE_DIR}/StaleTextureBindingMain.cpp)

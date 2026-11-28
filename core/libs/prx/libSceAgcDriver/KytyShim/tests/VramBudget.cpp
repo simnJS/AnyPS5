@@ -206,6 +206,8 @@ using namespace Libs::Graphics;
 
 constexpr uint64_t GiB          = 1024ull * 1024 * 1024;
 constexpr uint64_t GuestBytes   = 0x20000;
+constexpr uint64_t LazyCaseOffset = 192 * 1024;
+constexpr uint64_t SpillGuestBytes = LazyCaseOffset + 2 * 256 * 256 * sizeof(uint32_t);
 constexpr int      CpuReadWrite = 0x03;
 
 const char* CheckDescriptorPoolRetirement(GraphicContext& graphics) {
@@ -357,6 +359,81 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	return nullptr;
 }
 
+bool CanSpill(const GraphicContext& graphics, const VulkanImage& backing) {
+	if (!graphics.spill_allocator) return false;
+	const auto types = graphics.device.getImageMemoryRequirements(backing.image).memoryTypeBits;
+	for (uint32_t type = 0; type < graphics.physical_device_memory_properties.memoryTypeCount; ++type) {
+		if ((types & (uint32_t {1} << type)) && !graphics.IsLocalMemoryType(type)) return true;
+	}
+	return false;
+}
+
+const char* CheckSpillContent(GraphicContext& graphics, CommandScheduler& scheduler, TextureCache& textures,
+                             uint64_t address, uint32_t width, uint32_t levels) {
+	TextureCache::ImageDesc desc {};
+	desc.info.data.address = address;
+	desc.info.pixel_format = vk::Format::eR32Uint;
+	desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+	desc.info.extent = vk::Extent3D {width, width, 1};
+	desc.info.pitch = width;
+	desc.info.resources.levels = levels;
+	desc.info.UpdateSize();
+	desc.type = TextureCache::BindingType::Storage;
+	desc.view_info.format = desc.info.pixel_format;
+	desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+	const auto bytes = desc.info.data.size;
+	std::vector<uint8_t> expected(2 * bytes, 0xa5);
+	Libs::LibKernel::Memory::WriteBacking(address, expected.data(), expected.size());
+	for (size_t i = 0; i < bytes; ++i) expected[i] = static_cast<uint8_t>((i * 37) ^ (i >> 7));
+
+	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 0);
+	const auto source = textures.FindImage(desc);
+	if (!textures.FindTexture(source, desc)) return "could not bind storage before the spill";
+	auto& image = textures.GetImage(source);
+	const bool source_local = image.backing.charge.local;
+	if (image.backing.spilled) return "source image unexpectedly spilled below threshold";
+	Buffer upload(graphics, scheduler, MemoryUsage::Upload, 0, vk::BufferUsageFlagBits::eTransferSrc, bytes);
+	std::memcpy(upload.Mapped().data(), expected.data(), bytes);
+	upload.Flush(0, bytes);
+	image.Upload(desc.info.BufferCopies(), upload.Handle(), 0, bytes);
+
+	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 5 * GiB);
+	desc.type = TextureCache::BindingType::Texture;
+	desc.info.data.size = 0;
+	desc.info.resources.layers = 2;
+	desc.info.UpdateSize();
+	desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+	desc.view_info.type = vk::ImageViewType::e2DArray;
+	desc.view_info.layer_count = 2;
+	const auto replacement = textures.FindImage(desc);
+	const auto view = textures.FindTexture(replacement, desc);
+	auto& expanded = textures.GetImage(replacement);
+	const bool placed = !CanSpill(graphics, expanded.backing) ||
+	                    (expanded.backing.spilled && !expanded.backing.charge.local);
+	std::printf("texture with %u levels, %llu bytes per layer: %s -> %s\n", levels,
+	            static_cast<unsigned long long>(bytes), source_local ? "local" : "system",
+	            expanded.backing.charge.local ? "local" : "system");
+	Buffer download(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, expected.size());
+	expanded.Download(desc.info.BufferCopies(), download.Handle(), 0, expected.size());
+	textures.ProcessDownloadImages();
+	const auto tick = scheduler.CurrentTick();
+	scheduler.Wait(tick);
+	scheduler.WaitPriorityOperations(tick);
+	download.Invalidate(0, expected.size());
+	if (source == replacement || !view || !placed || VramBudgetTestAccess::IsImageRegistered(textures, source)) {
+		return "cache did not replace the image with the requested backing";
+	}
+	if (std::memcmp(download.Mapped().data(), expected.data(), expected.size()) != 0) {
+		return "replacement image lost texels or changed the added layer";
+	}
+	textures.FlushLazyReadback(address, bytes);
+	std::vector<uint8_t> guest(expected.size());
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, guest.data(), guest.size()) || guest != expected) {
+		return "replacement lost guest readback of GPU-written texels";
+	}
+	return nullptr;
+}
+
 const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures, uint64_t address) {
 	ImageInfo info;
 	info.data.address = address;
@@ -381,12 +458,7 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	desc.info = info;
 	const auto mixed = textures.FindImage(desc);
 	const auto& crowded = textures.GetImage(mixed).backing;
-	const auto types = graphics.device.getImageMemoryRequirements(crowded.image).memoryTypeBits;
-	bool can_spill = false;
-	for (uint32_t type = 0; type < graphics.physical_device_memory_properties.memoryTypeCount; ++type) {
-		if ((types & (uint32_t {1} << type)) && !graphics.IsLocalMemoryType(type)) can_spill = true;
-	}
-	can_spill &= graphics.spill_allocator != nullptr;
+	const bool can_spill = CanSpill(graphics, crowded);
 	if (crowded.charge.kind != MemoryTelemetry::Kind::Texture || (can_spill && (!crowded.spilled || crowded.charge.local))) {
 		return "ordinary texture did not use compatible system memory under pressure";
 	}
@@ -460,7 +532,7 @@ bool CheckScheduledPoolTrim(RenderContext& renderer, CommandProcessor& producer,
 	return std::memcmp(output.Mapped().data(), expected, sizeof(expected)) == 0;
 }
 
-const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool acceleration_storage) {
+const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool acceleration_storage, bool spill_content) {
 	if (graphics.memory_budget_ext_enabled && graphics.GetLocalMemoryUsage().budget == 0) {
 		return "the driver reported an empty device-local memory budget";
 	}
@@ -485,6 +557,10 @@ const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool accel
 		if (renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Upload).Size() != (256ull << 20)) return "upload ring capacity";
 		if (acceleration_storage && !VramBudgetTestAccess::MeasureArena(renderer)) return "acceleration storage retention";
 	}
+	if (spill_content) {
+		if (const auto* failure = CheckSpillContent(graphics, scheduler, textures, address, 128, 2)) return failure;
+		return CheckSpillContent(graphics, scheduler, textures, address + LazyCaseOffset, 256, 1);
+	}
 	const auto* failure = address == 0 ? CheckVramBudget(graphics, textures, renderer.GetBufferCache())
 	                                  : CheckGuestEviction(graphics, textures, address);
 	const auto last = scheduler.CurrentTick();
@@ -493,15 +569,15 @@ const char* CheckVramCase(GraphicContext& graphics, uint64_t address, bool accel
 	return failure;
 }
 
-}
-
-extern "C" int RunKytyVramBudgetTest(bool guest_eviction, bool wait_for_minute) {
-	const char* name = guest_eviction ? "kyty_shim_vram_budget_guest_eviction" : "kyty_shim_vram_budget";
+int RunVramTest(bool mapped, bool wait_for_minute, bool spill_content) {
+	const uint64_t guest_bytes = spill_content ? SpillGuestBytes : GuestBytes;
+	const char* name = spill_content ? "kyty_shim_texture_spill_content" :
+	                   mapped ? "kyty_shim_vram_budget_guest_eviction" : "kyty_shim_vram_budget";
 	Common::InitializeThreads();
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
-	if (const auto* unavailable = gpu.Initialize(false, true, true, !guest_eviction)) {
+	if (const auto* unavailable = gpu.Initialize(false, true, true, !mapped)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n",
 		             name, required ? "FAILED" : "skipped", unavailable);
@@ -513,17 +589,17 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction, bool wait_for_minute) 
 	}
 
 	uint64_t address = 0;
-	if (guest_eviction) {
+	if (mapped) {
 		void* guest = nullptr;
-		if (sceKernelMapFlexibleMemory(&guest, GuestBytes, CpuReadWrite, 0) != 0 || guest == nullptr) {
+		if (sceKernelMapFlexibleMemory(&guest, guest_bytes, CpuReadWrite, 0) != 0 || guest == nullptr) {
 			std::fprintf(stderr, "%s: FAILED: could not map guest backing\n", name);
 			return 1;
 		}
 		address = reinterpret_cast<uint64_t>(guest);
 	}
-	const bool invalid_range = guest_eviction && !GuestRange {address, GuestBytes}.Valid();
+	const bool invalid_range = mapped && !GuestRange {address, guest_bytes}.Valid();
 	gpu.graphics.StartMemoryMinutes();
-	const char* failure = invalid_range ? nullptr : CheckVramCase(gpu.graphics, address, gpu.acceleration_storage);
+	const char* failure = invalid_range ? nullptr : CheckVramCase(gpu.graphics, address, gpu.acceleration_storage, spill_content);
 	gpu.graphics.TrimRecycledImages();
 	if (wait_for_minute) std::this_thread::sleep_for(std::chrono::seconds(61));
 	gpu.graphics.StopMemoryMinutes();
@@ -539,7 +615,7 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction, bool wait_for_minute) 
 			failure = "destroyed renderer retained a memory or object charge";
 		}
 	}
-	if (guest_eviction && sceKernelMunmap(address, GuestBytes) != 0) {
+	if (mapped && sceKernelMunmap(address, guest_bytes) != 0) {
 		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", name);
 		return 1;
 	}
@@ -554,4 +630,14 @@ extern "C" int RunKytyVramBudgetTest(bool guest_eviction, bool wait_for_minute) 
 	}
 	std::printf("%s: ok\n", name);
 	return 0;
+}
+
+}
+
+extern "C" int RunKytyVramBudgetTest(bool guest_eviction, bool wait_for_minute) {
+	return RunVramTest(guest_eviction, wait_for_minute, false);
+}
+
+extern "C" int RunKytyTextureSpillContentTest() {
+	return RunVramTest(true, false, true);
 }
