@@ -220,9 +220,10 @@ struct ComputeBinaryHandles {
 	ComputeBinaryHandles& operator=(const ComputeBinaryHandles&) = delete;
 };
 
-std::optional<vk::Result> RestoreComputeBinary(vk::Device device, const std::filesystem::path& path,
-                                               const ComputeBinaryHeader& expected,
-                                               vk::ComputePipelineCreateInfo info, vk::Pipeline& pipeline) {
+template <class CreateInfo>
+std::optional<vk::Result> RestorePipelineBinary(vk::Device device, const std::filesystem::path& path,
+                                                const ComputeBinaryHeader& expected, CreateInfo info,
+                                                vk::Pipeline& pipeline) {
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
 	if (!file) {
 		return std::nullopt;
@@ -386,11 +387,10 @@ bool SaveComputeBinary(vk::Device device, const std::filesystem::path& path, Com
 	return WriteComputeBinaryFile(path, header, records, blobs);
 }
 
-std::optional<vk::Result> CreateComputePipelineWithBinary(const GraphicContext& graphics,
-                                                          vk::ComputePipelineCreateInfo info,
-                                                          vk::PipelineCache driver_cache,
-                                                          ComputePipelineCacheMode cache_mode,
-                                                          vk::Pipeline& pipeline, const char*& mode) {
+template <class CreateInfo>
+std::optional<vk::Result> CreatePipelineWithBinary(const GraphicContext& graphics, CreateInfo info,
+                                                   vk::PipelineCache driver_cache, ComputePipelineCacheMode cache_mode,
+                                                   vk::Pipeline& pipeline, const char*& mode) {
 	const auto device = graphics.device;
 	info.flags &= ~vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
 	vk::PipelineBinaryKeyKHR  exact {};
@@ -405,7 +405,7 @@ std::optional<vk::Result> CreateComputePipelineWithBinary(const GraphicContext& 
 	const auto path = graphics.compute_pipeline_binary_directory /
 	                  fmt::format("{:016x}-{:016x}.bin", header.device.Hash(), header.pipeline.Hash());
 	if (cache_mode != ComputePipelineCacheMode::KnownMiss) {
-		if (const auto restored = RestoreComputeBinary(device, path, header, info, pipeline)) {
+		if (const auto restored = RestorePipelineBinary(device, path, header, info, pipeline)) {
 			mode = "binary";
 			return restored;
 		}
@@ -461,13 +461,34 @@ std::optional<vk::Result> CreateComputePipelineWithBinary(const GraphicContext& 
 }
 
 #if defined(ANYPS5_KYTY)
-bool CanUseComputeBinaries(const GraphicContext& graphics, const ShaderModule& module) {
+static bool PipelineBinariesUsable(const GraphicContext& graphics) {
 	const auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
 	return graphics.compute_pipeline_binaries && !graphics.compute_pipeline_binary_directory.empty() &&
-	       module.spirv_words >= MinComputeBinaryWords && !PipelineCompileAuditEnabled() &&
-	       dispatcher.vkGetPipelineKeyKHR != nullptr && dispatcher.vkCreatePipelineBinariesKHR != nullptr &&
-	       dispatcher.vkDestroyPipelineBinaryKHR != nullptr && dispatcher.vkGetPipelineBinaryDataKHR != nullptr &&
-	       dispatcher.vkReleaseCapturedPipelineDataKHR != nullptr;
+	       !PipelineCompileAuditEnabled() && dispatcher.vkGetPipelineKeyKHR != nullptr &&
+	       dispatcher.vkCreatePipelineBinariesKHR != nullptr && dispatcher.vkDestroyPipelineBinaryKHR != nullptr &&
+	       dispatcher.vkGetPipelineBinaryDataKHR != nullptr && dispatcher.vkReleaseCapturedPipelineDataKHR != nullptr;
+}
+
+bool CanUseComputeBinaries(const GraphicContext& graphics, const ShaderModule& module) {
+	return module.spirv_words >= MinComputeBinaryWords && PipelineBinariesUsable(graphics);
+}
+
+bool CanUseGraphicsBinaries(const GraphicContext& graphics, const std::array<const ShaderModule*, 4>& stages) {
+	uint64_t words = 0;
+	for (const auto* stage: stages) {
+		if (stage != nullptr) {
+			words += stage->spirv_words;
+		}
+	}
+	return words >= MinComputeBinaryWords && PipelineBinariesUsable(graphics);
+}
+
+std::optional<vk::Result> CreateGraphicsPipelineWithBinary(const GraphicContext&                 graphics,
+                                                           const vk::GraphicsPipelineCreateInfo& info,
+                                                           vk::PipelineCache                     driver_cache,
+                                                           ComputePipelineCacheMode              cache_mode,
+                                                           vk::Pipeline& pipeline, const char*& mode) {
+	return CreatePipelineWithBinary(graphics, info, driver_cache, cache_mode, pipeline, mode);
 }
 #endif
 
@@ -941,6 +962,16 @@ public:
 		const ScopedDriverCreation creation(
 		    {Name(0, mesh ? "ms" : "vs"), Name(1, "hs"), Name(2, "ds"), Name(3, "ps")},
 		    {Hash(0), Hash(1), Hash(2), Hash(3)});
+		if (!(m_graphics.fn_get_shader_info && mesh) && CanUseGraphicsBinaries(m_graphics, m_stages)) {
+			const bool  lookup = static_cast<bool>(flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
+			const char* mode   = nullptr;
+			pipeline_info.flags = flags;
+			if (const auto binary = CreateGraphicsPipelineWithBinary(
+			        m_graphics, pipeline_info, cache,
+			        lookup ? ComputePipelineCacheMode::Lookup : ComputePipelineCacheMode::Full, out, mode)) {
+				return *binary;
+			}
+		}
 		const auto create = [&](vk::PipelineCreateFlags create_flags) {
 			pipeline_info.flags = create_flags;
 			const auto result = MemoryTelemetry::Create(m_graphics.device, cache, pipeline_info, out);
@@ -1432,7 +1463,7 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 		const bool driver_lookup = lookup && graphics.pipeline_cache_lookup_enabled && driver_cache;
 		std::optional<vk::Result> binary;
 		if (CanUseComputeBinaries(graphics, module)) {
-			binary = CreateComputePipelineWithBinary(graphics, info, driver_cache, cache_mode, pipeline.pipeline, mode);
+			binary = CreatePipelineWithBinary(graphics, info, driver_cache, cache_mode, pipeline.pipeline, mode);
 		}
 		if (binary) {
 			result = *binary;

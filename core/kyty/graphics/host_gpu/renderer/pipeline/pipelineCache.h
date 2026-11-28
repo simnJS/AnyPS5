@@ -1043,6 +1043,13 @@ bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipe
                          const ShaderModule& module, vk::PipelineCache cache);
 #if defined(ANYPS5_KYTY)
 [[nodiscard]] bool CanUseComputeBinaries(const GraphicContext& graphics, const ShaderModule& module);
+[[nodiscard]] bool CanUseGraphicsBinaries(const GraphicContext&                     graphics,
+                                          const std::array<const ShaderModule*, 4>& stages);
+[[nodiscard]] std::optional<vk::Result> CreateGraphicsPipelineWithBinary(const GraphicContext&                 graphics,
+                                                                         const vk::GraphicsPipelineCreateInfo& info,
+                                                                         vk::PipelineCache        driver_cache,
+                                                                         ComputePipelineCacheMode cache_mode,
+                                                                         vk::Pipeline& pipeline, const char*& mode);
 #endif
 struct DriverCreations {
 	uint32_t running = 0;
