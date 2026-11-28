@@ -82,6 +82,16 @@ struct ManifestStartupWait {
 	Clock::time_point last_progress;
 };
 
+inline constexpr uint64_t LowHostRam = uint64_t {18} << 30;
+
+inline std::pair<uint64_t, uint64_t> ManifestPauseThresholds(uint64_t total) {
+	constexpr uint64_t GiB = uint64_t {1} << 30;
+	if (total != 0 && total <= LowHostRam) {
+		return {total / 4, total / 3};
+	}
+	return {std::min(12 * GiB, total / 2), std::min(14 * GiB, total / 12 * 7)};
+}
+
 struct ManifestMemoryPause {
 	using Clock = std::chrono::steady_clock;
 
@@ -89,10 +99,10 @@ struct ManifestMemoryPause {
 	std::thread::id worker;
 
 	void Sample(Clock::time_point now, uint64_t total, uint64_t available) {
-		constexpr uint64_t GiB = uint64_t {1} << 30;
-		if (!since && available < std::min(12 * GiB, total / 2)) {
+		const auto [low, high] = ManifestPauseThresholds(total);
+		if (!since && available < low) {
 			since = now;
-		} else if (since && available > std::min(14 * GiB, total / 12 * 7)) {
+		} else if (since && available > high) {
 			since.reset();
 			worker = {};
 		}
@@ -108,5 +118,14 @@ struct ManifestMemoryPause {
 		if (worker == id) worker = {};
 	}
 };
+
+inline std::pair<size_t, size_t> ManifestWorkerLimits(size_t total_threads, uint64_t total_ram, size_t max_large) {
+	if (total_ram != 0 && total_ram <= LowHostRam) {
+		const size_t workers = std::min<size_t>(total_threads, 6);
+		const size_t large   = std::min<size_t>(max_large, std::max<size_t>(1, workers / 3));
+		return {workers, large};
+	}
+	return {total_threads, max_large};
+}
 
 }

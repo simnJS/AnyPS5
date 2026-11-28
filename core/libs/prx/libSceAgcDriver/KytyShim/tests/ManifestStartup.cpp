@@ -90,8 +90,8 @@ void MemoryPause() {
 	const auto second = second_thread.get_id();
 	second_thread.join();
 	for (const auto total: {16 * GiB, 32 * GiB}) {
-		const auto low = std::min(12 * GiB, total / 2);
-		const auto high = std::min(14 * GiB, total / 12 * 7);
+		const auto low  = total <= 18 * GiB ? total / 4 : std::min(12 * GiB, total / 2);
+		const auto high = total <= 18 * GiB ? total / 3 : std::min(14 * GiB, total / 12 * 7);
 		ManifestMemoryPause memory;
 		memory.Sample(now, total, low);
 		Check(memory.Admit(now, first), "work starts at the low threshold");
@@ -106,6 +106,10 @@ void MemoryPause() {
 		memory.Sample(now + 32s, total, high + 1);
 		Check(memory.Admit(now + 32s, first), "all workers resume above the high threshold");
 	}
+	const auto [low_workers, low_large] = Libs::Graphics::ManifestWorkerLimits(24, 16 * GiB, 6);
+	Check(low_workers == 6 && low_large == 2, "16 GiB hosts cap manifest and large workers");
+	const auto [high_workers, high_large] = Libs::Graphics::ManifestWorkerLimits(24, 32 * GiB, 6);
+	Check(high_workers == 24 && high_large == 6, "larger hosts keep configured manifest worker counts");
 }
 
 }
