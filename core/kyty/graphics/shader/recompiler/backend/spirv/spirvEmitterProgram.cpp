@@ -805,6 +805,7 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 template <typename EmitInstruction>
 void EmitBlockInstructions(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
+	ctx.state.block_epoch++;
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {

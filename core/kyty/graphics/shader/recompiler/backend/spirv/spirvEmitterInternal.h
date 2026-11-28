@@ -124,6 +124,25 @@ struct OracleVariables {
 	uint32_t                           resumed  = 0;
 };
 
+struct BdaGroupPlan {
+	const IR::Inst* leader = nullptr;
+	int64_t         delta  = 0;
+	int64_t         low    = 0;
+	int64_t         high   = 0;
+	bool            scalar = false;
+};
+
+struct BdaGroupPointers {
+	uint64_t epoch      = 0;
+	int64_t  delta      = 0;
+	uint32_t first      = 0;
+	uint32_t last       = 0;
+	uint32_t page_low   = 0;
+	uint32_t last_delta = 0;
+	uint32_t byte       = 0;
+	uint32_t unaligned  = 0;
+};
+
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -178,6 +197,9 @@ struct EmitterState {
 	uint32_t                                         bda_dword_function      = 0;
 	uint32_t                                         bda_dword_masked_function = 0;
 	std::map<std::array<uint32_t, 2>, uint32_t>      bda_load_functions;
+	std::unordered_map<const IR::Inst*, BdaGroupPlan> bda_group_plan;
+	bool                                             bda_groups_planned      = false;
+	uint64_t                                         block_epoch             = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
@@ -407,6 +429,7 @@ struct ValueEmitContext {
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
 	uint32_t                                                           scratch_u32_variable = 0;
 	uint32_t                                                           relative_vgpr_variable = 0;
+	std::unordered_map<const IR::Inst*, BdaGroupPointers>              bda_groups;
 	ValueEmitContext*                                                  other_half = nullptr;
 	uint32_t                                                           half       = 0;
 	bool                                                               quad_read  = false;
