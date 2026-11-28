@@ -801,8 +801,8 @@ void PipelineCache::OpenManifest() {
 		state.ReleaseStartup(state.startup_total == state.startup_done ? result : "skipped");
 	}
 	for (size_t i = 0; i < workers; i++) {
-		state.threads.emplace_back([this, i, large_workers](const std::stop_token& stop) {
-			ManifestWorker(stop, i < large_workers);
+		state.threads.emplace_back([this, i, workers, large_workers](const std::stop_token& stop) {
+			ManifestWorker(stop, i < large_workers, i < large_workers && workers > large_workers);
 		});
 	}
 	state.code_path   = folders.back() / (stem + ".code");
@@ -2919,15 +2919,10 @@ bool PipelineCache::WaitForStartupManifest(std::chrono::milliseconds timeout, ui
 	return !state.startup;
 }
 
-void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large) {
+void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large, bool prefer_large) {
 	KYTY_PROFILER_THREAD("Thread_PipelineManifest");
 	Common::Thread::LowerCurrentPriority();
 	auto& state = *m_manifest;
-	const auto memory_sample = Common::ReadSystemMemory();
-	const auto [worker_count, large_workers] =
-	    ManifestWorkerLimits(Common::ParallelThreads(), memory_sample ? memory_sample->total : 0,
-	                         m_large_manifest_workers);
-	const bool prefer_large = allow_large && worker_count > large_workers;
 	for (;;) {
 		std::shared_ptr<const std::vector<uint32_t>> code;
 		std::shared_ptr<const std::vector<uint32_t>> back_code;

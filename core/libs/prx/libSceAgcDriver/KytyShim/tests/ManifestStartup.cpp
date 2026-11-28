@@ -89,9 +89,12 @@ void MemoryPause() {
 	std::thread second_thread([] {});
 	const auto second = second_thread.get_id();
 	second_thread.join();
+	const auto [low_16, high_16] = Libs::Graphics::ManifestPauseThresholds(16 * GiB);
+	Check(low_16 == 4 * GiB && high_16 == 16 * GiB / 3, "16 GiB hosts use fractional pause thresholds");
+	const auto [low_32, high_32] = Libs::Graphics::ManifestPauseThresholds(32 * GiB);
+	Check(low_32 == 12 * GiB && high_32 == 14 * GiB, "larger hosts retain absolute pause thresholds");
 	for (const auto total: {16 * GiB, 32 * GiB}) {
-		const auto low  = total <= 18 * GiB ? total / 4 : std::min(12 * GiB, total / 2);
-		const auto high = total <= 18 * GiB ? total / 3 : std::min(14 * GiB, total / 12 * 7);
+		const auto [low, high] = Libs::Graphics::ManifestPauseThresholds(total);
 		ManifestMemoryPause memory;
 		memory.Sample(now, total, low);
 		Check(memory.Admit(now, first), "work starts at the low threshold");
@@ -110,6 +113,16 @@ void MemoryPause() {
 	Check(low_workers == 6 && low_large == 2, "16 GiB hosts cap manifest and large workers");
 	const auto [high_workers, high_large] = Libs::Graphics::ManifestWorkerLimits(24, 32 * GiB, 6);
 	Check(high_workers == 24 && high_large == 6, "larger hosts keep configured manifest worker counts");
+	Check(ManifestWorkerLimits(24, 18 * GiB, 6) == std::pair<size_t, size_t> {6, 2},
+	      "the constrained tier includes its upper boundary");
+	Check(ManifestWorkerLimits(24, 18 * GiB + 1, 6) == std::pair<size_t, size_t> {24, 6},
+	      "hosts above the constrained tier retain their configuration");
+	Check(ManifestWorkerLimits(2, 16 * GiB, 6) == std::pair<size_t, size_t> {2, 1},
+	      "a small pool retains one large worker");
+	Check(ManifestWorkerLimits(24, 16 * GiB, 0) == std::pair<size_t, size_t> {6, 0},
+	      "the constrained tier respects disabled large workers");
+	Check(ManifestWorkerLimits(24, 0, 6) == std::pair<size_t, size_t> {24, 6},
+	      "an unavailable memory sample preserves configured limits");
 }
 
 }
