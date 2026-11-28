@@ -407,8 +407,15 @@ static_assert(LOWER_ADDRESS_SIZE % BdaGroupPage == 0 && LibKernel::Memory::kExte
               LibKernel::Memory::kExtendedMemorySize % BdaGroupPage == 0 && BdaGroupPage > uint64_t {BdaGroupSpan} + 8u);
 
 bool BdaGroupScalar(const IR::Program& program, const IR::Inst& inst, bool& scalar) {
-	if (inst.GetOpcode() != IR::ValueOpcode::LoadAddressU32) return false;
+	if (inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer && inst.GetOpcode() != IR::ValueOpcode::LoadAddressU32) {
+		return false;
+	}
 	const auto& mem = program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+	if (inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) {
+		scalar = true;
+		return !mem.planning_only && mem.kind == IR::ResourceKind::IndirectBuffer &&
+		       static_cast<int32_t>(mem.offset) >= 0;
+	}
 	if (mem.planning_only || mem.kind == IR::ResourceKind::FlatLocal || mem.kind == IR::ResourceKind::Scratch) return false;
 	scalar = mem.kind == IR::ResourceKind::ScalarAddress;
 	return scalar || IR::AddressOpcodeInfoOf(inst.GetOpcode()).access == IR::AddressAccess::Read;
@@ -422,14 +429,14 @@ int64_t BdaGroupOffset(const IR::MemoryInfo& mem, bool scalar) {
 bool SameBdaGroup(const IR::Program& program, const IR::Inst& a, const IR::Inst& b) {
 	const auto& x = program.memory_info.at(a.Flags<IR::MemoryFlags>().index);
 	const auto& y = program.memory_info.at(b.Flags<IR::MemoryFlags>().index);
-	if (x.kind != y.kind || x.coherent != y.coherent || x.address_is_full != y.address_is_full ||
-	    a.NumArgs() != b.NumArgs()) {
+	if (a.GetOpcode() != b.GetOpcode() || x.kind != y.kind || x.coherent != y.coherent ||
+	    x.address_is_full != y.address_is_full || a.NumArgs() != b.NumArgs()) {
 		return false;
 	}
 	for (size_t index = 0; index < a.NumArgs(); index++) {
 		if (!(a.Arg(index).Resolve() == b.Arg(index).Resolve())) return false;
 	}
-	const bool scalar = x.kind == IR::ResourceKind::ScalarAddress;
+	const bool scalar = x.kind == IR::ResourceKind::ScalarAddress || x.kind == IR::ResourceKind::IndirectBuffer;
 	return (BdaGroupOffset(x, scalar) - BdaGroupOffset(y, scalar)) % 4 == 0;
 }
 
@@ -506,33 +513,15 @@ std::pair<uint32_t, uint32_t> ResolveBdaGroupPages(EmitterState& state, uint32_t
 	return {Select(state, u64, pass, kept, pointer), Select(state, u64, pass, pointer, zero)};
 }
 
-BdaGroupPointers EmitBdaGroup(ValueEmitContext& ctx, const BdaGroupPlan& plan, uint32_t address, uint32_t active) {
-	auto&      state = ctx.state;
+BdaGroupPointers EmitBdaGroupPointers(EmitterState& state, BdaGroupPointers group, uint32_t first, uint32_t active) {
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
-	BdaGroupPointers group {.epoch = state.block_epoch, .delta = plan.delta};
-	const auto start =
-	    plan.low == plan.delta
-	        ? address
-	        : Binary(state, spv::OpIAdd, u64, address, ConstantU64(state, static_cast<uint64_t>(plan.low - plan.delta)));
-	const auto span = static_cast<uint32_t>(plan.high - plan.low);
-	uint32_t   first = start;
-	if (plan.scalar) {
-		group.byte       = ConstantU32(state, 0);
-		group.unaligned  = ConstantBool(state, false);
-		group.last_delta = ConstantU32(state, span);
-	} else {
-		first            = Binary(state, spv::OpBitwiseAnd, u64, start, ConstantU64(state, ~uint64_t {3}));
-		group.byte       = Binary(state, spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, start), ConstantU32(state, 3));
-		group.unaligned  = Binary(state, spv::OpINotEqual, boolean, group.byte, ConstantU32(state, 0));
-		group.last_delta = Select(state, u32, group.unaligned, ConstantU32(state, span + 4u), ConstantU32(state, span));
-	}
 	group.page_low = Binary(state, spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, first),
 	                        ConstantU32(state, static_cast<uint32_t>(BdaGroupPage - 1u)));
 	const auto last = Binary(state, spv::OpIAdd, u64, first, Unary(state, spv::OpUConvert, u64, group.last_delta));
 	const auto crosses =
 	    Binary(state, spv::OpUGreaterThanEqual, boolean, Binary(state, spv::OpIAdd, u32, group.page_low, group.last_delta),
 	           ConstantU32(state, static_cast<uint32_t>(BdaGroupPage)));
-	if (active == 0 || active == ConstantBool(state, true)) {
+	if (active == ConstantBool(state, true)) {
 		std::tie(group.first, group.last) = ResolveBdaGroupPages(state, first, last, crosses);
 		return group;
 	}
@@ -554,8 +543,31 @@ BdaGroupPointers EmitBdaGroup(ValueEmitContext& ctx, const BdaGroupPlan& plan, u
 	return group;
 }
 
-uint32_t BdaGroupDwordPointer(EmitterState& state, const BdaGroupPointers& group, uint32_t rel) {
+BdaGroupPointers EmitBdaGroup(ValueEmitContext& ctx, const BdaGroupPlan& plan, uint32_t address, uint32_t active) {
+	auto&      state = ctx.state;
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
+	BdaGroupPointers group {.epoch = state.block_epoch, .delta = plan.delta};
+	const auto start =
+	    plan.low == plan.delta
+	        ? address
+	        : Binary(state, spv::OpIAdd, u64, address, ConstantU64(state, static_cast<uint64_t>(plan.low - plan.delta)));
+	const auto span = static_cast<uint32_t>(plan.high - plan.low);
+	uint32_t   first = start;
+	if (plan.scalar) {
+		group.byte       = ConstantU32(state, 0);
+		group.unaligned  = ConstantBool(state, false);
+		group.last_delta = ConstantU32(state, span);
+	} else {
+		first            = Binary(state, spv::OpBitwiseAnd, u64, start, ConstantU64(state, ~uint64_t {3}));
+		group.byte       = Binary(state, spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, start), ConstantU32(state, 3));
+		group.unaligned  = Binary(state, spv::OpINotEqual, boolean, group.byte, ConstantU32(state, 0));
+		group.last_delta = Select(state, u32, group.unaligned, ConstantU32(state, span + 4u), ConstantU32(state, span));
+	}
+	return EmitBdaGroupPointers(state, group, first, active == 0 ? ConstantBool(state, true) : active);
+}
+
+uint32_t BdaGroupDwordPointer(EmitterState& state, const BdaGroupPointers& group, uint32_t rel) {
+	const auto u64 = TypeU64(state), boolean = TypeBool(state);
 	const auto zero     = ConstantU64(state, 0);
 	const auto in_first = Binary(state, spv::OpULessThan, boolean, group.page_low,
 	                             ConstantU32(state, static_cast<uint32_t>(BdaGroupPage) - rel));
@@ -1337,6 +1349,44 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 	});
 }
 
+uint32_t LoadGroupedIndirectScalar(ValueEmitContext& ctx, const BdaGroupPlan& plan, uint32_t base, uint32_t offset,
+                                   uint32_t size) {
+	auto&      state = ctx.state;
+	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
+	const auto dword = ConstantU64(state, sizeof(uint32_t));
+	auto       found = ctx.bda_groups.find(plan.leader);
+	if (found == ctx.bda_groups.end() || found->second.epoch != state.block_epoch) {
+		const auto first_offset =
+		    plan.low == plan.delta
+		        ? offset
+		        : Binary(state, spv::OpIAdd, u64, offset, ConstantU64(state, static_cast<uint64_t>(plan.low - plan.delta)));
+		const auto active =
+		    Binary(state, spv::OpULessThanEqual, boolean, Binary(state, spv::OpIAdd, u64, first_offset, dword), size);
+		const auto room = Binary(state, spv::OpBitwiseAnd, u64,
+		                         Binary(state, spv::OpISub, u64, Binary(state, spv::OpISub, u64, size, dword), first_offset),
+		                         ConstantU64(state, ~uint64_t {3}));
+		const auto span = ConstantU64(state, static_cast<uint64_t>(plan.high - plan.low));
+		BdaGroupPointers group {.epoch = state.block_epoch, .delta = plan.delta};
+		group.byte       = ConstantU32(state, 0);
+		group.unaligned  = ConstantBool(state, false);
+		group.last_delta = Unary(state, spv::OpUConvert, u32,
+		                         Select(state, u64,
+		                                AndCondition(state, active, Binary(state, spv::OpULessThan, boolean, room, span)),
+		                                room, Select(state, u64, active, span, ConstantU64(state, 0))));
+		found = ctx.bda_groups
+		            .insert_or_assign(plan.leader, EmitBdaGroupPointers(state, group, Binary(state, spv::OpIAdd, u64, base, first_offset),
+		                                                                active))
+		            .first;
+	}
+	const auto& group = found->second;
+	const auto  rel   = static_cast<uint32_t>(plan.delta - plan.low);
+	return EmitValueOrDefaultIfCondition(
+	    state, Binary(state, spv::OpULessThanEqual, boolean, Binary(state, spv::OpIAdd, u64, offset, dword), size), u32,
+	    ConstantU32(state, 0), [&]() {
+		    return LoadBdaPointerDword(ctx, BdaGroupDwordPointer(state, group, rel), false, MissingBdaDword(state));
+	    });
+}
+
 uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state  = ctx.state;
 	const auto& handle = *inst.Arg(0).ResolveInstruction();
@@ -1362,6 +1412,12 @@ uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                                 ConstantU32(state, 0xffffu)));
 		return Binary(state, spv::OpIAdd, TypeU64(state), base, offset);
 	};
+	if (const auto* group = FindBdaGroup(state, inst); group != nullptr) {
+		const auto base = PackU64(state,
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(handle, 0), ConstantU32(state, ~3u)),
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, 0xffffu)));
+		return LoadGroupedIndirectScalar(ctx, *group, base, offset, size);
+	}
 	return LoadBdaDwordIf(ctx, Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size),
 	                      scalar_address());
 }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -33,6 +34,13 @@ bool IsMarked(const Inst* inst, bool write) {
 	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32) return false;
 	const auto flags = inst->Flags<uint64_t>();
 	return (flags & RelativeVgprMark) != 0 && ((flags & RelativeVgprWrite) != 0) == write;
+}
+
+std::optional<uint32_t> PhiRegister(const Inst& inst) {
+	if (inst.GetOpcode() != ValueOpcode::Phi) return std::nullopt;
+	const auto flags = inst.Flags<uint64_t>();
+	if ((flags & RelativeVgprMark) == 0) return std::nullopt;
+	return static_cast<uint32_t>((flags >> 40u) & 0xffu);
 }
 
 struct ReadSite {
@@ -120,8 +128,14 @@ std::optional<WriteSite> MatchWrite(Block::iterator first, Block::iterator end) 
 	return seen ? std::optional<WriteSite>(write) : std::nullopt;
 }
 
-uint32_t FindWindowEnd(const Program& program) {
-	uint32_t end = 0;
+struct Window {
+	uint32_t                     end    = 0;
+	bool                         writes = false;
+	std::unordered_set<uint32_t> registers;
+};
+
+Window FindWindow(const Program& program) {
+	Window window;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SelectU32) continue;
@@ -130,23 +144,65 @@ uint32_t FindWindowEnd(const Program& program) {
 			const auto base  = FlagBase(flags);
 			const auto count = (flags & RelativeVgprWrite) != 0 ? static_cast<uint32_t>((flags >> 48u) & 0x3fffu)
 			                                                    : static_cast<uint32_t>((flags >> 32u) & 0xffffu) + 1u;
-			end = std::max(end, base + count);
+			for (uint32_t reg = base; reg < base + count; reg++) window.registers.insert(reg);
+			window.writes = window.writes || (flags & RelativeVgprWrite) != 0;
+			window.end = std::max(window.end, base + count);
 		}
 	}
-	return end;
+	return window;
 }
 
 }
 
 uint32_t LowerRelativeVgprs(Program& program) {
 	if (program.stage == ShaderType::Pixel) return 0;
-	const auto spare = FindWindowEnd(program);
-	if (spare == 0) return 0;
+	const auto window = FindWindow(program);
+	if (window.end == 0) return 0;
+	const auto spare = window.end;
 
-	uint32_t                                lowered = 0;
+	std::vector<std::pair<Block*, Block::iterator>>                         phis;
+	std::unordered_map<const Block*, Block::iterator>                      bodies;
+	std::unordered_map<const Block*, std::unordered_map<uint32_t, Value>> incoming_by_edge;
+	std::unordered_set<uint32_t>                                           split_registers;
+	for (auto* block: program.blocks) {
+		if (!window.writes) break;
+		auto& instructions = block->Instructions();
+		auto  body         = std::ranges::find_if(instructions, [](const Inst& inst) {
+			return inst.GetOpcode() != ValueOpcode::Phi && inst.GetOpcode() != ValueOpcode::Identity;
+		});
+		bodies.emplace(block, body);
+		for (auto it = instructions.begin(); it != body; ++it) {
+			const auto reg = PhiRegister(*it);
+			if (!reg || !window.registers.contains(*reg)) continue;
+			phis.emplace_back(block, it);
+			for (size_t index = 0; index < it->NumArgs(); index++) {
+				const auto incoming = it->Arg(index).Resolve();
+				const auto [found, inserted] = incoming_by_edge[it->PhiBlock(index)].try_emplace(*reg, incoming);
+				if (!inserted && !(found->second == incoming)) split_registers.insert(*reg);
+			}
+		}
+	}
+
+	uint32_t                                                                   lowered = 0;
+	std::unordered_map<const Block*, Slots>                                    entry;
+	std::unordered_map<const Block*, std::vector<std::pair<uint32_t, Value>>> outgoing;
+	for (auto& [block, it]: phis) {
+		const auto reg = *PhiRegister(*it);
+		if (split_registers.contains(reg)) continue;
+		for (size_t index = 0; index < it->NumArgs(); index++) {
+			outgoing[it->PhiBlock(index)].emplace_back(reg, it->Arg(index));
+		}
+		const auto loaded =
+		    Value(&*block->PrependNewInst(bodies.at(block), ValueOpcode::LoadRelativeVgpr, {Value(reg)}));
+		entry[block][reg] = loaded;
+		it->SetFlags(it->Flags<Type>());
+		it->ReplaceUsesWith(loaded);
+		lowered++;
+	}
+
 	std::unordered_map<const Block*, Slots> exit_state;
 	for (auto* block: program.blocks) {
-		Slots stored;
+		Slots stored = entry[block];
 		if (const auto predecessors = block->ImmPredecessors(); predecessors.size() == 1u) {
 			if (const auto found = exit_state.find(predecessors.front()); found != exit_state.end()) {
 				for (const auto& [slot, value]: found->second) stored.try_emplace(slot, value);
@@ -207,6 +263,11 @@ uint32_t LowerRelativeVgprs(Program& program) {
 				write->selects[offset]->ReplaceUsesWith(loaded);
 			}
 			lowered++;
+		}
+		if (const auto found = outgoing.find(block); found != outgoing.end()) {
+			for (const auto& [reg, incoming]: found->second) {
+				sync(block->end(), reg, incoming.Resolve());
+			}
 		}
 		exit_state[block] = std::move(stored);
 	}
