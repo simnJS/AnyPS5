@@ -57,6 +57,12 @@ constexpr uint64_t ParkPercent          = 60;
 constexpr uint64_t ParkStopPercent      = 50;
 constexpr uint64_t MaxParkBytes         = uint64_t {512} << 20u;
 constexpr size_t   MaxParks             = 1024;
+constexpr uint32_t CrowdedUnreadMs      = 2'000;
+constexpr uint32_t CrowdedCheckMs       = 250;
+constexpr uint64_t MaxCrowdedParkBytes  = uint64_t {1} << 30u;
+constexpr size_t   MaxCrowdedParks      = 4096;
+constexpr uint32_t ReleaseFrames        = 2;
+constexpr uint32_t ReportReadsMs        = 10'000;
 static_assert(Slots::ArmShift == IR::ImageHeapKindShift);
 static_assert(IR::ImageHeapCapacity - 1u <= Slots::IndexMask);
 
@@ -722,7 +728,11 @@ void ImageHeap::Mark(uint32_t index, State state) {
 		    m_directory.Insert(element.key.value.dwords, profile, 0u, Slots::NegativeFlag | Slots::DeadFlag)) {
 			m_dead.emplace_back(element.key.value.dwords, profile);
 		}
-		Repend(element.key, profile);
+		if (m_batch_repends) {
+			m_repends.emplace_back(profile, element.key.value.dwords);
+		} else {
+			Repend(element.key, profile);
+		}
 	}
 	element.hashed = false;
 	if (state == State::Stale) m_requeue.push_back(index);
@@ -1019,6 +1029,40 @@ void ImageHeap::Repend(const Key& key, uint32_t profile) {
 			}
 		}
 	}
+}
+
+void ImageHeap::FlushRepends() {
+	if (m_repends.empty()) return;
+	std::ranges::sort(m_repends);
+	m_repends.erase(std::ranges::unique(m_repends).begin(), m_repends.end());
+	using Repended = std::pair<uint32_t, Slots::KeyWordArray>;
+	for (const auto& memory: m_memories) {
+		const std::span<const uint32_t> words {memory->words};
+		for (const auto& view: memory->views) {
+			if (view->full) continue;
+			const auto profile = view->shape.profile;
+			const auto keys    = std::ranges::equal_range(m_repends, profile, {}, &Repended::first);
+			if (keys.empty()) continue;
+			memory->gpu_bytes.ForEach([&](uint64_t begin, uint64_t end) {
+				AddBytes(*view, begin - memory->base, end - memory->base, false);
+			});
+			const auto key_words = m_profiles[profile].r128 ? 4u : 8u;
+			const auto first     = view->shape.first / 4u;
+			const auto step      = view->shape.step / 4u;
+			for (uint32_t probe = 0; probe < view->count; ++probe) {
+				const auto at = first + uint64_t {probe} * step;
+				if (at >= words.size()) continue;
+				const auto lead = std::ranges::equal_range(keys, words[at], {},
+				                                           [](const Repended& repended) { return repended.second[0]; });
+				if (lead.empty()) continue;
+				const auto read = Slots::ReadKey(words, at, key_words);
+				if (std::ranges::any_of(lead, [&](const Repended& repended) { return repended.second == read; })) {
+					view->pending.push_back({probe, probe + 1u});
+				}
+			}
+		}
+	}
+	m_repends.clear();
 }
 
 void ImageHeap::SyncMemory(Memory& memory) {
@@ -1751,7 +1795,7 @@ void ImageHeap::CollectAt(std::chrono::steady_clock::time_point now) {
 		m_suspend_draw = m_draw;
 	}
 	Report();
-	ReportReads();
+	ReportReads(stamp);
 }
 
 uint32_t ImageHeap::ReadStamp(std::chrono::steady_clock::time_point now) const {
@@ -1771,6 +1815,8 @@ void ImageHeap::TakeReads() {
 			if (index < m_elements.size() && m_elements[index].parked) m_unparked.push_back(static_cast<uint32_t>(index));
 		});
 		m_read_seen = front.stamp;
+		m_recent_reads[m_read_stats.readbacks % RecentReads] = front.stamp;
+		m_recent_count = std::min(m_recent_count + 1u, RecentReads);
 		++m_read_stats.readbacks;
 		m_free_readbacks.push_back(std::move(front.buffer));
 		m_readbacks.pop_front();
@@ -1811,13 +1857,13 @@ void ImageHeap::RecordReads(uint32_t stamp) {
 	m_readbacks.push_back({.buffer = std::move(target), .tick = scheduler.CurrentTick(), .stamp = stamp});
 }
 
-const Image* ImageHeap::Parkable(const Element& element, uint32_t index) const {
+const Image* ImageHeap::Parkable(const Element& element, uint32_t index, uint32_t cutoff) const {
 	if (element.freed || element.parked || element.evicting || element.state != State::Live || !element.image ||
 	    (!element.table && element.refs == 0u) || m_read_stamps.Pending(index)) {
 		return nullptr;
 	}
 	const auto last = std::max(element.since, m_read_stamps.Stamp(index));
-	if (last == 0u || m_read_seen < last || m_read_seen - last < UnreadMs) return nullptr;
+	if (last == 0u || (last >= cutoff && (m_read_seen < last || m_read_seen - last < UnreadMs))) return nullptr;
 	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(element.image);
 	if (image == nullptr || image->serial != element.serial || !image->registered || image->depth_id ||
 	    image->is_depth_copy || image->is_stencil_copy || image->usage.render_target || image->usage.video_out ||
@@ -1830,18 +1876,37 @@ const Image* ImageHeap::Parkable(const Element& element, uint32_t index) const {
 	return image;
 }
 
+uint32_t ImageHeap::CrowdedCutoff() const {
+	if (m_recent_count < RecentReads || m_read_seen <= CrowdedUnreadMs) return 0u;
+	return std::min(m_read_seen - CrowdedUnreadMs, m_recent_reads[m_read_stats.readbacks % RecentReads]);
+}
+
 void ImageHeap::ParkUnread(uint32_t stamp) {
-	if (m_read_seen == 0u || stamp - m_park_check < ParkCheckMs) return;
+	if (m_read_seen == 0u || stamp - m_park_check < (m_crowded ? CrowdedCheckMs : ParkCheckMs)) return;
 	m_park_check = stamp;
 	const auto local = m_context.GetGraphics().GetLocalMemoryUsage();
 	if (local.budget == 0u) return;
-	m_pressure = local.usage * 100u >= local.budget * (m_pressure ? ParkStopPercent : ParkPercent);
+	auto&    scheduler = m_context.GetCommandScheduler();
+	uint64_t releasing = 0;
+	std::erase_if(m_releasing, [&](const Releasing& entry) {
+		if (m_frame > entry.frame + ReleaseFrames && scheduler.IsFree(entry.tick)) return true;
+		releasing += entry.bytes;
+		return false;
+	});
+	const auto usage = local.usage - std::min(local.usage, releasing + m_context.GetGraphics().LocalBlockSpace());
+	m_pressure = usage * 100u >= local.budget * (m_pressure ? ParkStopPercent : ParkPercent);
+	m_crowded  = usage >= GraphicContext::BudgetShare(local.budget, m_crowded ? GraphicContext::CrowdedStopPercent
+	                                                                           : GraphicContext::CrowdedPercent);
 	if (!m_pressure) return;
+	if (m_crowded) {
+		ParkLeastRead(usage - std::min(usage, GraphicContext::BudgetShare(local.budget, GraphicContext::CrowdedStopPercent)));
+		return;
+	}
 	uint64_t bytes = 0;
 	size_t   parks = 0;
 	for (uint32_t index = 1; index < m_elements.size() && parks < MaxParks && bytes < MaxParkBytes; ++index) {
 		const auto& element = m_elements[index];
-		const auto* image   = Parkable(element, index);
+		const auto* image   = Parkable(element, index, 0u);
 		if (image == nullptr) continue;
 		bytes += image->AccountedSize();
 		++parks;
@@ -1854,14 +1919,71 @@ void ImageHeap::ParkUnread(uint32_t stamp) {
 	Repoint();
 }
 
-void ImageHeap::ReportReads() {
-	if (m_frame < m_read_stats.reported + ReportFrames || m_read_stats.readbacks == 0u) return;
-	m_read_stats.reported = m_frame;
+void ImageHeap::ParkLeastRead(uint64_t wanted) {
+	auto&      textures = m_context.GetTextureCache();
+	const auto cutoff   = CrowdedCutoff();
+	m_cold.clear();
+	m_read_stats.live       = 0;
+	m_read_stats.live_bytes = 0;
+	for (uint32_t index = 1; index < m_elements.size(); ++index) {
+		const auto& element = m_elements[index];
+		if (element.freed || element.state != State::Live || !element.image) continue;
+		const auto* live = textures.m_slot_images.try_get(element.image);
+		if (live == nullptr || live->serial != element.serial || !live->backing.charge.local ||
+		    live->backing.charge.bytes == 0u) {
+			continue;
+		}
+		++m_read_stats.live;
+		m_read_stats.live_bytes += live->backing.charge.bytes;
+		if (Parkable(element, index, cutoff) == nullptr) continue;
+		m_cold.push_back({.last  = std::max(element.since, m_read_stamps.Stamp(index)),
+		                  .index = index,
+		                  .bytes = live->backing.charge.bytes});
+	}
+	m_read_stats.cold       = m_cold.size();
+	m_read_stats.cold_bytes = 0;
+	for (const auto& cold: m_cold) m_read_stats.cold_bytes += cold.bytes;
+	std::ranges::sort(m_cold, {}, [](const Cold& cold) { return std::pair {cold.last, cold.index}; });
+	uint64_t bytes = 0;
+	size_t   parks = 0;
+	m_batch_repends = true;
+	for (const auto& cold: m_cold) {
+		if (bytes >= wanted || bytes >= MaxCrowdedParkBytes || parks >= MaxCrowdedParks) break;
+		const auto& element = m_elements[cold.index];
+		const auto  id      = element.image;
+		const auto  serial  = element.serial;
+		bytes += cold.bytes;
+		++parks;
+		m_parking.insert(element.key);
+		Mark(cold.index, State::Stale);
+		textures.EvictUnread(id, serial);
+	}
+	m_batch_repends = false;
+	FlushRepends();
+	if (parks == 0u) return;
+	m_read_stats.crowded += parks;
+	m_read_stats.crowded_bytes += bytes;
+	m_releasing.push_back({.tick = m_context.GetCommandScheduler().CurrentTick(), .frame = m_frame, .bytes = bytes});
+	Repoint();
+}
+
+void ImageHeap::ReportReads(uint32_t stamp) {
+	if ((m_frame < m_read_stats.reported + ReportFrames && stamp - m_read_stats.reported_ms < ReportReadsMs) ||
+	    m_read_stats.readbacks == 0u) {
+		return;
+	}
+	m_read_stats.reported    = m_frame;
+	m_read_stats.reported_ms = stamp;
 	std::fprintf(stderr,
 	             "[kyty-image-heap-reads] %" PRIu64 " readbacks, %" PRIu64 " unread slots parked (%" PRIu64
-	             " MiB), %" PRIu64 " read again, pressure %s\n",
+	             " MiB), %" PRIu64 " read again, pressure %s; crowded %s: %" PRIu64
+	             " least read slots parked (%" PRIu64 " MiB); last crowded check: %" PRIu64
+	             " live slots on device-local memory (%" PRIu64 " MiB), %" PRIu64 " of them unread for 2 s and %zu readbacks (%" PRIu64
+	             " MiB); %u ms\n",
 	             m_read_stats.readbacks, m_read_stats.parked, m_read_stats.parked_bytes >> 20u, m_read_stats.unparked,
-	             m_pressure ? "on" : "off");
+	             m_pressure ? "on" : "off", m_crowded ? "on" : "off", m_read_stats.crowded, m_read_stats.crowded_bytes >> 20u,
+	             m_read_stats.live, m_read_stats.live_bytes >> 20u, m_read_stats.cold, RecentReads,
+	             m_read_stats.cold_bytes >> 20u, stamp);
 }
 
 void ImageHeap::Report() {

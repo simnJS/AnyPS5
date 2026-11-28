@@ -186,6 +186,11 @@ struct VramBudgetTestAccess {
 		cache.m_slot_images[id].MarkBufferModified();
 	}
 
+	static uint64_t Serial(TextureCache& cache, ImageId id) {
+		Common::ScopedLock lock {cache.m_lock};
+		return cache.m_slot_images[id].serial;
+	}
+
 	static bool IsImageRegistered(TextureCache& cache, ImageId id) {
 		Common::ScopedLock lock {cache.m_lock};
 		const auto*        image = cache.m_slot_images.try_get(id);
@@ -369,7 +374,30 @@ const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures,
 	info.data.address += info.data.size;
 	const auto mixed = VramBudgetTestAccess::CreateImage(textures, info);
 	VramBudgetTestAccess::MarkMixedOwnership(textures, mixed);
+	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 0);
+	textures.RunGarbageCollector();
+	textures.RunGarbageCollector();
+	info.data.address += info.data.size;
+	const auto unread = VramBudgetTestAccess::CreateImage(textures, info);
+	info.data.address += info.data.size;
+	const auto unread_mixed = VramBudgetTestAccess::CreateImage(textures, info);
+	VramBudgetTestAccess::MarkMixedOwnership(textures, unread_mixed);
+	info.data.address += info.data.size;
+	const auto renewed = VramBudgetTestAccess::CreateImage(textures, info);
 	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 6 * GiB);
+	textures.EvictUnread(unread, VramBudgetTestAccess::Serial(textures, unread));
+	textures.EvictUnread(unread_mixed, VramBudgetTestAccess::Serial(textures, unread_mixed));
+	textures.EvictUnread(renewed, VramBudgetTestAccess::Serial(textures, renewed) + 1u);
+	textures.RunGarbageCollector();
+	if (VramBudgetTestAccess::IsImageRegistered(textures, unread)) {
+		return "an unread texture handed over by the image heap was not evicted in the same pass";
+	}
+	if (!VramBudgetTestAccess::IsImageRegistered(textures, unread_mixed)) {
+		return "the unread eviction discarded an image with GPU writes and mixed ownership";
+	}
+	if (!VramBudgetTestAccess::IsImageRegistered(textures, renewed)) {
+		return "the unread eviction freed an image whose serial no longer matches";
+	}
 	for (uint32_t i = 0; i < 4; i++) {
 		textures.RunGarbageCollector();
 	}

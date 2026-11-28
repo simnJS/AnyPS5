@@ -198,6 +198,7 @@ public:
 	}
 	void PinImage(TableImageRef ref);
 	void UnpinImage(TableImageRef ref);
+	void EvictUnread(ImageId id, uint64_t serial);
 	void RunGarbageCollector();
 
 private:
@@ -550,7 +551,9 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	bool             m_collecting = false;
+	std::vector<std::pair<ImageId, uint64_t>> m_unread_images KYTY_GUARDED_BY(m_lock);
 	void             UpdateMemoryThresholds(uint64_t budget_bytes);
+	void             EvictUnreadImages(uint64_t& used) KYTY_REQUIRES(m_lock);
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint32_t> m_partial_candidates {0};
 	uint64_t         m_image_set_epoch        = 0;

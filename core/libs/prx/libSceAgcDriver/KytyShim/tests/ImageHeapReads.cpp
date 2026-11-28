@@ -1,9 +1,11 @@
 #include "RenderExecutorTestAccess.h"
 #include "TestVulkanDevice.h"
+#include "common/alignment.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/host_gpu/memoryTelemetry.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -54,6 +56,35 @@ struct ImageHeapReadsTestAccess {
 		graphics.m_memory_usage_override   = usage;
 	}
 	static void Relax(GraphicContext& graphics) { graphics.m_memory_override_enabled = false; }
+	static bool Crowded(const ImageHeap& heap) { return heap.m_crowded; }
+	static void MarkRead(ImageHeap& heap, uint32_t slot) { heap.m_read_stamps.Mark(slot); }
+	static bool Overridden(const GraphicContext& graphics) { return graphics.m_memory_override_enabled; }
+	static bool CanSpill(const GraphicContext& graphics) { return graphics.spill_allocator != nullptr; }
+
+	static std::string Views(const ImageHeap& heap, uint32_t slot) {
+		std::string text = " profiles " + std::to_string(heap.m_elements[slot].table_profiles.size()) + ", views";
+		for (const auto& memory: heap.m_memories) {
+			for (const auto& view: memory->views) {
+				text += " " + std::to_string(view->shape.profile) + (view->full ? " full" : " partial") + " " +
+				        std::to_string(view->count);
+			}
+		}
+		return text;
+	}
+
+	static std::vector<uint32_t> PendingProbes(const ImageHeap& heap) {
+		std::vector<uint32_t> probes;
+		for (const auto& memory: heap.m_memories) {
+			for (const auto& view: memory->views) {
+				for (const auto& range: view->pending) {
+					for (auto probe = range.begin; probe < range.end; ++probe) probes.push_back(probe);
+				}
+			}
+		}
+		std::ranges::sort(probes);
+		probes.erase(std::ranges::unique(probes).begin(), probes.end());
+		return probes;
+	}
 };
 
 }
@@ -86,6 +117,16 @@ int Finish() {
 constexpr uint32_t TexelCount = 16;
 constexpr uint32_t Textures   = 4;
 constexpr uint32_t Lanes      = 64;
+
+IR::DescriptorValue SquareTexture(uint64_t address, uint32_t side) {
+	IR::DescriptorValue value {.dword_count = 8u};
+	value.dwords[0] = static_cast<uint32_t>(address >> 8u);
+	value.dwords[1] = static_cast<uint32_t>((address >> 40u) & 0xffu) |
+	                  (static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u) | (((side - 1u) & 0x3u) << 30u);
+	value.dwords[2] = (side - 1u) >> 2u | (side - 1u) << 14u;
+	value.dwords[3] = 0xfacu | (9u << 28u);
+	return value;
+}
 
 IR::DescriptorValue HeapTexture(uint64_t address) {
 	IR::DescriptorValue value {.dword_count = 8u};
@@ -803,6 +844,344 @@ void CheckReads(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	            static_cast<unsigned long long>(heap.Reads().readbacks));
 }
 
+void CheckCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
+	RenderContext renderer(graphics);
+	renderer.MapMemory(address, bytes);
+	CommandProcessor processor(renderer, 0);
+	processor.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(processor.GetCtx(), processor.GetUcfg(), processor.GetShCtx());
+	auto& heap     = renderer.GetImageHeap();
+	auto& buffers  = renderer.GetBufferCache();
+	auto& textures = renderer.GetTextureCache();
+	auto& executor = renderer.GetRenderExecutor();
+	RenderExecutorTestAccess::Reset(executor);
+
+	std::array<IR::DescriptorValue, Textures>             values {};
+	std::array<std::array<uint8_t, TexelCount>, Textures> texels {};
+	for (uint32_t texture = 0; texture < Textures; ++texture) {
+		const auto base = address + 0x10000u + uint64_t {texture} * 0x4000u;
+		values[texture] = HeapTexture(base);
+		for (uint32_t texel = 0; texel < TexelCount; ++texel) {
+			texels[texture][texel] = static_cast<uint8_t>(3u + texture * 41u + texel * 13u);
+		}
+		Libs::LibKernel::Memory::WriteBacking(base, texels[texture].data(), TexelCount);
+		buffers.InvalidateMemory(base, TexelCount);
+		Libs::LibKernel::Memory::WriteBacking(address + uint64_t {texture} * 32u, values[texture].dwords.data(),
+		                                      sizeof(values[texture].dwords));
+		buffers.InvalidateMemory(address + uint64_t {texture} * 32u, sizeof(values[texture].dwords));
+	}
+	IR::ImageResource root;
+	root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+	const auto                 profile = IR::ImageTableHeapProfile(root, false);
+	const IR::ImageHeapRequest request {.base  = address,
+	                                    .size  = Textures * 32u,
+	                                    .step  = 32u,
+	                                    .count = Textures,
+	                                    .root  = &profile,
+	                                    .table = true};
+	IR::ImageHeapView view;
+	heap.BeginDraw();
+	if (!heap.Acquire(request, view)) {
+		Check(false, "the heap admits a table of four textures");
+		return;
+	}
+	heap.Rebind(executor);
+	constexpr uint32_t Hot = 0, Once = 1, ColdFirst = 2, ColdSecond = 3;
+	std::array<uint32_t, Textures> slots {};
+	std::array<ImageId, Textures>  images {};
+	for (uint32_t texture = 0; texture < Textures; ++texture) {
+		slots[texture]  = Access::Slot(heap, values[texture]);
+		images[texture] = slots[texture] != 0u ? Access::ImageOf(heap, slots[texture]) : ImageId {};
+		Check(slots[texture] != 0u && static_cast<bool>(images[texture]), "each texture resolves to a heap slot and an image");
+	}
+	if (!std::ranges::all_of(images, [](ImageId id) { return static_cast<bool>(id); })) return;
+	std::array<uint64_t, Textures> charges {};
+	for (uint32_t texture = 0; texture < Textures; ++texture) {
+		const auto& charge = Access::Find(textures, images[texture])->backing.charge;
+		charges[texture]   = charge.bytes;
+		Check(charge.local && charge.bytes != 0u, "each texture is charged to device-local memory");
+	}
+	const auto cold_before = ReadImage(scheduler, graphics, *Access::Find(textures, images[ColdFirst]));
+	Check(std::ranges::equal(cold_before, texels[ColdFirst]), "the cold texture holds the guest bytes before eviction");
+
+	Kernel kernel;
+	if (!MakeKernel(graphics, scheduler, kernel, Lanes)) {
+		Check(false, "the marking pipelines");
+		return;
+	}
+	const auto t0 = Clock::now();
+	const auto at = [&](uint32_t ms) { return t0 + std::chrono::milliseconds(ms); };
+	Run(heap, scheduler, kernel, kernel.marked, slots[Hot], slots[Once], 1, 1);
+	Access::Collect(heap, at(100));
+	Wait(scheduler);
+	for (uint32_t pass = 1; pass <= 6u; ++pass) {
+		Run(heap, scheduler, kernel, kernel.marked, slots[Hot], slots[Hot], 1, 1);
+		Access::Collect(heap, at(100u + pass * 600u));
+		Wait(scheduler);
+	}
+	Check(Access::ReadStamp(heap, slots[Hot]) > Access::ReadStamp(heap, slots[Once]) &&
+	          Access::ReadStamp(heap, slots[Once]) != 0u && Access::ReadStamp(heap, slots[ColdFirst]) == 0u,
+	      "the read stamps order the hot, the once read and the cold textures");
+	Check(Access::Parking(heap) == 0u && !Access::Crowded(heap), "nothing is parked below the crowded mark");
+
+	const uint64_t two_cold = charges[ColdFirst] + charges[ColdSecond];
+	const uint64_t wanted   = two_cold - std::min(charges[ColdFirst], charges[ColdSecond]) / 2u;
+	const uint64_t unit     = wanted / 5u;
+	const uint64_t budget   = unit * 100u;
+	const uint64_t usage    = unit * 80u + wanted;
+	Check(usage >= GraphicContext::BudgetShare(budget, GraphicContext::CrowdedPercent), "the test usage is past the crowded mark");
+	heap.BeginDraw();
+	Check(heap.Acquire(request, view), "the table is drawn again before the crowded check");
+	heap.Rebind(executor);
+	Run(heap, scheduler, kernel, kernel.marked, slots[Hot], slots[Hot], 1, 1);
+	Wait(scheduler);
+	Access::Pressure(graphics, budget, usage);
+	Check(graphics.LocalMemoryCrowded(), "the context reports crowded device-local memory");
+	Access::Collect(heap, at(4800));
+	Check(Access::Crowded(heap), "the heap enters the crowded state at 85 % of the budget");
+	Check(Access::Parking(heap) == 2u, "the crowded heap parks the two least read textures and no more than the bytes it needs");
+	const auto pending = Access::PendingProbes(heap);
+	std::string probes = Access::Views(heap, slots[ColdFirst]) + ";";
+	for (const auto probe: pending) probes += " " + std::to_string(probe);
+	Check(std::ranges::binary_search(pending, ColdFirst) && std::ranges::binary_search(pending, ColdSecond) &&
+	          !std::ranges::binary_search(pending, Hot) && !std::ranges::binary_search(pending, Once),
+	      "the batched repend queues the probes of the parked textures only (pending:" + probes + ")");
+	for (const auto texture: {ColdFirst, ColdSecond}) {
+		Check(Access::Find(textures, images[texture])->heap_refs.load() == 0u, "a parked texture is no longer pinned");
+	}
+	heap.BeginDraw();
+	Check(heap.Acquire(request, view), "the table stays on the heap while slots are parked");
+	heap.Rebind(executor);
+	for (const auto texture: {ColdFirst, ColdSecond}) {
+		const auto slot = Access::Slot(heap, values[texture]);
+		Check(slot != 0u && slot != slots[texture] && Access::Parked(heap, slot) && !Access::ImageOf(heap, slot),
+		      "a cold texture moves to a parked slot with a null descriptor");
+	}
+	for (const auto texture: {Hot, Once}) {
+		const auto slot = Access::Slot(heap, values[texture]);
+		Check(slot == slots[texture] && !Access::Parked(heap, slot) && Access::ImageOf(heap, slot) == images[texture],
+		      "the hot and the once read textures keep their slot and image");
+	}
+	Common::DebugCounters::SetEnabled(true);
+	const auto evictions = Common::DebugCounters::Get(Common::DebugCounters::Counter::TextureEvictions);
+	textures.RunGarbageCollector();
+	for (const auto texture: {ColdFirst, ColdSecond}) {
+		const auto* image = Access::Find(textures, images[texture]);
+		Check(image == nullptr || !image->registered, "the texture cache frees a parked texture in the same pass");
+	}
+	Check(Common::DebugCounters::Get(Common::DebugCounters::Counter::TextureEvictions) >= evictions + 2u,
+	      "the two evictions are counted");
+	for (const auto texture: {Hot, Once}) {
+		const auto* image = Access::Find(textures, images[texture]);
+		Check(image != nullptr && image->registered, "the hot and the once read textures stay");
+	}
+	Wait(scheduler);
+
+	Access::Pressure(graphics, budget, unit * 95u);
+	Access::Collect(heap, at(5100));
+	Wait(scheduler);
+	Check(Access::Parking(heap) == 1u, "a higher usage parks the texture read once, the next least read");
+	heap.BeginDraw();
+	(void)heap.Acquire(request, view);
+	heap.Rebind(executor);
+	const auto hot = Access::Slot(heap, values[Hot]);
+	Check(hot == slots[Hot] && !Access::Parked(heap, hot), "a texture read in each of the last readbacks is never parked");
+	const auto once = Access::Slot(heap, values[Once]);
+	Check(once != slots[Once] && Access::Parked(heap, once), "the texture read once moves to a parked slot");
+	textures.RunGarbageCollector();
+	Wait(scheduler);
+
+	const auto parked = Access::Slot(heap, values[ColdFirst]);
+	Run(heap, scheduler, kernel, kernel.marked, parked, slots[Hot], 1, 1);
+	Wait(scheduler);
+	const auto null_reads = Lanes0(kernel);
+	Check(null_reads[0] == 0u && SameTexel(null_reads[1], texels[Hot][1]),
+	      "a parked slot reads zero while its neighbour lane reads the hot texture");
+	Access::Collect(heap, at(5400));
+	Wait(scheduler);
+	Access::Collect(heap, at(5700));
+	heap.BeginDraw();
+	Check(heap.Acquire(request, view), "the table is admitted after the read");
+	heap.Rebind(executor);
+	const auto back       = Access::Slot(heap, values[ColdFirst]);
+	const auto back_image = back != 0u ? Access::ImageOf(heap, back) : ImageId {};
+	Check(back != 0u && back != parked && !Access::Parked(heap, back) && static_cast<bool>(back_image),
+	      "a parked slot read by a shader comes back with an image");
+	if (back_image) {
+		auto* image = Access::Find(textures, back_image);
+		Check(image != nullptr && ReadImage(scheduler, graphics, *image) == cold_before,
+		      "the texture made again has the same bytes");
+	}
+	graphics.TrimRecycledImages();
+	vk::ImageCreateInfo heap_info {};
+	heap_info.imageType     = vk::ImageType::e2D;
+	heap_info.format        = vk::Format::eR8G8B8A8Unorm;
+	heap_info.extent        = vk::Extent3D {48, 48, 1};
+	heap_info.mipLevels     = 1;
+	heap_info.arrayLayers   = 1;
+	heap_info.samples       = vk::SampleCountFlagBits::e1;
+	heap_info.tiling        = vk::ImageTiling::eOptimal;
+	heap_info.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+	heap_info.sharingMode   = vk::SharingMode::eExclusive;
+	heap_info.initialLayout = vk::ImageLayout::eUndefined;
+	VulkanImage crowded_image {};
+	Check(graphics.CreateImage(heap_info, crowded_image, true) && crowded_image.spilled == Access::CanSpill(graphics) &&
+	          crowded_image.charge.local != Access::CanSpill(graphics),
+	      "a heap image made while memory is crowded is placed in system memory");
+	if (crowded_image.image) graphics.DeleteImage(crowded_image);
+	Run(heap, scheduler, kernel, kernel.marked, back, back, 1, 1);
+	Wait(scheduler);
+	Check(SameTexel(Lanes0(kernel)[3], texels[ColdFirst][3]), "the shader reads the texture again through its new slot");
+	Access::Pressure(graphics, budget, unit * 79u);
+	Access::Collect(heap, at(6100));
+	Check(!Access::Crowded(heap) && !graphics.LocalMemoryCrowded(), "the crowded state ends below 80 % of the budget");
+	graphics.TrimRecycledImages();
+	VulkanImage relaxed_image {};
+	Check(graphics.CreateImage(heap_info, relaxed_image, true) && !relaxed_image.spilled && relaxed_image.charge.local,
+	      "a heap image made below the crowded mark stays on device-local memory");
+	if (relaxed_image.image) graphics.DeleteImage(relaxed_image);
+	graphics.TrimRecycledImages();
+	Access::Relax(graphics);
+	scheduler.Finish();
+	renderer.UnmapMemory(address, bytes);
+	std::printf("%s: crowded parks=%llu (%llu bytes) read_again=%llu readbacks=%llu\n", g_name,
+	            static_cast<unsigned long long>(heap.Reads().crowded),
+	            static_cast<unsigned long long>(heap.Reads().crowded_bytes),
+	            static_cast<unsigned long long>(heap.Reads().unparked),
+	            static_cast<unsigned long long>(heap.Reads().readbacks));
+}
+
+constexpr uint32_t ScaleTextures = 8192;
+constexpr uint32_t ScaleSide     = 64;
+constexpr uint64_t ScaleBytes    = 0x10000u + uint64_t {ScaleTextures} * ScaleSide * ScaleSide;
+
+void MeasureCrowded(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
+	using Clock      = std::chrono::steady_clock;
+	const auto since = [](Clock::time_point start) {
+		return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+	};
+	RenderContext renderer(graphics);
+	renderer.MapMemory(address, bytes);
+	CommandProcessor processor(renderer, 0);
+	processor.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	scheduler.Begin(processor.GetCtx(), processor.GetUcfg(), processor.GetShCtx());
+	auto& heap     = renderer.GetImageHeap();
+	auto& buffers  = renderer.GetBufferCache();
+	auto& textures = renderer.GetTextureCache();
+	auto& executor = renderer.GetRenderExecutor();
+	RenderExecutorTestAccess::Reset(executor);
+	std::vector<IR::DescriptorValue> values(ScaleTextures);
+	std::vector<uint8_t>             texels(uint64_t {ScaleSide} * ScaleSide);
+	for (uint32_t texture = 0; texture < ScaleTextures; ++texture) {
+		const auto base = address + 0x10000u + uint64_t {texture} * texels.size();
+		values[texture] = SquareTexture(base, ScaleSide);
+		for (size_t texel = 0; texel < texels.size(); ++texel) texels[texel] = static_cast<uint8_t>(texture * 7u + texel);
+		Libs::LibKernel::Memory::WriteBacking(base, texels.data(), texels.size());
+		Libs::LibKernel::Memory::WriteBacking(address + uint64_t {texture} * 32u, values[texture].dwords.data(),
+		                                      sizeof(values[texture].dwords));
+	}
+	buffers.InvalidateMemory(address, bytes);
+	IR::ImageResource root;
+	root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+	const auto                 profile = IR::ImageTableHeapProfile(root, false);
+	const IR::ImageHeapRequest request {.base  = address,
+	                                    .size  = ScaleTextures * 32u,
+	                                    .step  = 32u,
+	                                    .count = ScaleTextures,
+	                                    .root  = &profile,
+	                                    .table = true};
+	IR::ImageHeapView view;
+	const auto        resolve_start = Clock::now();
+	for (uint32_t attempt = 0; attempt < 4u; ++attempt) {
+		heap.BeginDraw();
+		(void)heap.Acquire(request, view);
+		heap.Rebind(executor);
+	}
+	const auto resolve_ms = since(resolve_start);
+	std::vector<uint32_t> slots(ScaleTextures);
+	uint32_t              resolved = 0;
+	for (uint32_t texture = 0; texture < ScaleTextures; ++texture) {
+		slots[texture] = Access::Slot(heap, values[texture]);
+		if (slots[texture] != 0u && Access::ImageOf(heap, slots[texture])) ++resolved;
+	}
+	Check(resolved == ScaleTextures, "every texture of the large table resolves to a heap slot (" + std::to_string(resolved) + ")");
+	if (resolved != ScaleTextures) return;
+	Kernel kernel;
+	if (!MakeKernel(graphics, scheduler, kernel, Lanes)) {
+		Check(false, "the marking pipelines");
+		return;
+	}
+	constexpr uint32_t Hot = ScaleTextures / 4u;
+	const auto         t0  = Clock::now();
+	const auto         at  = [&](uint32_t ms) { return t0 + std::chrono::milliseconds(ms); };
+	for (uint32_t pass = 0; pass <= 6u; ++pass) {
+		for (uint32_t texture = 0; texture < Hot; ++texture) Access::MarkRead(heap, slots[texture]);
+		Run(heap, scheduler, kernel, kernel.marked, slots[0], slots[1], 1, 1);
+		Access::Collect(heap, at(100u + pass * 600u));
+		Wait(scheduler);
+	}
+	const auto& local_heap = MemoryTelemetry::totals[static_cast<size_t>(MemoryTelemetry::Kind::HeapTexture)][1];
+	const auto  live       = local_heap.bytes.load();
+	const auto  live_count = local_heap.count.load();
+	const auto  real       = [&] {
+        const bool overridden = Access::Overridden(graphics);
+        if (overridden) Access::Relax(graphics);
+        const auto local = graphics.GetLocalMemoryUsage();
+        const auto space = graphics.LocalBlockSpace();
+        return std::pair {local.usage, space};
+	};
+	const auto before = real();
+	for (uint32_t texture = 0; texture < Hot; ++texture) Access::MarkRead(heap, slots[texture]);
+	const uint64_t budget = live * 10u;
+	const uint64_t usage  = GraphicContext::BudgetShare(budget, GraphicContext::CrowdedPercent);
+	const uint64_t wanted = usage - GraphicContext::BudgetShare(budget, GraphicContext::CrowdedStopPercent);
+	Access::Pressure(graphics, budget, usage);
+	const auto check_start = Clock::now();
+	Access::Collect(heap, at(4800));
+	const auto check_ms     = since(check_start);
+	const auto parked       = heap.Reads().crowded;
+	const auto parked_bytes = heap.Reads().crowded_bytes;
+	const auto rebind_start = Clock::now();
+	heap.BeginDraw();
+	(void)heap.Acquire(request, view);
+	heap.Rebind(executor);
+	const auto rebind_ms = since(rebind_start);
+	const auto gc_start  = Clock::now();
+	textures.RunGarbageCollector();
+	const auto gc_ms = since(gc_start);
+	Wait(scheduler);
+	Run(heap, scheduler, kernel, kernel.marked, slots[0], slots[1], 1, 1);
+	Wait(scheduler);
+	graphics.TrimRecycledImages();
+	const auto after_live  = local_heap.bytes.load();
+	const auto after_count = local_heap.count.load();
+	const auto after       = real();
+	uint32_t   hot_parked  = 0;
+	for (uint32_t texture = 0; texture < Hot; ++texture) {
+		const auto slot = Access::Slot(heap, values[texture]);
+		if (slot != slots[texture] || Access::Parked(heap, slot)) ++hot_parked;
+	}
+	Check(hot_parked == 0u, "no texture read in the last readbacks is parked (" + std::to_string(hot_parked) + ")");
+	Check(parked_bytes >= wanted && parked_bytes < wanted + live / live_count * 2u,
+	      "the crowded check parks the bytes it needs and stops there");
+	Check(live - after_live >= parked_bytes, "the texture cache frees on device-local memory every byte the heap parked");
+	std::printf("%s: %u textures of %ux%u (%llu heap images, %.1f MiB on device-local memory) resolved in %.1f ms; "
+	            "%u read in each readback; asked %.1f MiB, crowded check %.2f ms parked %llu slots (%.1f MiB); rebind %.2f ms; "
+	            "texture collection %.2f ms; heap images on device-local memory %.1f -> %.1f MiB (%llu -> %llu); "
+	            "process device-local usage %.1f -> %.1f MiB, free space inside VMA blocks %.1f -> %.1f MiB\n",
+	            g_name, ScaleTextures, ScaleSide, ScaleSide, static_cast<unsigned long long>(live_count),
+	            static_cast<double>(live) / 1048576.0, resolve_ms, Hot, static_cast<double>(wanted) / 1048576.0, check_ms,
+	            static_cast<unsigned long long>(parked), static_cast<double>(parked_bytes) / 1048576.0, rebind_ms, gc_ms,
+	            static_cast<double>(live) / 1048576.0, static_cast<double>(after_live) / 1048576.0,
+	            static_cast<unsigned long long>(live_count), static_cast<unsigned long long>(after_count),
+	            static_cast<double>(before.first) / 1048576.0, static_cast<double>(after.first) / 1048576.0,
+	            static_cast<double>(before.second) / 1048576.0, static_cast<double>(after.second) / 1048576.0);
+	scheduler.Finish();
+	renderer.UnmapMemory(address, bytes);
+}
+
 void MeasureCost(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 	RenderContext renderer(graphics);
 	renderer.MapMemory(address, bytes);
@@ -901,8 +1280,12 @@ void MeasureCost(GraphicContext& graphics, uint64_t address, uint64_t bytes) {
 }
 
 extern "C" int RunKytyImageHeapReadsTest(int argc, char** argv) {
-	const bool cost = argc > 1 && std::strcmp(argv[1], "cost") == 0;
+	const bool cost    = argc > 1 && std::strcmp(argv[1], "cost") == 0;
+	const bool crowded = argc > 1 && std::strcmp(argv[1], "crowded") == 0;
+	const bool scale   = argc > 1 && std::strcmp(argv[1], "crowded-scale") == 0;
 	if (cost) g_name = "kyty_shim_image_heap_reads_cost";
+	if (crowded) g_name = "kyty_shim_image_heap_reads_crowded";
+	if (scale) g_name = "kyty_shim_image_heap_reads_crowded_scale";
 	Common::InitializeThreads();
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
@@ -913,7 +1296,7 @@ extern "C" int RunKytyImageHeapReadsTest(int argc, char** argv) {
 	}
 	if (!gpu.graphics.CreateAllocator()) return 1;
 	void*              guest = nullptr;
-	constexpr uint64_t bytes = 0x100000u;
+	const uint64_t     bytes = scale ? Common::AlignUp(ScaleBytes, size_t {0x100000u}) : uint64_t {0x100000u};
 	if (sceKernelMapFlexibleMemory(&guest, bytes, 3, 0) != 0 || guest == nullptr) {
 		Check(false, "map backing for the table and textures");
 		return Finish();
@@ -921,6 +1304,10 @@ extern "C" int RunKytyImageHeapReadsTest(int argc, char** argv) {
 	const auto address = reinterpret_cast<uint64_t>(guest);
 	if (cost) {
 		MeasureCost(gpu.graphics, address, bytes);
+	} else if (crowded) {
+		CheckCrowded(gpu.graphics, address, bytes);
+	} else if (scale) {
+		MeasureCrowded(gpu.graphics, address, bytes);
 	} else {
 		CheckReads(gpu.graphics, address, bytes);
 	}

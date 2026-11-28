@@ -827,6 +827,14 @@ if(NOT ANYPS5_KYTY_DLL)
     set_tests_properties(kyty_shim_image_heap_reads PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0" PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_reads: ok"
             FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_image_heap_reads_crowded COMMAND kyty_shim_image_heap_reads_tests crowded)
+    set_tests_properties(kyty_shim_image_heap_reads_crowded PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0" PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_reads_crowded: ok"
+            FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_image_heap_reads_crowded_scale COMMAND kyty_shim_image_heap_reads_tests crowded-scale)
+    set_tests_properties(kyty_shim_image_heap_reads_crowded_scale PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0" PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_reads_crowded_scale: ok"
+            FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
     add_test(NAME kyty_shim_image_heap_reads_cost COMMAND kyty_shim_image_heap_reads_tests cost)
     set_tests_properties(kyty_shim_image_heap_reads_cost PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0" PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_reads_cost: ok"

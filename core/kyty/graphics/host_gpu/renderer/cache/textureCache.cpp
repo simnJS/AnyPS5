@@ -4222,6 +4222,7 @@ void TextureCache::RunGarbageCollector() {
 	auto used = m_total_used_memory;
 	if (local.budget == 0 && m_graphics.CanReportMemoryUsage()) {
 		m_collecting = false;
+		m_unread_images.clear();
 		return;
 	}
 	if (local.budget != 0) {
@@ -4231,9 +4232,11 @@ void TextureCache::RunGarbageCollector() {
 		used = local.usage;
 		m_collecting = m_collecting ? used > m_stop_gc_memory : used >= m_pressure_gc_memory;
 		if (!m_collecting) {
+			m_unread_images.clear();
 			return;
 		}
 	}
+	EvictUnreadImages(used);
 	const auto collect = [&](bool allow_aggressive) KYTY_REQUIRES(m_lock) {
 		bool     pressured  = used >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && used >= m_critical_gc_memory;
@@ -4292,6 +4295,28 @@ void TextureCache::RunGarbageCollector() {
 	if (m_collecting || used >= m_pressure_gc_memory) {
 		m_graphics.TrimRecycledImages();
 	}
+}
+
+void TextureCache::EvictUnread(ImageId id, uint64_t serial) {
+	Common::ScopedLock lock {m_lock};
+	m_unread_images.emplace_back(id, serial);
+}
+
+void TextureCache::EvictUnreadImages(uint64_t& used) {
+	for (const auto& [id, serial]: m_unread_images) {
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || owner->serial != serial || !owner->registered || owner->depth_id ||
+		    !owner->stencil_ids.empty() || owner->is_depth_copy || owner->is_stencil_copy || owner->usage.video_out ||
+		    owner->usage.render_target || IsTargetImage(*owner) || owner->binding.is_bound || owner->binding.is_target ||
+		    owner->binding.shader_write || owner->heap_refs.load(std::memory_order_relaxed) != 0u ||
+		    owner->table_pins != 0 || owner->IsGpuModified() || owner->IsBufferModified()) {
+			continue;
+		}
+		used -= std::min(used, owner->AccountedSize());
+		FreeImage(id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+	}
+	m_unread_images.clear();
 }
 
 void TextureCache::ProcessDownloadImages() {

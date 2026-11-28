@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/pipeline/imageHeapSlots.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <array>
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -51,7 +52,14 @@ public:
 		uint64_t parked        = 0;
 		uint64_t parked_bytes  = 0;
 		uint64_t unparked      = 0;
+		uint64_t crowded       = 0;
+		uint64_t crowded_bytes = 0;
+		uint64_t live          = 0;
+		uint64_t live_bytes    = 0;
+		uint64_t cold          = 0;
+		uint64_t cold_bytes    = 0;
 		uint32_t reported      = 0;
+		uint32_t reported_ms   = 0;
 	};
 	[[nodiscard]] const ReadStats& Reads() const noexcept { return m_read_stats; }
 
@@ -143,6 +151,20 @@ private:
 		uint32_t begin = 0;
 		uint32_t end   = 0;
 	};
+
+	struct Cold {
+		uint32_t last  = 0;
+		uint32_t index = 0;
+		uint64_t bytes = 0;
+	};
+
+	struct Releasing {
+		uint64_t tick  = 0;
+		uint32_t frame = 0;
+		uint64_t bytes = 0;
+	};
+
+	static constexpr size_t RecentReads = 4;
 
 	struct Memory;
 
@@ -309,8 +331,11 @@ private:
 	void     TakeReads();
 	void     RecordReads(uint32_t stamp);
 	void     ParkUnread(uint32_t stamp);
-	const Image* Parkable(const Element& element, uint32_t index) const;
-	void     ReportReads();
+	void     ParkLeastRead(uint64_t wanted);
+	void     FlushRepends();
+	[[nodiscard]] uint32_t CrowdedCutoff() const;
+	const Image* Parkable(const Element& element, uint32_t index, uint32_t cutoff) const;
+	void     ReportReads(uint32_t stamp);
 
 	RenderContext&                                                      m_context;
 	std::mutex                                                          m_mutex;
@@ -390,9 +415,16 @@ private:
 	UsageBitmap                                                         m_read_stamps;
 	std::unordered_set<Key, KeyHash>                                    m_parking;
 	std::vector<uint32_t>                                               m_unparked;
+	std::vector<Cold>                                                   m_cold;
+	std::deque<Releasing>                                               m_releasing;
+	std::vector<std::pair<uint32_t, ImageHeapSlots::KeyWordArray>>      m_repends;
+	std::array<uint32_t, RecentReads>                                   m_recent_reads {};
+	size_t                                                              m_recent_count = 0;
 	uint32_t                                                            m_read_seen   = 0;
 	uint32_t                                                            m_park_check  = 0;
 	bool                                                                m_pressure    = false;
+	bool                                                                m_crowded     = false;
+	bool                                                                m_batch_repends = false;
 	ReadStats                                                           m_read_stats;
 
 	friend struct ImageHeapTestAccess;

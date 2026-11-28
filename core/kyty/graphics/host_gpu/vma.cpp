@@ -336,6 +336,49 @@ GraphicContext::HeapUsage GraphicContext::GetLocalMemoryUsage() const {
 	return local;
 }
 
+uint64_t GraphicContext::LocalBlockSpace() const {
+	if (m_memory_override_enabled) {
+		return 0;
+	}
+	uint64_t space = 0;
+	for (VmaAllocator vma: {allocator, spill_allocator}) {
+		if (vma == nullptr) {
+			continue;
+		}
+		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(vma, budgets);
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			const auto& statistics = budgets[heap].statistics;
+			if ((physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) &&
+			    statistics.blockBytes > statistics.allocationBytes) {
+				space += statistics.blockBytes - statistics.allocationBytes;
+			}
+		}
+	}
+	return space;
+}
+
+bool GraphicContext::LocalMemoryCrowded() const {
+	const auto space = LocalBlockSpace();
+	if (!m_memory_override_enabled && allocator != nullptr) {
+		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(allocator, budgets);
+		uint64_t usage  = 0;
+		uint64_t budget = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			if (physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				usage += budgets[heap].usage;
+				budget += budgets[heap].budget;
+			}
+		}
+		if (usage - std::min(usage, space) < BudgetShare(budget, CrowdedPercent)) {
+			return false;
+		}
+	}
+	const auto local = GetLocalMemoryUsage();
+	return local.budget != 0 && local.usage - std::min(local.usage, space) >= BudgetShare(local.budget, CrowdedPercent);
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (m_memory_override_enabled) {
 		return m_memory_budget_override;
@@ -393,7 +436,7 @@ static uint32_t BindlessImageSpillTypes(const GraphicContext& graphics) {
 			break;
 		}
 	}
-	if (!pressure) {
+	if (!pressure && !graphics.LocalMemoryCrowded()) {
 		return 0;
 	}
 	uint32_t types = 0;
