@@ -154,6 +154,24 @@ class StallReportTests(unittest.TestCase):
         ])
         self.assertTrue(session.canonical_strides)
 
+    def test_refusal_named_by_the_compute_service(self):
+        prepared = [f"M 000000000001 cs code=00000000000000e5 {COMPUTE} sb=st:16383 si=n:Float/d:2D/heap"]
+        recorded = prepared + [f"M 000000000011 cs code=00000000000000e5 {COMPUTE} sb=st:16383 si=n:Float/d:2D/t:0/tc:32768"]
+        session = self.session(
+            [
+                "[kyty-gpl] unserved compute 0x00000000000000e5 variants 1 closest image-addressing slot 37 after-rebind @5000000000",
+                "[kyty-gpl] translate 0.300 s 0x00000000000000e5 @5400000000",
+                "[kyty-gpl] stall 4.000 s compute-sync 0x00000000000000e5  why=writes-images @9500000000",
+                "[kyty-gpl] stall 1.000 s compute-sync 0x00000000000000e5  why=writes-images @60000000000",
+                "Pipeline manifest: wrote _PipelineCache/title.kpm (2 modules)",
+            ],
+            prepared, recorded, ["00000000000000e5"])
+        self.assertEqual([wait.cause for wait in session.waits], [
+            "generic-unbound:image-addressing:37:after-rebind",
+            "generic-unbound:image-addressing:37:after-rebind",
+            "generic-unbound:image-heap+image-t+image-table-capacity(0->32768)",
+        ])
+
     def test_bounds_bits_kept_in_the_key_by_an_older_engine(self):
         prepared = [f"M 000000000001 cs code=00000000000000e1 {COMPUTE} sb=st:16383"]
         recorded = prepared + [f"M 000000000011 cs code=00000000000000e1 {COMPUTE} sb=st:2113535"]

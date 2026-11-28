@@ -63,6 +63,8 @@ STATE_AXES = (
 
 STALL = re.compile(r"\[kyty-gpl\] stall (\d+\.\d+) s (\S+) 0x([0-9a-fA-F]{16})(?: (.*?))? ?@(\d+)\s*$")
 TRANSLATE = re.compile(r"\[kyty-gpl\] translate (\d+\.\d+) s 0x([0-9a-fA-F]{16})(?: (.*?))? ?@(\d+)\s*$")
+UNSERVED = re.compile(r"\[kyty-gpl\] unserved compute 0x([0-9a-fA-F]{16}) variants \d+ closest (\S+)(?: slot (\d+))?"
+                      r"( after-rebind)? @(\d+)")
 WAITING = re.compile(r"\[kyty-gpl\] waiting_shader shader=([0-9a-fA-F]{16}) elapsed_s=(\d+\.\d+) monotonic_ns=(\d+)")
 GUEST_ENTRY = re.compile(r"\[kyty-startup\] guest_entry monotonic_ns=(\d+)")
 GENERIC_REFUSED = re.compile(r"\[kyty-startup\] generic_refused stage=\d+ program=([0-9a-fA-F]{16}) variant=\S+ reason=(\S+)")
@@ -403,6 +405,7 @@ class Session:
         self.refused = {}
         self.unresolved = defaultdict(Counter)
         self.runtime_descriptors = defaultdict(set)
+        self.unserved = defaultdict(list)
         self.waits = []
         self.unfinished = []
         shared_counts = None
@@ -426,6 +429,9 @@ class Session:
                                                engine_cause="cause" in extra, line=number))
                     elif match := WAITING.search(line):
                         announcements.append((match[1].lower(), float(match[2]), int(match[3]), number))
+                    elif match := UNSERVED.search(line):
+                        reason = match[2] + (f":{match[3]}" if match[3] else "") + (":after-rebind" if match[4] else "")
+                        self.unserved[match[1].lower()].append((int(match[5]), reason))
                 elif line.startswith(MANIFEST_WRITTEN):
                     self.last_write = number
                 elif "[kyty-startup] " in line:
@@ -589,6 +595,12 @@ class Session:
             return
         prepared = self.prepared_programs.get(program, [])
         compute = wait.stage == "cs"
+        started = wait.end_ns - int(wait.seconds * 1e9)
+        named = [reason for at, reason in self.unserved.get(program, ()) if started - 2_000_000_000 <= at <= wait.end_ns]
+        if compute and named:
+            wait.cause = f"generic-unbound:{named[-1]}"
+            wait.evidence = "refusal named by the compute variant service just before the wait"
+            return
         if not compute and program in self.refused:
             wait.cause = f"generic-refused:{self.refused[program]}"
             wait.evidence = "generic_refused at startup"
