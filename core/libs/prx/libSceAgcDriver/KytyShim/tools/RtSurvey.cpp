@@ -248,6 +248,7 @@ void Prepare(Prepared& prepared, const SurveySettings& settings, std::span<const
     options.emit_debug_info = false;
     options.native_ray_tracing = true;
     options.rt_oracle = settings.oracle;
+    options.rt_emulation = settings.emulation;
     options.profile = &Profile();
     options.plain_mip_stats_variant = options.stage == ShaderType::Pixel;
 }
@@ -273,7 +274,7 @@ void Count(const IR::Program& program, Row& row) {
             if (inst.GetOpcode() != IR::ValueOpcode::BvhIntersect) continue;
             const auto flags = inst.Flags<std::uint32_t>();
             ++row.bvh;
-            if ((flags & IR::BvhIntersectEmpty) != 0) ++row.empty;
+            if ((flags & (IR::BvhIntersectEmpty | IR::BvhIntersectNative)) == IR::BvhIntersectEmpty) ++row.empty;
             else if ((flags & IR::BvhIntersectOracle) != 0) ++((flags & IR::BvhIntersectOracleLane) != 0 ? row.lane : row.oracle);
             else if ((flags & IR::BvhIntersectNative) != 0) ++row.native;
             else ++row.emulated;
@@ -442,6 +443,9 @@ int RunSurvey(const SurveySettings& settings) {
     }
     if (!manifestRead) {
         notes.push_back("no pipeline manifest next to the cache: every program is probed with default inputs");
+    }
+    if (!settings.emulation) {
+        notes.push_back("ray tracing emulation off: an intersection no native query serves counts as empty");
     }
     Quiet();
 

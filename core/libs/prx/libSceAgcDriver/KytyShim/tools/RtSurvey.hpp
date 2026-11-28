@@ -34,6 +34,7 @@ struct SurveySettings {
     std::uint32_t ldsLimitBytes = 49152;
     bool validate = true;
     bool every = false;
+    bool emulation = true;
     std::string build;
 };
 

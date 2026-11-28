@@ -601,8 +601,9 @@ with a default 8x8x1 workgroup, 8192 LDS dwords and 16384 scratch dwords (`sourc
 writes to the execution mask and tries both sizes when the evidence is ambiguous or absent. A graphics shader with BVH instructions and
 no record is listed as `no_record`. Nothing is written, and stderr stays empty. The options that depend on
 the GPU are `--subgroup 32|64` (the host subgroup size; 32 by default), `--lds-limit <bytes>` (49152 by default) and `--oracle`
-(the value of `KYTY_RT_ORACLE`; 1, the default of the build, here), `--no-validate` skips the SPIR-V validation, and `--version`
-prints the commit of the build. The output has one line per program, `key=value` pairs after the hash:
+(the value of `KYTY_RT_ORACLE`; 1, the default of the build, here), `--no-emulation` translates as `KYTY_RT_EMULATION=0` does
+(a `note` line says so, and an intersection no native query serves counts as `empty`), `--no-validate` skips the SPIR-V
+validation, and `--version` prints the commit of the build. The output has one line per program, `key=value` pairs after the hash:
 
 ```text
 rt-survey 1 build=<commit> oracle=1 subgroup=32 lds_limit=49152
