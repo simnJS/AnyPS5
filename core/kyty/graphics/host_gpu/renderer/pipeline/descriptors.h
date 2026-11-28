@@ -133,8 +133,24 @@ struct ImageTableFill {
 
 [[nodiscard]] bool TableDescriptorWrites(vk::DriverId driver);
 
-inline constexpr size_t DefaultTableResolutions = 256;
-inline constexpr size_t MaxTableResolutions     = 4096;
+inline constexpr size_t DefaultTableResolutions   = 256;
+inline constexpr size_t MaxTableResolutions       = 4096;
+inline constexpr size_t TableElementBudget        = size_t {8} * (size_t {1} << 16u);
+inline constexpr size_t LowVramTableElementBudget = TableElementBudget / 2;
+
+[[nodiscard]] inline size_t TableElementBudgetForDevice(const vk::PhysicalDeviceMemoryProperties& properties) {
+	uint64_t largest_device_local = 0;
+	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
+		const auto& heap = properties.memoryHeaps[i];
+		if ((heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal) && heap.size > largest_device_local) {
+			largest_device_local = heap.size;
+		}
+	}
+	if (largest_device_local != 0 && largest_device_local <= (uint64_t {9} << 30u)) {
+		return LowVramTableElementBudget;
+	}
+	return TableElementBudget;
+}
 
 struct TableResolutionSettings {
 	size_t capacity = DefaultTableResolutions;

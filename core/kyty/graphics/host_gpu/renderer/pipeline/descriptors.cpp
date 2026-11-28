@@ -56,8 +56,6 @@ namespace {
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
 constexpr size_t MaxTableElements         = size_t {1} << 16u;
-constexpr size_t TableElementBudget       = 8 * MaxTableElements;
-constexpr size_t LowVramTableElementBudget = 4 * MaxTableElements;
 
 constexpr auto TableOversized = [](const auto& table) { return table.elements.size() > MaxTableElements; };
 
@@ -1273,16 +1271,7 @@ size_t RenderExecutor::TableResolutionKeyHash::operator()(
 void RenderExecutor::ConfigureTableResolutions() {
 	const auto settings = ReadTableResolutionSettings();
 	m_table_resolutions.Configure(settings.capacity);
-	uint64_t   device_local = 0;
-	const auto& properties  = m_context.GetGraphics().physical_device_memory_properties;
-	for (uint32_t heap = 0; heap < properties.memoryHeapCount; heap++) {
-		if (properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
-			device_local += properties.memoryHeaps[heap].size;
-		}
-	}
-	m_table_element_budget = device_local != 0 && device_local <= (uint64_t {9} << 30)
-	                             ? LowVramTableElementBudget
-	                             : TableElementBudget;
+	m_table_element_budget = TableElementBudgetForDevice(m_context.GetGraphics().physical_device_memory_properties);
 }
 
 void RenderExecutor::RetireTableResolution(TableResolution& table) {

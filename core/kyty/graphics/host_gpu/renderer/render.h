@@ -511,7 +511,7 @@ private:
 	std::vector<std::pair<uint8_t, uint8_t>>                   m_commit_capture_kinds;
 	std::unordered_map<uint64_t, vk::DescriptorUpdateTemplate> m_commit_templates;
 	std::vector<uint8_t>                                       m_commit_data;
-	size_t                                                     m_table_element_budget = 524288;
+	size_t                                                     m_table_element_budget = TableElementBudget;
 	[[nodiscard]] static bool TemplateCommitsSupported();
 	void StoreTemplateCommit(DrawTemplate& stored, const PipelineCache::Pipeline& pipeline);
 	void CommitTemplateBindings(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
