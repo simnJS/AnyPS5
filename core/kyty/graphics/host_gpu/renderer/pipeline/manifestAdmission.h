@@ -27,13 +27,16 @@ public:
 	static constexpr uint64_t MiB               = uint64_t {1} << 20u;
 	static constexpr uint64_t GiB               = uint64_t {1} << 30u;
 	static constexpr uint64_t LightBytes        = 512 * MiB;
-	static constexpr uint64_t BaseBytes         = 512 * MiB;
-	static constexpr uint64_t MinDriverBytes    = 1 * GiB;
+	static constexpr uint64_t MinLightBytes     = 64 * MiB;
+	static constexpr uint64_t BaseBytes         = 256 * MiB;
+	static constexpr uint64_t MinDriverBytes    = 256 * MiB;
 	static constexpr uint64_t LoneMargin        = 2 * GiB;
-	static constexpr double   FirstBytesPerWord = 8192.0;
-	static constexpr double   MinBytesPerWord   = 4096.0;
+	static constexpr double   FirstBytesPerWord = 6144.0;
+	static constexpr double   MinBytesPerWord   = 768.0;
 	static constexpr double   MaxBytesPerWord   = 65536.0;
+	static constexpr double   SafetyFactor      = 1.25;
 	static constexpr double   PriorWords        = 200'000.0;
+	static constexpr double   PriorLights       = 20.0;
 	static constexpr double   LearnDecay        = 0.95;
 	static constexpr double   SpareCpus         = 1.0;
 	static constexpr auto     LoneWait          = std::chrono::seconds(30);
@@ -83,20 +86,31 @@ public:
 		m_jobs.erase(found);
 		if (m_jobs.empty()) m_baseline = std::min(m_baseline, m_sample.process);
 		(job.driver ? m_finished_driver : m_finished_light)++;
-		if (!job.driver || job.samples == 0 || job.words == 0) return;
+		if (job.samples == 0) return;
+		if (!job.driver) {
+			m_light_bytes  = m_light_bytes * LearnDecay + static_cast<double>(job.peak);
+			m_light_weight = m_light_weight * LearnDecay + 1.0;
+			return;
+		}
+		if (job.words == 0) return;
 		const auto excess = static_cast<double>(job.peak > BaseBytes ? job.peak - BaseBytes : 0);
 		m_learned_bytes   = m_learned_bytes * LearnDecay + excess;
 		m_learned_words   = m_learned_words * LearnDecay + static_cast<double>(job.words);
 	}
 
 	[[nodiscard]] uint64_t Estimate(size_t words, bool driver) const {
-		if (!driver) return LightBytes;
+		if (!driver) return LightEstimate();
 		const auto bytes = static_cast<double>(BaseBytes) + BytesPerWord() * static_cast<double>(words);
 		return std::clamp(static_cast<uint64_t>(bytes), MinDriverBytes, MaxDriverBytes());
 	}
 
+	[[nodiscard]] uint64_t LightEstimate() const {
+		const auto bytes = SafetyFactor * m_light_bytes / m_light_weight;
+		return std::clamp(static_cast<uint64_t>(bytes), MinLightBytes, LightBytes);
+	}
+
 	[[nodiscard]] double BytesPerWord() const {
-		return std::clamp(m_learned_bytes / m_learned_words, MinBytesPerWord, MaxBytesPerWord);
+		return std::clamp(SafetyFactor * m_learned_bytes / m_learned_words, MinBytesPerWord, MaxBytesPerWord);
 	}
 
 	[[nodiscard]] uint64_t MaxDriverBytes() const {
@@ -201,6 +215,8 @@ private:
 	Refusal                                m_refusal       = Refusal::None;
 	double                                 m_learned_bytes = FirstBytesPerWord * PriorWords;
 	double                                 m_learned_words = PriorWords;
+	double                                 m_light_bytes   = static_cast<double>(LightBytes) / SafetyFactor * PriorLights;
+	double                                 m_light_weight  = PriorLights;
 	uint32_t                               m_finished_driver = 0;
 	uint32_t                               m_finished_light  = 0;
 };

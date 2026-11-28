@@ -163,7 +163,7 @@ void LearnedEstimate() {
 	admission.Sample(now, {.total = 60 * GiB, .available = 50 * GiB, .process = 2 * GiB, .busy_cpus = 0.0, .cpus = 32});
 	const auto before = admission.Estimate(100'000, true);
 	Check(admission.Estimate(100'000, false) == ManifestAdmission::LightBytes, "a translation has a fixed estimate");
-	Check(admission.Estimate(1, true) == ManifestAdmission::MinDriverBytes, "a driver compilation needs at least 1 GiB");
+	Check(admission.Estimate(1, true) >= ManifestAdmission::MinDriverBytes && admission.Estimate(1, true) < ManifestAdmission::MinDriverBytes + 1 * ManifestAdmission::MiB, "a driver compilation needs at least its minimum estimate");
 	Check(admission.Estimate(1'000'000'000, true) == 15 * GiB, "an estimate never exceeds a quarter of the memory");
 	const auto ticket = admission.Admit(now, 100'000, true, id, now);
 	Check(ticket.has_value(), "a compilation starts");
@@ -174,6 +174,67 @@ void LearnedEstimate() {
 	const auto learned = admission.Estimate(100'000, true);
 	admission.Finish(*quick);
 	Check(admission.Estimate(100'000, true) == learned, "a compilation shorter than a sample teaches nothing");
+}
+
+void LearnedEstimateFollowsMeasuredUse() {
+	constexpr uint64_t GiB = ManifestAdmission::GiB;
+	constexpr uint64_t MiB = ManifestAdmission::MiB;
+	constexpr size_t   Words = 150'000;
+	constexpr uint64_t Real = 512 * MiB;
+	const auto start = ManifestAdmission::Clock::time_point {};
+	const auto id = std::this_thread::get_id();
+	ManifestAdmission admission(28);
+	const ManifestAdmissionSample idle {.total = 60 * GiB, .available = 48 * GiB, .process = 2 * GiB, .busy_cpus = 0.0, .cpus = 32};
+	admission.Sample(start, idle);
+	Check(admission.BytesPerWord() > 4096.0, "the first estimate starts cautious");
+
+	auto now = start;
+	for (int round = 0; round < 60; ++round) {
+		std::vector<uint64_t> batch;
+		for (int i = 0; i < 8; ++i) {
+			const auto ticket = admission.Admit(now, Words, true, id, now);
+			Check(ticket.has_value(), "a batch starts while the memory is free");
+			batch.push_back(*ticket);
+		}
+		for (int tick = 1; tick <= 4; ++tick) {
+			now += 250ms;
+			admission.Sample(now, {.total = 60 * GiB, .available = 48 * GiB - 8 * Real, .process = 2 * GiB + 8 * Real * tick / 4,
+			                       .busy_cpus = 8.0, .cpus = 32});
+		}
+		for (const auto ticket: batch) admission.Finish(ticket);
+		now += 250ms;
+		admission.Sample(now, idle);
+	}
+
+	const auto per_job = admission.Estimate(Words, true);
+	Check(per_job < 2 * Real, "the estimate drops to about what a compilation really takes");
+	Check(per_job >= Real, "the estimate does not go below what a compilation really takes");
+	Check(admission.BytesPerWord() >= ManifestAdmission::MinBytesPerWord, "the learned size per word keeps its floor");
+	Check(admission.BytesPerWord() < 4096.0, "the learned size per word is no longer held at 4 KiB");
+
+	const ManifestAdmissionSample loaded {.total = 60 * GiB, .available = 34 * GiB, .process = 2 * GiB, .busy_cpus = 0.0, .cpus = 32};
+	admission.Sample(now + 1s, loaded);
+	size_t admitted = 0;
+	while (admitted < 28 && admission.Admit(now + 1s, Words, true, id, now + 1s)) ++admitted;
+	Check(admitted == 28, "the real memory lets all 28 compilations run");
+}
+
+void MemoryFloorStaysLow() {
+	constexpr uint64_t GiB = ManifestAdmission::GiB;
+	const auto start = ManifestAdmission::Clock::time_point {};
+	const auto id = std::this_thread::get_id();
+	ManifestAdmission admission(4);
+	auto now = start;
+	admission.Sample(now, {.total = 60 * GiB, .available = 50 * GiB, .process = 2 * GiB, .busy_cpus = 0.0, .cpus = 32});
+	for (int round = 0; round < 200; ++round) {
+		const auto ticket = admission.Admit(now, 100'000, true, id, now);
+		Check(ticket.has_value(), "a compilation starts");
+		now += 500ms;
+		admission.Sample(now, {.total = 60 * GiB, .available = 50 * GiB, .process = 2 * GiB, .busy_cpus = 1.0, .cpus = 32});
+		admission.Finish(*ticket);
+	}
+	Check(admission.BytesPerWord() == ManifestAdmission::MinBytesPerWord, "a size per word never goes under its floor");
+	Check(admission.Estimate(100'000, true) >= ManifestAdmission::BaseBytes + 100'000 * 768, "the estimate keeps the fixed base");
 }
 
 void LargeJobsDoNotStarve() {
@@ -257,6 +318,8 @@ int main() {
 	MemoryAdmission();
 	CpuAdmission();
 	LearnedEstimate();
+	LearnedEstimateFollowsMeasuredUse();
+	MemoryFloorStaysLow();
 	LargeJobsDoNotStarve();
 	GenericRefusalSkipsPipelines();
 	return 0;
