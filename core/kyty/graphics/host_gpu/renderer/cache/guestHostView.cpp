@@ -118,8 +118,33 @@ void GuestHostView::HolesIn(uint64_t vaddr, uint64_t size, std::vector<std::pair
 }
 
 void GuestHostView::KeepHolesLocked(const std::vector<HoleRun>& holes, uint64_t blocks, uint64_t epoch) {
-	for (const auto& hole: holes) {
-		if (hole.guest < hole.end) m_holes[hole.guest] = Hole {.end = hole.end, .host = hole.host, .blocks = blocks, .epoch = epoch};
+	const auto stamp = [](Hole& into, const Hole& other) {
+		if (into.blocks != other.blocks || into.epoch != other.epoch) {
+			into.blocks = UINT64_MAX;
+			into.epoch  = UINT64_MAX;
+		}
+	};
+	for (const auto& run: holes) {
+		if (run.guest >= run.end) continue;
+		auto guest = run.guest;
+		Hole hole {.end = run.end, .host = run.host, .blocks = blocks, .epoch = epoch};
+		auto next  = m_holes.lower_bound(guest);
+		if (next != m_holes.end() && next->first == guest) next = m_holes.erase(next);
+		if (next != m_holes.begin()) {
+			const auto before = std::prev(next);
+			if (before->second.end == guest && before->second.host + (guest - before->first) == hole.host) {
+				stamp(hole, before->second);
+				hole.host = before->second.host;
+				guest     = before->first;
+				m_holes.erase(before);
+			}
+		}
+		if (next != m_holes.end() && next->first == hole.end && hole.host + (hole.end - guest) == next->second.host) {
+			stamp(hole, next->second);
+			hole.end = next->second.end;
+			m_holes.erase(next);
+		}
+		m_holes.emplace(guest, hole);
 	}
 }
 
@@ -302,15 +327,32 @@ void GuestHostView::Refresh(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	if (stale.empty()) return;
-	std::vector<Imported> made;
-	std::vector<HoleRun>  holes;
-	for (const auto& [guest, hole]: stale) ImportPopulated(hole.host, guest, hole.end - guest, made, holes);
+	std::vector<Imported>                  made;
+	std::vector<HoleRun>                   holes;
+	std::vector<std::pair<uint64_t, Hole>> written;
+	std::vector<std::pair<uint64_t, Hole>> unchanged;
+	for (const auto& entry: stale) {
+		const auto& [guest, hole] = entry;
+		const auto made_before    = made.size();
+		const auto holes_before   = holes.size();
+		ImportPopulated(hole.host, guest, hole.end - guest, made, holes);
+		if (made.size() == made_before && holes.size() == holes_before + 1 && holes.back().guest == guest && holes.back().end == hole.end) {
+			holes.pop_back();
+			unchanged.push_back(entry);
+		} else {
+			written.push_back(entry);
+		}
+	}
 	{
 		std::lock_guard lock(m_mutex);
-		for (const auto& [guest, hole]: stale) {
+		for (const auto& [guest, hole]: unchanged) {
 			const auto found = m_holes.find(guest);
-			if (found != m_holes.end() && found->second.end == hole.end && found->second.host == hole.host) m_holes.erase(found);
+			if (found != m_holes.end() && found->second.end == hole.end && found->second.host == hole.host) {
+				found->second.blocks = blocks;
+				found->second.epoch  = epoch;
+			}
 		}
+		for (const auto& [guest, hole]: written) DropHolesLocked(guest, hole.end);
 		KeepHolesLocked(holes, blocks, epoch);
 		if (!made.empty()) {
 			m_arrivals.insert(m_arrivals.end(), made.begin(), made.end());
@@ -343,10 +385,7 @@ void GuestHostView::Claim(uint64_t vaddr, uint64_t size) {
 	}
 	{
 		std::lock_guard lock(m_mutex);
-		for (const auto& [guest, hole]: claimed) {
-			const auto found = m_holes.find(guest);
-			if (found != m_holes.end() && found->second.end == hole.end && found->second.host == hole.host) m_holes.erase(found);
-		}
+		for (const auto& [guest, hole]: claimed) DropHolesLocked(guest, hole.end);
 		KeepHolesLocked(holes, UINT64_MAX, UINT64_MAX);
 		if (!made.empty()) {
 			m_arrivals.insert(m_arrivals.end(), made.begin(), made.end());

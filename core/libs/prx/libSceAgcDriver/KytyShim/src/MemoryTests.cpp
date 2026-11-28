@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
+#include "PopulatedRuns.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <random>
 #include <source_location>
 #include <stdexcept>
 #include <system_error>
@@ -1318,6 +1320,161 @@ void TestSparseReadsSwappedPage() {
     }
 }
 
+using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+class PageModel {
+public:
+    explicit PageModel(std::uint64_t bytes) : m_words((bytes / 0x1000 + 63) / 64, 0) {}
+
+    void Write(std::uint64_t at, std::uint64_t bytes) {
+        for (auto page = at / 0x1000; page < (at + bytes + 0xfff) / 0x1000; ++page) m_words[page / 64] |= std::uint64_t{1} << (page % 64);
+    }
+
+    std::uint64_t NextData(std::uint64_t at) const {
+        auto page = at / 0x1000;
+        if (page / 64 >= m_words.size()) return Memory::PopulatedRuns::None;
+        if ((m_words[page / 64] >> (page % 64) & 1u) != 0) return at;
+        auto word = m_words[page / 64] & (~std::uint64_t{0} << (page % 64));
+        for (auto index = page / 64; index < m_words.size();) {
+            if (word != 0) return (index * 64 + static_cast<std::uint64_t>(__builtin_ctzll(word))) * 0x1000;
+            if (++index < m_words.size()) word = m_words[index];
+        }
+        return Memory::PopulatedRuns::None;
+    }
+
+    Runs Reference(std::uint64_t offset, std::uint64_t size, std::uint64_t join) const {
+        Runs runs;
+        const auto end = offset + size;
+        for (auto at = NextData(offset); at < end; at = NextData((at & ~(Page - 1)) + Page)) {
+            const auto begin = std::max(offset, at & ~(Page - 1));
+            const auto stop = std::min(end, (at & ~(Page - 1)) + Page);
+            if (!runs.empty() && offset + runs.back().first + runs.back().second + join >= begin) {
+                runs.back().second = stop - offset - runs.back().first;
+            } else {
+                runs.emplace_back(begin - offset, stop - begin);
+            }
+        }
+        return runs;
+    }
+
+private:
+    std::vector<std::uint64_t> m_words;
+};
+
+void TestPopulatedRunsThousandsOfMaps() {
+    constexpr std::uint64_t GiB = std::uint64_t{1} << 30;
+    constexpr std::uint64_t MiB = std::uint64_t{1} << 20;
+    constexpr std::uint64_t Bytes = 64 * GiB;
+    constexpr std::uint64_t Join = MiB;
+    constexpr int Maps = 4000;
+    PageModel model(Bytes);
+    model.Write(8 * GiB, 512 * MiB);
+    model.Write(12 * GiB, 16 * MiB);
+    for (std::uint64_t at = 0; at < Bytes; at += 64 * MiB) model.Write(at + 3 * Page + 0x1000, 0x1000);
+    for (std::uint64_t at = 9 * GiB; at < 9 * GiB + 64 * MiB; at += 256 * KiB) model.Write(at, Page);
+    model.Write(10 * GiB + 2 * MiB - 0x1000, 0x2000);
+    std::uint64_t seeks = 0;
+    const auto seek = [&](std::uint64_t at, std::uint64_t& data) {
+        ++seeks;
+        data = model.NextData(at);
+        return true;
+    };
+    const auto runs_of = [&](std::uint64_t offset, std::uint64_t size) {
+        Runs runs;
+        Require(Memory::PopulatedRuns::Append(seek, Page, Join, offset, offset + size, offset, offset + size, runs));
+        Require(runs == model.Reference(offset, size, Join));
+        return runs;
+    };
+    std::mt19937_64 random(1128);
+    std::uint64_t perRun[2] = {};
+    const std::uint64_t dense[2][2] = {{12 * GiB, 16 * MiB}, {8 * GiB, 512 * MiB}};
+    for (int pool = 0; pool < 2; ++pool) {
+        seeks = 0;
+        for (int map = 0; map < Maps; ++map) {
+            const auto size = (std::uint64_t{4} + random() % 61) * Page;
+            const auto offset = dense[pool][0] + (random() % ((dense[pool][1] - size) / Page)) * Page;
+            const auto runs = runs_of(offset, size);
+            Require(runs.size() == 1 && runs[0].first == 0 && runs[0].second == size);
+        }
+        perRun[pool] = seeks;
+        Require(seeks <= static_cast<std::uint64_t>(Maps) * 4);
+    }
+    Require(perRun[1] <= perRun[0] + perRun[0] / 8);
+    for (int map = 0; map < Maps / 4; ++map) {
+        const auto size = (std::uint64_t{1} + random() % 64) * MiB;
+        const auto offset = (random() % ((Bytes - size) / Page)) * Page;
+        (void)runs_of(offset, size);
+        const auto near = 9 * GiB + (random() % (64 * MiB / Page)) * Page;
+        (void)runs_of(near, std::min<std::uint64_t>(size, 9 * GiB + 64 * MiB - near));
+    }
+    seeks = 0;
+    const auto hole = runs_of(8 * GiB - 32 * MiB, 32 * MiB);
+    Require(hole.empty() && seeks == 1);
+    model.Write(8 * GiB - 0x1000, 0x1000);
+    seeks = 0;
+    const auto tail = runs_of(8 * GiB - 32 * MiB, 32 * MiB);
+    Require(tail.size() == 1 && tail[0].first == 32 * MiB - Page && tail[0].second == Page && seeks <= 8);
+    const auto tailSeeks = seeks;
+    seeks = 0;
+    const auto large = runs_of(0, Bytes);
+    Require(!large.empty() && seeks < 4096 + 8 * large.size());
+    std::printf("populated runs: %d maps of 64 KiB-1 MiB slices cost %llu SEEK_DATA in a 16 MiB run and %llu in a 512 MiB run, a written hole "
+                "tail before that run costs %llu; every run matches a page-by-page reference\n",
+        Maps, static_cast<unsigned long long>(perRun[0]), static_cast<unsigned long long>(perRun[1]), static_cast<unsigned long long>(tailSeeks));
+}
+
+void TestPopulatedRunsDirectAliases() {
+    constexpr std::size_t bytes = 64 * 1024 * KiB;
+    constexpr std::size_t holeStart = 32 * 1024 * KiB;
+    constexpr std::size_t holeBytes = 4 * 1024 * KiB;
+    constexpr std::size_t join = 1024 * KiB;
+    constexpr int aliases = 2000;
+    const bool sparse = SparseReadsOn();
+    int guestFile = -1;
+    int directFile = -1;
+    ViewFiles(&guestFile, &directFile);
+    const auto directSize = static_cast<int64_t>(sceKernelGetDirectMemorySize());
+    const int64_t low = directSize - 192 * 1024 * 1024;
+    int64_t phys = -1;
+    Require(sceKernelAllocateDirectMemory(low, directSize - 64 * 1024 * 1024, bytes, 0, 0, &phys) == 0 && phys >= low);
+    Require(FileHole(directFile, static_cast<std::uint64_t>(phys), bytes));
+    void* first = nullptr;
+    Require(sceKernelMapDirectMemory(&first, bytes, CpuReadWrite | GpuReadWrite, 0, phys, 0) == 0 && first != nullptr);
+    auto* memory = static_cast<std::uint8_t*>(first);
+    for (std::size_t at = 0; at < bytes; at += 0x1000) {
+        if (at < holeStart || at >= holeStart + holeBytes) memory[at] = static_cast<std::uint8_t>(1 + (at >> 12));
+    }
+    std::mt19937_64 random(2811);
+    std::vector<std::pair<std::uint64_t, std::size_t>> mapped;
+    std::vector<std::pair<const std::uint8_t*, std::uint64_t>> pieces;
+    Runs runs;
+    for (int alias = 0; alias < aliases; ++alias) {
+        const auto size = (std::size_t{1} + random() % 64) * Page;
+        const auto offset = (random() % ((bytes - size) / Page)) * Page;
+        void* view = nullptr;
+        Require(sceKernelMapDirectMemory(&view, size, CpuReadWrite | GpuReadWrite, 0, phys + static_cast<int64_t>(offset), 0) == 0 && view != nullptr);
+        mapped.emplace_back(Address(view), size);
+        Require(Memory::TryGetBackingPieces(Address(view), size, pieces) && pieces.size() == 1 && pieces[0].second == size);
+        if (!sparse) {
+            Require(!Memory::TryGetPopulatedRuns(pieces[0].first, size, join, runs) && runs.empty());
+            continue;
+        }
+        Require(Memory::TryGetPopulatedRuns(pieces[0].first, size, join, runs));
+        Runs expected;
+        if (offset < holeStart) expected.emplace_back(0, std::min(offset + size, holeStart) - offset);
+        if (offset + size > holeStart + holeBytes) {
+            const auto begin = std::max(offset, holeStart + holeBytes);
+            expected.emplace_back(begin - offset, offset + size - begin);
+        }
+        Require(runs == expected);
+    }
+    for (const auto& [address, size] : mapped) Require(sceKernelMunmap(address, size) == 0);
+    Require(sceKernelMunmap(Address(first), bytes) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, bytes) == 0);
+    std::printf("direct 0x%llx: %d aliases of 16 KiB-1 MiB slices around a 4 MiB hole %s\n", static_cast<unsigned long long>(Address(first)), aliases,
+        sparse ? "report exactly their populated runs" : "report no populated runs without the memory files (plain reads)");
+}
+
 }
 
 int main() {
@@ -1345,6 +1502,8 @@ int main() {
     TestSparseReadsGuestFile();
     TestSparseReadsDirectFile();
     TestSparseReadsSwappedPage();
+    TestPopulatedRunsThousandsOfMaps();
+    TestPopulatedRunsDirectAliases();
     TestHostWriteHoldRaised();
     TestThreadRegistryRaised();
     TestViewHookRaised();
