@@ -255,6 +255,25 @@ class StallReportTests(unittest.TestCase):
         self.assertIn("fields that made the new variants of this session", text)
         self.assertIn("image-addressing", text)
 
+    def test_session_that_never_started_the_title(self):
+        cache = self.root / "_PipelineCache"
+        (self.root / "stderr.log").write_text(
+            "[kyty-startup] preparing pipelines before guest entry\n"
+            "Pipeline manifest: 2 modules, 1 pipelines in _PipelineCache/title.shared.kpm (loaded in 1.0 ms)\n"
+            "Pipeline manifest: 6000/6675 modules, 167/2559 pipelines (0 modules wait for their shaders) at 2.0 s\n"
+            "Pipeline manifest: 6178/6675 modules, 1134/2559 pipelines (0 modules wait for their shaders) at 863.1 s\n",
+            encoding="utf-8")
+        (cache / "title.shared.kpm").write_text("# manifest\n", encoding="utf-8")
+        session = tool.Session(*tool.find_inputs(self.root))
+        summary = session.summary()
+        self.assertFalse(summary["entered_game"])
+        self.assertEqual(summary["startup_progress"], {"modules": 6178, "modules_total": 6675, "pipelines": 1134,
+                                                       "pipelines_total": 2559, "seconds": 863.1})
+        text = subprocess.run([sys.executable, "-B", str(TOOL), str(self.root)], check=True, capture_output=True,
+                              text=True).stdout
+        self.assertIn("the title never started in this session (no guest entry in the log); its startup stood at "
+                      "6178/6675 modules and 1134/2559 pipelines after 863 s", text)
+
     def test_command_line_report(self):
         self.session(
             ["[kyty-gpl] stall 0.500 s compute-sync 0x0000000000000aa1  why=writes-buffers @3000000000"],
@@ -262,6 +281,7 @@ class StallReportTests(unittest.TestCase):
         text = subprocess.run([sys.executable, "-B", str(TOOL), str(self.root), "--detail"],
                               check=True, capture_output=True, text=True).stdout
         self.assertIn("waits on known programs: 1, 0.5 s", text)
+        self.assertNotIn("never started", text)
         self.assertIn("waits on unknown programs: 0, 0.0 s", text)
         self.assertIn("cause=generic-not-prepared:no-recipe", text)
         report = json.loads(subprocess.run([sys.executable, "-B", str(TOOL), str(self.root), "--json", "--detail"],

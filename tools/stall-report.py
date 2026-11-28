@@ -72,6 +72,7 @@ UNRESOLVED_MODULE = re.compile(
     r"\[kyty-startup\] unresolved_module stage=\d+ program=([0-9a-fA-F]{16}) variant=\S+"
     r"(?: generic=(\d))? reason=(\S+)(?: detail=(\S+))?")
 UNRESOLVED_COMPUTE = re.compile(r"\[kyty-startup\] unresolved_compute shader=([0-9a-fA-F]{16}) variant=\S+ reason=(\S+)")
+MANIFEST_PROGRESS = re.compile(r"Pipeline manifest: (\d+)/(\d+) modules, (\d+)/(\d+) pipelines .* at (\d+\.\d+) s")
 MANIFEST_WRITTEN = "Pipeline manifest: wrote "
 MANIFEST_LOADED = re.compile(r"Pipeline manifest: (\d+) modules, (\d+) pipelines in (\S+) \(loaded")
 CODE_LOADED = re.compile(r"Pipeline manifest: the code of \d+ shaders comes from (\S+) \((\d+) shaders\)")
@@ -412,6 +413,7 @@ class Session:
         code_count = None
         announcements = []
         self.last_write = 0
+        self.startup_progress = None
         with self.log.open(encoding="utf-8", errors="replace") as stream:
             for number, line in enumerate(stream, 1):
                 if "[kyty-gpl] " in line:
@@ -448,6 +450,8 @@ class Session:
                         shared_counts = (int(match[1]), int(match[2]))
                     elif match := CODE_LOADED.search(line):
                         code_count = int(match[2])
+                    elif self.guest_entry is None and (match := MANIFEST_PROGRESS.search(line)):
+                        self.startup_progress = tuple(int(match[index]) for index in range(1, 5)) + (float(match[5]),)
                 elif match := RUNTIME_DESCRIPTORS.search(line):
                     self.runtime_descriptors[match[1].lower()].add("rb" if match[2] == "buffer" else "rs")
         for program, elapsed, at, number in announcements:
@@ -778,6 +782,9 @@ class Session:
             "unknown_waits": len(unknown),
             "unknown_seconds": round(sum(wait.seconds for wait in unknown), 3),
             "engine_causes": sum(wait.engine_cause for wait in self.waits),
+            "entered_game": self.guest_entry is not None,
+            "startup_progress": None if self.startup_progress is None else dict(zip(
+                ("modules", "modules_total", "pipelines", "pipelines_total", "seconds"), self.startup_progress)),
             "known_programs": None if self.known is None else len(self.known),
             "prepared_modules": len(self.prepared.modules),
             "prepared_pipelines": len(self.prepared.pipelines),
@@ -817,6 +824,12 @@ def print_report(session, detail, limit):
     source = "computed by the engine" if summary["engine_causes"] == summary["waits"] and summary["waits"] else \
         f"computed by the engine for {summary['engine_causes']} waits, inferred from the manifests for the others"
     print(f"waits: {summary['waits']}, {summary['seconds']:.1f} s; causes {source}")
+    if not summary["entered_game"]:
+        progress = summary["startup_progress"]
+        where = "" if progress is None else (
+            f"; its startup stood at {progress['modules']}/{progress['modules_total']} modules and "
+            f"{progress['pipelines']}/{progress['pipelines_total']} pipelines after {progress['seconds']:.0f} s")
+        print(f"the title never started in this session (no guest entry in the log){where}: nothing below measures it")
     print()
     print(f"{'seconds':>9} {'waits':>6} {'programs':>8}  cause")
     for name, family in sorted(summary["families"].items(), key=lambda item: -item[1]["seconds"]):
