@@ -129,9 +129,53 @@ std::vector<ManifestModule> Reload(const std::vector<ManifestModule>& recipes, s
 	return loaded.modules;
 }
 
+void GenericGraphics() {
+	IR::ResourcePlan plan;
+	plan.stage                      = ShaderType::Pixel;
+	plan.resource_tracking_complete = true;
+	plan.srt_plan_complete          = true;
+	plan.descriptor_sources.emplace_back();
+	plan.info.buffers.emplace_back().source = 0;
+	plan.buffer_vector_access.push_back(1);
+	IR::ResourceSpecialization shape;
+	Check(IR::GenericGraphicsShape(plan, shape) && shape.buffers.size() == 1 &&
+	          shape.buffers.front().packed_stride == IR::RuntimeBufferStride,
+	      "generic graphics: the buffer reads its stride at run time, without bounds in the key");
+	if (shape.buffers.size() != 1) return;
+	struct Draw {
+		const char* name;
+		Sharp       sharp;
+		uint32_t    stride;
+	};
+	const std::array draws {
+	    Draw {"structured records", MakeSharp(SourceAddress, Records, 0, 16), 16u | IR::StructuredBufferBounds},
+	    Draw {"records by count", MakeSharp(SourceAddress, Records * 4u, 1, 16), 16u},
+	    Draw {"exact bytes", MakeSharp(SourceAddress, Records * 4u, 3, 1), 1u | IR::ExactBufferBounds},
+	};
+	for (const auto& draw: draws) {
+		IR::ResourceSpecialization live;
+		live.buffers.emplace_back().packed_stride = draw.stride;
+		IR::ResourceSnapshot snapshot;
+		auto&                value = snapshot.buffers.emplace_back();
+		value.dword_count          = 4;
+		std::copy(draw.sharp.begin(), draw.sharp.end(), value.dwords.begin());
+		Check(IR::BindGenericGraphics(plan, snapshot, live, shape),
+		      std::string("generic graphics: ") + draw.name + " bind the module prepared from the code alone");
+		Check(LiveBounds(draw.sharp) == (draw.stride & BoundsBits),
+		      std::string("generic graphics: ") + draw.name + " reach the module in the stride word");
+	}
+	IR::ResourceSpecialization swizzled;
+	swizzled.buffers.emplace_back().packed_stride = 16u | (1u << 14u) | IR::StructuredBufferBounds;
+	IR::ResourceSnapshot snapshot;
+	snapshot.buffers.emplace_back().dword_count = 4;
+	Check(!IR::BindGenericGraphics(plan, snapshot, swizzled, shape),
+	      "generic graphics: a buffer whose stride stays fixed keeps its own variant");
+}
+
 }
 
 int main() {
+	GenericGraphics();
 	const auto program = Translate();
 	const auto slot    = SourceSlot(program.plan);
 	Check(slot != UINT32_MAX, "the source buffer is planned");
