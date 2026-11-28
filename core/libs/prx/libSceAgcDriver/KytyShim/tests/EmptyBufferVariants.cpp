@@ -210,6 +210,50 @@ void RawSlot(bool sharing) {
 	Check(recorded.buffers[slot].scalar_empty == sharing, "raw: a recorded empty form reads back marked empty");
 }
 
+uint32_t StrideWordBounds(const Sharp& sharp) {
+	ShaderBufferResource descriptor;
+	std::copy_n(sharp.begin(), std::size(descriptor.fields), descriptor.fields);
+	return IR::RuntimeStrideData(descriptor) & (IR::StructuredBufferBounds | IR::ExactBufferBounds);
+}
+
+void StrideWord(bool sharing) {
+	const auto program = Translate(Shader(LoadRaw));
+	const auto slot    = SourceSlot(program.plan);
+	Check(slot != UINT32_MAX, "stride word: the source buffer is planned");
+	if (slot == UINT32_MAX) return;
+	const auto target = MakeSharp(TargetAddress, Records * 4u, Format32UInt, SwizzleXyzw, 3);
+	struct Case {
+		const char* name;
+		Sharp       sharp;
+		uint32_t    unshared;
+	};
+	const std::array cases {
+	    Case {"an empty structured V#", MakeSharp(SourceAddress, 0u, Format32UInt, SwizzleXyzw, 0, 16),
+	          IR::StructuredBufferBounds},
+	    Case {"an empty V# bounded by its record count", MakeSharp(SourceAddress, 0u, Format32UInt, SwizzleXyzw, 1, 16),
+	          0u},
+	    Case {"an empty V# with exact bounds", MakeSharp(SourceAddress, 0u, Format32UInt, SwizzleXyzw, 3, 16),
+	          IR::ExactBufferBounds},
+	};
+	for (const auto& entry: cases) {
+		const auto label = std::string("stride word: ") + entry.name;
+		Check(StrideWordBounds(entry.sharp) == (sharing ? IR::ExactBufferBounds : entry.unshared),
+		      label + (sharing ? " reads as exact when empty buffers are shared"
+		                       : " keeps the bounds of its descriptor when sharing is off"));
+		const auto keyed = Materialize(program.plan, entry.sharp, target, false);
+		Check(keyed.ok, label + " materializes with a fixed stride");
+		if (!keyed.ok || sharing) continue;
+		Check((keyed.specialization.buffers[slot].packed_stride & (IR::StructuredBufferBounds | IR::ExactBufferBounds)) ==
+		          StrideWordBounds(entry.sharp),
+		      label + " carries the bounds its key holds when sharing is off");
+	}
+	Check(StrideWordBounds(MakeSharp(SourceAddress, Records, Format32UInt, SwizzleXyzw, 0, 16)) ==
+	          IR::StructuredBufferBounds,
+	      "stride word: a bound structured V# keeps structured bounds");
+	Check(StrideWordBounds(MakeSharp(SourceAddress, Records * 4u, Format32UInt, SwizzleXyzw, 3)) == IR::ExactBufferBounds,
+	      "stride word: a bound V# with exact bounds keeps them");
+}
+
 void FormattedSlot(bool sharing) {
 	const auto target = MakeSharp(TargetAddress, Records * 4u, Format32UInt, SwizzleXyzw, 3);
 	struct Case {
@@ -283,6 +327,7 @@ int main() {
 	const bool  sharing = setting == nullptr || std::strcmp(setting, "0") != 0;
 	Check(IR::SharesEmptyBuffers() == sharing, "the setting is read");
 	RawSlot(sharing);
+	StrideWord(sharing);
 	FormattedSlot(sharing);
 	EmptyReads();
 	if (g_failures != 0) {

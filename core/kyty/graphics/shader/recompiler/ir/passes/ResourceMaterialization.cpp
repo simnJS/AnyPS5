@@ -2690,6 +2690,15 @@ bool PopulatedBuffersCoverEmptySpecialization(const ResourcePlan& program, const
 }
 #endif
 
+uint32_t RuntimeStrideData(const ShaderBufferResource& descriptor) {
+	const uint32_t stride = descriptor.Stride();
+#if defined(ANYPS5_KYTY)
+	if (descriptor.NumRecords() == 0u && SharesEmptyBuffers()) return stride | ExactBufferBounds;
+#endif
+	if (descriptor.OutOfBounds() == 3u) return stride | ExactBufferBounds;
+	return stride | (stride != 0u && descriptor.OutOfBounds() == 0u ? StructuredBufferBounds : 0u);
+}
+
 thread_local bool t_indirect_buffer_failure = false;
 
 bool IndirectBufferMaterializationFailed() {
