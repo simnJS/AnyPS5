@@ -167,9 +167,11 @@ public:
 		return std::max(MinDriverBytes, std::min(16 * GiB, cap));
 	}
 
-	[[nodiscard]] uint64_t Reserve() const {
-		return m_sample.total != 0 ? std::clamp(m_sample.total / 5, 4 * GiB, 12 * GiB) : 4 * GiB;
+	[[nodiscard]] static uint64_t Reserve(uint64_t total) {
+		return total != 0 ? std::clamp(total / 5, 4 * GiB, 12 * GiB) : 4 * GiB;
 	}
+
+	[[nodiscard]] uint64_t Reserve() const { return Reserve(m_sample.total); }
 
 	[[nodiscard]] uint64_t Committed() const {
 		uint64_t total = 0;

@@ -565,10 +565,26 @@ ProcessMemory ReadProcessMemory() {
 #if __GLIBC_PREREQ(2, 33)
 	const auto heap = mallinfo2();
 	result.malloc_bytes = heap.uordblks + heap.hblkhd;
+	result.malloc_free = heap.fordblks;
 #endif
 #endif
 #endif
 	return result;
+}
+
+std::optional<HeapTrim> TrimUnusedHeap() {
+#if defined(__GLIBC__)
+#if __GLIBC_PREREQ(2, 33)
+	const auto free = mallinfo2().fordblks;
+	if (free < 64u * 1024u * 1024u) return std::nullopt;
+	const auto rss = [] { return Find(ReadProcValues("/proc/self/status"), "VmRSS"); };
+	const auto before = rss();
+	if (malloc_trim(0) != 0 && before) {
+		if (const auto after = rss()) return HeapTrim {free, *before, *after};
+	}
+#endif
+#endif
+	return std::nullopt;
 }
 
 std::optional<SystemMemory> ReadSystemMemory() {

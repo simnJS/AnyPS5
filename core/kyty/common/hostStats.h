@@ -62,9 +62,18 @@ struct ProcessMemory {
 	std::optional<uint64_t> rss;
 	std::optional<uint64_t> private_bytes;
 	std::optional<uint64_t> malloc_bytes;
+	std::optional<uint64_t> malloc_free;
 };
 
 [[nodiscard]] ProcessMemory ReadProcessMemory();
+
+struct HeapTrim {
+	uint64_t free_bytes;
+	uint64_t rss_before;
+	uint64_t rss_after;
+};
+
+[[nodiscard]] std::optional<HeapTrim> TrimUnusedHeap();
 
 struct SystemMemory {
 	uint64_t total;
