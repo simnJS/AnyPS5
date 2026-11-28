@@ -1471,6 +1471,7 @@ size_t PipelineCache::FindReadyComputeVariant(const Program& program,
 ShaderModule* PipelineCache::ServeComputeVariant(Program& program, const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor, const ShaderModule* exact) {
 	ShaderRecompiler::IR::ClearServeRefusal();
+	t_compute_serve_miss = {};
 	auto best_index = FindReadyComputeVariant(program, program.resources, program.specialization,
 	                                          push_data_cursor, exact, false);
 	const auto& plan = program.resource_plan;
