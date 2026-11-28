@@ -257,6 +257,27 @@ std::optional<uint64_t> SimulatedThreadBytes(int thread) {
 	return found->second;
 }
 
+void GuestGrowthDoesNotSpendReservations() {
+	const auto now = ManifestAdmission::Clock::time_point {};
+	const auto caller = std::this_thread::get_id();
+	constexpr auto total = 44 * ManifestAdmission::GiB;
+	ManifestAdmission admission(16, SimulatedThreadBytes);
+	g_thread_bytes = {{1, 0}, {2, 0}, {3, 0}};
+	admission.Sample(now, {.total = total, .available = total, .process = ManifestAdmission::GiB});
+	const auto cost = admission.LightEstimate();
+	const auto first = admission.Admit(now, 0, false, caller, now, 1);
+	Check(first.has_value(), "one translation holds a reservation");
+	admission.Sample(now + 1s, {.total = total, .available = admission.Reserve() + 2 * cost, .process = 16 * ManifestAdmission::GiB});
+	Check(admission.Pending() == cost, "guest RSS growth leaves the worker's reservation intact");
+	Check(admission.Admit(now + 1s, 0, false, caller, now, 2).has_value(), "the second translation fits");
+	Check(!admission.Admit(now + 1s, 0, false, caller, now, 3), "new tickets cannot use RSS growth from an earlier sample");
+	g_thread_bytes[1] = cost;
+	admission.Sample(now + 2s, {.total = total, .available = admission.Reserve() + 2 * cost, .process = 16 * ManifestAdmission::GiB});
+	Check(admission.Pending() == cost, "observed memory covers only its own translation");
+	admission.Finish(*first);
+	Check(admission.Pending() == cost, "finishing a worker preserves the other reservation");
+}
+
 struct GrowthRun {
 	double   measured_per_word = 0.0;
 	double   blind_per_word    = 0.0;
@@ -415,6 +436,7 @@ int main() {
 	LearnedEstimateFollowsMeasuredUse();
 	MemoryFloorStaysLow();
 	GameGrowthIsNotLearned();
+	GuestGrowthDoesNotSpendReservations();
 	CompilationGrowthStillLearned();
 	LargeJobsDoNotStarve();
 	GenericRefusalSkipsPipelines();
