@@ -410,6 +410,22 @@ void GenericShapeRefusalsNameTheirReason() {
     auto single = graphics();
     single.descriptor_sources.push_back(table(true));
     Require(refusal(single) == "accepted", "a single table array was refused");
+
+    const auto table_image = [&](bool compare, bool written) {
+        auto plan = graphics();
+        plan.stage = ShaderType::Pixel;
+        plan.descriptor_sources.push_back(table(true));
+        auto& image = plan.info.images.emplace_back();
+        image.source = 0;
+        image.resource_class = ImageResourceClass::Sampled;
+        image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        image.depth_compare = compare;
+        image.written = written;
+        return plan;
+    };
+    Require(refusal(table_image(true, false)) == "accepted", "a compared table image was refused");
+    Require(refusal(table_image(false, true)) == "table_image_not_plain_sampled",
+            "a written table image was not named");
 }
 
 }

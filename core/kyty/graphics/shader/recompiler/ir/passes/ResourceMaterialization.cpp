@@ -2419,8 +2419,8 @@ bool GenericGraphicsShape(const ResourcePlan& plan, ResourceSpecialization& shap
 		const bool table = image.source == table_source && table_source != UINT32_MAX;
 		if (image.mip_mode != ImageMipMode::None) return refuse("image_mip_mode");
 		if (!table && image.paired_view != ImageResource::NoIndirectImage) return refuse("image_paired_view");
-		if (table && (image.resource_class != ImageResourceClass::Sampled || image.depth_compare ||
-		              image.atomic || image.written || image.r128))
+		if (table && (image.resource_class != ImageResourceClass::Sampled || image.atomic || image.written ||
+		              image.r128))
 			return refuse("table_image_not_plain_sampled");
 		auto& view = shape.images.emplace_back();
 		if (table) {
