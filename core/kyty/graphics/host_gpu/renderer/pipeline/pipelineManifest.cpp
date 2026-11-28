@@ -703,7 +703,7 @@ void PipelineCache::DecideRuntimeStrides(std::span<PipelineManifest*> manifests)
 
 const ShaderModule* PipelineCache::FindCompiledModule(
     const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-    uint32_t push_data_cursor, bool generic_graphics) const {
+    uint32_t push_data_cursor, bool generic_graphics, std::span<const uint32_t> function_code) const {
 	const auto entry = m_program_cache.find(key);
 	if (entry == m_program_cache.end()) {
 		return nullptr;
@@ -719,7 +719,7 @@ const ShaderModule* PipelineCache::FindCompiledModule(
 #else
 		const bool same = module.specialization == specialization;
 #endif
-		if (module.function_code.empty() && same &&
+		if (std::ranges::equal(module.function_code, function_code) && same &&
 		    layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
 		                                        push_data_cursor, layout.ShaderDataDwords())) {
 			return &module;
@@ -1090,9 +1090,11 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 			for (const auto i: new_modules) {
 				const auto& record = loaded.modules[i];
 				const auto* hit = FindCompiledModule(ManifestProgramKey(record, false),
-				                                     record.specialization, record.push_data_cursor, record.generic_graphics);
+				                                     record.specialization, record.push_data_cursor, record.generic_graphics,
+				                                     record.function_code);
 				if (hit && native && record.stage == ShaderType::Compute && hit->info.info.ray_query &&
-				    !FindCompiledModule(ManifestProgramKey(record, true), record.specialization, record.push_data_cursor)) {
+				    !FindCompiledModule(ManifestProgramKey(record, true), record.specialization, record.push_data_cursor,
+				                        false, record.function_code)) {
 					continue;
 				}
 				cached[i] = hit;
@@ -3377,7 +3379,8 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	auto                specialization = record.specialization;
 	const ShaderModule* compiled       = nullptr;
 	LockPrograms();
-	compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics);
+	compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics,
+	                              record.function_code);
 	UnlockPrograms();
 	if (compiled != nullptr) {
 		finish(compiled, false);
@@ -3387,6 +3390,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	if (!admitted) return;
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	std::optional<ShaderModule>                       module;
+	std::unique_ptr<ShaderRecompiler::ShaderSource>   call_source;
 	const auto what = fmt::format("module {:016x}", record.code_hash);
 	const bool ran = RunDroppable(state.dropped, record.from_assets, record.code_hash, 0, what, [&] {
 		auto source = ShaderRecompiler::PrepareShaderSource(code, options);
@@ -3394,11 +3398,16 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			refusal = fmt::format("unsupported_call_pc_{:x}", source.unsupported_call_pc);
 			return;
 		}
-		if (!source.calls.empty()) {
-			refusal = fmt::format("calls_{}", source.calls.size());
+		if (source.calls.empty() != record.function_code.empty()) {
+			refusal = source.calls.empty() ? "function_code_without_calls" : fmt::format("calls_{}", source.calls.size());
 			return;
 		}
-		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		if (!source.calls.empty() && !ShaderRecompiler::LinkShaderSource(source, record.function_code)) {
+			refusal = "function_code_does_not_fit";
+			return;
+		}
+		auto translated = ShaderRecompiler::TranslateProgram(source.linked ? source.linked->decoded : source.decoded,
+		                                                     options);
 		plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		if (record.generic_graphics) {
 			const char* shape_refusal = "shape";
@@ -3414,7 +3423,8 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		if (record.stage == ShaderType::Compute && RuntimeStride(key.hash)) {
 			ShaderRecompiler::IR::ReadStridesAtRunTime(*plan, specialization);
 			LockPrograms();
-			compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics);
+			compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics,
+			                              record.function_code);
 			UnlockPrograms();
 			if (compiled != nullptr) {
 				return;
@@ -3428,7 +3438,8 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		}
 		if (specialization != recorded) {
 			LockPrograms();
-			compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics);
+			compiled = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics,
+			                              record.function_code);
 			UnlockPrograms();
 			if (compiled != nullptr) {
 				return;
@@ -3436,9 +3447,10 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		}
 #endif
 		std::string build_refusal;
-		module          = BuildModule(key, options, std::move(translated), specialization, {},
+		module          = BuildModule(key, options, std::move(translated), specialization, record.function_code,
 		                              record.push_data_cursor, spirv, plain_spirv, &build_refusal);
 		if (!module) refusal = build_refusal.empty() ? "build_refused" : fmt::format("build_{}", build_refusal);
+		if (module && source.linked) call_source = std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source));
 	});
 	admitted.Reset();
 	if (!ran) refusal = "dropped_after_fatal_error";
@@ -3453,20 +3465,25 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	bool added = false;
 	{
 		LockPrograms();
-		auto entry = m_program_cache.find(key);
+		const bool linked = call_source != nullptr;
+		auto       entry  = m_program_cache.find(key);
 		if (entry == m_program_cache.end()) {
-			entry =
-			    m_program_cache.try_emplace(key, Program {.resource_plan = std::move(*plan)}).first;
+			entry = m_program_cache.try_emplace(key, Program {.call_source   = std::move(call_source),
+			                                                  .resource_plan = std::move(*plan)}).first;
 		}
 		auto& program = entry->second;
-		compiled      = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics);
-		if (compiled != nullptr || program.skip_dispatch || program.call_source != nullptr) {
+		compiled      = FindCompiledModule(key, specialization, record.push_data_cursor, record.generic_graphics,
+		                                   record.function_code);
+		const bool same_kind = linked ? program.call_source != nullptr && !program.call_source->expand_calls
+		                              : program.call_source == nullptr;
+		if (compiled != nullptr || program.skip_dispatch || !same_kind) {
 			DestroyModule(*module);
+			if (compiled == nullptr) refusal = same_kind ? "program_skipped" : "program_links_differently";
 		} else {
 			auto& added_module = program.modules.emplace_back(std::move(*module));
 			added_module.plan  = &program.resource_plan;
 			compiled           = &added_module;
-			StoreModule(key, program, *compiled, spirv, plain_spirv);
+			if (!linked) StoreModule(key, program, *compiled, spirv, plain_spirv);
 			added = true;
 		}
 		UnlockPrograms();
@@ -3740,7 +3757,10 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 	}
 	switch (key.stage) {
 		case ShaderType::Pixel: record.input = *options.input_info.pixel; break;
-		case ShaderType::Compute: record.input = *options.input_info.compute; break;
+		case ShaderType::Compute:
+			record.input         = *options.input_info.compute;
+			record.function_code = module.function_code;
+			break;
 		default: record.input = *options.input_info.vertex; break;
 	}
 	NormalizeManifestInput(record);

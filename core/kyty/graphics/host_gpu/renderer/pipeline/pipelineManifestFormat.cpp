@@ -748,6 +748,8 @@ void ReadElements(TextReader& r, std::string_view key, std::vector<Element>& ele
 	}
 }
 
+constexpr size_t MaxFunctionCodeWords = 1u << 16u;
+
 ManifestModule DefaultModule(ShaderType stage) {
 	ManifestModule module {.stage = stage};
 	if (stage == ShaderType::Pixel) {
@@ -784,6 +786,12 @@ std::string ModuleText(ManifestModule& module) {
 	WriteElements(w, "sb", buffers);
 	WriteElements(w, "si", images);
 	WriteElements(w, "ss", samplers);
+	if (!module.function_code.empty()) {
+		std::string words;
+		words.reserve(module.function_code.size() * 8u);
+		for (const auto word: module.function_code) fmt::format_to(std::back_inserter(words), "{:08x}", word);
+		w.Value("fn", words);
+	}
 	return text;
 }
 
@@ -827,6 +835,16 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 	ReadElements(r, "si", images);
 	ReadElements(r, "ss", samplers);
 	if (module.generic_graphics && (!buffers.empty() || !images.empty() || !samplers.empty())) return false;
+	if (const auto words = r.Find("fn")) {
+		if (stage != ShaderType::Compute || words->empty() || words->size() % 8u != 0 ||
+		    words->size() / 8u > MaxFunctionCodeWords) return false;
+		module.function_code.resize(words->size() / 8u);
+		for (size_t i = 0; i < module.function_code.size(); i++) {
+			uint64_t word = 0;
+			if (!ParseNumber(words->substr(i * 8u, 8u), word, 16)) return false;
+			module.function_code[i] = static_cast<uint32_t>(word);
+		}
+	}
 	return r.ok && module.user_data_count <= ShaderParams {}.user_data.size();
 }
 
@@ -1223,6 +1241,10 @@ uint64_t ManifestModuleIdentity(const ManifestModule&     module,
 	                                  (uint32_t(module.generic_graphics) << 2u));
 	if (modes != 0) Io(writer, modes);
 	writer.Raw(static_state.data(), static_state.size_bytes());
+	if (!module.function_code.empty()) {
+		auto linked = XXH3_64bits(module.function_code.data(), module.function_code.size() * sizeof(uint32_t));
+		Io(writer, linked);
+	}
 	return XXH3_64bits(writer.bytes.data(), writer.bytes.size());
 }
 

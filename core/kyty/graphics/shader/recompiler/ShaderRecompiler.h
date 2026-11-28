@@ -123,6 +123,7 @@ bool                             NoteRayTracingProgram(RayTracingProgramKind kin
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
+[[nodiscard]] bool LinkShaderSource(ShaderSource& source, std::span<const uint32_t> function_code);
 [[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
 	                                           const CompileOptions& options);
 

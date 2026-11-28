@@ -1279,6 +1279,8 @@ void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
 	if (program.call_source == nullptr) {
 		StoreModule(key, program, module, spirv, plain_spirv);
 		RecordModule(key, options, code, push_data_cursor, module);
+	} else if (!program.call_source->expand_calls) {
+		RecordModule(key, options, code, push_data_cursor, module);
 	}
 #if defined(ANYPS5_KYTY)
 	NoteWaitCause(key, program, module);

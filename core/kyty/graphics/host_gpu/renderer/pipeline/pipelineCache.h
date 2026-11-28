@@ -993,7 +993,8 @@ private:
 	void SetHostInput(ManifestModule& module) const;
 	const ShaderModule* FindCompiledModule(
 	    const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	    uint32_t push_data_cursor, bool generic_graphics = false) const KYTY_REQUIRES(m_program_lock);
+	    uint32_t push_data_cursor, bool generic_graphics = false,
+	    std::span<const uint32_t> function_code = {}) const KYTY_REQUIRES(m_program_lock);
 	void ManifestProgress(bool force);
 	void SaveManifestRecording();
 	struct ManifestBacklog {
