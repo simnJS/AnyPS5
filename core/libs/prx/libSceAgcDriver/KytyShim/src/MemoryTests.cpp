@@ -34,6 +34,7 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -48,6 +49,7 @@ constexpr int MapFixed = 0x10;
 
 void Require(bool condition, std::source_location location = std::source_location::current()) {
     if (!condition) {
+        std::fflush(stdout);
         std::fprintf(stderr, "KytyShim memory check failed at %s:%u\n", location.file_name(), static_cast<unsigned>(location.line()));
         std::abort();
     }
@@ -1478,6 +1480,7 @@ void TestPopulatedRunsDirectAliases() {
 }
 
 int main() {
+    Require(prctl(PR_SET_THP_DISABLE, 1L, 0L, 0L, 0L) == 0);
     setenv("APS5_HEAP_CACHE_MIB", "0", 1);
     Require(Libs::LibKernel::Memory::Shim::ViewEnabled());
     TestFlexible();
