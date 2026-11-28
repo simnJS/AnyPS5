@@ -552,16 +552,26 @@ void ImageHeap::Forget(uint32_t index) {
 	}
 }
 
-void ImageHeap::Free(uint32_t index) {
-	auto& element = m_elements[index];
-	element.freed = true;
-	m_capacity_changed = true;
+void ImageHeap::UnpinImage(uint32_t index) {
+	const auto& element = m_elements[index];
+	if (!element.image) return;
+	const auto found = m_by_serial.find(element.serial);
+	if (found != m_by_serial.end()) {
+		std::erase(found->second, index);
+		if (found->second.empty()) m_by_serial.erase(found);
+	}
 	auto& textures = m_context.GetTextureCache();
 	if (auto* image = textures.m_slot_images.try_get(element.image);
 	    image != nullptr && image->serial == element.serial) {
 		image->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
 		image->tick_accessed_last = textures.m_gc_tick;
 	}
+}
+
+void ImageHeap::Free(uint32_t index) {
+	UnpinImage(index);
+	m_elements[index].freed = true;
+	m_capacity_changed = true;
 	m_released.push_back(index);
 }
 
@@ -699,8 +709,8 @@ void ImageHeap::Release(uint32_t entry) {
 void ImageHeap::Retire() {
 	if (m_released.empty()) return;
 	const auto released = [&](uint32_t index) { return m_elements[index].freed; };
-	std::erase_if(m_held, released);
-	std::erase_if(m_dcc, released);
+	std::erase_if(m_held, [&](const Discovery& entry) { return released(entry.index); });
+	std::erase_if(m_dcc, [&](const DccEntry& entry) { return released(entry.last.index); });
 	const auto tick = m_context.GetCommandScheduler().CurrentTick();
 	for (const auto index: m_released) m_retired.emplace_back(tick, index);
 	m_released.clear();
@@ -731,16 +741,34 @@ void ImageHeap::Mark(uint32_t index, State state) {
 
 template <typename Fn>
 bool ImageHeap::ForEachChanged(Fn&& fn) {
-	bool found = false;
-	for (uint32_t index = 1; !m_changes.empty() && index < m_elements.size(); ++index) {
-		const auto& element = m_elements[index];
-		if (!element.freed && (element.table || element.refs != 0u) && element.image &&
-		    std::ranges::binary_search(m_changes, element.serial, {}, &Image::HeapChange::serial)) {
-			fn(index);
-			found = true;
+	if (m_changes.empty()) return false;
+	m_changed.clear();
+	for (const auto& change: m_changes) {
+		const auto found = m_by_serial.find(change.serial);
+		if (found == m_by_serial.end()) continue;
+		for (const auto index: found->second) {
+			const auto& element = m_elements[index];
+			if (!element.freed && (element.table || element.refs != 0u) && element.image &&
+			    element.serial == change.serial) {
+				m_changed.push_back(index);
+			}
 		}
 	}
-	return found;
+	std::ranges::sort(m_changed);
+	m_changed.erase(std::ranges::unique(m_changed).begin(), m_changed.end());
+	if (m_verify_discovery) {
+		std::vector<uint32_t> expected;
+		for (uint32_t index = 1; index < m_elements.size(); ++index) {
+			const auto& element = m_elements[index];
+			if (!element.freed && (element.table || element.refs != 0u) && element.image &&
+			    std::ranges::binary_search(m_changes, element.serial, {}, &Image::HeapChange::serial)) {
+				expected.push_back(index);
+			}
+		}
+		if (expected != m_changed) EXIT("Image heap serial index differs from the full scan");
+	}
+	for (const auto index: m_changed) fn(index);
+	return !m_changed.empty();
 }
 
 void ImageHeap::Repoint() {
@@ -1551,6 +1579,79 @@ void ImageHeap::FinishChecks() {
 	}
 }
 
+ImageHeap::Discovery ImageHeap::RecordDiscovery(uint32_t index, const TextureCache::ImageDesc& desc,
+                                               ImageId image, uint64_t mappings, uint64_t backing) {
+	const auto& info = desc.info;
+	Discovery last {index, info.data, info.metadata.range, 0, mappings, backing, {}};
+	if (info.data.Empty() || info.IsDepth() || info.HasStencil() || info.IsBlock()) return last;
+	if (m_table_profiles[m_elements[index].key.profile] &&
+	    (!LibKernel::Memory::IsBackingReadable(info.data.address, info.data.size) ||
+	     (info.HasMetadata() && !info.metadata.range.Valid()))) return last;
+	auto& textures = m_context.GetTextureCache();
+	Common::ScopedLock lock {textures.m_lock};
+	uint32_t count = 0;
+	textures.ForEachImageInRegion(info.data.address, info.data.size, [&](ImageId id, Image& owner) {
+		++count;
+		if (owner.depth_id || owner.info.IsDepth() || owner.info.HasStencil() || owner.info.IsBlock()) return;
+		if (image) {
+			if (id == image && TextureCache::SameBacking(owner.info, info, true)) last.sole_image = id;
+		} else if (desc.heap && owner.heap_refs.load(std::memory_order_relaxed) != 0u &&
+		           owner.info.data.address == info.data.address && owner.info.type == info.type &&
+		           owner.info.extent != info.extent) {
+			last.sole_image = id;
+		}
+	});
+	if (count != 1u) last.sole_image = {};
+	last.image_epoch = textures.ImageSetEpoch();
+	return last;
+}
+
+bool ImageHeap::RangeUnchanged(Discovery& last) {
+	if (!last.sole_image) return false;
+	auto& textures = m_context.GetTextureCache();
+	const auto images = textures.ImageSetEpoch();
+	if (images != last.image_epoch) {
+		bool overlaps = false;
+		const bool known = textures.ForEachImageSetChangeSince(last.image_epoch, [&](uint64_t start, uint64_t size) {
+			overlaps |= ImageRangeOverlaps(last.data, {start, size});
+		});
+		if (!known || overlaps) return false;
+		last.image_epoch = images;
+	}
+	const auto mappings = m_context.MappingEpoch();
+	if (mappings != last.mapping_epoch) {
+		if (m_context.UnmappedSince(last.mapping_epoch, last.data.address, last.data.size)) return false;
+		last.mapping_epoch = mappings;
+	}
+	const auto backing = LibKernel::Memory::BackingEpoch();
+	if (backing != last.backing_epoch) {
+		std::vector<std::pair<uint64_t, uint64_t>> changes;
+		if (!LibKernel::Memory::BackingChangesSince(last.backing_epoch, changes) ||
+		    std::ranges::any_of(changes, [&](const auto& change) {
+			    const GuestRange range {change.first, change.second};
+			    return ImageRangeOverlaps(last.data, range) ||
+			           (last.metadata.size != 0 && ImageRangeOverlaps(last.metadata, range));
+		    })) return false;
+		last.backing_epoch = backing;
+	}
+	return true;
+}
+
+bool ImageHeap::ReuseDcc(DccEntry& entry) {
+	if (!RangeUnchanged(entry.last)) return false;
+	auto& textures = m_context.GetTextureCache();
+	const auto& desc = entry.desc;
+	{
+		Common::ScopedLock lock {textures.m_lock};
+		auto& image = textures.m_slot_images[entry.last.sole_image];
+		if (image.serial != m_elements[entry.last.index].serial || image.info.metadata != desc.info.metadata ||
+		    textures.m_surface_metas.contains(desc.info.metadata.range.address)) return false;
+	}
+	if (!textures.ColorClearSettled(desc)) return false;
+	textures.GetImage(entry.last.sole_image).tick_accessed_last = textures.m_gc_tick;
+	return true;
+}
+
 void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
 	auto& textures = m_context.GetTextureCache();
@@ -1577,24 +1678,41 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		return executor.ResolveTexture(IR::ImageHeapResource(profile, element.kind), element.key.value);
 	};
-	const auto retry = [&](uint32_t index) {
+	const auto retry = [&](Discovery& last, DccEntry* dcc) {
+		const auto index = last.index;
 		const auto& element = m_elements[index];
 		if (element.state != State::Live || element.freed) return true;
 		if (element.evicting) return false;
+		const bool kept = dcc != nullptr ? ReuseDcc(*dcc) :
+		    RangeUnchanged(last) && textures.m_slot_images[last.sole_image].heap_refs.load(std::memory_order_relaxed) != 0;
+		if (kept && !m_verify_discovery) return false;
+		const auto mappings = m_context.MappingEpoch();
+		const auto backing = LibKernel::Memory::BackingEpoch();
 		const auto binding = resolve(element);
-		if (binding.image_id == element.image &&
-		    (!element.image || textures.m_slot_images[element.image].serial == element.serial)) {
-			return !element.image && binding.desc.info.data.Empty();
+		const bool same = binding.image_id == element.image &&
+		                  (!element.image || textures.m_slot_images[element.image].serial == element.serial);
+		const bool leaves = !element.image && binding.desc.info.data.Empty();
+		if (kept && (!same || leaves || last.data != binding.desc.info.data ||
+		             last.metadata != binding.desc.info.metadata.range ||
+		             (dcc != nullptr && dcc->desc.view_info != binding.desc.view_info))) {
+			EXIT("Image heap discovery disagrees at slot %u", index);
+		}
+		if (same) {
+			if (!leaves) {
+				last = RecordDiscovery(index, binding.desc, binding.image_id, mappings, backing);
+				if (dcc != nullptr) dcc->desc = binding.desc;
+			}
+			return leaves;
 		}
 		Mark(index, State::Stale);
 		stale = true;
 		return true;
 	};
-	std::erase_if(m_dcc, retry);
+	std::erase_if(m_dcc, [&](DccEntry& entry) { return retry(entry.last, &entry); });
 	if (const auto serial = Image::serials.load(std::memory_order_relaxed);
 	    m_held_serial != serial) {
 		m_held_serial = serial;
-		std::erase_if(m_held, retry);
+		std::erase_if(m_held, [&](Discovery& entry) { return retry(entry, nullptr); });
 	}
 	if (stale) Repoint();
 	Requeue();
@@ -1608,22 +1726,30 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			if (element.table) Hash(index);
 			continue;
 		}
+		const auto mappings = m_context.MappingEpoch();
+		const auto backing = LibKernel::Memory::BackingEpoch();
 		auto binding = resolve(m_elements[index]);
 		auto& element = m_elements[index];
 		if (binding.image_id) {
-			auto& image        = textures.GetImage(binding.image_id);
-			image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+			auto& image = textures.GetImage(binding.image_id);
+			if (element.image != binding.image_id || element.serial != image.serial) {
+				UnpinImage(index);
+				m_by_serial[image.serial].push_back(index);
+				image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+			}
 			element.image      = binding.image_id;
 			element.serial     = image.serial;
 			element.since      = stamp;
 			binding.layout     = image.ReadLayout();
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
-			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back(index);
+			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+				m_dcc.push_back({RecordDiscovery(index, binding.desc, binding.image_id, mappings, backing), binding.desc});
+			}
 			m_away.emplace_back(image.serial, binding.image_id);
 		} else if (binding.declined) {
 			m_declined.push_back(index);
 		} else if (!binding.desc.info.data.Empty()) {
-			m_held.push_back(index);
+			m_held.push_back(RecordDiscovery(index, binding.desc, {}, mappings, backing));
 		}
 		m_writes.push_back({index, {nullptr, binding.image_view,
 		                             binding.image_view ? binding.layout : vk::ImageLayout::eGeneral}});

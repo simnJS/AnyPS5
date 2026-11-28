@@ -791,6 +791,10 @@ if(NOT ANYPS5_KYTY_DLL)
             PASS_REGULAR_EXPRESSION "invalid KYTY_TABLE_DESCRIPTOR_WRITES: 2" FAIL_REGULAR_EXPRESSION "did not stop")
     add_test(NAME kyty_shim_descriptor_tables_draw COMMAND kyty_shim_descriptor_tables_tests draw)
     set_tests_properties(kyty_shim_descriptor_tables_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+    add_test(NAME kyty_shim_image_heap_discovery COMMAND kyty_shim_descriptor_tables_tests heap-discovery)
+    add_test(NAME kyty_shim_image_heap_discovery_checked COMMAND kyty_shim_descriptor_tables_tests heap-discovery-checked)
+    set_tests_properties(kyty_shim_image_heap_discovery kyty_shim_image_heap_discovery_checked PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0" FAIL_REGULAR_EXPRESSION "FAILED")
     add_test(NAME kyty_shim_image_heap_exhaustion COMMAND kyty_shim_descriptor_tables_tests heap-exhaustion)
     set_tests_properties(kyty_shim_image_heap_exhaustion PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0" FAIL_REGULAR_EXPRESSION "FAILED")
